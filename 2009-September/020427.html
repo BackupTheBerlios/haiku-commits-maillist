@@ -1,0 +1,538 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32978 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32978%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200909070058.n870wYmU011762%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020426.html">
+   <LINK REL="Next"  HREF="020428.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32978 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata</H1>
+    <B>marcusoverhagen at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32978%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200909070058.n870wYmU011762%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32978 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata">marcusoverhagen at mail.berlios.de
+       </A><BR>
+    <I>Mon Sep  7 02:58:34 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020426.html">[Haiku-commits] r32977 -	haiku/trunk/src/add-ons/kernel/generic/ata_adapter
+</A></li>
+        <LI>Next message: <A HREF="020428.html">[Haiku-commits] r32979 - haiku/trunk/src/servers/input
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20427">[ date ]</a>
+              <a href="thread.html#20427">[ thread ]</a>
+              <a href="subject.html#20427">[ subject ]</a>
+              <a href="author.html#20427">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: marcusoverhagen
+Date: 2009-09-07 02:58:31 +0200 (Mon, 07 Sep 2009)
+New Revision: 32978
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32978&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32978&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h
+Log:
+Faster bus scan by reusing device presence information that is available before 
+resetting the bus. This allows to skip devices that are not present. Works for
+most but not all devices. Sometimes device 0 pretends that a device 1 exists,
+but it's usefull anyway.
+Allow working device 1 only configurations by not selecting device 0 anymore
+for identification. Moved indentification from Reset into BusScan to do everything
+in a single step. A SATA emulation in combined mode might have a slave (device 1)
+only configuration when only one device is connected, depending on the port.
+Also tested with PATA.
+Recovery for lost interrupts. Works but is dead slow because of the timeout.
+Bus reset isn't possible anymore, this needs to be implemented in a save way.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp	2009-09-07 00:46:02 UTC (rev 32977)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp	2009-09-07 00:58:31 UTC (rev 32978)
+@@ -115,23 +115,115 @@
+ }
+ 
+ 
++bool
++ATAChannel::_DevicePresent(int device)
++{
++	SelectDevice(device);
++
++	if (SelectedDevice() != device) {
++		TRACE_ALWAYS(&quot;_DevicePresent: device selection failed for device %i\n&quot;,
++		device);
++		return false;
++	}
++
++	ata_task_file taskFile;
++	taskFile.chs.sector_count = 0x5a;
++	taskFile.chs.sector_number = 0xa5;
++	if (_WriteRegs(&amp;taskFile, ATA_MASK_SECTOR_COUNT 
++		| ATA_MASK_SECTOR_NUMBER) != B_OK) {
++		TRACE_ERROR(&quot;_DevicePresent: writing registers failed\n&quot;);
++		return false;
++	}
++	if (_ReadRegs(&amp;taskFile, ATA_MASK_SECTOR_COUNT 
++		| ATA_MASK_SECTOR_NUMBER) != B_OK) {
++		TRACE_ERROR(&quot;_DevicePresent: reading registers failed\n&quot;);
++		return false;
++	}
++	bool present = (taskFile.chs.sector_count == 0x5a &amp;&amp; 
++		taskFile.chs.sector_number == 0xa5);
++
++	TRACE_ALWAYS(&quot;_DevicePresent: device %i, presence %d\n&quot;, device, present);
++	return present;
++}
++
++
+ status_t
+ ATAChannel::ScanBus()
+ {
+-	bool devicePresent[fDeviceCount];
+-	uint16 deviceSignature[fDeviceCount];
+-	status_t result = Reset(devicePresent, deviceSignature);
++	uint deviceMask = 0;
++
++	for (int i = 0; i &lt; fDeviceCount; i++)
++		deviceMask |= (int)_DevicePresent(i) &lt;&lt; i;
++
++	status_t result = Reset();
+ 	if (result != B_OK) {
+ 		TRACE_ERROR(&quot;resetting the channel failed\n&quot;);
+ 		return result;
+ 	}
+ 
+-	for (uint8 i = 0; i &lt; fDeviceCount; i++) {
+-		if (!devicePresent[i])
++	TRACE_ALWAYS(&quot;deviceMask %d\n&quot;, deviceMask);
++
++	for (int i = 0; i &lt; fDeviceCount; i++) {
++		if (!(deviceMask &amp; (1 &lt;&lt; i))) {
++			TRACE_ALWAYS(&quot;ignoring device %d\n&quot;, i);
+ 			continue;
++		}
+ 
++		TRACE_ALWAYS(&quot;probing device %d\n&quot;, i);
++		SelectDevice(i);
++
++		// ensure interrupts are disabled for this device
++		_WriteControl(ATA_DEVICE_CONTROL_DISABLE_INTS);
++
++		// wait up to 3 seconds for busy to clear
++		if (Wait(0, ATA_STATUS_BUSY, 0, 3 * 1000 * 1000) != B_OK) {
++			uint8 status = AltStatus();
++			if (status == 0xff || status == 0x7f) {
++				TRACE_ALWAYS(&quot;illegal status value 0x%02x for device %d\n&quot;, 
++					status, i);
++				continue;
++			} else {
++				TRACE_ALWAYS(&quot;device %d is slow\n&quot;, i);
++			}
++		}
++
++		// wait up to 31 seconds for busy to clear (already 3 sec. waited)
++		if (Wait(0, ATA_STATUS_BUSY, 0, 28 * 1000 * 1000) != B_OK) {
++			TRACE_ALWAYS(&quot;device %d reset timeout\n&quot;, i);
++			continue;
++		}
++
++		// reselect device
++		SelectDevice(i);
++		WaitForIdle();
++
++		if (SelectedDevice() != i) {
++			TRACE_ALWAYS(&quot;device selection failed for device %i\n&quot;, i);
++			continue;
++		}
++
++		ata_task_file taskFile;
++		if (_ReadRegs(&amp;taskFile, ATA_MASK_LBA_MID | ATA_MASK_LBA_HIGH
++				| ATA_MASK_ERROR) != B_OK) {
++			TRACE_ERROR(&quot;reading status failed\n&quot;);
++			return B_ERROR;
++		}
++
++		// for information only
++		if ((i == 0) &amp;&amp; (taskFile.read.error &amp; 0x80)) {
++			TRACE_ERROR(&quot;device 0 indicates that device 1 failed&quot;
++				&quot; error code is 0x%02x\n&quot;, taskFile.read.error);
++		} else if (taskFile.read.error != 0x01) {
++			TRACE_ERROR(&quot;device %d failed, error code is 0x%02x\n&quot;, 
++				i, taskFile.read.error);
++		}
++
++		uint16 signature = taskFile.lba.lba_8_15
++			| (((uint16)taskFile.lba.lba_16_23) &lt;&lt; 8);
++		TRACE_ALWAYS(&quot;signature of device %d: 0x%04x\n&quot;, i, signature);
++
+ 		ATADevice *device = NULL;
+-		if (deviceSignature[i] == ATA_SIGNATURE_ATAPI)
++		if (signature == ATA_SIGNATURE_ATAPI)
+ 			device = new(std::nothrow) ATAPIDevice(this, i);
+ 		else
+ 			device = new(std::nothrow) ATADevice(this, i);
+@@ -290,7 +382,7 @@
+ 
+ 
+ status_t
+-ATAChannel::Reset(bool *presence, uint16 *signatures)
++ATAChannel::Reset()
+ {
+ 	TRACE_FUNCTION(&quot;\n&quot;);
+ 
+@@ -313,95 +405,6 @@
+ 
+ 	_FlushAndWait(150 * 1000);
+ 
+-	for (uint8 i = 0; i &lt; fDeviceCount; i++)
+-		presence[i] = false;
+-
+-	// up to 2 devices on each channel
+-	for (uint8 i = 0; i &lt; fDeviceCount; i++) {
+-		TRACE_ALWAYS(&quot;probing device %d\n&quot;, i);
+-		SelectDevice(i);
+-		if (i == 1) {
+-			if (presence[0]) {
+-				TRACE_ALWAYS(&quot;possibly master and slave configuration...\n&quot;);
+-			} else {
+-				TRACE_ALWAYS(&quot;possibly single device 1 configuration...\n&quot;);
+-				int maxtrys;
+-				for (maxtrys = 20; maxtrys &gt; 0; maxtrys--) {
+-					SelectDevice(1);
+-					ata_task_file taskFile;
+-					taskFile.chs.sector_count = 0x5a;
+-					taskFile.chs.sector_number = 0xa5;
+-					if (_WriteRegs(&amp;taskFile, ATA_MASK_SECTOR_COUNT 
+-						| ATA_MASK_SECTOR_NUMBER) != B_OK) {
+-						TRACE_ERROR(&quot;writing registers failed\n&quot;);
+-						return B_ERROR;
+-					}
+-					if (_ReadRegs(&amp;taskFile, ATA_MASK_SECTOR_COUNT 
+-						| ATA_MASK_SECTOR_NUMBER) != B_OK) {
+-						TRACE_ERROR(&quot;reading registers failed\n&quot;);
+-						return B_ERROR;
+-					}
+-					if (taskFile.chs.sector_count == 0x5a &amp;&amp; 
+-						taskFile.chs.sector_number == 0xa5)
+-						break;
+-					snooze(100000);
+-				}
+-				if (maxtrys == 0) {
+-					TRACE_ALWAYS(&quot;Can't access device 1\n&quot;);
+-					continue;
+-				}
+-			}
+-		}
+-
+-		// ensure interrupts are disabled for this device
+-		_WriteControl(ATA_DEVICE_CONTROL_DISABLE_INTS);
+-
+-		if (AltStatus() == 0xff)
+-			snooze(150 * 1000);
+-
+-		if (AltStatus() == 0xff) {
+-			TRACE_ALWAYS(&quot;illegal status value for device %d\n&quot;, i);
+-			continue;
+-		}
+-
+-		// wait up to 31 seconds for busy to clear
+-		if (Wait(0, ATA_STATUS_BUSY, 0, 31 * 1000 * 1000) != B_OK) {
+-			TRACE_ALWAYS(&quot;device %d reset timeout\n&quot;, i);
+-			continue;
+-		}
+-
+-		// reselect device
+-		SelectDevice(i);
+-
+-		if (SelectedDevice() != i) {
+-			TRACE_ALWAYS(&quot;device selection failed for device %i\n&quot;, i);
+-			continue;
+-		}
+-
+-		ata_task_file taskFile;
+-		if (_ReadRegs(&amp;taskFile, ATA_MASK_LBA_MID | ATA_MASK_LBA_HIGH
+-				| ATA_MASK_ERROR) != B_OK) {
+-			TRACE_ERROR(&quot;reading status failed\n&quot;);
+-			return B_ERROR;
+-		}
+-
+-		// for information only
+-		if ((i == 0) &amp;&amp; (taskFile.read.error &amp; 0x80)) {
+-			TRACE_ERROR(&quot;device 0 indicates that device 1 failed&quot;
+-				&quot; error code is 0x%02x\n&quot;, taskFile.read.error);
+-		} else if (taskFile.read.error != 0x01) {
+-			TRACE_ERROR(&quot;device %d failed, error code is 0x%02x\n&quot;, 
+-				i, taskFile.read.error);
+-		}
+-
+-		presence[i] = true;
+-
+-		signatures[i] = taskFile.lba.lba_8_15
+-			| (((uint16)taskFile.lba.lba_16_23) &lt;&lt; 8);
+-		TRACE_ALWAYS(&quot;signature of device %d: 0x%04x\n&quot;, i, signatures[i]);
+-
+-	}
+-
+ 	return B_OK;
+ }
+ 
+@@ -413,7 +416,7 @@
+ 	bigtime_t startTime = system_time();
+ 	_FlushAndWait(1);
+ 
+-	TRACE(&quot;waiting for set bits 0x%02x and cleared bits 0x%02x\n&quot;,
++	TRACE(&quot;wait for set bits 0x%02x and cleared bits 0x%02x\n&quot;,
+ 		setBits, clearedBits);
+ 
+ #if ATA_TRACING
+@@ -424,34 +427,39 @@
+ 		if ((flags &amp; ATA_CHECK_ERROR_BIT) != 0
+ 			&amp;&amp; (status &amp; ATA_STATUS_BUSY) == 0
+ 			&amp;&amp; (status &amp; ATA_STATUS_ERROR) != 0) {
+-			TRACE(&quot;error bit set while waiting\n&quot;);
++			TRACE(&quot;wait failed, error bit set, status 0x%02x\n&quot;, status);
+ 			return B_ERROR;
+ 		}
+ 
+ 		if ((flags &amp; ATA_CHECK_DEVICE_FAULT) != 0
+ 			&amp;&amp; (status &amp; ATA_STATUS_BUSY) == 0
+ 			&amp;&amp; (status &amp; ATA_STATUS_DEVICE_FAULT) != 0) {
+-			TRACE(&quot;device fault bit set while waiting\n&quot;);
++			TRACE(&quot;wait failed, device fault bit set, status 0x%02x\n&quot;, status);
+ 			return B_ERROR;
+ 		}
+ 
+ 		if ((status &amp; clearedBits) == 0) {
+-			if ((flags &amp; ATA_WAIT_ANY_BIT) != 0 &amp;&amp; (status &amp; setBits) != 0)
++			if ((flags &amp; ATA_WAIT_ANY_BIT) != 0 &amp;&amp; (status &amp; setBits) != 0) {
++				TRACE(&quot;wait success, status 0x%02x\n&quot;, status);
+ 				return B_OK;
+-			if ((status &amp; setBits) == setBits)
++			}
++			if ((status &amp; setBits) == setBits) {
++				TRACE(&quot;wait success, status 0x%02x\n&quot;, status);
+ 				return B_OK;
++			}
+ 		}
+ 
+ 		bigtime_t elapsedTime = system_time() - startTime;
+ #if ATA_TRACING
+ 		if (lastStatus != status) {
+-			TRACE(&quot;wait status after %lld: 0x%02x\n&quot;, elapsedTime, status);
++			TRACE(&quot;wait status changed after %lld, status 0x%02x\n&quot;, 
++				elapsedTime, status);
+ 			lastStatus = status;
+ 		}
+ #endif
+ 
+ 		if (elapsedTime &gt; timeout) {
+-			TRACE(&quot;timeout, wait status after %lld: 0x%02x\n&quot;,
++			TRACE(&quot;wait timeout after %lld, status 0x%02x\n&quot;,
+ 				elapsedTime, status);
+ 			return B_TIMED_OUT;
+ 		}
+@@ -492,6 +500,27 @@
+ }
+ 
+ 
++status_t
++ATAChannel::Interrupt(uint8 status)
++{
++	SpinLocker locker(fInterruptLock);
++	if (!fExpectsInterrupt) {
++		TRACE(&quot;interrupt when not expecting transfer\n&quot;);
++		return B_UNHANDLED_INTERRUPT;
++	}
++
++	if ((status &amp; ATA_STATUS_BUSY) != 0) {
++		TRACE(&quot;interrupt while device is busy\n&quot;);
++		return B_UNHANDLED_INTERRUPT;
++	}
++
++	TRACE(&quot;interrupt\n&quot;);
++
++	fInterruptCondition.NotifyAll();
++	return B_INVOKE_SCHEDULER;
++}
++
++
+ void
+ ATAChannel::PrepareWaitingForInterrupt()
+ {
+@@ -516,11 +545,15 @@
+ 	fExpectsInterrupt = false;
+ 	locker.Unlock();
+ 
++	if (result != B_OK) {
++		TRACE_ERROR(&quot;timeout waiting for interrupt\n&quot;);
++		result = RecoverLostInterrupt();
++	}
++
+ 	// disable interrupts
+ 	_WriteControl(ATA_DEVICE_CONTROL_DISABLE_INTS);
+ 
+ 	if (result != B_OK) {
+-		TRACE_ERROR(&quot;timeout waiting for interrupt\n&quot;);
+ 		return B_TIMED_OUT;
+ 	}
+ 
+@@ -529,8 +562,22 @@
+ 
+ 
+ status_t
++ATAChannel::RecoverLostInterrupt()
++{
++	uint8 status = AltStatus();
++	if (status &amp; (ATA_STATUS_BUSY | ATA_STATUS_DATA_REQUEST)) {
++		TRACE_ERROR(&quot;RecoverLostInterrupt: device busy, status 0x%02x\n&quot;, status);
++		return B_ERROR;
++	}
++	TRACE_ERROR(&quot;RecoverLostInterrupt: lost interrupt, status 0x%02x\n&quot;, status);
++	return B_OK;
++}
++
++
++status_t
+ ATAChannel::SendRequest(ATARequest *request, uint32 flags)
+ {
++	TRACE_FUNCTION(&quot;\n&quot;);
+ 	ATADevice *device = request-&gt;Device();
+ 	if (device-&gt;Select() != B_OK || WaitForIdle() != B_OK) {
+ 		// resetting the device here will discard current configuration,
+@@ -561,6 +608,7 @@
+ status_t
+ ATAChannel::FinishRequest(ATARequest *request, uint32 flags, uint8 errorMask)
+ {
++	TRACE_FUNCTION(&quot;\n&quot;);
+ 	if (flags &amp; ATA_WAIT_FINISH) {
+ 		// wait for the device to finish current command (device no longer busy)
+ 		status_t result = Wait(0, ATA_STATUS_BUSY, flags, request-&gt;Timeout());
+@@ -603,8 +651,8 @@
+ 
+ 	if ((taskFile-&gt;read.error &amp; ATA_ERROR_MEDIUM_CHANGED)
+ 			!= ATA_ERROR_MEDIUM_CHANGED) {
+-		TRACE_ERROR(&quot;command failed, error bit is set: 0x%02x\n&quot;,
+-			taskFile-&gt;read.error);
++		TRACE_ERROR(&quot;command failed, error bit is set. status 0x%02x, error 0x%02x\n&quot;,
++			taskFile-&gt;read.status, taskFile-&gt;read.error);
+ 	}
+ 
+ 	uint8 error = taskFile-&gt;read.error &amp; errorMask;
+@@ -757,25 +805,6 @@
+ 
+ 
+ status_t
+-ATAChannel::Interrupt(uint8 status)
+-{
+-	SpinLocker locker(fInterruptLock);
+-	if (!fExpectsInterrupt) {
+-		TRACE(&quot;interrupt when not expecting transfer\n&quot;);
+-		return B_UNHANDLED_INTERRUPT;
+-	}
+-
+-	if ((status &amp; ATA_STATUS_BUSY) != 0) {
+-		TRACE((&quot;interrupt while device is busy\n&quot;));
+-		return B_UNHANDLED_INTERRUPT;
+-	}
+-
+-	fInterruptCondition.NotifyAll();
+-	return B_INVOKE_SCHEDULER;
+-}
+-
+-
+-status_t
+ ATAChannel::_ReadRegs(ata_task_file *taskFile, ata_reg_mask mask)
+ {
+ 	return fController-&gt;read_command_block_regs(fCookie, taskFile, mask);
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp	2009-09-07 00:46:02 UTC (rev 32977)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp	2009-09-07 00:58:31 UTC (rev 32978)
+@@ -138,7 +138,8 @@
+ 	if (channel-&gt;Bus() == NULL)
+ 		return SCSI_NO_HBA;
+ 
+-	channel-&gt;Reset(NULL, NULL);
++	//channel-&gt;Reset();
++	panic(&quot;asking for trouble&quot;);
+ 	return SCSI_REQ_CMP;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h	2009-09-07 00:46:02 UTC (rev 32977)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h	2009-09-07 00:58:31 UTC (rev 32978)
+@@ -79,7 +79,7 @@
+ 		status_t					SelectDevice(uint8 index);
+ 		uint8						SelectedDevice();
+ 
+-		status_t					Reset(bool *presence, uint16 *signatures);
++		status_t					Reset();
+ 
+ 		bool						UseDMA() { return fUseDMA; };
+ 
+@@ -91,6 +91,7 @@
+ 
+ 		void						PrepareWaitingForInterrupt();
+ 		status_t					WaitForInterrupt(bigtime_t timeout);
++		status_t					RecoverLostInterrupt();
+ 
+ 		// request handling
+ 		status_t					SendRequest(ATARequest *request,
+@@ -107,7 +108,6 @@
+ 
+ 		status_t					ReadRegs(ATADevice *device);
+ 		uint8						AltStatus();
+-		bool						IsDMAInterruptSet();
+ 
+ 		status_t					ReadPIO(uint8 *buffer, size_t length);
+ 		status_t					WritePIO(uint8 *buffer, size_t length);
+@@ -123,6 +123,8 @@
+ 
+ 		void						_FlushAndWait(bigtime_t waitTime);
+ 
++		bool						_DevicePresent(int device);
++
+ 		status_t					_ReadPIOBlock(ATARequest *request,
+ 										size_t length);
+ 		status_t					_WritePIOBlock(ATARequest *request,
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020426.html">[Haiku-commits] r32977 -	haiku/trunk/src/add-ons/kernel/generic/ata_adapter
+</A></li>
+	<LI>Next message: <A HREF="020428.html">[Haiku-commits] r32979 - haiku/trunk/src/servers/input
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20427">[ date ]</a>
+              <a href="thread.html#20427">[ thread ]</a>
+              <a href="subject.html#20427">[ subject ]</a>
+              <a href="author.html#20427">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

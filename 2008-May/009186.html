@@ -1,0 +1,384 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25716 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25716%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200805300027.m4U0R4ld000652%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009185.html">
+   <LINK REL="Next"  HREF="009188.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25716 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25716%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200805300027.m4U0R4ld000652%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25716 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri May 30 02:27:04 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009185.html">[Haiku-commits] r25715 - in haiku/trunk: build/config_headers	src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="009188.html">[Haiku-commits] r25716 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9186">[ date ]</a>
+              <a href="thread.html#9186">[ thread ]</a>
+              <a href="subject.html#9186">[ subject ]</a>
+              <a href="author.html#9186">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-05-30 02:27:02 +0200 (Fri, 30 May 2008)
+New Revision: 25716
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25716&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25716&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+Log:
+* Broke the cache merging code out of vm_cache_remove_consumer() into
+  new function merge_cache_with_only_consumer(), which is also used in
+  vm_cache_remove_area(), now.
+* Added tracing for the merge case.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-05-29 22:09:51 UTC (rev 25715)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-05-30 00:27:02 UTC (rev 25716)
+@@ -193,6 +193,27 @@
+ };
+ 
+ 
++class Merge : public VMCacheTraceEntry {
++	public:
++		Merge(vm_cache* cache, vm_cache* consumer)
++			:
++			VMCacheTraceEntry(cache),
++			fConsumer(consumer)
++		{
++			Initialized();
++		}
++
++		virtual void AddDump(TraceOutput&amp; out)
++		{
++			out.Print(&quot;vm cache merge with consumer: cache: %p, consumer: %p&quot;,
++				fCache, fConsumer);
++		}
++
++	private:
++		vm_cache*	fConsumer;
++};
++
++
+ class InsertArea : public VMCacheTraceEntry {
+ 	public:
+ 		InsertArea(vm_cache* cache, vm_area* area)
+@@ -359,6 +380,140 @@
+ }
+ 
+ 
++static bool
++is_cache_mergeable(vm_cache* cache)
++{
++	return (cache-&gt;areas == NULL &amp;&amp; cache-&gt;source != NULL
++		&amp;&amp; !list_is_empty(&amp;cache-&gt;consumers)
++		&amp;&amp; cache-&gt;consumers.link.next == cache-&gt;consumers.link.prev);
++}
++
++
++/*!	Merges the given cache with its only consumer.
++	The caller must own a reference (other than the one from the consumer) and
++	hold the cache's lock.
++*/
++static void
++merge_cache_with_only_consumer(vm_cache* cache)
++{
++	vm_cache* consumer = (vm_cache*)list_get_first_item(&amp;cache-&gt;consumers);
++
++	if (!acquire_unreferenced_cache_ref(consumer))
++		return;
++
++	// In case we managed to grab a reference to the consumerRef,
++	// this doesn't guarantee that we get the cache we wanted
++	// to, so we need to check if this cache is really the last
++	// consumer of the cache we want to merge it with.
++
++	ConditionVariable busyCondition;
++
++	// But since we need to keep the locking order upper-&gt;lower cache, we
++	// need to unlock our cache now
++	busyCondition.Publish(cache, &quot;cache&quot;);
++	cache-&gt;busy = true;
++
++	while (true) {
++		mutex_unlock(&amp;cache-&gt;lock);
++
++		mutex_lock(&amp;consumer-&gt;lock);
++		mutex_lock(&amp;cache-&gt;lock);
++
++		bool isMergeable = is_cache_mergeable(cache);
++		if (isMergeable &amp;&amp; consumer == list_get_first_item(&amp;cache-&gt;consumers))
++			break;
++
++		// something changed, get rid of the consumer lock and ref
++		mutex_unlock(&amp;consumer-&gt;lock);
++		vm_cache_release_ref(consumer);
++
++		if (!isMergeable) {
++			dprintf(&quot;merge_cache_with_only_consumer(): cache %p is no longer; &quot;
++				&quot;mergeable\n&quot;, cache);
++			cache-&gt;busy = false;
++			busyCondition.Unpublish();
++			return;
++		}
++
++		// the cache is still mergeable, just the consumer changed
++		consumer = (vm_cache*)list_get_first_item(&amp;cache-&gt;consumers);
++	
++		if (!acquire_unreferenced_cache_ref(consumer))
++			return;
++	}
++
++	consumer = (vm_cache*)list_remove_head_item(&amp;cache-&gt;consumers);
++
++	TRACE((&quot;merge vm cache %p (ref == %ld) with vm cache %p\n&quot;,
++		cache, cache-&gt;ref_count, consumer));
++
++	T(Merge(cache, consumer));
++
++	vm_page* nextPage;
++	for (vm_page* page = cache-&gt;page_list; page != NULL;
++			page = nextPage) {
++		vm_page* consumerPage;
++		nextPage = page-&gt;cache_next;
++
++		consumerPage = vm_cache_lookup_page(consumer,
++			(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++		if (consumerPage == NULL) {
++			// the page is not yet in the consumer cache - move it upwards
++			vm_cache_remove_page(cache, page);
++			vm_cache_insert_page(consumer, page,
++				(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++		} else if (consumerPage-&gt;state == PAGE_STATE_BUSY
++			&amp;&amp; consumerPage-&gt;type == PAGE_TYPE_DUMMY) {
++			// the page is currently busy taking a read fault - IOW,
++			// vm_soft_fault() has mapped our page so we can just
++			// move it up
++			//dprintf(&quot;%ld: merged busy page %p, cache %p, offset %ld\n&quot;, find_thread(NULL), page, cacheRef-&gt;cache, page-&gt;cache_offset);
++			vm_cache_remove_page(consumer, consumerPage);
++			consumerPage-&gt;state = PAGE_STATE_INACTIVE;
++			((vm_dummy_page*)consumerPage)-&gt;busy_condition.Unpublish();
++
++			vm_cache_remove_page(cache, page);
++			vm_cache_insert_page(consumer, page,
++				(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++#ifdef DEBUG_PAGE_CACHE_TRANSITIONS
++		} else {
++			page-&gt;debug_flags = 0;
++			if (consumerPage-&gt;state == PAGE_STATE_BUSY)
++				page-&gt;debug_flags |= 0x1;
++			if (consumerPage-&gt;type == PAGE_TYPE_DUMMY)
++				page-&gt;debug_flags |= 0x2;
++			page-&gt;collided_page = consumerPage;
++			consumerPage-&gt;collided_page = page;
++#endif	// DEBUG_PAGE_CACHE_TRANSITIONS
++		}
++	}
++
++	vm_cache* newSource = cache-&gt;source;
++
++	// The remaining consumer has got a new source
++	mutex_lock(&amp;newSource-&gt;lock);
++
++	list_remove_item(&amp;newSource-&gt;consumers, cache);
++	list_add_item(&amp;newSource-&gt;consumers, consumer);
++	consumer-&gt;source = newSource;
++	cache-&gt;source = NULL;
++
++	mutex_unlock(&amp;newSource-&gt;lock);
++
++	// Release the reference the cache's consumer owned. The consumer takes
++	// over the cache's ref to its source instead.
++if (cache-&gt;ref_count &lt; 2)
++panic(&quot;cacheRef %p ref count too low!\n&quot;, cache);
++	vm_cache_release_ref(cache);
++
++	cache-&gt;busy = false;
++	busyCondition.Unpublish();
++
++	mutex_unlock(&amp;consumer-&gt;lock);
++	vm_cache_release_ref(consumer);
++}
++
++
+ //	#pragma mark -
+ 
+ 
+@@ -750,121 +905,10 @@
+ 	list_remove_item(&amp;cache-&gt;consumers, consumer);
+ 	consumer-&gt;source = NULL;
+ 
+-	if (cache-&gt;areas == NULL &amp;&amp; cache-&gt;source != NULL
+-		&amp;&amp; !list_is_empty(&amp;cache-&gt;consumers)
+-		&amp;&amp; cache-&gt;consumers.link.next == cache-&gt;consumers.link.prev) {
+-		// The cache is not really needed anymore - it can be merged with its only
+-		// consumer left.
++	// merge cache, if possible
++	if (is_cache_mergeable(cache))
++		merge_cache_with_only_consumer(cache);
+ 
+-		consumer = (vm_cache*)list_get_first_item(&amp;cache-&gt;consumers);
+-
+-		bool merge = acquire_unreferenced_cache_ref(consumer);
+-
+-		// In case we managed to grab a reference to the consumerRef,
+-		// this doesn't guarantee that we get the cache we wanted
+-		// to, so we need to check if this cache is really the last
+-		// consumer of the cache we want to merge it with.
+-
+-		ConditionVariable busyCondition;
+-
+-		if (merge) {
+-			// But since we need to keep the locking order upper-&gt;lower cache, we
+-			// need to unlock our cache now
+-			busyCondition.Publish(cache, &quot;cache&quot;);
+-			cache-&gt;busy = true;
+-			mutex_unlock(&amp;cache-&gt;lock);
+-
+-			mutex_lock(&amp;consumer-&gt;lock);
+-			mutex_lock(&amp;cache-&gt;lock);
+-
+-			if (cache-&gt;areas != NULL || cache-&gt;source == NULL
+-				|| list_is_empty(&amp;cache-&gt;consumers)
+-				|| cache-&gt;consumers.link.next != cache-&gt;consumers.link.prev
+-				|| consumer != list_get_first_item(&amp;cache-&gt;consumers)) {
+-				dprintf(&quot;vm_cache_remove_consumer(): cache %p was modified; &quot;
+-					&quot;not merging it\n&quot;, cache);
+-				merge = false;
+-				cache-&gt;busy = false;
+-				busyCondition.Unpublish();
+-				mutex_unlock(&amp;consumer-&gt;lock);
+-				vm_cache_release_ref(consumer);
+-			}
+-		}
+-
+-		if (merge) {
+-			consumer = (vm_cache*)list_remove_head_item(&amp;cache-&gt;consumers);
+-
+-			TRACE((&quot;merge vm cache %p (ref == %ld) with vm cache %p\n&quot;,
+-				cache, cache-&gt;ref_count, consumer));
+-
+-			vm_page* nextPage;
+-			for (vm_page* page = cache-&gt;page_list; page != NULL;
+-					page = nextPage) {
+-				vm_page* consumerPage;
+-				nextPage = page-&gt;cache_next;
+-
+-				consumerPage = vm_cache_lookup_page(consumer,
+-					(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+-				if (consumerPage == NULL) {
+-					// the page already is not yet in the consumer cache - move
+-					// it upwards
+-					vm_cache_remove_page(cache, page);
+-					vm_cache_insert_page(consumer, page,
+-						(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+-				} else if (consumerPage-&gt;state == PAGE_STATE_BUSY
+-					&amp;&amp; consumerPage-&gt;type == PAGE_TYPE_DUMMY) {
+-					// the page is currently busy taking a read fault - IOW,
+-					// vm_soft_fault() has mapped our page so we can just
+-					// move it up
+-					//dprintf(&quot;%ld: merged busy page %p, cache %p, offset %ld\n&quot;, find_thread(NULL), page, cacheRef-&gt;cache, page-&gt;cache_offset);
+-					vm_cache_remove_page(consumer, consumerPage);
+-					consumerPage-&gt;state = PAGE_STATE_INACTIVE;
+-					((vm_dummy_page*)consumerPage)-&gt;busy_condition.Unpublish();
+-
+-					vm_cache_remove_page(cache, page);
+-					vm_cache_insert_page(consumer, page,
+-						(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+-#ifdef DEBUG_PAGE_CACHE_TRANSITIONS
+-				} else {
+-					page-&gt;debug_flags = 0;
+-					if (consumerPage-&gt;state == PAGE_STATE_BUSY)
+-						page-&gt;debug_flags |= 0x1;
+-					if (consumerPage-&gt;type == PAGE_TYPE_DUMMY)
+-						page-&gt;debug_flags |= 0x2;
+-					page-&gt;collided_page = consumerPage;
+-					consumerPage-&gt;collided_page = page;
+-#endif	// DEBUG_PAGE_CACHE_TRANSITIONS
+-				}
+-			}
+-
+-			vm_cache* newSource = cache-&gt;source;
+-
+-			// The remaining consumer has gotten a new source
+-			mutex_lock(&amp;newSource-&gt;lock);
+-
+-			list_remove_item(&amp;newSource-&gt;consumers, cache);
+-			list_add_item(&amp;newSource-&gt;consumers, consumer);
+-			consumer-&gt;source = newSource;
+-			cache-&gt;source = NULL;
+-
+-			mutex_unlock(&amp;newSource-&gt;lock);
+-
+-			// Release the other reference to the cache - we take over
+-			// its reference of its source cache; we can do this here
+-			// (with the cacheRef locked) since we own another reference
+-			// from the first consumer we removed
+-if (cache-&gt;ref_count &lt; 2)
+-panic(&quot;cacheRef %p ref count too low!\n&quot;, cache);
+-			vm_cache_release_ref(cache);
+-
+-			mutex_unlock(&amp;consumer-&gt;lock);
+-			vm_cache_release_ref(consumer);
+-		}
+-
+-		if (cache-&gt;busy)
+-			busyCondition.Unpublish();
+-	}
+-
+ 	mutex_unlock(&amp;cache-&gt;lock);
+ 	vm_cache_release_ref(cache);
+ }
+@@ -937,5 +981,9 @@
+ 	if (cache-&gt;store-&gt;ops-&gt;release_ref)
+ 		cache-&gt;store-&gt;ops-&gt;release_ref(cache-&gt;store);
+ 
++	// merge cache, if possible
++	if (is_cache_mergeable(cache))
++		merge_cache_with_only_consumer(cache);
++
+ 	return B_OK;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009185.html">[Haiku-commits] r25715 - in haiku/trunk: build/config_headers	src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="009188.html">[Haiku-commits] r25716 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9186">[ date ]</a>
+              <a href="thread.html#9186">[ thread ]</a>
+              <a href="subject.html#9186">[ subject ]</a>
+              <a href="author.html#9186">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

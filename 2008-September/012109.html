@@ -1,0 +1,182 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27688 - haiku/trunk/src/kits/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27688%20-%20haiku/trunk/src/kits/debug&In-Reply-To=%3C200809221117.m8MBHVl3017627%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012108.html">
+   <LINK REL="Next"  HREF="012115.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27688 - haiku/trunk/src/kits/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27688%20-%20haiku/trunk/src/kits/debug&In-Reply-To=%3C200809221117.m8MBHVl3017627%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27688 - haiku/trunk/src/kits/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Sep 22 13:17:31 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012108.html">[Haiku-commits] r27687 - in haiku/trunk: headers/private/kernel	headers/private/system src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="012115.html">[Haiku-commits] r27689 - in haiku/trunk:	headers/private/kernel/util src/system/kernel/util
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12109">[ date ]</a>
+              <a href="thread.html#12109">[ thread ]</a>
+              <a href="subject.html#12109">[ subject ]</a>
+              <a href="author.html#12109">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-22 13:17:30 +0200 (Mon, 22 Sep 2008)
+New Revision: 27688
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27688&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27688&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/kits/debug/SymbolLookup.cpp
+   haiku/trunk/src/kits/debug/SymbolLookup.h
+Log:
+Rather use the new _kern_read_kernel_image_symbols() syscall to use
+kernel image symbol tables.
+
+
+Modified: haiku/trunk/src/kits/debug/SymbolLookup.cpp
+===================================================================
+--- haiku/trunk/src/kits/debug/SymbolLookup.cpp	2008-09-22 11:13:38 UTC (rev 27687)
++++ haiku/trunk/src/kits/debug/SymbolLookup.cpp	2008-09-22 11:17:30 UTC (rev 27688)
+@@ -15,6 +15,7 @@
+ #include &lt;new&gt;
+ 
+ #include &lt;runtime_loader.h&gt;
++#include &lt;syscalls.h&gt;
+ 
+ 
+ #undef TRACE
+@@ -208,8 +209,12 @@
+ 
+ ImageFile::~ImageFile()
+ {
+-	if (fMappedFile != MAP_FAILED)
++	if (fMappedFile != MAP_FAILED) {
+ 		munmap(fMappedFile, fFileSize);
++	} else {
++		delete[] fSymbolTable;
++		delete[] fStringTable;
++	}
+ 
+ 	if (fFD &gt;= 0)
+ 		close(fFD);
+@@ -297,9 +302,8 @@
+ 				return B_BAD_DATA;
+ 			}
+ 
+-			fSymbolTable
+-				= (const Elf32_Sym*)(fMappedFile + sectionHeader-&gt;sh_offset);
+-			fStringTable = (const char*)(fMappedFile + stringHeader.sh_offset);
++			fSymbolTable = (Elf32_Sym*)(fMappedFile + sectionHeader-&gt;sh_offset);
++			fStringTable = (char*)(fMappedFile + stringHeader.sh_offset);
+ 			fSymbolCount = sectionHeader-&gt;sh_size / sizeof(Elf32_Sym);
+ 			fStringTableSize = stringHeader.sh_size;
+ 
+@@ -311,6 +315,30 @@
+ }
+ 
+ 
++status_t
++ImageFile::LoadKernel()
++{
++	// get the table sizes
++	fSymbolCount = 0;
++	fStringTableSize = 0;
++	status_t error = _kern_read_kernel_image_symbols(fInfo.id,
++		NULL, &amp;fSymbolCount, NULL, &amp;fStringTableSize, NULL);
++	if (error != B_OK)
++		return error;
++
++	// allocate the tables
++	fSymbolTable = new(std::nothrow) Elf32_Sym[fSymbolCount];
++	fStringTable = new(std::nothrow) char[fStringTableSize];
++	if (fSymbolTable == NULL || fStringTable == NULL)
++		return B_NO_MEMORY;
++
++	// get the info
++	return _kern_read_kernel_image_symbols(fInfo.id,
++		fSymbolTable, &amp;fSymbolCount, fStringTable, &amp;fStringTableSize,
++		&amp;fLoadDelta);
++}
++
++
+ const Elf32_Sym*
+ ImageFile::LookupSymbol(addr_t address, addr_t* _baseAddress,
+ 	const char** _symbolName, size_t *_symbolNameLen, bool *_exactMatch) const
+@@ -474,8 +502,12 @@
+ 		if (imageFile == NULL)
+ 			break;
+ 
+-		if (imageFile-&gt;Load() != B_OK)
++		error = fTeam == B_SYSTEM_TEAM
++			? imageFile-&gt;LoadKernel() : imageFile-&gt;Load();
++		if (error != B_OK) {
+ 			delete imageFile;
++			continue;
++		}
+ 
+ 		fImageFiles.Add(imageFile);
+ 	}
+
+Modified: haiku/trunk/src/kits/debug/SymbolLookup.h
+===================================================================
+--- haiku/trunk/src/kits/debug/SymbolLookup.h	2008-09-22 11:13:38 UTC (rev 27687)
++++ haiku/trunk/src/kits/debug/SymbolLookup.h	2008-09-22 11:17:30 UTC (rev 27688)
+@@ -132,6 +132,7 @@
+ 	const image_info&amp; Info() const	{ return fInfo; }
+ 
+ 	status_t Load();
++	status_t LoadKernel();
+ 
+ 	const Elf32_Sym* LookupSymbol(addr_t address, addr_t* _baseAddress,
+ 		const char** _symbolName, size_t *_symbolNameLen,
+@@ -149,8 +150,8 @@
+ 	off_t				fFileSize;
+ 	uint8*				fMappedFile;
+ 	addr_t				fLoadDelta;
+-	const Elf32_Sym*	fSymbolTable;
+-	const char*			fStringTable;
++	Elf32_Sym*			fSymbolTable;
++	char*				fStringTable;
+ 	int32				fSymbolCount;
+ 	size_t				fStringTableSize;
+ };
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012108.html">[Haiku-commits] r27687 - in haiku/trunk: headers/private/kernel	headers/private/system src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="012115.html">[Haiku-commits] r27689 - in haiku/trunk:	headers/private/kernel/util src/system/kernel/util
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12109">[ date ]</a>
+              <a href="thread.html#12109">[ thread ]</a>
+              <a href="subject.html#12109">[ subject ]</a>
+              <a href="author.html#12109">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

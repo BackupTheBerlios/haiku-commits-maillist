@@ -1,0 +1,1077 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26239 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26239%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200807031152.m63BqaTx029938%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009994.html">
+   <LINK REL="Next"  HREF="009996.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26239 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26239%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200807031152.m63BqaTx029938%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26239 - in haiku/trunk: headers/private/kernel	src/system/kernel">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Jul  3 13:52:37 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009994.html">[Haiku-commits] r26238 - haiku/trunk/src/data/beos_mime/text
+</A></li>
+        <LI>Next message: <A HREF="009996.html">[Haiku-commits] r26239 - in haiku/trunk: headers/private/kernel src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9995">[ date ]</a>
+              <a href="thread.html#9995">[ thread ]</a>
+              <a href="subject.html#9995">[ subject ]</a>
+              <a href="author.html#9995">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-07-03 13:52:36 +0200 (Thu, 03 Jul 2008)
+New Revision: 26239
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26239&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26239&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/kmodule.h
+   haiku/trunk/src/system/kernel/module.cpp
+Log:
+* Preparations for a module listener API - this will be used in the (disk)
+  device managers.
+* Cleanup.
+
+
+Modified: haiku/trunk/headers/private/kernel/kmodule.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/kmodule.h	2008-07-03 11:36:28 UTC (rev 26238)
++++ haiku/trunk/headers/private/kernel/kmodule.h	2008-07-03 11:52:36 UTC (rev 26239)
+@@ -1,6 +1,5 @@
+ /*
+- * Copyright 2005, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
+- *
++ * Copyright 2005-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  */
+ #ifndef _KERNEL_MODULE_H
+@@ -14,6 +13,16 @@
+ 
+ 
+ #ifdef __cplusplus
++// C++ only part
++
++class NotificationListener;
++
++extern status_t start_watching_modules(const char *prefix,
++	NotificationListener &amp;listener);
++extern status_t stop_watching_modules(const char *prefix,
++	NotificationListener &amp;listener);
++
++
+ extern &quot;C&quot; {
+ #endif
+ 
+
+Modified: haiku/trunk/src/system/kernel/module.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/module.cpp	2008-07-03 11:36:28 UTC (rev 26238)
++++ haiku/trunk/src/system/kernel/module.cpp	2008-07-03 11:52:36 UTC (rev 26239)
+@@ -17,16 +17,18 @@
+ #include &lt;sys/stat.h&gt;
+ 
+ #include &lt;FindDirectory.h&gt;
++#include &lt;NodeMonitor.h&gt;
+ 
+ #include &lt;boot_device.h&gt;
++#include &lt;boot/elf.h&gt;
+ #include &lt;elf.h&gt;
++#include &lt;fs/KPath.h&gt;
+ #include &lt;lock.h&gt;
+-#include &lt;vfs.h&gt;
+-#include &lt;boot/elf.h&gt;
+-#include &lt;fs/KPath.h&gt;
++#include &lt;Notifications.h&gt;
+ #include &lt;safemode.h&gt;
+ #include &lt;util/AutoLock.h&gt;
+ #include &lt;util/khash.h&gt;
++#include &lt;vfs.h&gt;
+ 
+ 
+ //#define TRACE_MODULE
+@@ -51,7 +53,7 @@
+ extern module_info gRootFileSystem;
+ extern module_info gDeviceFileSystem;
+ 
+-static module_info *sBuiltInModules[] = {
++static module_info* sBuiltInModules[] = {
+ 	&amp;gDeviceManagerModule,
+ 	&amp;gDeviceRootModule,
+ 	&amp;gFrameBufferConsoleModule,
+@@ -74,17 +76,17 @@
+ /* Each loaded module image (which can export several modules) is put
+  * in a hash (gModuleImagesHash) to be easily found when you search
+  * for a specific file name.
+- * ToDo: Could use only the inode number for hashing. Would probably be
++ * TODO: Could use only the inode number for hashing. Would probably be
+  * a little bit slower, but would lower the memory foot print quite a lot.
+  */
+ 
+ struct module_image {
+-	struct module_image	*next;
+-	module_info			**info;		/* the module_info we use */
+-	module_dependency	*dependencies;
+-	char				*path;		/* the full path for the module */
++	struct module_image* next;
++	module_info**		info;		// the module_info we use
++	module_dependency*	dependencies;
++	char*				path;		// the full path for the module
+ 	image_id			image;
+-	int32				ref_count;	/* how many ref's to this file */
++	int32				ref_count;	// how many ref's to this file
+ 	bool				keep_loaded;
+ };
+ 
+@@ -93,57 +95,99 @@
+  */
+ 
+ struct module {
+-	struct module		*next;
+-	::module_image		*module_image;
+-	char				*name;
+-	char				*file;
++	struct module*		next;
++	::module_image*		module_image;
++	char*				name;
++	char*				file;
+ 	int32				ref_count;
+-	module_info			*info;		/* will only be valid if ref_count &gt; 0 */
+-	int32				offset;		/* this is the offset in the headers */
+-	module_state		state;		/* state of module */
++	module_info*		info;		// will only be valid if ref_count &gt; 0
++	int32				offset;		// this is the offset in the headers
++	module_state		state;
+ 	uint32				flags;
+ };
+ 
+ #define B_BUILT_IN_MODULE	2
+ 
+ typedef struct module_path {
+-	const char			*name;
++	const char*			name;
+ 	uint32				base_length;
+ } module_path;
+ 
+ typedef struct module_iterator {
+-	module_path			*stack;
++	module_path*		stack;
+ 	int32				stack_size;
+ 	int32				stack_current;
+ 
+-	char				*prefix;
++	char*				prefix;
+ 	size_t				prefix_length;
+-	const char			*suffix;
++	const char*			suffix;
+ 	size_t				suffix_length;
+-	DIR					*current_dir;
++	DIR*				current_dir;
+ 	status_t			status;
+ 	int32				module_offset;
+-		/* This is used to keep track of which module_info
+-		 * within a module we're addressing. */
+-	::module_image		*module_image;
+-	module_info			**current_header;
+-	const char			*current_path;
++		// This is used to keep track of which module_info
++		// within a module we're addressing.
++	::module_image*		module_image;
++	module_info**		current_header;
++	const char*			current_path;
+ 	uint32				path_base_length;
+-	const char			*current_module_path;
++	const char*			current_module_path;
+ 	bool				builtin_modules;
+ 	bool				loaded_modules;
+ } module_iterator;
+ 
++namespace Module {
+ 
+-static bool sDisableUserAddOns = false;
++struct module_listener : DoublyLinkedListLink&lt;module_listener&gt; {
++	NotificationListener* listener;
++	const char*			prefix;
++};
+ 
+-/* locking scheme: there is a global lock only; having several locks
+- * makes trouble if dependent modules get loaded concurrently -&gt;
+- * they have to wait for each other, i.e. we need one lock per module;
+- * also we must detect circular references during init and not dead-lock
+- */
+-static recursive_lock sModulesLock;
++typedef DoublyLinkedList&lt;module_listener&gt; ModuleListenerList;
+ 
++class ModuleNotificationService : public NotificationService {
++public:
++						ModuleNotificationService();
++	virtual				~ModuleNotificationService();
++
++			status_t	InitCheck();
++
++			status_t	AddListener(const KMessage* eventSpecifier,
++							NotificationListener&amp; listener);
++			status_t	UpdateListener(const KMessage* eventSpecifier,
++							NotificationListener&amp; listener);
++			status_t	RemoveListener(const KMessage* eventSpecifier,
++							NotificationListener&amp; listener);
++
++	virtual const char*	Name() { return &quot;modules&quot;; }
++
++private:
++	recursive_lock		fLock;
++	ModuleListenerList	fListeners;
++};
++
++class DirectoryWatcher : public NotificationListener {
++public:
++						DirectoryWatcher();
++	virtual				~DirectoryWatcher();
++
++	virtual void		EventOccured(NotificationService&amp; service,
++							const KMessage* event);
++};
++
++class ModuleWatcher : public NotificationListener {
++public:
++						ModuleWatcher();
++	virtual				~ModuleWatcher();
++
++	virtual void		EventOccured(NotificationService&amp; service,
++							const KMessage* event);
++};
++
++}	// namespace Module
++
++using namespace Module;
++
+ /* These are the standard base paths where we start to look for modules
+  * to load. Order is important, the last entry here will be searched
+  * first.
+@@ -158,19 +202,30 @@
+ 	/ sizeof(kModulePaths[0]);
+ static const uint32 kFirstNonSystemModulePath = 1;
+ 
++
++static ModuleNotificationService sModuleNotificationService;
++static bool sDisableUserAddOns = false;
++
++/* locking scheme: there is a global lock only; having several locks
++ * makes trouble if dependent modules get loaded concurrently -&gt;
++ * they have to wait for each other, i.e. we need one lock per module;
++ * also we must detect circular references during init and not dead-lock
++ */
++static recursive_lock sModulesLock;
++
+ /* We store the loaded modules by directory path, and all known modules
+  * by module name in a hash table for quick access
+  */
+-static hash_table *sModuleImagesHash;
+-static hash_table *sModulesHash;
++static hash_table* sModuleImagesHash;
++static hash_table* sModulesHash;
+ 
+ 
+ /*!	Calculates hash for a module using its name */
+ static uint32
+-module_hash(void *_module, const void *_key, uint32 range)
++module_hash(void* _module, const void* _key, uint32 range)
+ {
+-	module *module = (struct module *)_module;
+-	const char *name = (const char *)_key;
++	module* module = (struct module*)_module;
++	const char* name = (const char*)_key;
+ 
+ 	if (module != NULL)
+ 		return hash_hash_string(module-&gt;name) % range;
+@@ -184,10 +239,10 @@
+ 
+ /*!	Compares a module to a given name */
+ static int
+-module_compare(void *_module, const void *_key)
++module_compare(void* _module, const void* _key)
+ {
+-	module *module = (struct module *)_module;
+-	const char *name = (const char *)_key;
++	module* module = (struct module*)_module;
++	const char* name = (const char*)_key;
+ 	if (name == NULL)
+ 		return -1;
+ 
+@@ -197,10 +252,10 @@
+ 
+ /*!	Calculates the hash of a module image using its path */
+ static uint32
+-module_image_hash(void *_module, const void *_key, uint32 range)
++module_image_hash(void* _module, const void* _key, uint32 range)
+ {
+-	module_image *image = (module_image *)_module;
+-	const char *path = (const char *)_key;
++	module_image* image = (module_image*)_module;
++	const char* path = (const char*)_key;
+ 
+ 	if (image != NULL)
+ 		return hash_hash_string(image-&gt;path) % range;
+@@ -214,10 +269,10 @@
+ 
+ /*!	Compares a module image to a path */
+ static int
+-module_image_compare(void *_module, const void *_key)
++module_image_compare(void* _module, const void* _key)
+ {
+-	module_image *image = (module_image *)_module;
+-	const char *path = (const char *)_key;
++	module_image* image = (module_image*)_module;
++	const char* path = (const char*)_key;
+ 	if (path == NULL)
+ 		return -1;
+ 
+@@ -230,9 +285,9 @@
+ 	to the module_image object in &quot;_moduleImage&quot;.
+ */
+ static status_t
+-load_module_image(const char *path, module_image **_moduleImage)
++load_module_image(const char* path, module_image** _moduleImage)
+ {
+-	module_image *moduleImage;
++	module_image* moduleImage;
+ 	status_t status;
+ 	image_id image;
+ 
+@@ -245,14 +300,14 @@
+ 		return image;
+ 	}
+ 
+-	moduleImage = (module_image *)malloc(sizeof(module_image));
+-	if (!moduleImage) {
++	moduleImage = (module_image*)malloc(sizeof(module_image));
++	if (moduleImage == NULL) {
+ 		status = B_NO_MEMORY;
+ 		goto err;
+ 	}
+ 
+ 	if (get_image_symbol(image, &quot;modules&quot;, B_SYMBOL_TYPE_DATA,
+-			(void **)&amp;moduleImage-&gt;info) != B_OK) {
++			(void**)&amp;moduleImage-&gt;info) != B_OK) {
+ 		TRACE((&quot;load_module_image: Failed to load \&quot;%s\&quot; due to lack of 'modules' symbol\n&quot;, path));
+ 		status = B_BAD_TYPE;
+ 		goto err1;
+@@ -260,7 +315,7 @@
+ 
+ 	moduleImage-&gt;dependencies = NULL;
+ 	get_image_symbol(image, &quot;module_dependencies&quot;, B_SYMBOL_TYPE_DATA,
+-		(void **)&amp;moduleImage-&gt;dependencies);
++		(void**)&amp;moduleImage-&gt;dependencies);
+ 		// this is allowed to be NULL
+ 
+ 	moduleImage-&gt;path = strdup(path);
+@@ -290,7 +345,7 @@
+ 
+ 
+ static status_t
+-unload_module_image(module_image *moduleImage, const char *path)
++unload_module_image(module_image* moduleImage, const char* path)
+ {
+ 	TRACE((&quot;unload_module_image(image = %p, path = %s)\n&quot;, moduleImage, path));
+ 
+@@ -298,7 +353,7 @@
+ 
+ 	if (moduleImage == NULL) {
+ 		// if no image was specified, lookup it up in the hash table
+-		moduleImage = (module_image *)hash_lookup(sModuleImagesHash, path);
++		moduleImage = (module_image*)hash_lookup(sModuleImagesHash, path);
+ 		if (moduleImage == NULL)
+ 			return B_ENTRY_NOT_FOUND;
+ 	}
+@@ -321,7 +376,7 @@
+ 
+ 
+ static void
+-put_module_image(module_image *image)
++put_module_image(module_image* image)
+ {
+ 	int32 refCount = atomic_add(&amp;image-&gt;ref_count, -1);
+ 	ASSERT(refCount &gt; 0);
+@@ -335,15 +390,15 @@
+ 
+ 
+ static status_t
+-get_module_image(const char *path, module_image **_image)
++get_module_image(const char* path, module_image** _image)
+ {
+-	struct module_image *image;
++	struct module_image* image;
+ 
+ 	TRACE((&quot;get_module_image(path = \&quot;%s\&quot;)\n&quot;, path));
+ 
+ 	RecursiveLocker _(sModulesLock);
+ 
+-	image = (module_image *)hash_lookup(sModuleImagesHash, path);
++	image = (module_image*)hash_lookup(sModuleImagesHash, path);
+ 	if (image == NULL) {
+ 		status_t status = load_module_image(path, &amp;image);
+ 		if (status &lt; B_OK)
+@@ -361,9 +416,9 @@
+ 	by &quot;info&quot; and create the entries required for access to it's details.
+ */
+ static status_t
+-create_module(module_info *info, const char *file, int offset, module **_module)
++create_module(module_info* info, const char* file, int offset, module** _module)
+ {
+-	module *module;
++	module* module;
+ 
+ 	TRACE((&quot;create_module(info = %p, file = \&quot;%s\&quot;, offset = %d, _module = %p)\n&quot;,
+ 		info, file, offset, _module));
+@@ -371,13 +426,13 @@
+ 	if (!info-&gt;name)
+ 		return B_BAD_VALUE;
+ 
+-	module = (struct module *)hash_lookup(sModulesHash, info-&gt;name);
++	module = (struct module*)hash_lookup(sModulesHash, info-&gt;name);
+ 	if (module) {
+ 		FATAL((&quot;Duplicate module name (%s) detected... ignoring new one\n&quot;, info-&gt;name));
+ 		return B_FILE_EXISTS;
+ 	}
+ 
+-	if ((module = (struct module *)malloc(sizeof(struct module))) == NULL)
++	if ((module = (struct module*)malloc(sizeof(struct module))) == NULL)
+ 		return B_NO_MEMORY;
+ 
+ 	TRACE((&quot;create_module: name = \&quot;%s\&quot;, file = \&quot;%s\&quot;\n&quot;, info-&gt;name, file));
+@@ -421,10 +476,10 @@
+ 	&quot;searchedName&quot; is allowed to be NULL (if all modules should be scanned)
+ */
+ static status_t
+-check_module_image(const char *path, const char *searchedName)
++check_module_image(const char* path, const char* searchedName)
+ {
+-	module_image *image;
+-	module_info **info;
++	module_image* image;
++	module_info** info;
+ 	int index = 0, match = B_ENTRY_NOT_FOUND;
+ 
+ 	TRACE((&quot;check_module_image(path = \&quot;%s\&quot;, searchedName = \&quot;%s\&quot;)\n&quot;, path,
+@@ -460,8 +515,8 @@
+ /*!	This is only called if we fail to find a module already in our cache...
+ 	saves us some extra checking here :)
+ */
+-static module *
+-search_module(const char *name)
++static module*
++search_module(const char* name)
+ {
+ 	status_t status = B_ENTRY_NOT_FOUND;
+ 	uint32 i;
+@@ -496,15 +551,15 @@
+ 	if (status != B_OK)
+ 		return NULL;
+ 
+-	return (module *)hash_lookup(sModulesHash, name);
++	return (module*)hash_lookup(sModulesHash, name);
+ }
+ 
+ 
+ static status_t
+-put_dependent_modules(struct module *module)
++put_dependent_modules(struct module* module)
+ {
+-	module_image *image = module-&gt;module_image;
+-	module_dependency *dependencies;
++	module_image* image = module-&gt;module_image;
++	module_dependency* dependencies;
+ 
+ 	// built-in modules don't have a module_image structure
+ 	if (image == NULL
+@@ -522,10 +577,10 @@
+ 
+ 
+ static status_t
+-get_dependent_modules(struct module *module)
++get_dependent_modules(struct module* module)
+ {
+-	module_image *image = module-&gt;module_image;
+-	module_dependency *dependencies;
++	module_image* image = module-&gt;module_image;
++	module_dependency* dependencies;
+ 
+ 	// built-in modules don't have a module_image structure
+ 	if (image == NULL
+@@ -550,7 +605,7 @@
+ 
+ /*!	Initializes a loaded module depending on its state */
+ static inline status_t
+-init_module(module *module)
++init_module(module* module)
+ {
+ 	switch (module-&gt;state) {
+ 		case MODULE_QUERIED:
+@@ -610,7 +665,7 @@
+ 
+ /*!	Uninitializes a module depeding on its state */
+ static inline int
+-uninit_module(module *module)
++uninit_module(module* module)
+ {
+ 	TRACE((&quot;uninit_module(%s)\n&quot;, module-&gt;name));
+ 
+@@ -660,8 +715,8 @@
+ }
+ 
+ 
+-static const char *
+-iterator_pop_path_from_stack(module_iterator *iterator, uint32 *_baseLength)
++static const char*
++iterator_pop_path_from_stack(module_iterator* iterator, uint32* _baseLength)
+ {
+ 	if (iterator-&gt;stack_current &lt;= 0)
+ 		return NULL;
+@@ -674,11 +729,12 @@
+ 
+ 
+ static status_t
+-iterator_push_path_on_stack(module_iterator *iterator, const char *path, uint32 baseLength)
++iterator_push_path_on_stack(module_iterator* iterator, const char* path,
++	uint32 baseLength)
+ {
+ 	if (iterator-&gt;stack_current + 1 &gt; iterator-&gt;stack_size) {
+ 		// allocate new space on the stack
+-		module_path *stack = (module_path *)realloc(iterator-&gt;stack,
++		module_path* stack = (module_path*)realloc(iterator-&gt;stack,
+ 			(iterator-&gt;stack_size + 8) * sizeof(module_path));
+ 		if (stack == NULL)
+ 			return B_NO_MEMORY;
+@@ -694,7 +750,7 @@
+ 
+ 
+ static bool
+-match_iterator_suffix(module_iterator *iterator, const char *name)
++match_iterator_suffix(module_iterator* iterator, const char* name)
+ {
+ 	if (iterator-&gt;suffix == NULL || iterator-&gt;suffix_length == 0)
+ 		return true;
+@@ -709,8 +765,8 @@
+ 
+ 
+ static status_t
+-iterator_get_next_module(module_iterator *iterator, char *buffer,
+-	size_t *_bufferSize)
++iterator_get_next_module(module_iterator* iterator, char* buffer,
++	size_t* _bufferSize)
+ {
+ 	status_t status;
+ 
+@@ -737,7 +793,7 @@
+ 		hash_iterator hashIterator;
+ 		hash_open(sModulesHash, &amp;hashIterator);
+ 
+-		struct module *module = (struct module *)hash_next(sModulesHash,
++		struct module* module = (struct module*)hash_next(sModulesHash,
+ 			&amp;hashIterator);
+ 		for (int32 i = 0; module != NULL; i++) {
+ 			if (i &gt;= iterator-&gt;module_offset) {
+@@ -752,7 +808,7 @@
+ 					return B_OK;
+ 				}
+ 			}
+-			module = (struct module *)hash_next(sModulesHash, &amp;hashIterator);
++			module = (struct module*)hash_next(sModulesHash, &amp;hashIterator);
+ 		}
+ 
+ 		hash_close(sModulesHash, &amp;hashIterator, false);
+@@ -765,14 +821,14 @@
+ nextPath:
+ 	if (iterator-&gt;current_dir == NULL) {
+ 		// get next directory path from the stack
+-		const char *path = iterator_pop_path_from_stack(iterator,
++		const char* path = iterator_pop_path_from_stack(iterator,
+ 			&amp;iterator-&gt;path_base_length);
+ 		if (path == NULL) {
+ 			// we are finished, there are no more entries on the stack
+ 			return B_ENTRY_NOT_FOUND;
+ 		}
+ 
+-		free((void *)iterator-&gt;current_path);
++		free((char*)iterator-&gt;current_path);
+ 		iterator-&gt;current_path = path;
+ 		iterator-&gt;current_dir = opendir(path);
+ 		TRACE((&quot;open directory at %s -&gt; %p\n&quot;, path, iterator-&gt;current_dir));
+@@ -790,7 +846,7 @@
+ 
+ 		errno = 0;
+ 
+-		struct dirent *dirent;
++		struct dirent* dirent;
+ 		if ((dirent = readdir(iterator-&gt;current_dir)) == NULL) {
+ 			closedir(iterator-&gt;current_dir);
+ 			iterator-&gt;current_dir = NULL;
+@@ -832,15 +888,15 @@
+ 			return B_BUFFER_OVERFLOW;
+ 
+ 		// find out if it's a directory or a file
+-		struct stat st;
+-		if (stat(path.Path(), &amp;st) &lt; 0)
++		struct stat stat;
++		if (::stat(path.Path(), &amp;stat) &lt; 0)
+ 			return errno;
+ 
+ 		iterator-&gt;current_module_path = strdup(path.Path());
+ 		if (iterator-&gt;current_module_path == NULL)
+ 			return B_NO_MEMORY;
+ 
+-		if (S_ISDIR(st.st_mode)) {
++		if (S_ISDIR(stat.st_mode)) {
+ 			status = iterator_push_path_on_stack(iterator,
+ 				iterator-&gt;current_module_path, iterator-&gt;path_base_length);
+ 			if (status &lt; B_OK)
+@@ -850,14 +906,14 @@
+ 			goto nextModuleImage;
+ 		}
+ 
+-		if (!S_ISREG(st.st_mode))
++		if (!S_ISREG(stat.st_mode))
+ 			return B_BAD_TYPE;
+ 
+ 		TRACE((&quot;open module at %s\n&quot;, path.Path()));
+ 
+ 		status = get_module_image(path.Path(), &amp;iterator-&gt;module_image);
+ 		if (status &lt; B_OK) {
+-			free((void *)iterator-&gt;current_module_path);
++			free((char*)iterator-&gt;current_module_path);
+ 			iterator-&gt;current_module_path = NULL;
+ 			goto nextModuleImage;
+ 		}
+@@ -868,9 +924,9 @@
+ 
+ 	// search the current module image until we've got a match
+ 	while (*iterator-&gt;current_header != NULL) {
+-		module_info *info = *iterator-&gt;current_header;
++		module_info* info = *iterator-&gt;current_header;
+ 
+-		// TODO: we might want to create a module here and cache it in the
++		// TODO: we mightS want to create a module here and cache it in the
+ 		// hash table
+ 
+ 		iterator-&gt;current_header++;
+@@ -887,7 +943,7 @@
+ 	// leave this module and get the next one
+ 
+ 	iterator-&gt;current_header = NULL;
+-	free((void *)iterator-&gt;current_module_path);
++	free((char*)iterator-&gt;current_module_path);
+ 	iterator-&gt;current_module_path = NULL;
+ 
+ 	put_module_image(iterator-&gt;module_image);
+@@ -898,7 +954,7 @@
+ 
+ 
+ static void
+-register_builtin_modules(struct module_info **info)
++register_builtin_modules(struct module_info** info)
+ {
+ 	for (; *info; info++) {
+ 		(*info)-&gt;flags |= B_BUILT_IN_MODULE;
+@@ -911,10 +967,10 @@
+ 
+ 
+ static status_t
+-register_preloaded_module_image(struct preloaded_image *image)
++register_preloaded_module_image(struct preloaded_image* image)
+ {
+-	module_image *moduleImage;
+-	struct module_info **info;
++	module_image* moduleImage;
++	struct module_info** info;
+ 	status_t status;
+ 	int32 index = 0;
+ 
+@@ -925,12 +981,12 @@
+ 	if (image-&gt;id &lt; 0)
+ 		return B_BAD_VALUE;
+ 
+-	moduleImage = (module_image *)malloc(sizeof(module_image));
++	moduleImage = (module_image*)malloc(sizeof(module_image));
+ 	if (moduleImage == NULL)
+ 		return B_NO_MEMORY;
+ 
+ 	if (get_image_symbol(image-&gt;id, &quot;modules&quot;, B_SYMBOL_TYPE_DATA,
+-			(void **)&amp;moduleImage-&gt;info) != B_OK) {
++			(void**)&amp;moduleImage-&gt;info) != B_OK) {
+ 		status = B_BAD_TYPE;
+ 		goto error;
+ 	}
+@@ -939,7 +995,7 @@
+ 
+ 	moduleImage-&gt;dependencies = NULL;
+ 	get_image_symbol(image-&gt;id, &quot;module_dependencies&quot;, B_SYMBOL_TYPE_DATA,
+-		(void **)&amp;moduleImage-&gt;dependencies);
++		(void**)&amp;moduleImage-&gt;dependencies);
+ 		// this is allowed to be NULL
+ 
+ 	// Try to recreate the full module path, so that we don't try to load the
+@@ -951,7 +1007,8 @@
+ 		//	(it always assumes the preloaded add-ons to be in the system
+ 		//	directory)
+ 		char path[B_FILE_NAME_LENGTH];
+-		const char *name, *suffix;
++		const char* suffix;
++		const char* name;
+ 		if (moduleImage-&gt;info[0]
+ 			&amp;&amp; (suffix = strstr(name = moduleImage-&gt;info[0]-&gt;name,
+ 					image-&gt;name)) != NULL) {
+@@ -1015,16 +1072,16 @@
+ 
+ 
+ static int
+-dump_modules(int argc, char **argv)
++dump_modules(int argc, char** argv)
+ {
+ 	hash_iterator iterator;
+-	struct module_image *image;
+-	struct module *module;
++	struct module_image* image;
++	struct module* module;
+ 
+ 	hash_rewind(sModulesHash, &amp;iterator);
+ 	dprintf(&quot;-- known modules:\n&quot;);
+ 
+-	while ((module = (struct module *)hash_next(sModulesHash, &amp;iterator)) != NULL) {
++	while ((module = (struct module*)hash_next(sModulesHash, &amp;iterator)) != NULL) {
+ 		dprintf(&quot;%p: \&quot;%s\&quot;, \&quot;%s\&quot; (%ld), refcount = %ld, state = %d, mimage = %p\n&quot;,
+ 			module, module-&gt;name, module-&gt;file, module-&gt;offset, module-&gt;ref_count,
+ 			module-&gt;state, module-&gt;module_image);
+@@ -1033,7 +1090,7 @@
+ 	hash_rewind(sModuleImagesHash, &amp;iterator);
+ 	dprintf(&quot;\n-- loaded module images:\n&quot;);
+ 
+-	while ((image = (struct module_image *)hash_next(sModuleImagesHash, &amp;iterator)) != NULL) {
++	while ((image = (struct module_image*)hash_next(sModuleImagesHash, &amp;iterator)) != NULL) {
+ 		dprintf(&quot;%p: \&quot;%s\&quot; (image_id = %ld), info = %p, refcount = %ld, %s\n&quot;, image,
+ 			image-&gt;path, image-&gt;image, image-&gt;info, image-&gt;ref_count,
+ 			image-&gt;keep_loaded ? &quot;keep loaded&quot; : &quot;can be unloaded&quot;);
+@@ -1042,6 +1099,108 @@
+ }
+ 
+ 
++//	#pragma mark - DirectoryWatcher
++
++
++DirectoryWatcher::DirectoryWatcher()
++{
++}
++
++
++DirectoryWatcher::~DirectoryWatcher()
++{
++}
++
++
++void
++DirectoryWatcher::EventOccured(NotificationService&amp; service,
++	const KMessage* event)
++{
++	int32 opcode = event-&gt;GetInt32(&quot;opcode&quot;, -1);
++	dev_t device = event-&gt;GetInt32(&quot;device&quot;, -1);
++	ino_t directory = event-&gt;GetInt64(&quot;directory&quot;, -1);
++	const char *name = event-&gt;GetString(&quot;name&quot;, NULL);
++
++	if (opcode == B_ENTRY_MOVED) {
++		// Determine wether it's a move within, out of, or into one
++		// of our watched directories.
++		ino_t from = event-&gt;GetInt64(&quot;from directory&quot;, -1);
++		ino_t to = event-&gt;GetInt64(&quot;to directory&quot;, -1);
++	}
++
++	KPath path(B_PATH_NAME_LENGTH + 1);
++	if (path.InitCheck() != B_OK || vfs_entry_ref_to_path(device, directory,
++			name, path.LockBuffer(), path.BufferSize()) != B_OK)
++		return;
++
++	path.UnlockBuffer();
++
++	dprintf(&quot;module \&quot;%s\&quot; %s\n&quot;, path.Leaf(),
++		opcode == B_ENTRY_CREATED ? &quot;added&quot; : &quot;removed&quot;);
++}
++
++
++//	#pragma mark - ModuleWatcher
++
++
++ModuleWatcher::ModuleWatcher()
++{
++}
++
++
++ModuleWatcher::~ModuleWatcher()
++{
++}
++
++
++void
++ModuleWatcher::EventOccured(NotificationService&amp; service, const KMessage* event)
++{
++	if (event-&gt;GetInt32(&quot;opcode&quot;, -1) != B_STAT_CHANGED
++		|| (event-&gt;GetInt32(&quot;fields&quot;, 0) &amp; B_STAT_MODIFICATION_TIME) == 0)
++		return;
++}
++
++
++//	#pragma mark - ModuleNotificationService
++
++
++ModuleNotificationService::ModuleNotificationService()
++{
++	recursive_lock_init(&amp;fLock, &quot;module notifications&quot;);
++}
++
++
++ModuleNotificationService::~ModuleNotificationService()
++{
++	recursive_lock_destroy(&amp;fLock);
++}
++
++
++status_t
++ModuleNotificationService::AddListener(const KMessage* eventSpecifier,
++	NotificationListener&amp; listener)
++{
++	return B_ERROR;
++}
++
++
++status_t
++ModuleNotificationService::UpdateListener(const KMessage* eventSpecifier,
++	NotificationListener&amp; listener)
++{
++	return B_ERROR;
++}
++
++
++status_t
++ModuleNotificationService::RemoveListener(const KMessage* eventSpecifier,
++	NotificationListener&amp; listener)
++{
++	return B_ERROR;
++}
++
++
+ //	#pragma mark - Exported Kernel API (private part)
+ 
+ 
+@@ -1049,12 +1208,12 @@
+ 	to load_module().
+ */
+ status_t
+-unload_module(const char *path)
++unload_module(const char* path)
+ {
+-	struct module_image *moduleImage;
++	struct module_image* moduleImage;
+ 
+ 	recursive_lock_lock(&amp;sModulesLock);
+-	moduleImage = (module_image *)hash_lookup(sModuleImagesHash, path);
++	moduleImage = (module_image*)hash_lookup(sModuleImagesHash, path);
+ 	recursive_lock_unlock(&amp;sModulesLock);
+ 
+ 	if (moduleImage == NULL)
+@@ -1074,9 +1233,9 @@
+ 	add-on won't be unloaded until the last put_module().
+ */
+ status_t
+-load_module(const char *path, module_info ***_modules)
++load_module(const char* path, module_info*** _modules)
+ {
+-	module_image *moduleImage;
++	module_image* moduleImage;
+ 	status_t status = get_module_image(path, &amp;moduleImage);
+ 	if (status != B_OK)
+ 		return status;
+@@ -1086,13 +1245,37 @@
+ }
+ 
+ 
++status_t
++start_watching_modules(const char* prefix, NotificationListener&amp; listener)
++{
++	KMessage specifier;
++	status_t status = specifier.AddString(&quot;prefix&quot;, prefix);
++	if (status != B_OK)
++		return status;
++
++	return sModuleNotificationService.AddListener(&amp;specifier, listener);
++}
++
++
++status_t
++stop_watching_modules(const char* prefix, NotificationListener&amp; listener)
++{
++	KMessage specifier;
++	status_t status = specifier.AddString(&quot;prefix&quot;, prefix);
++	if (status != B_OK)
++		return status;
++
++	return sModuleNotificationService.RemoveListener(&amp;specifier, listener);
++}
++
++
+ /*! Setup the module structures and data for use - must be called
+ 	before any other module call.
+ */
+ status_t
+-module_init(kernel_args *args)
++module_init(kernel_args* args)
+ {
+-	struct preloaded_image *image;
++	struct preloaded_image* image;
+ 
+ 	recursive_lock_init(&amp;sModulesLock, &quot;modules rlock&quot;);
+ 
+@@ -1119,6 +1302,8 @@
+ 		}
+ 	}
+ 
++	new(&amp;sModuleNotificationService) ModuleNotificationService();
++
+ 	sDisableUserAddOns = get_safemode_boolean(B_SAFEMODE_DISABLE_USER_ADD_ONS,
+ 		false);
+ 
+@@ -1140,8 +1325,8 @@
+ 	The structure is then used by read_next_module_name(), and
+ 	must be freed by calling close_module_list().
+ */
+-void *
+-open_module_list_etc(const char *prefix, const char *suffix)
++void*
++open_module_list_etc(const char* prefix, const char* suffix)
+ {
+ 	TRACE((&quot;open_module_list(prefix = %s)\n&quot;, prefix));
+ 
+@@ -1150,9 +1335,9 @@
+ 		return NULL;
+ 	}
+ 
+-	module_iterator *iterator = (module_iterator *)malloc(
++	module_iterator* iterator = (module_iterator*)malloc(
+ 		sizeof(module_iterator));
+-	if (!iterator)
++	if (iterator == NULL)
+ 		return NULL;
+ 
+ 	memset(iterator, 0, sizeof(module_iterator));
+@@ -1189,7 +1374,7 @@
+ 			pathBuffer.Append(&quot;kernel&quot;);
+ 
+ 			// Copy base path onto the iterator stack
+-			char *path = strdup(pathBuffer.Path());
++			char* path = strdup(pathBuffer.Path());
+ 			if (path == NULL)
+ 				continue;
+ 
+@@ -1202,7 +1387,7 @@
+ #if 0
+ 			// Build path component: base path + '/' + prefix
+ 			size_t length = strlen(sModulePaths[i]);
+-			char *path = (char *)malloc(length + iterator-&gt;prefix_length + 2);
++			char* path = (char*)malloc(length + iterator-&gt;prefix_length + 2);
+ 			if (path == NULL) {
+ 				// ToDo: should we abort the whole operation here?
+ 				//	if we do, don't forget to empty the stack
+@@ -1223,12 +1408,12 @@
+ 		iterator-&gt;loaded_modules = true;
+ 	}
+ 
+-	return (void *)iterator;
++	return (void*)iterator;
+ }
+ 
+ 
+-void *
+-open_module_list(const char *prefix)
++void*
++open_module_list(const char* prefix)
+ {
+ 	return open_module_list_etc(prefix, NULL);
+ }
+@@ -1236,10 +1421,10 @@
+ 
+ /*!	Frees the cookie allocated by open_module_list() */
+ status_t
+-close_module_list(void *cookie)
++close_module_list(void* cookie)
+ {
+-	module_iterator *iterator = (module_iterator *)cookie;
+-	const char *path;
++	module_iterator* iterator = (module_iterator*)cookie;
++	const char* path;
+ 
+ 	TRACE((&quot;close_module_list()\n&quot;));
+ 
+@@ -1248,7 +1433,7 @@
+ 
+ 	// free stack
+ 	while ((path = iterator_pop_path_from_stack(iterator, NULL)) != NULL)
+-		free((void *)path);
++		free((char*)path);
+ 
+ 	// close what have been left open
+ 	if (iterator-&gt;module_image != NULL)
+@@ -1258,8 +1443,8 @@
+ 		closedir(iterator-&gt;current_dir);
+ 
+ 	free(iterator-&gt;stack);
+-	free((void *)iterator-&gt;current_path);
+-	free((void *)iterator-&gt;current_module_path);
++	free((char*)iterator-&gt;current_path);
++	free((char*)iterator-&gt;current_module_path);
+ 
+ 	free(iterator-&gt;prefix);
+ 	free(iterator);
+@@ -1274,9 +1459,9 @@
+ 	when done.
+ */
+ status_t
+-read_next_module_name(void *cookie, char *buffer, size_t *_bufferSize)
++read_next_module_name(void* cookie, char* buffer, size_t* _bufferSize)
+ {
+
+[... truncated: 83 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009994.html">[Haiku-commits] r26238 - haiku/trunk/src/data/beos_mime/text
+</A></li>
+	<LI>Next message: <A HREF="009996.html">[Haiku-commits] r26239 - in haiku/trunk: headers/private/kernel src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9995">[ date ]</a>
+              <a href="thread.html#9995">[ thread ]</a>
+              <a href="subject.html#9995">[ subject ]</a>
+              <a href="author.html#9995">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

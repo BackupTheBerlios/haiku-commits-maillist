@@ -1,0 +1,682 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31780 - in haiku/trunk/src/servers/app: . drawing	drawing/Painter
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31780%20-%20in%20haiku/trunk/src/servers/app%3A%20.%20drawing%0A%09drawing/Painter&In-Reply-To=%3C200907261804.n6QI48LM023533%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018281.html">
+   <LINK REL="Next"  HREF="018286.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31780 - in haiku/trunk/src/servers/app: . drawing	drawing/Painter</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31780%20-%20in%20haiku/trunk/src/servers/app%3A%20.%20drawing%0A%09drawing/Painter&In-Reply-To=%3C200907261804.n6QI48LM023533%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31780 - in haiku/trunk/src/servers/app: . drawing	drawing/Painter">stippi at mail.berlios.de
+       </A><BR>
+    <I>Sun Jul 26 20:04:08 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018281.html">[Haiku-commits] r31779 - in haiku/trunk:	headers/private/kernel/disk_device_manager	headers/private/system src/kits/storage/disk_device/jobs	src/system/kernel/disk_device_manager
+</A></li>
+        <LI>Next message: <A HREF="018286.html">[Haiku-commits] r31780 - in haiku/trunk/src/servers/app: .	drawing drawing/Painter
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18282">[ date ]</a>
+              <a href="thread.html#18282">[ thread ]</a>
+              <a href="subject.html#18282">[ subject ]</a>
+              <a href="author.html#18282">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-07-26 20:04:01 +0200 (Sun, 26 Jul 2009)
+New Revision: 31780
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31780&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31780&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/FontCacheEntry.cpp
+   haiku/trunk/src/servers/app/FontCacheEntry.h
+   haiku/trunk/src/servers/app/FontEngine.cpp
+   haiku/trunk/src/servers/app/FontEngine.h
+   haiku/trunk/src/servers/app/drawing/Jamfile
+   haiku/trunk/src/servers/app/drawing/Painter/Jamfile
+Log:
+bonefish + stippi:
+Reworked the glyph caching:
+* It is now glyph index based (a font file has an internal glyph code to
+  index mapping, so that for example the same fallback glyph is used for
+  all unsupported codes).
+* We do not truncate to uint16 anymore at various places, but support
+  the full 32 bit char codes.
+* This made it necessary to switch to an OpenHashTable based cache lookup.
+* In CharacterMap, you can now see that the second Unicode plane does not
+  wrap around anymore.
+TODO: Remove old entries from the hash table after a while to free up memory.
+
+
+Modified: haiku/trunk/src/servers/app/FontCacheEntry.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/FontCacheEntry.cpp	2009-07-26 17:27:27 UTC (rev 31779)
++++ haiku/trunk/src/servers/app/FontCacheEntry.cpp	2009-07-26 18:04:01 UTC (rev 31780)
+@@ -27,6 +27,9 @@
+ #include &quot;FontCacheEntry.h&quot;
+ 
+ #include &lt;string.h&gt;
++
++#include &lt;new&gt;
++
+ #include &lt;agg_array.h&gt;
+ 
+ #include &lt;Autolock.h&gt;
+@@ -40,88 +43,114 @@
+ FontCacheEntry::sUsageUpdateLock(&quot;FontCacheEntry usage lock&quot;);
+ 
+ class FontCacheEntry::GlyphCachePool {
+- public:
+-	enum block_size_e { block_size = 16384-16 };
+-
++public:
+ 	GlyphCachePool()
+-		: fAllocator(block_size)
+ 	{
+-		memset(fGlyphs, 0, sizeof(fGlyphs));
+ 	}
+ 
+-	const GlyphCache* FindGlyph(uint16 glyphCode) const
++	~GlyphCachePool()
+ 	{
+-		unsigned msb = (glyphCode &gt;&gt; 8) &amp; 0xFF;
+-		if (fGlyphs[msb])
+-			return fGlyphs[msb][glyphCode &amp; 0xFF];
+-		return 0;
++		GlyphCache* glyph = fGlyphTable.Clear(true);
++		while (glyph != NULL) {
++			GlyphCache* next = glyph-&gt;fNext;
++			delete glyph;
++			glyph = next;
++		}
+ 	}
+ 
+-	GlyphCache* CacheGlyph(uint16 glyphCode, unsigned glyphIndex,
+-		unsigned dataSize, glyph_data_type dataType, const agg::rect_i&amp; bounds,
+-		float advanceX, float advanceY, float insetLeft, float insetRight)
++	status_t Init()
+ 	{
+-		unsigned msb = (glyphCode &gt;&gt; 8) &amp; 0xFF;
+-		if (fGlyphs[msb] == 0) {
+-			fGlyphs[msb]
+-				= (GlyphCache**)fAllocator.allocate(sizeof(GlyphCache*) * 256,
+-						sizeof(GlyphCache*));
+-			memset(fGlyphs[msb], 0, sizeof(GlyphCache*) * 256);
+-		}
++		return fGlyphTable.Init();
++	}
+ 
+-		unsigned lsb = glyphCode &amp; 0xFF;
+-		if (fGlyphs[msb][lsb])
+-			return NULL; // already exists, do not overwrite
++	const GlyphCache* FindGlyph(uint32 glyphIndex) const
++	{
++		return fGlyphTable.Lookup(glyphIndex);
++	}
+ 
+-		GlyphCache* glyph
+-			= (GlyphCache*)fAllocator.allocate(sizeof(GlyphCache),
+-					sizeof(double));
++	GlyphCache* CacheGlyph(uint32 glyphIndex,
++		uint32 dataSize, glyph_data_type dataType, const agg::rect_i&amp; bounds,
++		float advanceX, float advanceY, float insetLeft, float insetRight)
++	{
++		GlyphCache* glyph = fGlyphTable.Lookup(glyphIndex);
++		if (glyph != NULL)
++			return NULL;
+ 
+-		if (glyph == NULL)
++		glyph = new(std::nothrow) GlyphCache(glyphIndex, dataSize, dataType,
++			bounds, advanceX, advanceY, insetLeft, insetRight);
++		if (glyph == NULL || glyph-&gt;data == NULL) {
++			delete glyph;
+ 			return NULL;
++		}
+ 
+-		glyph-&gt;glyph_index = glyphIndex;
+-		glyph-&gt;data = fAllocator.allocate(dataSize);
+-		glyph-&gt;data_size = dataSize;
+-		glyph-&gt;data_type = dataType;
+-		glyph-&gt;bounds = bounds;
+-		glyph-&gt;advance_x = advanceX;
+-		glyph-&gt;advance_y = advanceY;
+-		glyph-&gt;inset_left = insetLeft;
+-		glyph-&gt;inset_right = insetRight;
++		// TODO: The HashTable grows without bounds. We should cleanup
++		// older entries from time to time.
+ 
+-		return fGlyphs[msb][lsb] = glyph;
++		fGlyphTable.Insert(glyph);
++
++		return glyph;
+ 	}
+ 
+- private:
+-	agg::block_allocator	fAllocator;
+-	GlyphCache**			fGlyphs[256];
++private:
++	struct GlyphHashTableDefinition {
++		typedef uint32		KeyType;
++		typedef	GlyphCache	ValueType;
++
++		size_t HashKey(uint32 key) const
++		{
++			return key;
++		}
++
++		size_t Hash(GlyphCache* value) const
++		{
++			return value-&gt;glyph_index;
++		}
++
++		bool Compare(uint32 key, GlyphCache* value) const
++		{
++			return value-&gt;glyph_index == key;
++		}
++
++		HashTableLink&lt;GlyphCache&gt;* GetLink(GlyphCache* value) const
++		{
++			return value;
++		}
++	};
++
++	typedef OpenHashTable&lt;GlyphHashTableDefinition&gt; GlyphTable;
++
++	GlyphTable	fGlyphTable;
+ };
+ 
++
+ // #pragma mark -
+ 
+-// constructor
++
+ FontCacheEntry::FontCacheEntry()
+-	: MultiLocker(&quot;FontCacheEntry lock&quot;)
+-	, Referenceable()
+-	, fGlyphCache(new GlyphCachePool())
+-	, fEngine()
+-	, fLastUsedTime(LONGLONG_MIN)
+-	, fUseCounter(0)
++	:
++	MultiLocker(&quot;FontCacheEntry lock&quot;),
++	Referenceable(),
++	fGlyphCache(new(std::nothrow) GlyphCachePool()),
++	fEngine(),
++	fLastUsedTime(LONGLONG_MIN),
++	fUseCounter(0)
+ {
+ }
+ 
+-// destructor
++
+ FontCacheEntry::~FontCacheEntry()
+ {
+ //printf(&quot;~FontCacheEntry()\n&quot;);
+ 	delete fGlyphCache;
+ }
+ 
+-// Init
++
+ bool
+ FontCacheEntry::Init(const ServerFont&amp; font)
+ {
++	if (fGlyphCache == NULL)
++		return false;
++
+ 	glyph_rendering renderingType = _RenderTypeFor(font);
+ 
+ 	// TODO: encoding from font
+@@ -134,17 +163,24 @@
+ 			&quot;file %s\n&quot;, font.Path());
+ 		return false;
+ 	}
++	if (fGlyphCache-&gt;Init() != B_OK) {
++		fprintf(stderr, &quot;FontCacheEntry::Init() - failed to allocate &quot;
++			&quot;GlyphCache table for font file %s\n&quot;, font.Path());
++		return false;
++	}
++
+ 	return true;
+ }
+ 
+-// HasGlyphs
++
+ bool
+ FontCacheEntry::HasGlyphs(const char* utf8String, ssize_t length) const
+ {
+ 	uint32 charCode;
+ 	const char* start = utf8String;
+ 	while ((charCode = UTF8ToCharCode(&amp;utf8String))) {
+-		if (!fGlyphCache-&gt;FindGlyph(charCode))
++		uint32 glyphIndex = fEngine.GlyphIndexForGlyphCode(charCode);
++		if (!fGlyphCache-&gt;FindGlyph(glyphIndex))
+ 			return false;
+ 		if (utf8String - start + 1 &gt; length)
+ 			break;
+@@ -152,30 +188,31 @@
+ 	return true;
+ }
+ 
+-// Glyph
++
+ const GlyphCache*
+-FontCacheEntry::Glyph(uint16 glyphCode)
++FontCacheEntry::Glyph(uint32 glyphCode)
+ {
+-	const GlyphCache* glyph = fGlyphCache-&gt;FindGlyph(glyphCode);
++	uint32 glyphIndex = fEngine.GlyphIndexForGlyphCode(glyphCode);
++	const GlyphCache* glyph = fGlyphCache-&gt;FindGlyph(glyphIndex);
+ 	if (glyph) {
+ 		return glyph;
+ 	} else {
+-		if (fEngine.PrepareGlyph(glyphCode)) {
+-			glyph = fGlyphCache-&gt;CacheGlyph(glyphCode,
+-				fEngine.GlyphIndex(), fEngine.DataSize(),
+-				fEngine.DataType(), fEngine.Bounds(),
++		if (fEngine.PrepareGlyph(glyphIndex)) {
++			glyph = fGlyphCache-&gt;CacheGlyph(glyphIndex,
++				fEngine.DataSize(), fEngine.DataType(), fEngine.Bounds(),
+ 				fEngine.AdvanceX(), fEngine.AdvanceY(),
+ 				fEngine.InsetLeft(), fEngine.InsetRight());
+ 
+-			fEngine.WriteGlyphTo(glyph-&gt;data);
++			if (glyph != NULL)
++				fEngine.WriteGlyphTo(glyph-&gt;data);
+ 
+ 			return glyph;
+ 		}
+ 	}
+-	return 0;
++	return NULL;
+ }
+ 
+-// InitAdaptors
++
+ void
+ FontCacheEntry::InitAdaptors(const GlyphCache* glyph,
+ 	double x, double y, GlyphMonoAdapter&amp; monoAdapter,
+@@ -207,15 +244,15 @@
+ 	}
+ }
+ 
+-// GetKerning
++
+ bool
+-FontCacheEntry::GetKerning(uint16 glyphCode1, uint16 glyphCode2,
++FontCacheEntry::GetKerning(uint32 glyphCode1, uint32 glyphCode2,
+ 	double* x, double* y)
+ {
+ 	return fEngine.GetKerning(glyphCode1, glyphCode2, x, y);
+ }
+ 
+-// GenerateSignature
++
+ /*static*/ void
+ FontCacheEntry::GenerateSignature(char* signature, size_t signatureSize,
+ 	const ServerFont&amp; font)
+@@ -232,7 +269,7 @@
+ 		font.Face(), int(renderingType), font.Size(), hinting, averageWeight);
+ }
+ 
+-// UpdateUsage
++
+ void
+ FontCacheEntry::UpdateUsage()
+ {
+@@ -248,7 +285,6 @@
+ }
+ 
+ 
+-// _RenderTypeFor
+ /*static*/ glyph_rendering
+ FontCacheEntry::_RenderTypeFor(const ServerFont&amp; font)
+ {
+
+Modified: haiku/trunk/src/servers/app/FontCacheEntry.h
+===================================================================
+--- haiku/trunk/src/servers/app/FontCacheEntry.h	2009-07-26 17:27:27 UTC (rev 31779)
++++ haiku/trunk/src/servers/app/FontCacheEntry.h	2009-07-26 18:04:01 UTC (rev 31780)
+@@ -12,8 +12,8 @@
+ // Anti-Grain Geometry - Version 2.4
+ // Copyright (C) 2002-2005 Maxim Shemanarev (<A HREF="http://www.antigrain.com">http://www.antigrain.com</A>)
+ //
+-// Permission to copy, use, modify, sell and distribute this software 
+-// is granted provided this copyright notice appears in all copies. 
++// Permission to copy, use, modify, sell and distribute this software
++// is granted provided this copyright notice appears in all copies.
+ // This software is provided &quot;as is&quot; without express or implied
+ // warranty, and with no claim as to its suitability for any purpose.
+ //
+@@ -33,6 +33,8 @@
+ #include &lt;agg_conv_contour.h&gt;
+ #include &lt;agg_conv_transform.h&gt;
+ 
++#include &lt;util/OpenHashTable.h&gt;
++
+ #include &quot;ServerFont.h&quot;
+ #include &quot;FontEngine.h&quot;
+ #include &quot;MultiLocker.h&quot;
+@@ -40,10 +42,31 @@
+ #include &quot;Transformable.h&quot;
+ 
+ 
+-struct GlyphCache {
+-	unsigned		glyph_index;
++struct GlyphCache : public HashTableLink&lt;GlyphCache&gt; {
++	GlyphCache(uint32 glyphIndex, uint32 dataSize, glyph_data_type dataType,
++			const agg::rect_i&amp; bounds, float advanceX, float advanceY,
++			float insetLeft, float insetRight)
++		:
++		glyph_index(glyphIndex),
++		data((uint8*)malloc(dataSize)),
++		data_size(dataSize),
++		data_type(dataType),
++		bounds(bounds),
++		advance_x(advanceX),
++		advance_y(advanceY),
++		inset_left(insetLeft),
++		inset_right(insetRight)
++	{
++	}
++
++	~GlyphCache()
++	{
++		free(data);
++	}
++
++	uint32			glyph_index;
+ 	uint8*			data;
+-	unsigned		data_size;
++	uint32			data_size;
+ 	glyph_data_type	data_type;
+ 	agg::rect_i		bounds;
+ 	float			advance_x;
+@@ -80,7 +103,7 @@
+ 			bool				HasGlyphs(const char* utf8String,
+ 									ssize_t glyphCount) const;
+ 
+-			const GlyphCache*	Glyph(uint16 glyphCode);
++			const GlyphCache*	Glyph(uint32 glyphCode);
+ 
+ 			void				InitAdaptors(const GlyphCache* glyph,
+ 									double x, double y,
+@@ -89,8 +112,8 @@
+ 									GlyphPathAdapter&amp; pathAdapter,
+ 									double scale = 1.0);
+ 
+-			bool				GetKerning(uint16 glyphCode1,
+-									uint16 glyphCode2, double* x, double* y);
++			bool				GetKerning(uint32 glyphCode1,
++									uint32 glyphCode2, double* x, double* y);
+ 
+ 	static	void				GenerateSignature(char* signature,
+ 									size_t signatureSize,
+
+Modified: haiku/trunk/src/servers/app/FontEngine.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/FontEngine.cpp	2009-07-26 17:27:27 UTC (rev 31779)
++++ haiku/trunk/src/servers/app/FontEngine.cpp	2009-07-26 18:04:01 UTC (rev 31780)
+@@ -42,14 +42,13 @@
+ static const bool kFlipY = true;
+ 
+ 
+-// int26p6_to_dbl
+ static inline double
+ int26p6_to_dbl(int p)
+ {
+ 	return double(p) / 64.0;
+ }
+ 
+-// dbl_to_int26p6
++
+ static inline int
+ dbl_to_int26p6(double p)
+ {
+@@ -57,7 +56,6 @@
+ }
+ 
+ 
+-// decompose_ft_outline
+ template&lt;class PathStorage&gt;
+ bool
+ decompose_ft_outline(const FT_Outline&amp; outline, bool flip_y, PathStorage&amp; path)
+@@ -289,7 +287,6 @@
+ }
+ 
+ 
+-// decompose_ft_bitmap_mono
+ template&lt;class Scanline, class ScanlineStorage&gt;
+ void
+ decompose_ft_bitmap_mono(const FT_Bitmap&amp; bitmap, int x, int y,
+@@ -321,7 +318,6 @@
+ }
+ 
+ 
+-// decompose_ft_bitmap_gray8
+ template&lt;class Scanline, class ScanlineStorage&gt;
+ void
+ decompose_ft_bitmap_gray8(const FT_Bitmap&amp; bitmap, int x, int y,
+@@ -365,7 +361,6 @@
+ }
+ 
+ 
+-// decompose_ft_bitmap_subpix
+ template&lt;class Scanline, class ScanlineStorage&gt;
+ void
+ decompose_ft_bitmap_subpix(const FT_Bitmap&amp; bitmap, int x, int y,
+@@ -557,36 +552,36 @@
+ #endif
+ }
+ 
++
+ // #pragma mark -
+ 
+ 
+-// constructor
+ FontEngine::FontEngine()
+-	: fLastError(0)
+-	, fLibraryInitialized(false)
+-	, fLibrary(0)
+-	, fFace(NULL)
++	:
++	fLastError(0),
++	fLibraryInitialized(false),
++	fLibrary(0),
++	fFace(NULL),
+ 
+-	, fGlyphRendering(glyph_ren_native_gray8)
+-	, fHinting(true)
++	fGlyphRendering(glyph_ren_native_gray8),
++	fHinting(true),
+ 
+-	, fGlyphIndex(0)
+-	, fDataSize(0)
+-	, fDataType(glyph_data_invalid)
+-	, fBounds(1, 1, 0, 0)
+-	, fAdvanceX(0.0)
+-	, fAdvanceY(0.0)
+-	, fInsetLeft(0.0)
+-	, fInsetRight(0.0)
++	fDataSize(0),
++	fDataType(glyph_data_invalid),
++	fBounds(1, 1, 0, 0),
++	fAdvanceX(0.0),
++	fAdvanceY(0.0),
++	fInsetLeft(0.0),
++	fInsetRight(0.0),
+ 
+-	, fPath()
+-	, fCurves(fPath)
+-	, fScanlineAA()
+-	, fScanlineBin()
+-	, fScanlineSubpix()
+-	, fScanlineStorageAA()
+-	, fScanlineStorageBin()
+-	, fScanlineStorageSubpix()
++	fPath(),
++	fCurves(fPath),
++	fScanlineAA(),
++	fScanlineBin(),
++	fScanlineSubpix(),
++	fScanlineStorageAA(),
++	fScanlineStorageBin(),
++	fScanlineStorageSubpix()
+ {
+ 	fCurves.approximation_scale(4.0);
+ 
+@@ -596,7 +591,6 @@
+ }
+ 
+ 
+-// destructor
+ FontEngine::~FontEngine()
+ {
+ 	FT_Done_Face(fFace);
+@@ -606,7 +600,6 @@
+ }
+ 
+ 
+-// CountFaces
+ unsigned
+ FontEngine::CountFaces() const
+ {
+@@ -617,13 +610,19 @@
+ }
+ 
+ 
+-// PrepareGlyph
++uint32
++FontEngine::GlyphIndexForGlyphCode(uint32 glyphCode) const
++{
++	FT_Get_Char_Index(fFace, glyphCode);
++}
++
++
+ bool
+-FontEngine::PrepareGlyph(unsigned glyphCode)
++FontEngine::PrepareGlyph(uint32 glyphIndex)
+ {
+-	fGlyphIndex = FT_Get_Char_Index(fFace, glyphCode);
+-	fLastError = FT_Load_Glyph(fFace, fGlyphIndex,
+-		(fHinting ? (FT_LOAD_DEFAULT | FT_LOAD_TARGET_LCD) : FT_LOAD_NO_HINTING));
++	fLastError = FT_Load_Glyph(fFace, glyphIndex,
++		(fHinting ? (FT_LOAD_DEFAULT | FT_LOAD_TARGET_LCD)
++			: FT_LOAD_NO_HINTING));
+ 
+ 	if (fLastError != 0)
+ 		return false;
+@@ -740,8 +739,7 @@
+ 
+ // GetKerning
+ bool
+-FontEngine::GetKerning(unsigned first, unsigned second,
+-									   double* x, double* y)
++FontEngine::GetKerning(uint32 first, uint32 second, double* x, double* y)
+ {
+ 	if (fFace &amp;&amp; first &amp;&amp; second &amp;&amp; FT_HAS_KERNING(fFace)) {
+ 		FT_Vector delta;
+
+Modified: haiku/trunk/src/servers/app/FontEngine.h
+===================================================================
+--- haiku/trunk/src/servers/app/FontEngine.h	2009-07-26 17:27:27 UTC (rev 31779)
++++ haiku/trunk/src/servers/app/FontEngine.h	2009-07-26 18:04:01 UTC (rev 31780)
+@@ -92,11 +92,10 @@
+ 									{ return fHinting; }
+ 
+ 
+-			bool				PrepareGlyph(unsigned glyphCode);
++			uint32				GlyphIndexForGlyphCode(uint32 glyphCode) const;
++			bool				PrepareGlyph(uint32 glyphIndex);
+ 
+-			unsigned			GlyphIndex() const
+-									{ return fGlyphIndex; }
+-			unsigned			DataSize() const
++			uint32				DataSize() const
+ 									{ return fDataSize; }
+ 			glyph_data_type		DataType() const
+ 									{ return fDataType; }
+@@ -114,7 +113,7 @@
+ 			void				WriteGlyphTo(uint8* data) const;
+ 
+ 
+-			bool				GetKerning(unsigned first, unsigned second,
++			bool				GetKerning(uint32 first, uint32 second,
+ 									double* x, double* y);
+ 
+  private:
+@@ -132,8 +131,7 @@
+ 
+ 			// members needed to generate individual glyphs according
+ 			// to glyph rendering type
+-			unsigned			fGlyphIndex;
+-			unsigned			fDataSize;
++			uint32				fDataSize;
+ 			glyph_data_type		fDataType;
+ 			agg::rect_i			fBounds;
+ 			double				fAdvanceX;
+
+Modified: haiku/trunk/src/servers/app/drawing/Jamfile
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/Jamfile	2009-07-26 17:27:27 UTC (rev 31779)
++++ haiku/trunk/src/servers/app/drawing/Jamfile	2009-07-26 18:04:01 UTC (rev 31780)
+@@ -1,7 +1,7 @@
+ SubDir HAIKU_TOP src servers app drawing ;
+ 
+ UseLibraryHeaders agg ;
+-UsePrivateHeaders app graphics interface shared ;
++UsePrivateHeaders app graphics interface kernel shared ;
+ UsePrivateHeaders [ FDirName graphics common ] ;
+ UsePrivateSystemHeaders ;
+ 
+
+Modified: haiku/trunk/src/servers/app/drawing/Painter/Jamfile
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/Painter/Jamfile	2009-07-26 17:27:27 UTC (rev 31779)
++++ haiku/trunk/src/servers/app/drawing/Painter/Jamfile	2009-07-26 18:04:01 UTC (rev 31780)
+@@ -4,7 +4,7 @@
+ AddSubDirSupportedPlatforms libbe_test ;
+ 
+ UseLibraryHeaders agg ;
+-UsePrivateHeaders app graphics interface shared ;
++UsePrivateHeaders app graphics interface kernel shared ;
+ UseHeaders [ FDirName $(HAIKU_TOP) src servers app ] ;
+ UseHeaders [ FDirName $(HAIKU_TOP) src servers app drawing ] ;
+ UseHeaders [ FDirName $(HAIKU_TOP) src servers app drawing Painter drawing_modes ] ;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018281.html">[Haiku-commits] r31779 - in haiku/trunk:	headers/private/kernel/disk_device_manager	headers/private/system src/kits/storage/disk_device/jobs	src/system/kernel/disk_device_manager
+</A></li>
+	<LI>Next message: <A HREF="018286.html">[Haiku-commits] r31780 - in haiku/trunk/src/servers/app: .	drawing drawing/Painter
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18282">[ date ]</a>
+              <a href="thread.html#18282">[ thread ]</a>
+              <a href="subject.html#18282">[ subject ]</a>
+              <a href="author.html#18282">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

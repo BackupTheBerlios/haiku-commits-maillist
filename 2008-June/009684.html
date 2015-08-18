@@ -1,0 +1,526 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26009 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26009%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel%20src/system/kernel/vm&In-Reply-To=%3C200806181955.m5IJtrUa028948%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009683.html">
+   <LINK REL="Next"  HREF="009686.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26009 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/vm</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26009%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel%20src/system/kernel/vm&In-Reply-To=%3C200806181955.m5IJtrUa028948%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26009 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/vm">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Wed Jun 18 21:55:53 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009683.html">[Haiku-commits] r26008 - in haiku/trunk: headers/private/bluetooth	src/kits/bluetooth
+</A></li>
+        <LI>Next message: <A HREF="009686.html">[Haiku-commits] r26010 - in haiku/trunk: headers/private/bluetooth	src/kits/bluetooth src/kits/bluetooth/UI
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9684">[ date ]</a>
+              <a href="thread.html#9684">[ thread ]</a>
+              <a href="subject.html#9684">[ subject ]</a>
+              <a href="author.html#9684">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-06-18 21:55:51 +0200 (Wed, 18 Jun 2008)
+New Revision: 26009
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26009&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26009&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/heap.h
+   haiku/trunk/src/system/kernel/heap.cpp
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_address_space.cpp
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+   haiku/trunk/src/system/kernel/vm/vm_store_anonymous_noswap.cpp
+   haiku/trunk/src/system/kernel/vm/vm_store_device.c
+   haiku/trunk/src/system/kernel/vm/vm_store_null.c
+Log:
+* Added malloc_nogrow() function that does allocation without triggering or
+  waiting for a heap grow.
+* Use that nogrow version in the VM code to avoid a deadlock with the address
+  space lock when a grow operation would try to create an area while a malloc
+  happened from such a function in the VM.
+* When waiting for a grow to happen, notify the waiting thread from the grower
+  also if it failed to allocate a new heap. Otherwise a thread would just sit
+  there and wait until another thread requested growing too and that one
+  succeeded (or just forever in the worst case).
+* Make the dedicated grow heap growable too. If the current grow heaps run low
+  on memory it will instruct the grower to allocate a new grow heap. This
+  reduces the likelyhood of running out of memory with no way to grow to a
+  minimum. As the growing is done asynchronously it is still possible to
+  happen, but it is highly unlikely as the grow heap is solely used to
+  allocate memory in the process of creating new heap areas and it will even
+  try using normal public memory if the dedicated memory has run out.
+* Reduced the dedicated grow heap from 2 to 1MB. As it can now grow itself, it
+  doesn't need to last so long.
+* Extract heap creation into it's own function that does area creation and heap
+  attach and use this function for growing normal and grow heaps.
+
+Modified: haiku/trunk/headers/private/kernel/heap.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/heap.h	2008-06-18 19:17:35 UTC (rev 26008)
++++ haiku/trunk/headers/private/kernel/heap.h	2008-06-18 19:55:51 UTC (rev 26009)
+@@ -14,14 +14,18 @@
+ #define INITIAL_HEAP_SIZE			16 * 1024 * 1024
+ // grow by another 8MB each time the heap runs out of memory
+ #define HEAP_GROW_SIZE				8 * 1024 * 1024
+-// allocate a dedicated 2MB area for dynamic growing
+-#define HEAP_DEDICATED_GROW_SIZE	2 * 1024 * 1024
++// allocate a dedicated 1MB area for dynamic growing
++#define HEAP_DEDICATED_GROW_SIZE	1 * 1024 * 1024
+ 
+ 
+ #ifdef __cplusplus
+ extern &quot;C&quot; {
+ #endif
+ 
++// malloc_nogrow disallows waiting for a grow to happen - only to be used by
++// vm functions that may deadlock on a triggered area creation
++void *malloc_nogrow(size_t size);
++
+ void *memalign(size_t alignment, size_t size);
+ 
+ void deferred_free(void* block);
+
+Modified: haiku/trunk/src/system/kernel/heap.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/heap.cpp	2008-06-18 19:17:35 UTC (rev 26008)
++++ haiku/trunk/src/system/kernel/heap.cpp	2008-06-18 19:55:51 UTC (rev 26009)
+@@ -101,10 +101,11 @@
+ 
+ static heap_allocator *sHeapList = NULL;
+ static heap_allocator *sLastGrowRequest = NULL;
+-static heap_allocator *sGrowHeap = NULL;
++static heap_allocator *sGrowHeapList = NULL;
+ static thread_id sHeapGrowThread = -1;
+ static sem_id sHeapGrowSem = -1;
+ static sem_id sHeapGrownNotify = -1;
++static bool sAddGrowHeap = false;
+ 
+ static DeferredFreeList sDeferredFreeList;
+ static spinlock sDeferredFreeListLock;
+@@ -257,8 +258,12 @@
+ 	if (argc == 2) {
+ 		if (strcmp(argv[1], &quot;grow&quot;) == 0) {
+ 			// only dump dedicated grow heap info
+-			dprintf(&quot;dedicated grow heap:\n&quot;);
+-			dump_allocator(sGrowHeap);
++			dprintf(&quot;dedicated grow heap(s):\n&quot;);
++			heap_allocator *heap = sGrowHeapList;
++			while (heap) {
++				dump_allocator(heap);
++				heap = heap-&gt;next;
++			}
+ 		} else if (strcmp(argv[1], &quot;stats&quot;) == 0) {
+ 			uint32 heapCount = 0;
+ 			heap_allocator *heap = sHeapList;
+@@ -1177,15 +1182,61 @@
+ //	#pragma mark -
+ 
+ 
++static heap_allocator *
++heap_create_new_heap(const char *name, size_t size)
++{
++	void *heapAddress = NULL;
++	area_id heapArea = create_area(name, &amp;heapAddress,
++		B_ANY_KERNEL_BLOCK_ADDRESS, size, B_FULL_LOCK,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (heapArea &lt; B_OK) {
++		TRACE((&quot;heap: couldn't allocate heap \&quot;%s\&quot;\n&quot;, name));
++		return NULL;
++	}
++
++	heap_allocator *newHeap = heap_attach((addr_t)heapAddress, size);
++	if (newHeap == NULL) {
++		panic(&quot;heap: could not attach heap to area!\n&quot;);
++		delete_area(heapArea);
++		return NULL;
++	}
++
++#if PARANOID_VALIDATION
++	heap_validate_heap(newHeap);
++#endif
++	return newHeap;
++}
++
++
+ static int32
+ heap_grow_thread(void *)
+ {
+ 	heap_allocator *heap = sHeapList;
++	heap_allocator *growHeap = sGrowHeapList;
+ 	while (true) {
+ 		// wait for a request to grow the heap list
+ 		if (acquire_sem(sHeapGrowSem) &lt; B_OK)
+ 			continue;
+ 
++		if (sAddGrowHeap) {
++			while (growHeap-&gt;next)
++				growHeap = growHeap-&gt;next;
++
++			// the last grow heap is going to run full soon, try to allocate
++			// a new one to make some room.
++			TRACE((&quot;heap_grower: grow heaps will run out of memory soon\n&quot;));
++			heap_allocator *newHeap = heap_create_new_heap(
++				&quot;additional grow heap&quot;, HEAP_DEDICATED_GROW_SIZE);
++			if (newHeap != NULL) {
++#if PARANOID_VALIDATION
++				heap_validate_heap(newHeap);
++#endif
++				growHeap-&gt;next = newHeap;
++				sAddGrowHeap = false;
++				TRACE((&quot;heap_grower: new grow heap %p linked in\n&quot;, newHeap));
++			}
++		}
++
+ 		// find the last heap
+ 		while (heap-&gt;next)
+ 			heap = heap-&gt;next;
+@@ -1196,28 +1247,15 @@
+ 		}
+ 
+ 		TRACE((&quot;heap_grower: kernel heap will run out of memory soon, allocating new one\n&quot;));
+-		void *heapAddress = NULL;
+-		area_id heapArea = create_area(&quot;additional heap&quot;, &amp;heapAddress,
+-			B_ANY_KERNEL_BLOCK_ADDRESS, HEAP_GROW_SIZE, B_FULL_LOCK,
+-			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+-		if (heapArea &lt; B_OK) {
+-			panic(&quot;heap_grower: couldn't allocate additional heap area\n&quot;);
+-			continue;
+-		}
+-
+-		heap_allocator *newHeap = heap_attach((addr_t)heapAddress,
++		heap_allocator *newHeap = heap_create_new_heap(&quot;additional heap&quot;,
+ 			HEAP_GROW_SIZE);
+-		if (newHeap == NULL) {
+-			panic(&quot;heap_grower: could not attach additional heap!\n&quot;);
+-			delete_area(heapArea);
+-			continue;
+-		}
+-
++		if (newHeap != NULL) {
+ #if PARANOID_VALIDATION
+-		heap_validate_heap(newHeap);
++			heap_validate_heap(newHeap);
+ #endif
+-		heap-&gt;next = newHeap;
+-		TRACE((&quot;heap_grower: new heap linked in\n&quot;));
++			heap-&gt;next = newHeap;
++			TRACE((&quot;heap_grower: new heap linked in\n&quot;));
++		}
+ 
+ 		// notify anyone waiting for this request
+ 		release_sem_etc(sHeapGrownNotify, -1, B_RELEASE_ALL);
+@@ -1282,19 +1320,10 @@
+ status_t
+ heap_init_post_thread()
+ {
+-	void *dedicated = NULL;
+-	area_id area = create_area(&quot;heap dedicated grow&quot;, &amp;dedicated,
+-		B_ANY_KERNEL_BLOCK_ADDRESS, HEAP_DEDICATED_GROW_SIZE, B_FULL_LOCK,
+-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+-	if (area &lt; 0) {
+-		panic(&quot;heap_init_post_thread(): cannot allocate dedicated grow memory\n&quot;);
+-		return area;
+-	}
+-
+-	sGrowHeap = heap_attach((addr_t)dedicated, HEAP_DEDICATED_GROW_SIZE);
+-	if (sGrowHeap == NULL) {
++	sGrowHeapList = heap_create_new_heap(&quot;dedicated grow heap&quot;,
++		HEAP_DEDICATED_GROW_SIZE);
++	if (sGrowHeapList == NULL) {
+ 		panic(&quot;heap_init_post_thread(): failed to attach dedicated grow heap\n&quot;);
+-		delete_area(area);
+ 		return B_ERROR;
+ 	}
+ 
+@@ -1302,7 +1331,6 @@
+ 		B_URGENT_PRIORITY, NULL);
+ 	if (sHeapGrowThread &lt; 0) {
+ 		panic(&quot;heap_init_post_thread(): cannot create heap grow thread\n&quot;);
+-		delete_area(area);
+ 		return sHeapGrowThread;
+ 	}
+ 
+@@ -1331,17 +1359,6 @@
+ 		return NULL;
+ 	}
+ 
+-	if (thread_get_current_thread_id() == sHeapGrowThread) {
+-		// this is the grower thread, allocate from our dedicated memory
+-		void *result = heap_memalign(sGrowHeap, alignment, size, NULL);
+-		if (result == NULL) {
+-			panic(&quot;heap: grow thread ran out of dedicated memory!\n&quot;);
+-			return NULL;
+-		}
+-
+-		return result;
+-	}
+-
+ 	heap_allocator *heap = sHeapList;
+ 	while (heap) {
+ 		bool shouldGrow = false;
+@@ -1352,6 +1369,10 @@
+ 			if (result == NULL) {
+ 				// urgent request, do the request and wait
+ 				switch_sem(sHeapGrowSem, sHeapGrownNotify);
++				if (heap-&gt;next == NULL) {
++					// the grower didn't manage to add a new heap
++					return NULL;
++				}
+ 			} else {
+ 				// not so urgent, just notify the grower
+ 				release_sem_etc(sHeapGrowSem, 1, B_DO_NOT_RESCHEDULE);
+@@ -1376,6 +1397,46 @@
+ 
+ 
+ void *
++malloc_nogrow(size_t size)
++{
++	// use dedicated memory in the grow thread by default
++	if (thread_get_current_thread_id() == sHeapGrowThread) {
++		bool shouldGrow = false;
++		heap_allocator *heap = sGrowHeapList;
++		while (heap) {
++			void *result = heap_memalign(heap, 0, size, &amp;shouldGrow);
++			if (shouldGrow &amp;&amp; heap-&gt;next == NULL &amp;&amp; !sAddGrowHeap) {
++				// hopefully the heap grower will manage to create a new heap
++				// before running out of private memory...
++				dprintf(&quot;heap: requesting new grow heap\n&quot;);
++				sAddGrowHeap = true;
++				release_sem_etc(sHeapGrowSem, 1, B_DO_NOT_RESCHEDULE);
++			}
++
++			if (result != NULL)
++				return result;
++
++			heap = heap-&gt;next;
++		}
++	}
++
++	// try public memory, there might be something available
++	heap_allocator *heap = sHeapList;
++	while (heap) {
++		void *result = heap_memalign(heap, 0, size, NULL);
++		if (result != NULL)
++			return result;
++
++		heap = heap-&gt;next;
++	}
++
++	// no memory available
++	panic(&quot;heap: all heaps have run out of memory\n&quot;);
++	return NULL;
++}
++
++
++void *
+ malloc(size_t size)
+ {
+ 	return memalign(0, size);
+@@ -1402,10 +1463,15 @@
+ 		heap = heap-&gt;next;
+ 	}
+ 
+-	// maybe it was allocated from the dedicated grow heap
+-	if (heap_free(sGrowHeap, address) == B_OK)
+-		return;
++	// maybe it was allocated from a dedicated grow heap
++	heap = sGrowHeapList;
++	while (heap) {
++		if (heap_free(heap, address) == B_OK)
++			return;
+ 
++		heap = heap-&gt;next;
++	}
++
+ 	panic(&quot;free(): free failed for address %p\n&quot;, address);
+ }
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2008-06-18 19:17:35 UTC (rev 26008)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2008-06-18 19:55:51 UTC (rev 26009)
+@@ -810,7 +810,7 @@
+ static vm_area *
+ create_reserved_area_struct(vm_address_space *addressSpace, uint32 flags)
+ {
+-	vm_area *reserved = (vm_area *)malloc(sizeof(vm_area));
++	vm_area *reserved = (vm_area *)malloc_nogrow(sizeof(vm_area));
+ 	if (reserved == NULL)
+ 		return NULL;
+ 
+@@ -833,11 +833,11 @@
+ 	if (length &gt; B_OS_NAME_LENGTH)
+ 		length = B_OS_NAME_LENGTH;
+ 
+-	vm_area *area = (vm_area *)malloc(sizeof(vm_area));
++	vm_area *area = (vm_area *)malloc_nogrow(sizeof(vm_area));
+ 	if (area == NULL)
+ 		return NULL;
+ 
+-	area-&gt;name = (char *)malloc(length);
++	area-&gt;name = (char *)malloc_nogrow(length);
+ 	if (area-&gt;name == NULL) {
+ 		free(area);
+ 		return NULL;
+@@ -2856,7 +2856,7 @@
+ 	vm_page_mapping *mapping = NULL;
+ 
+ 	if (area-&gt;wiring == B_NO_LOCK) {
+-		mapping = (vm_page_mapping *)malloc(sizeof(vm_page_mapping));
++		mapping = (vm_page_mapping *)malloc_nogrow(sizeof(vm_page_mapping));
+ 		if (mapping == NULL)
+ 			return B_NO_MEMORY;
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_address_space.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_address_space.cpp	2008-06-18 19:17:35 UTC (rev 26008)
++++ haiku/trunk/src/system/kernel/vm/vm_address_space.cpp	2008-06-18 19:55:51 UTC (rev 26009)
+@@ -12,6 +12,7 @@
+ #include &lt;vm.h&gt;
+ #include &lt;vm_address_space.h&gt;
+ #include &lt;vm_priv.h&gt;
++#include &lt;heap.h&gt;
+ #include &lt;thread.h&gt;
+ #include &lt;util/khash.h&gt;
+ 
+@@ -263,7 +264,7 @@
+ 	vm_address_space *addressSpace;
+ 	status_t status;
+ 
+-	addressSpace = (vm_address_space *)malloc(sizeof(vm_address_space));
++	addressSpace = (vm_address_space *)malloc_nogrow(sizeof(vm_address_space));
+ 	if (addressSpace == NULL)
+ 		return B_NO_MEMORY;
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-06-18 19:17:35 UTC (rev 26008)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-06-18 19:55:51 UTC (rev 26009)
+@@ -14,6 +14,7 @@
+ #include &lt;arch/cpu.h&gt;
+ #include &lt;condition_variable.h&gt;
+ #include &lt;debug.h&gt;
++#include &lt;heap.h&gt;
+ #include &lt;int.h&gt;
+ #include &lt;kernel.h&gt;
+ #include &lt;lock.h&gt;
+@@ -543,7 +544,7 @@
+ 		return NULL;
+ 	}
+ 
+-	cache = (vm_cache*)malloc(sizeof(vm_cache));
++	cache = (vm_cache*)malloc_nogrow(sizeof(vm_cache));
+ 	if (cache == NULL)
+ 		return NULL;
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_store_anonymous_noswap.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_store_anonymous_noswap.cpp	2008-06-18 19:17:35 UTC (rev 26008)
++++ haiku/trunk/src/system/kernel/vm/vm_store_anonymous_noswap.cpp	2008-06-18 19:55:51 UTC (rev 26009)
+@@ -9,6 +9,7 @@
+ 
+ #include &quot;vm_store_anonymous_noswap.h&quot;
+ 
++#include &lt;heap.h&gt;
+ #include &lt;KernelExport.h&gt;
+ #include &lt;vm_priv.h&gt;
+ #include &lt;arch_config.h&gt;
+@@ -165,7 +166,7 @@
+ vm_store_create_anonymous_noswap(bool canOvercommit,
+ 	int32 numPrecommittedPages, int32 numGuardPages)
+ {
+-	anonymous_store *store = (anonymous_store *)malloc(
++	anonymous_store *store = (anonymous_store *)malloc_nogrow(
+ 		sizeof(anonymous_store));
+ 	if (store == NULL)
+ 		return NULL;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_store_device.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_store_device.c	2008-06-18 19:17:35 UTC (rev 26008)
++++ haiku/trunk/src/system/kernel/vm/vm_store_device.c	2008-06-18 19:55:51 UTC (rev 26009)
+@@ -9,6 +9,7 @@
+ 
+ #include &quot;vm_store_device.h&quot;
+ 
++#include &lt;heap.h&gt;
+ #include &lt;KernelExport.h&gt;
+ #include &lt;vm_priv.h&gt;
+ 
+@@ -87,7 +88,7 @@
+ struct vm_store *
+ vm_store_create_device(addr_t baseAddress)
+ {
+-	struct device_store *store = malloc(sizeof(struct device_store));
++	struct device_store *store = malloc_nogrow(sizeof(struct device_store));
+ 	if (store == NULL)
+ 		return NULL;
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_store_null.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_store_null.c	2008-06-18 19:17:35 UTC (rev 26008)
++++ haiku/trunk/src/system/kernel/vm/vm_store_null.c	2008-06-18 19:55:51 UTC (rev 26009)
+@@ -9,6 +9,7 @@
+ 
+ #include &quot;vm_store_null.h&quot;
+ 
++#include &lt;heap.h&gt;
+ #include &lt;stdlib.h&gt;
+ 
+ 
+@@ -78,7 +79,7 @@
+ {
+ 	struct vm_store *store;
+ 
+-	store = malloc(sizeof(struct vm_store));
++	store = malloc_nogrow(sizeof(struct vm_store));
+ 	if (store == NULL)
+ 		return NULL;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009683.html">[Haiku-commits] r26008 - in haiku/trunk: headers/private/bluetooth	src/kits/bluetooth
+</A></li>
+	<LI>Next message: <A HREF="009686.html">[Haiku-commits] r26010 - in haiku/trunk: headers/private/bluetooth	src/kits/bluetooth src/kits/bluetooth/UI
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9684">[ date ]</a>
+              <a href="thread.html#9684">[ thread ]</a>
+              <a href="subject.html#9684">[ subject ]</a>
+              <a href="author.html#9684">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,171 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24759 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24759%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200804022307.m32N7Nf8027220%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007398.html">
+   <LINK REL="Next"  HREF="007403.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24759 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24759%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200804022307.m32N7Nf8027220%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24759 - haiku/trunk/src/system/kernel/fs">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr  3 01:07:23 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007398.html">[Haiku-commits] r24758 - in haiku/trunk: headers/libs/png	src/libs/png
+</A></li>
+        <LI>Next message: <A HREF="007403.html">[Haiku-commits] r24759 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7399">[ date ]</a>
+              <a href="thread.html#7399">[ thread ]</a>
+              <a href="subject.html#7399">[ subject ]</a>
+              <a href="author.html#7399">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-04-03 01:07:22 +0200 (Thu, 03 Apr 2008)
+New Revision: 24759
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24759&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24759&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/devfs.cpp
+Log:
+Change publish_node() of the devfs to not insert the node into the directory.
+Instead return the directory vnode, so the calling function can insert it after
+all vnode initialization is done. Otherwise entry created notifications are
+sent upon inserting the node into the directory for vnodes that are not yet
+fully initialized (i.e. they have no type or the device hooks are not yet set).
+That would cause for example ioctls to fail when someone would react to a
+notification of a newly created device.
+
+Modified: haiku/trunk/src/system/kernel/fs/devfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/devfs.cpp	2008-04-02 20:58:54 UTC (rev 24758)
++++ haiku/trunk/src/system/kernel/fs/devfs.cpp	2008-04-02 23:07:22 UTC (rev 24759)
+@@ -1176,7 +1176,8 @@
+ 
+ 
+ static status_t
+-publish_node(struct devfs *fs, const char *path, struct devfs_vnode **_node)
++publish_node(struct devfs *fs, const char *path, struct devfs_vnode **_node,
++	struct devfs_vnode **_dir)
+ {
+ 	ASSERT_LOCKED_MUTEX(&amp;fs-&gt;lock);
+ 
+@@ -1240,17 +1241,21 @@
+ 			vnode-&gt;stream.type = S_IFDIR | 0755;
+ 			vnode-&gt;stream.u.dir.dir_head = NULL;
+ 			list_init(&amp;vnode-&gt;stream.u.dir.cookies);
++
++			hash_insert(sDeviceFileSystem-&gt;vnode_hash, vnode);
++			devfs_insert_in_dir(dir, vnode);
+ 		} else {
+ 			// this is the last component
++			// Note: We do not yet insert the node into the directory, as it
++			// is not yet fully initialized. Instead we return the directory
++			// vnode so that the calling function can insert it after all
++			// initialization is done. This ensures that no create notification
++			// is sent out for a vnode that is not yet fully valid.
+ 			*_node = vnode;
++			*_dir = dir;
++			break;
+ 		}
+ 
+-		hash_insert(sDeviceFileSystem-&gt;vnode_hash, vnode);
+-		devfs_insert_in_dir(dir, vnode);
+-
+-		if (atLeaf)
+-			break;
+-
+ 		last = i;
+ 		dir = vnode;
+ 	}
+@@ -1290,11 +1295,12 @@
+ 		isDisk = true;
+ 
+ 	struct devfs_vnode *node;
++	struct devfs_vnode *dirNode;
+ 	status_t status;
+ 
+ 	RecursiveLocker locker(&amp;fs-&gt;lock);
+ 
+-	status = publish_node(fs, path, &amp;node);
++	status = publish_node(fs, path, &amp;node, &amp;dirNode);
+ 	if (status != B_OK)
+ 		return status;
+ 
+@@ -1323,6 +1329,9 @@
+ 			return B_NO_MEMORY;
+ 	}
+ 
++	// the node is now fully valid and we may insert it into the dir
++	hash_insert(sDeviceFileSystem-&gt;vnode_hash, node);
++	devfs_insert_in_dir(dirNode, node);
+ 	return B_OK;
+ }
+ 
+@@ -2871,6 +2880,7 @@
+ devfs_publish_file_device(const char *path, const char *filePath)
+ {
+ 	struct devfs_vnode *node;
++	struct devfs_vnode *dirNode;
+ 	status_t status;
+ 
+ 	filePath = strdup(filePath);
+@@ -2879,7 +2889,7 @@
+ 
+ 	RecursiveLocker locker(&amp;sDeviceFileSystem-&gt;lock);
+ 
+-	status = publish_node(sDeviceFileSystem, path, &amp;node);
++	status = publish_node(sDeviceFileSystem, path, &amp;node, &amp;dirNode);
+ 	if (status != B_OK)
+ 		return status;
+ 
+@@ -2888,6 +2898,9 @@
+ 	node-&gt;stream.u.symlink.path = filePath;
+ 	node-&gt;stream.u.symlink.length = strlen(filePath);
+ 
++	// the node is now fully valid and we may insert it into the dir
++	hash_insert(sDeviceFileSystem-&gt;vnode_hash, node);
++	devfs_insert_in_dir(dirNode, node);
+ 	return B_OK;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007398.html">[Haiku-commits] r24758 - in haiku/trunk: headers/libs/png	src/libs/png
+</A></li>
+	<LI>Next message: <A HREF="007403.html">[Haiku-commits] r24759 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7399">[ date ]</a>
+              <a href="thread.html#7399">[ thread ]</a>
+              <a href="subject.html#7399">[ subject ]</a>
+              <a href="author.html#7399">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,393 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25854 - haiku/trunk/src/servers/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25854%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200806072309.m57N9MAq017914%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009443.html">
+   <LINK REL="Next"  HREF="009435.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25854 - haiku/trunk/src/servers/app</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25854%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200806072309.m57N9MAq017914%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25854 - haiku/trunk/src/servers/app">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun Jun  8 01:09:22 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009443.html">[Haiku-commits] r25853 - haiku/trunk/src/tests/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="009435.html">[Haiku-commits] r25855 - in haiku/trunk/src/tests/servers/app: .	drawing_debugger
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9433">[ date ]</a>
+              <a href="thread.html#9433">[ thread ]</a>
+              <a href="subject.html#9433">[ subject ]</a>
+              <a href="author.html#9433">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-06-08 01:09:21 +0200 (Sun, 08 Jun 2008)
+New Revision: 25854
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25854&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25854&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/View.cpp
+   haiku/trunk/src/servers/app/View.h
+   haiku/trunk/src/servers/app/Window.cpp
+   haiku/trunk/src/servers/app/WorkspacesView.cpp
+Log:
+* Decouple local and user clipping into normal local clipping and a user
+  clipping region pointer.
+* Provide _ScreenClipping() that only includes local and screen clipping but
+  not user clipping.
+* Provide ScreenAndUserClipping() that returns screen clipping if no user
+  clipping is present, or returns a combined region that is then cached.
+* Adapt all places where the former methods are used and decide which one to
+  use depending on the relevance of user clipping.
+
+User clipping is now ignored for background clearing and when determining
+whether or not to call Draw() on a view. This should make Haiku behaviourally
+compatible with BeOS (confirmed by the ClippingAndRedraw test app) and should
+also fix the Firefox redraw issues. Stephan please review!
+
+Modified: haiku/trunk/src/servers/app/View.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/View.cpp	2008-06-07 21:53:08 UTC (rev 25853)
++++ haiku/trunk/src/servers/app/View.cpp	2008-06-07 23:09:21 UTC (rev 25854)
+@@ -109,7 +109,9 @@
+ 
+ 	fLocalClipping((BRect)Bounds()),
+ 	fScreenClipping(),
+-	fScreenClippingValid(false)
++	fScreenClippingValid(false),
++	fUserClipping(NULL),
++	fScreenAndUserClipping(NULL)
+ {
+ 	if (fDrawState)
+ 		fDrawState-&gt;SetSubPixelPrecise(fFlags &amp; B_SUBPIXEL_PRECISE);
+@@ -1121,19 +1123,19 @@
+ 	// move src rect to destination here for efficiency reasons
+ 	visibleSrc.OffsetBy(xOffset, yOffset);
+ 
+-	// we need to interstect the copyRegion too times, onces
++	// we need to interstect the copyRegion two times, onces
+ 	// at the source and once at the destination (here done
+ 	// the other way arround but it doesn't matter)
+ 	// the reason for this is that we are not supposed to visually
+ 	// copy children in the source rect and neither to copy onto
+ 	// children in the destination rect...
+ 	copyRegion-&gt;Set((clipping_rect)visibleSrc);
+-	copyRegion-&gt;IntersectWith(&amp;ScreenClipping(&amp;windowContentClipping));
+-		// note that fScreenClipping is used directly from hereon
++	copyRegion-&gt;IntersectWith(&amp;ScreenAndUserClipping(&amp;windowContentClipping));
++		// note that fScreenAndUserClipping is used directly from hereon
+ 		// because it is now up to date
+ 
+ 	copyRegion-&gt;OffsetBy(-xOffset, -yOffset);
+-	copyRegion-&gt;IntersectWith(&amp;fScreenClipping);
++	copyRegion-&gt;IntersectWith(fScreenAndUserClipping);
+ 
+ 	// do the actual blit
+ 	fWindow-&gt;CopyContents(copyRegion, xOffset, yOffset);
+@@ -1155,7 +1157,7 @@
+ 	// exclude the part that we could copy
+ 	dirty-&gt;Exclude(copyRegion);
+ 
+-	dirty-&gt;IntersectWith(&amp;fScreenClipping);
++	dirty-&gt;IntersectWith(fScreenAndUserClipping);
+ 	fWindow-&gt;MarkContentDirty(*dirty);
+ 
+ 	fWindow-&gt;RecycleRegion(dirty);
+@@ -1242,7 +1244,8 @@
+ 
+ 	if (fViewBitmap != NULL || fViewColor != B_TRANSPARENT_COLOR) {
+ 		// we can only draw within our own area
+-		BRegion* redraw = fWindow-&gt;GetRegion(ScreenClipping(windowContentClipping));
++		BRegion* redraw = fWindow-&gt;GetRegion(
++			_ScreenClipping(windowContentClipping));
+ 		if (!redraw)
+ 			return;
+ 		// add the current clipping
+@@ -1478,7 +1481,7 @@
+ 	if (!fVisible)
+ 		return;
+ 
+-	if (region.Intersects(ScreenClipping(windowContentClipping).Frame()))
++	if (region.Intersects(_ScreenClipping(windowContentClipping).Frame()))
+ 		message-&gt;AddInt32(&quot;_token&quot;, fToken);
+ 
+ 	for (View* child = FirstChild(); child; child = child-&gt;NextSibling()) {
+@@ -1500,7 +1503,7 @@
+ 	if (!region.Intersects((clipping_rect)screenBounds))
+ 		return;
+ 
+-	if (region.Intersects(ScreenClipping(windowContentClipping).Frame()))
++	if (region.Intersects(_ScreenClipping(windowContentClipping).Frame()))
+ 		link.Attach&lt;int32&gt;(fToken);
+ 
+ 	for (View* child = FirstChild(); child; child = child-&gt;NextSibling()) {
+@@ -1525,6 +1528,19 @@
+ 	printf(&quot;  fScreenClipping:\n&quot;);
+ 	fScreenClipping.PrintToStream();
+ 	printf(&quot;  valid:            %d\n&quot;, fScreenClippingValid);
++
++	printf(&quot;  fUserClipping:\n&quot;);
++	if (fUserClipping != NULL)
++		fUserClipping-&gt;PrintToStream();
++	else
++		printf(&quot;  none\n&quot;);
++
++	printf(&quot;  fScreenAndUserClipping:\n&quot;);
++	if (fScreenAndUserClipping != NULL)
++		fScreenAndUserClipping-&gt;PrintToStream();
++	else
++		printf(&quot;  invalid\n&quot;);
++
+ 	printf(&quot;  state:\n&quot;);
+ 	printf(&quot;    user clipping:  %d\n&quot;, fDrawState-&gt;HasClipping());
+ 	BPoint origin = fDrawState-&gt;CombinedOrigin();
+@@ -1572,45 +1588,44 @@
+ 		// hand, views for which this feature is actually used will
+ 		// probably not have any children, so it is not that expensive
+ 		// after all
+-		BRegion* screenUserClipping = fWindow-&gt;GetRegion();
+-		if (!screenUserClipping)
+-			return;
+-		fDrawState-&gt;GetCombinedClippingRegion(screenUserClipping);
+-		fLocalClipping.IntersectWith(screenUserClipping);
+-		fWindow-&gt;RecycleRegion(screenUserClipping);
++		if (fUserClipping == NULL) {
++			fUserClipping = new (nothrow) BRegion;
++			if (fUserClipping == NULL)
++				return;
++		}
++
++		fDrawState-&gt;GetCombinedClippingRegion(fUserClipping);
++	} else {
++		delete fUserClipping;
++		fUserClipping = NULL;
+ 	}
+ 
++	delete fScreenAndUserClipping;
++	fScreenAndUserClipping = NULL;
+ 	fScreenClippingValid = false;
+ }
+ 
+ 
+ BRegion&amp;
+-View::ScreenClipping(BRegion* windowContentClipping, bool force) const
++View::ScreenAndUserClipping(BRegion* windowContentClipping, bool force) const
+ {
+-	if (!fScreenClippingValid || force) {
+-		fScreenClipping = fLocalClipping;
+-		ConvertToScreen(&amp;fScreenClipping);
++	// no user clipping - return screen clipping directly
++	if (fUserClipping == NULL)
++		return _ScreenClipping(windowContentClipping, force);
+ 
+-		// see if parts of our bounds are hidden underneath
+-		// the parent, the local clipping does not account for this
+-		IntRect clippedBounds = Bounds();
+-		ConvertToVisibleInTopView(&amp;clippedBounds);
+-		if (clippedBounds.Width() &lt; fScreenClipping.Frame().Width()
+-			|| clippedBounds.Height() &lt; fScreenClipping.Frame().Height()) {
+-			BRegion* temp = fWindow-&gt;GetRegion();
+-			if (temp) {
+-				temp-&gt;Set((clipping_rect)clippedBounds);
+-				fScreenClipping.IntersectWith(temp);
+-				fWindow-&gt;RecycleRegion(temp);
+-			}
+-		}
++	// combined screen and user clipping already valid
++	if (fScreenAndUserClipping != NULL)
++		return *fScreenAndUserClipping;
+ 
+-		fScreenClipping.IntersectWith(windowContentClipping);
+-		fScreenClippingValid = true;
+-	}
+-//printf(&quot;###View(%s)::ScreenClipping():\n&quot;, Name());
+-//fScreenClipping.PrintToStream();
+-	return fScreenClipping;
++	// build a new combined user and screen clipping
++	fScreenAndUserClipping = new (nothrow) BRegion(*fUserClipping);
++	if (fScreenAndUserClipping == NULL)
++		return fScreenClipping;
++
++	ConvertToScreen(fScreenAndUserClipping);
++	fScreenAndUserClipping-&gt;IntersectWith(
++		&amp;_ScreenClipping(windowContentClipping, force));
++	return *fScreenAndUserClipping;
+ }
+ 
+ 
+@@ -1633,6 +1648,8 @@
+ //	if (!fScreenClippingValid)
+ //		return;
+ 
++	delete fScreenAndUserClipping;
++	fScreenAndUserClipping = NULL;
+ 	fScreenClippingValid = false;
+ 	// invalidate the childrens screen clipping as well
+ 	for (View* child = FirstChild(); child; child = child-&gt;NextSibling()) {
+@@ -1641,11 +1658,43 @@
+ }
+ 
+ 
++BRegion&amp;
++View::_ScreenClipping(BRegion* windowContentClipping, bool force) const
++{
++	if (!fScreenClippingValid || force) {
++		fScreenClipping = fLocalClipping;
++		ConvertToScreen(&amp;fScreenClipping);
++
++		// see if parts of our bounds are hidden underneath
++		// the parent, the local clipping does not account for this
++		IntRect clippedBounds = Bounds();
++		ConvertToVisibleInTopView(&amp;clippedBounds);
++		if (clippedBounds.Width() &lt; fScreenClipping.Frame().Width()
++			|| clippedBounds.Height() &lt; fScreenClipping.Frame().Height()) {
++			BRegion* temp = fWindow-&gt;GetRegion();
++			if (temp) {
++				temp-&gt;Set((clipping_rect)clippedBounds);
++				fScreenClipping.IntersectWith(temp);
++				fWindow-&gt;RecycleRegion(temp);
++			}
++		}
++
++		fScreenClipping.IntersectWith(windowContentClipping);
++		fScreenClippingValid = true;
++	}
++
++	return fScreenClipping;
++}
++
++
+ void
+ View::_MoveScreenClipping(int32 x, int32 y, bool deep)
+ {
+-	if (fScreenClippingValid)
++	if (fScreenClippingValid) {
+ 		fScreenClipping.OffsetBy(x, y);
++		delete fScreenAndUserClipping;
++		fScreenAndUserClipping = NULL;
++	}
+ 
+ 	if (deep) {
+ 		// move the childrens screen clipping as well
+
+Modified: haiku/trunk/src/servers/app/View.h
+===================================================================
+--- haiku/trunk/src/servers/app/View.h	2008-06-07 21:53:08 UTC (rev 25853)
++++ haiku/trunk/src/servers/app/View.h	2008-06-07 23:09:21 UTC (rev 25854)
+@@ -225,11 +225,17 @@
+ 
+ 			// clipping
+ 			void			RebuildClipping(bool deep);
+-			BRegion&amp;		ScreenClipping(BRegion* windowContentClipping,
++			BRegion&amp;		ScreenAndUserClipping(
++								BRegion* windowContentClipping,
+ 								bool force = false) const;
+ 			void			InvalidateScreenClipping();
+ 	inline	bool			IsScreenClippingValid() const
+-								{ return fScreenClippingValid; }
++								{
++									return fScreenClippingValid
++										&amp;&amp; (fUserClipping == NULL
++										|| (fUserClipping != NULL
++										&amp;&amp; fScreenAndUserClipping != NULL));
++								}
+ 
+ 			// debugging
+ 			void			PrintToStream() const;
+@@ -239,6 +245,8 @@
+ #endif
+ 
+ 	protected:
++			BRegion&amp;		_ScreenClipping(BRegion* windowContentClipping,
++								bool force = false) const;
+ 			void			_MoveScreenClipping(int32 x, int32 y,
+ 								bool deep);
+ 			Overlay*		_Overlay() const;
+@@ -285,6 +293,9 @@
+ 
+ 	mutable	BRegion			fScreenClipping;
+ 	mutable	bool			fScreenClippingValid;
++
++			BRegion*		fUserClipping;
++	mutable	BRegion*		fScreenAndUserClipping;
+ };
+ 
+ #endif	// VIEW_H
+
+Modified: haiku/trunk/src/servers/app/Window.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/Window.cpp	2008-06-07 21:53:08 UTC (rev 25853)
++++ haiku/trunk/src/servers/app/Window.cpp	2008-06-07 23:09:21 UTC (rev 25854)
+@@ -581,7 +581,7 @@
+ 	if (!fContentRegionValid)
+ 		_UpdateContentRegion();
+ 
+-	region.IntersectWith(&amp;view-&gt;ScreenClipping(&amp;fContentRegion));
++	region.IntersectWith(&amp;view-&gt;ScreenAndUserClipping(&amp;fContentRegion));
+ }
+ 
+ 
+@@ -706,7 +706,8 @@
+ 		view-&gt;ConvertToScreen(&amp;viewRegion);
+ 		viewRegion.IntersectWith(&amp;VisibleContentRegion());
+ 		if (viewRegion.CountRects() &gt; 0) {
+-			viewRegion.IntersectWith(&amp;view-&gt;ScreenClipping(&amp;fContentRegion));
++			viewRegion.IntersectWith(
++				&amp;view-&gt;ScreenAndUserClipping(&amp;fContentRegion));
+ 
+ //fDrawingEngine-&gt;FillRegion(viewRegion, rgb_color{ 0, 255, 0, 255 });
+ //snooze(10000);
+
+Modified: haiku/trunk/src/servers/app/WorkspacesView.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/WorkspacesView.cpp	2008-06-07 21:53:08 UTC (rev 25853)
++++ haiku/trunk/src/servers/app/WorkspacesView.cpp	2008-06-07 23:09:21 UTC (rev 25854)
+@@ -325,7 +325,7 @@
+ 	BRegion* windowContentClipping, bool deep)
+ {
+ 	// we can only draw within our own area
+-	BRegion redraw(ScreenClipping(windowContentClipping));
++	BRegion redraw(ScreenAndUserClipping(windowContentClipping));
+ 	// add the current clipping
+ 	redraw.IntersectWith(effectiveClipping);
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009443.html">[Haiku-commits] r25853 - haiku/trunk/src/tests/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="009435.html">[Haiku-commits] r25855 - in haiku/trunk/src/tests/servers/app: .	drawing_debugger
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9433">[ date ]</a>
+              <a href="thread.html#9433">[ thread ]</a>
+              <a href="subject.html#9433">[ subject ]</a>
+              <a href="author.html#9433">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

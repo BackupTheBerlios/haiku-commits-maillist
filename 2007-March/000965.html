@@ -1,0 +1,302 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20269 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20269%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200703010809.l2189TwT027993%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000974.html">
+   <LINK REL="Next"  HREF="000969.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20269 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>geist at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20269%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200703010809.l2189TwT027993%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20269 - in haiku/trunk: headers/private/kernel	src/system/kernel">geist at mail.berlios.de
+       </A><BR>
+    <I>Thu Mar  1 09:09:29 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000974.html">[Haiku-commits] r20268 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+        <LI>Next message: <A HREF="000969.html">[Haiku-commits] r20252 - haiku/trunk/headers/private/kernel/util
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#965">[ date ]</a>
+              <a href="thread.html#965">[ thread ]</a>
+              <a href="subject.html#965">[ subject ]</a>
+              <a href="author.html#965">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: geist
+Date: 2007-03-01 09:09:28 +0100 (Thu, 01 Mar 2007)
+New Revision: 20269
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20269&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20269&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/smp.h
+   haiku/trunk/src/system/kernel/main.c
+   haiku/trunk/src/system/kernel/smp.c
+   haiku/trunk/src/system/kernel/thread.c
+Log:
+this seems to solve the 'lock up on bootup on core 2' problem.
+Basically, there was a pretty subtle race between the cpus in main where if the main cpu released the AP cpus and then before the AP cpus had a chance to run the boot cpu started creating the main thread (which causes smp ici messages to be created) the system would livelock, where the boot cpu waited forever for the AP cpu to acknowledge the ICI (for a TLB flush when creating the kernel stack).
+Added smp_cpu_rendezvous(), used to synchronize all the cpus to a particular point, and used it a few times in main().
+While i was at it i fixed another race that'll probably never happen, but what the hey. Make sure the kernel args are copied into kernel space by the main cpu before letting any other ones use it.
+
+
+Modified: haiku/trunk/headers/private/kernel/smp.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/smp.h	2007-03-01 07:49:43 UTC (rev 20268)
++++ haiku/trunk/headers/private/kernel/smp.h	2007-03-01 08:09:28 UTC (rev 20269)
+@@ -42,7 +42,7 @@
+ status_t smp_per_cpu_init(struct kernel_args *args, int32 cpu);
+ bool smp_trap_non_boot_cpus(int32 cpu);
+ void smp_wake_up_non_boot_cpus(void);
+-void smp_wait_for_non_boot_cpus(void);
++void smp_cpu_rendezvous(volatile uint32 *var, int current_cpu);
+ void smp_send_ici(int32 targetCPU, int32 message, uint32 data, uint32 data2, uint32 data3,
+ 		void *data_ptr, uint32 flags);
+ void smp_send_broadcast_ici(int32 message, uint32 data, uint32 data2, uint32 data3,
+
+Modified: haiku/trunk/src/system/kernel/main.c
+===================================================================
+--- haiku/trunk/src/system/kernel/main.c	2007-03-01 07:49:43 UTC (rev 20268)
++++ haiku/trunk/src/system/kernel/main.c	2007-03-01 08:09:28 UTC (rev 20269)
+@@ -40,26 +40,25 @@
+ #include &lt;string.h&gt;
+ 
+ 
+-//#define TRACE_BOOT
++#define TRACE_BOOT
+ #ifdef TRACE_BOOT
+ #	define TRACE(x...) dprintf(&quot;INIT : &quot; x)
+ #else
+ #	define TRACE(x...) ;
+ #endif
+ 
+-bool kernel_startup;
++bool kernel_startup = true;
+ 
+ static kernel_args sKernelArgs;
++static uint32 sCpuRendezvous;
++static uint32 sCpuRendezvous2;
+ 
+ static int32 main2(void *);
+ int _start(kernel_args *bootKernelArgs, int cpu);	/* keep compiler happy */
+ 
+-
+ int
+ _start(kernel_args *bootKernelArgs, int currentCPU)
+ {
+-	kernel_startup = true;
+-
+ 	if (bootKernelArgs-&gt;kernel_args_size != sizeof(kernel_args)
+ 		|| bootKernelArgs-&gt;version != CURRENT_KERNEL_ARGS_VERSION) {
+ 		// This is something we cannot handle right now - release kernels
+@@ -69,11 +68,17 @@
+ 		return -1;
+ 	}
+ 
+-	memcpy(&amp;sKernelArgs, bootKernelArgs, sizeof(kernel_args));
+-		// the passed in kernel args are in a non-allocated range of memory
++	smp_set_num_cpus(bootKernelArgs-&gt;num_cpus);
+ 
+-	smp_set_num_cpus(sKernelArgs.num_cpus);
++	// wait for all the cpus to get here
++	smp_cpu_rendezvous(&amp;sCpuRendezvous, currentCPU);
+ 
++	// the passed in kernel args are in a non-allocated range of memory
++	if (currentCPU == 0)
++		memcpy(&amp;sKernelArgs, bootKernelArgs, sizeof(kernel_args));
++
++	smp_cpu_rendezvous(&amp;sCpuRendezvous2, currentCPU);
++
+ 	// do any pre-booting cpu config
+ 	cpu_preboot_init_percpu(&amp;sKernelArgs, currentCPU);
+ 	thread_preboot_init_percpu(&amp;sKernelArgs, currentCPU);
+@@ -90,9 +95,6 @@
+ 		set_dprintf_enabled(true);
+ 		dprintf(&quot;Welcome to kernel debugger output!\n&quot;);
+ 
+-		// we're the boot processor, so wait for all of the APs to enter the kernel
+-		smp_wait_for_non_boot_cpus();
+-
+ 		// init modules
+ 		TRACE(&quot;init CPU\n&quot;);
+ 		cpu_init(&amp;sKernelArgs);
+@@ -154,24 +156,42 @@
+ 		TRACE(&quot;init VFS\n&quot;);
+ 		vfs_init(&amp;sKernelArgs);
+ 
+-		TRACE(&quot;enable interrupts, exit kernel startup\n&quot;);
++		// bring up the AP cpus in a lock step fashion
++		TRACE(&quot;waking up AP cpus\n&quot;);
++		sCpuRendezvous = sCpuRendezvous2 = 0;
++		smp_wake_up_non_boot_cpus();
++		smp_cpu_rendezvous(&amp;sCpuRendezvous, 0); // wait until they're booted
++
++		// exit the kernel startup phase (mutexes, etc work from now on out)
++		TRACE(&quot;exiting kernel startup\n&quot;);
+ 		kernel_startup = false;
+ 
+-		TRACE(&quot;waking up AP cpus\n&quot;);
+-		smp_wake_up_non_boot_cpus();		
++		smp_cpu_rendezvous(&amp;sCpuRendezvous2, 0); // release the AP cpus to go enter the scheduler
+ 
++		TRACE(&quot;enabling interrupts and starting scheduler on cpu 0\n&quot;);
+ 		enable_interrupts();
+ 		scheduler_start();
+ 
+ 		// start a thread to finish initializing the rest of the system
+ 		TRACE(&quot;starting main2 thread\n&quot;);
+ 		thread = spawn_kernel_thread(&amp;main2, &quot;main2&quot;, B_NORMAL_PRIORITY, NULL);
++		TRACE(&quot;resuming main2 thread...\n&quot;);
+ 		resume_thread(thread);
+ 	} else {
++		// lets make sure we're in sync with the main cpu
++		// the boot processor has probably been sending us 
++		// tlb sync messages all along the way, but we've 
++		// been ignoring them
++		arch_cpu_global_TLB_invalidate();
++	
+ 		// this is run for each non boot processor after they've been set loose
+ 		cpu_init_percpu(&amp;sKernelArgs, currentCPU);
+ 		smp_per_cpu_init(&amp;sKernelArgs, currentCPU);
+ 
++		// wait for all other AP cpus to get to this point
++		smp_cpu_rendezvous(&amp;sCpuRendezvous, currentCPU);
++		smp_cpu_rendezvous(&amp;sCpuRendezvous2, currentCPU);
++
+ 		// welcome to the machine
+ 		enable_interrupts();
+ 		scheduler_start();
+
+Modified: haiku/trunk/src/system/kernel/smp.c
+===================================================================
+--- haiku/trunk/src/system/kernel/smp.c	2007-03-01 07:49:43 UTC (rev 20268)
++++ haiku/trunk/src/system/kernel/smp.c	2007-03-01 08:09:28 UTC (rev 20269)
+@@ -553,12 +553,6 @@
+ 		boot_cpu_spin[cpu] = 1;
+ 		acquire_spinlock_nocheck(&amp;boot_cpu_spin[cpu]);
+ 
+-		// lets make sure we're in sync with the main cpu
+-		// the boot processor has probably been sending us 
+-		// tlb sync messages all along the way, but we've 
+-		// been ignoring them
+-		arch_cpu_global_TLB_invalidate();
+-
+ 		return false;
+ 	}
+ 
+@@ -581,22 +575,16 @@
+ 	}
+ }
+ 
+-
++/* have all cpus spin until all have run */
+ void
+-smp_wait_for_non_boot_cpus(void)
++smp_cpu_rendezvous(volatile uint32 *var, int current_cpu)
+ {
+-	bool retry;
+-	int32 i;
+-	do {
+-		retry = false;
+-		for (i = 1; i &lt; sNumCPUs; i++) {
+-			if (boot_cpu_spin[i] != 1)
+-				retry = true;
+-		}
+-	} while (retry == true);
++	atomic_or(var, 1&lt;&lt;current_cpu);
++
++	while (*var != ((1&lt;&lt;sNumCPUs) - 1))
++		;
+ }
+ 
+-
+ status_t
+ smp_init(kernel_args *args)
+ {
+
+Modified: haiku/trunk/src/system/kernel/thread.c
+===================================================================
+--- haiku/trunk/src/system/kernel/thread.c	2007-03-01 07:49:43 UTC (rev 20268)
++++ haiku/trunk/src/system/kernel/thread.c	2007-03-01 08:09:28 UTC (rev 20269)
+@@ -170,7 +170,7 @@
+  */
+ 
+ static struct thread *
+-create_thread_struct(struct thread *inthread, const char *name, thread_id threadID)
++create_thread_struct(struct thread *inthread, const char *name, thread_id threadID, struct cpu_ent *cpu)
+ {
+ 	struct thread *thread;
+ 	cpu_status state;
+@@ -201,8 +201,7 @@
+ 
+ 	thread-&gt;id = threadID &gt;= 0 ? threadID : allocate_thread_id();
+ 	thread-&gt;team = NULL;
+-	// XXX terrible hack, this is to leave the early boot cpu pointers alone while being initialized
+-//	thread-&gt;cpu = NULL;				
++	thread-&gt;cpu = cpu;
+ 	thread-&gt;sem.blocking = -1;
+ 	thread-&gt;fault_handler = 0;
+ 	thread-&gt;page_faults_allowed = 1;
+@@ -360,7 +359,7 @@
+ 
+ 	TRACE((&quot;create_thread(%s, id = %ld, %s)\n&quot;, name, threadID, kernel ? &quot;kernel&quot; : &quot;user&quot;));
+ 
+-	thread = create_thread_struct(NULL, name, threadID);
++	thread = create_thread_struct(NULL, name, threadID, NULL);
+ 	if (thread == NULL)
+ 		return B_NO_MEMORY;
+ 
+@@ -1470,7 +1469,7 @@
+ 
+ 		sprintf(name, &quot;idle thread %lu&quot;, i + 1);
+ 		thread = create_thread_struct(&amp;sIdleThreads[i], name,
+-			i == 0 ? team_get_kernel_team_id() : -1);
++			i == 0 ? team_get_kernel_team_id() : -1, &amp;gCPU[i]);
+ 		if (thread == NULL) {
+ 			panic(&quot;error creating idle thread struct\n&quot;);
+ 			return B_NO_MEMORY;
+@@ -1491,7 +1490,6 @@
+ 
+ 		hash_insert(sThreadHash, thread);
+ 		insert_thread_into_team(thread-&gt;team, thread);
+-		thread-&gt;cpu = &amp;gCPU[i];
+ 	}
+ 	sUsedThreads = args-&gt;num_cpus;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000974.html">[Haiku-commits] r20268 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+	<LI>Next message: <A HREF="000969.html">[Haiku-commits] r20252 - haiku/trunk/headers/private/kernel/util
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#965">[ date ]</a>
+              <a href="thread.html#965">[ thread ]</a>
+              <a href="subject.html#965">[ subject ]</a>
+              <a href="author.html#965">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

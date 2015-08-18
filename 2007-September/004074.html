@@ -1,0 +1,396 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22386 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22386%20-%0A%09haiku/trunk/src/add-ons/kernel/busses/scsi/ahci&In-Reply-To=%3C200709301512.l8UFCeNm008010%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004073.html">
+   <LINK REL="Next"  HREF="004075.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22386 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci</H1>
+    <B>marcusoverhagen at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22386%20-%0A%09haiku/trunk/src/add-ons/kernel/busses/scsi/ahci&In-Reply-To=%3C200709301512.l8UFCeNm008010%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22386 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci">marcusoverhagen at mail.berlios.de
+       </A><BR>
+    <I>Sun Sep 30 17:12:40 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004073.html">[Haiku-commits] r22385 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+        <LI>Next message: <A HREF="004075.html">[Haiku-commits] r22387 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4074">[ date ]</a>
+              <a href="thread.html#4074">[ thread ]</a>
+              <a href="subject.html#4074">[ subject ]</a>
+              <a href="author.html#4074">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: marcusoverhagen
+Date: 2007-09-30 17:12:39 +0200 (Sun, 30 Sep 2007)
+New Revision: 22386
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22386&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22386&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp
+   haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h
+   haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_sim.cpp
+Log:
+Improved interrupt handling
+Removed DBC_I interrupt
+Reduce debug output
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp	2007-09-30 14:02:04 UTC (rev 22385)
++++ haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp	2007-09-30 15:12:39 UTC (rev 22386)
+@@ -23,16 +23,17 @@
+ 	: fIndex(index)
+ 	, fRegs(&amp;controller-&gt;fRegs-&gt;port[index])
+ 	, fArea(-1)
++	, fSpinlock(0)
++	, fCommandsActive(0)
+ 	, fRequestSem(-1)
+ 	, fResponseSem(-1)
+-	, fCommandActive(false)
+ 	, fDevicePresent(false)
+ 	, fUse48BitCommands(false)
+ 	, fSectorSize(0)
+ 	, fSectorCount(0)
+ {
+ 	fRequestSem = create_sem(1, &quot;ahci request&quot;);
+-	fResponseSem = create_sem(1, &quot;ahci response&quot;);
++	fResponseSem = create_sem(0, &quot;ahci response&quot;);
+ }
+ 				
+ 
+@@ -269,18 +270,30 @@
+ AHCIPort::Interrupt()
+ {
+ 	uint32 is = fRegs-&gt;is;
+-	TRACE(&quot;AHCIPort::Interrupt port %d, status %#08lx\n&quot;, fIndex, is);
++	uint32 ci = fRegs-&gt;ci;
++	fRegs-&gt;is = is; // clear interrupts
+ 
+-	if (fCommandActive)	
++	FLOW(&quot;AHCIPort::Interrupt port %d, fCommandsActive 0x%08lx, is 0x%08lx, ci 0x%08lx\n&quot;, fIndex, fCommandsActive, is, ci);
++
++	int release = 0;
++
++	acquire_spinlock(&amp;fSpinlock);
++	if ((fCommandsActive &amp; 1) &amp;&amp; !(ci &amp; 1)) {
++		release = 1;
++		fCommandsActive &amp;= ~1;
++	}
++	release_spinlock(&amp;fSpinlock);
++	
++	if (is &amp; PORT_INT_FATAL)
++		panic(&quot;ahci fatal error, is 0x%08lx&quot;, is);
++
++	if (release)
+ 		release_sem_etc(fResponseSem, 1, B_RELEASE_IF_WAITING_ONLY | B_DO_NOT_RESCHEDULE);
+-
+-	// clear interrupts
+-	fRegs-&gt;is = is;
+ }
+ 
+ 
+ status_t
+-AHCIPort::FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const void *data, size_t dataSize, bool ioc)
++AHCIPort::FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const void *data, size_t dataSize)
+ {
+ 	int peMax = prdMax + 1;
+ 	physical_entry pe[peMax];
+@@ -291,12 +304,12 @@
+ 	int peUsed;
+ 	for (peUsed = 0; pe[peUsed].size; peUsed++)
+ 		;
+-	return FillPrdTable(prdTable, prdCount, prdMax, pe, peUsed, dataSize, ioc);
++	return FillPrdTable(prdTable, prdCount, prdMax, pe, peUsed, dataSize);
+ }
+ 
+ 
+ status_t
+-AHCIPort::FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const physical_entry *sgTable, int sgCount, size_t dataSize, bool ioc)
++AHCIPort::FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const physical_entry *sgTable, int sgCount, size_t dataSize)
+ {
+ 	*prdCount = 0;
+ 	while (sgCount &gt; 0 &amp;&amp; dataSize &gt; 0) {
+@@ -335,8 +348,6 @@
+ 		TRACE(&quot;AHCIPort::FillPrdTable: sg table %ld bytes too small\n&quot;, dataSize);
+ 		return B_ERROR;
+ 	}
+-	if (ioc)
+-		(prdTable - 1)-&gt;dbc |= DBC_I;
+ 	return B_OK;
+ }
+ 
+@@ -345,18 +356,19 @@
+ AHCIPort::StartTransfer()
+ {
+ 	acquire_sem(fRequestSem);
+-	fCommandActive = true;
+ }
+ 				
+ 
+ status_t
+-AHCIPort::WaitForTransfer(int *status, bigtime_t timeout)
++AHCIPort::WaitForTransfer(int *tfd, bigtime_t timeout)
+ {
+ 	status_t result = B_OK;
+ 	if (acquire_sem_etc(fResponseSem, 1, B_RELATIVE_TIMEOUT, timeout) &lt; B_OK) {
++		fCommandsActive &amp;= ~1;
+ 		result = B_TIMED_OUT;
++	} else {
++		*tfd = fRegs-&gt;tfd;
+ 	}
+-	fCommandActive = false;
+ 	return result;
+ }
+ 
+@@ -398,10 +410,10 @@
+ 	StartTransfer();
+ 
+ 	int prdEntrys;
+-	FillPrdTable(fPRDTable, &amp;prdEntrys, PRD_TABLE_ENTRY_COUNT, &amp;ataData, sizeof(ataData), true);
++	FillPrdTable(fPRDTable, &amp;prdEntrys, PRD_TABLE_ENTRY_COUNT, &amp;ataData, sizeof(ataData));
+ 
+ 
+-	TRACE(&quot;prdEntrys %d\n&quot;, prdEntrys);
++	FLOW(&quot;prdEntrys %d\n&quot;, prdEntrys);
+ 	
+ 	memset((void *)fCommandTable-&gt;cfis, 0, 5 * 4);
+ 	fCommandTable-&gt;cfis[0] = 0x27;
+@@ -421,16 +433,22 @@
+ 		gSCSI-&gt;finished(request, 1);
+ 		return;
+ 	}
++
++	cpu_status cpu = disable_interrupts();
++	acquire_spinlock(&amp;fSpinlock);
+ 	fRegs-&gt;ci |= 1;
+ 	FlushPostedWrites();
++	fCommandsActive |= 1;
++	release_spinlock(&amp;fSpinlock);
++	restore_interrupts(cpu);
+ 
+ 	int status;
+ 	WaitForTransfer(&amp;status, 100000);
+ 
+-	TRACE(&quot;prdbc %ld\n&quot;, fCommandList-&gt;prdbc);
+-	TRACE(&quot;ci   0x%08lx\n&quot;, fRegs-&gt;ci);
+-	TRACE(&quot;is   0x%08lx\n&quot;, fRegs-&gt;is);
+-	TRACE(&quot;serr 0x%08lx\n&quot;, fRegs-&gt;serr);
++	FLOW(&quot;prdbc %ld\n&quot;, fCommandList-&gt;prdbc);
++	FLOW(&quot;ci   0x%08lx\n&quot;, fRegs-&gt;ci);
++	FLOW(&quot;is   0x%08lx\n&quot;, fRegs-&gt;is);
++	FLOW(&quot;serr 0x%08lx\n&quot;, fRegs-&gt;serr);
+ 
+ /*
+ 	TRACE(&quot;ci   0x%08lx\n&quot;, fRegs-&gt;ci);
+@@ -484,13 +502,21 @@
+ 	}
+ #endif
+ 
+-	swap_words(ataData.model_number, sizeof(ataData.model_number));
+-	swap_words(ataData.serial_number, sizeof(ataData.serial_number));
+-	swap_words(ataData.firmware_revision, sizeof(ataData.firmware_revision));
++	char modelNumber[sizeof(ataData.model_number) + 1];
++	char serialNumber[sizeof(ataData.serial_number) + 1];
++	char firmwareRev[sizeof(ataData.firmware_revision) + 1];
+ 
+-	TRACE(&quot;model_number: %40s\n&quot;, ataData.model_number);
+-	TRACE(&quot;serial_number: %20s\n&quot;, ataData.serial_number);
+-  	TRACE(&quot;firmware_revision: %8s\n&quot;, ataData.firmware_revision);
++	strlcpy(modelNumber, ataData.model_number, sizeof(modelNumber));
++	strlcpy(serialNumber, ataData.serial_number, sizeof(serialNumber));
++	strlcpy(firmwareRev, ataData.firmware_revision, sizeof(firmwareRev));
++
++	swap_words(modelNumber, sizeof(modelNumber) - 1);
++	swap_words(serialNumber, sizeof(serialNumber) - 1);
++	swap_words(firmwareRev, sizeof(firmwareRev) - 1);
++
++	TRACE(&quot;model number:  %s\n&quot;, modelNumber);
++	TRACE(&quot;serial number: %s\n&quot;, serialNumber);
++  	TRACE(&quot;firmware rev.: %s\n&quot;, firmwareRev);
+ 	TRACE(&quot;lba %d, lba48 %d, fUse48BitCommands %d, sectors %lu, sectors48 %llu, size %llu\n&quot;,
+ 		lba, lba48, fUse48BitCommands, sectors, sectors48, fSectorCount * fSectorSize);
+ 
+@@ -502,7 +528,6 @@
+ 		request-&gt;data_length = sizeof(scsiData); // ???
+ 	}
+ 
+-	fRegs-&gt;ci &amp;= ~1;
+ 	FinishTransfer();
+ 
+ 	gSCSI-&gt;finished(request, 1);
+@@ -544,8 +569,10 @@
+ void
+ AHCIPort::ScsiReadWrite(scsi_ccb *request, uint64 position, size_t length, bool isWrite)
+ {
+-	TRACE(&quot;ScsiReadWrite: pos %llu, size %lu, isWrite %d\n&quot;, position, length, isWrite);
++	uint32 bytecount = length * 512;
+ 
++	TRACE(&quot;ScsiReadWrite: position %llu, size %lu, isWrite %d\n&quot;, position * 512, bytecount, isWrite);
++
+ #if 1
+ 	if (isWrite) {
+ 		TRACE(&quot;write request ignored\n&quot;);
+@@ -559,7 +586,7 @@
+ 	StartTransfer();
+ 
+ 	int prdEntrys;
+-	FillPrdTable(fPRDTable, &amp;prdEntrys, PRD_TABLE_ENTRY_COUNT, request-&gt;sg_list, request-&gt;sg_count, length * 512, true);
++	FillPrdTable(fPRDTable, &amp;prdEntrys, PRD_TABLE_ENTRY_COUNT, request-&gt;sg_list, request-&gt;sg_count, bytecount);
+ 
+ 	FLOW(&quot;prdEntrys %d\n&quot;, prdEntrys);
+ 	
+@@ -605,22 +632,31 @@
+ 		gSCSI-&gt;finished(request, 1);
+ 		return;
+ 	}
++	cpu_status cpu = disable_interrupts();
++	acquire_spinlock(&amp;fSpinlock);
+ 	fRegs-&gt;ci |= 1;
+ 	FlushPostedWrites();
++	fCommandsActive |= 1;
++	release_spinlock(&amp;fSpinlock);
++	restore_interrupts(cpu);
+ 
+-	int status;
+-	WaitForTransfer(&amp;status, 100000);
++	int tfd;
++	status_t status = WaitForTransfer(&amp;tfd, 4000000);
+ 
+-	TRACE(&quot;prdbc %ld\n&quot;, fCommandList-&gt;prdbc);
+-	TRACE(&quot;ci   0x%08lx\n&quot;, fRegs-&gt;ci);
+-	TRACE(&quot;is   0x%08lx\n&quot;, fRegs-&gt;is);
+-	TRACE(&quot;serr 0x%08lx\n&quot;, fRegs-&gt;serr);
++	FLOW(&quot;prdbc %ld\n&quot;, fCommandList-&gt;prdbc);
+ 
+-	request-&gt;subsys_status = SCSI_REQ_CMP;
++	if (status &lt; B_OK || (tfd &amp; ATA_ERR)) {
++		TRACE(&quot;device error\n&quot;);
++		request-&gt;subsys_status = SCSI_REQ_ABORTED;
++	} else if (fCommandList-&gt;prdbc != bytecount) {
++		TRACE(&quot;should never happen\n&quot;);
++		request-&gt;subsys_status = SCSI_REQ_CMP_ERR;
++	} else {
++		request-&gt;subsys_status = SCSI_REQ_CMP;
++	}
+ 	request-&gt;data_resid = request-&gt;data_length - fCommandList-&gt;prdbc;// ???
+ 	request-&gt;data_length = fCommandList-&gt;prdbc; // ???
+ 
+-	fRegs-&gt;ci &amp;= ~1;
+ 	FinishTransfer();
+ 
+ 	gSCSI-&gt;finished(request, 1);
+@@ -631,7 +667,7 @@
+ AHCIPort::ScsiExecuteRequest(scsi_ccb *request)
+ {
+ 
+-	TRACE(&quot;AHCIPort::ScsiExecuteRequest port %d, opcode 0x%02x, length %u\n&quot;, fIndex, request-&gt;cdb[0], request-&gt;cdb_length);
++//	TRACE(&quot;AHCIPort::ScsiExecuteRequest port %d, opcode 0x%02x, length %u\n&quot;, fIndex, request-&gt;cdb[0], request-&gt;cdb_length);
+ 
+ 	if (request-&gt;cdb[0] == SCSI_OP_REQUEST_SENSE) {
+ 		panic(&quot;ahci: SCSI_OP_REQUEST_SENSE not yet supported\n&quot;);
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h	2007-09-30 14:02:04 UTC (rev 22385)
++++ haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h	2007-09-30 15:12:39 UTC (rev 22386)
+@@ -38,21 +38,22 @@
+ 	void		DumpD2HFis();
+ 
+ 	void		StartTransfer();
+-	status_t	WaitForTransfer(int *status, bigtime_t timeout);
++	status_t	WaitForTransfer(int *tfd, bigtime_t timeout);
+ 	void		FinishTransfer();
+ 
+ 
+ //	uint8 *		SetCommandFis(volatile command_list_entry *cmd, volatile fis *fis, const void *data, size_t dataSize);
+-	status_t	FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const void *data, size_t dataSize, bool ioc = false);
+-	status_t	FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const physical_entry *sgTable, int sgCount, size_t dataSize, bool ioc = false);
++	status_t	FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const void *data, size_t dataSize);
++	status_t	FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const physical_entry *sgTable, int sgCount, size_t dataSize);
+ 
+ private:
+ 	int						fIndex;
+ 	volatile ahci_port *	fRegs;
+ 	area_id					fArea;
++	spinlock						fSpinlock;
++	volatile uint32					fCommandsActive;
+ 	sem_id							fRequestSem;
+ 	sem_id							fResponseSem;
+-	volatile bool					fCommandActive;
+ 	bool							fDevicePresent;
+ 	bool							fUse48BitCommands;
+ 	uint32							fSectorSize;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_sim.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_sim.cpp	2007-09-30 14:02:04 UTC (rev 22385)
++++ haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_sim.cpp	2007-09-30 15:12:39 UTC (rev 22386)
+@@ -10,7 +10,8 @@
+ #include &lt;new&gt;
+ 
+ #define TRACE(a...) dprintf(&quot;\33[34mahci:\33[0m &quot; a)
+-#define FLOW(a...)	dprintf(&quot;ahci: &quot; a)
++//#define FLOW(a...)	dprintf(&quot;ahci: &quot; a)
++#define FLOW(a...)
+ 
+ 
+ pci_device_module_info *gPCI;
+@@ -24,7 +25,7 @@
+ static void
+ ahci_scsi_io(scsi_sim_cookie cookie, scsi_ccb *request)
+ {
+-	TRACE(&quot;ahci_scsi_io, cookie %p, path_id %u, target_id %u, target_lun %u\n&quot;, 
++	FLOW(&quot;ahci_scsi_io, cookie %p, path_id %u, target_id %u, target_lun %u\n&quot;, 
+ 		cookie, request-&gt;path_id, request-&gt;target_id, request-&gt;target_lun);
+ 	static_cast&lt;AHCIController *&gt;(cookie)-&gt;ExecuteRequest(request);
+ }
+@@ -105,7 +106,7 @@
+ 
+ 	*isATAPI = false;
+ 	*noAutoSense = false;
+-	*maxBlocks = 255;
++	*maxBlocks = 256;
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004073.html">[Haiku-commits] r22385 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+	<LI>Next message: <A HREF="004075.html">[Haiku-commits] r22387 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4074">[ date ]</a>
+              <a href="thread.html#4074">[ thread ]</a>
+              <a href="subject.html#4074">[ subject ]</a>
+              <a href="author.html#4074">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

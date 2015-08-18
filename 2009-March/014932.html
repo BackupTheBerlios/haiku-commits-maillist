@@ -1,0 +1,691 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29579 -	haiku/trunk/src/tests/add-ons/kernel/kernelland_emu
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29579%20-%0A%09haiku/trunk/src/tests/add-ons/kernel/kernelland_emu&In-Reply-To=%3C200903180203.n2I23gR7015288%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014931.html">
+   <LINK REL="Next"  HREF="014933.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29579 -	haiku/trunk/src/tests/add-ons/kernel/kernelland_emu</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29579%20-%0A%09haiku/trunk/src/tests/add-ons/kernel/kernelland_emu&In-Reply-To=%3C200903180203.n2I23gR7015288%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29579 -	haiku/trunk/src/tests/add-ons/kernel/kernelland_emu">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Mar 18 03:03:42 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014931.html">[Haiku-commits] r29578 - in haiku/trunk/src/system: kernel	libroot/posix/pthread
+</A></li>
+        <LI>Next message: <A HREF="014933.html">[Haiku-commits] r29580 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/haiku
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14932">[ date ]</a>
+              <a href="thread.html#14932">[ thread ]</a>
+              <a href="subject.html#14932">[ subject ]</a>
+              <a href="author.html#14932">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-03-18 03:03:41 +0100 (Wed, 18 Mar 2009)
+New Revision: 29579
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29579&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29579&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/lock.cpp
+Log:
+Replaced the mutex and read-write lock implementations by the kernel code,
+too. It's slightly adjusted to use the thread blocking syscalls and a benaphore
+style threads spinlock replacement. This solves the following problems:
+* The static mutex/rwlock initializers are safe now.
+* The rwlock implementation is compatible with the kernel implementation. E.g.
+  a write lock owner can acquire a read lock, which would dead-lock before.
+* We don't use semaphores anymore. With a userland BFS one could quite easily
+  hit the global semaphore limit before.
+
+
+Modified: haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/lock.cpp
+===================================================================
+--- haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/lock.cpp	2009-03-18 01:53:06 UTC (rev 29578)
++++ haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/lock.cpp	2009-03-18 02:03:41 UTC (rev 29579)
+@@ -9,10 +9,90 @@
+ 
+ #include &lt;lock.h&gt;
+ 
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
+ 
+-#define RW_MAX_READERS 10000
++#include &lt;AutoLocker.h&gt;
+ 
++// libroot
++#include &lt;user_thread.h&gt;
+ 
++// system
++#include &lt;syscalls.h&gt;
++#include &lt;user_thread_defs.h&gt;
++
++#include &quot;thread.h&quot;
++
++
++struct mutex_waiter {
++	struct thread*	thread;
++	mutex_waiter*	next;		// next in queue
++	mutex_waiter*	last;		// last in queue (valid for the first in queue)
++};
++
++struct rw_lock_waiter {
++	struct thread*	thread;
++	rw_lock_waiter*	next;		// next in queue
++	rw_lock_waiter*	last;		// last in queue (valid for the first in queue)
++	bool			writer;
++};
++
++#define MUTEX_FLAG_OWNS_NAME	MUTEX_FLAG_CLONE_NAME
++#define MUTEX_FLAG_RELEASED		0x2
++
++#define RW_LOCK_FLAG_OWNS_NAME	RW_LOCK_FLAG_CLONE_NAME
++
++
++/*!	Helper class playing the role of the kernel's thread spinlock. We don't use
++	as spinlock as that could be expensive in userland (due to spinlock holder
++	potentially being unscheduled), but a benaphore.
++*/
++struct ThreadSpinlock {
++	ThreadSpinlock()
++		:
++		fCount(1),
++		fSemaphore(create_sem(0, &quot;thread spinlock&quot;))
++	{
++		if (fSemaphore &lt; 0)
++			panic(&quot;Failed to create thread spinlock semaphore!&quot;);
++	}
++
++	~ThreadSpinlock()
++	{
++		if (fSemaphore &gt;= 0)
++			delete_sem(fSemaphore);
++	}
++
++	bool Lock()
++	{
++		if (atomic_add(&amp;fCount, -1) &gt; 0)
++			return true;
++
++		status_t error;
++		do {
++			error = acquire_sem(fSemaphore);
++		} while (error == B_INTERRUPTED);
++
++		return error == B_OK;
++	}
++
++	void Unlock()
++	{
++		if (atomic_add(&amp;fCount, 1) &lt; 0)
++			release_sem(fSemaphore);
++	}
++
++private:
++	vint32	fCount;
++	sem_id	fSemaphore;
++};
++
++static ThreadSpinlock sThreadSpinlock;
++
++
++// #pragma mark -
++
++
+ int32
+ recursive_lock_get_recursion(recursive_lock *lock)
+ {
+@@ -106,162 +186,432 @@
+ //	#pragma mark -
+ 
+ 
+-void
+-mutex_init(mutex *m, const char *name)
++static status_t
++rw_lock_wait(rw_lock* lock, bool writer)
+ {
+-	if (m == NULL)
++	// enqueue in waiter list
++	rw_lock_waiter waiter;
++	waiter.thread = get_current_thread();
++	waiter.next = NULL;
++	waiter.writer = writer;
++
++	if (lock-&gt;waiters != NULL)
++		lock-&gt;waiters-&gt;last-&gt;next = &waiter;
++	else
++		lock-&gt;waiters = &waiter;
++
++	lock-&gt;waiters-&gt;last = &waiter;
++
++	// block
++	get_user_thread()-&gt;wait_status = 1;
++	sThreadSpinlock.Unlock();
++
++	status_t error;
++	while ((error = _kern_block_thread(0, 0)) == B_INTERRUPTED) {
++	}
++
++	sThreadSpinlock.Lock();
++	return error;
++}
++
++
++static void
++rw_lock_unblock(rw_lock* lock)
++{
++	// Check whether there any waiting threads at all and whether anyone
++	// has the write lock.
++	rw_lock_waiter* waiter = lock-&gt;waiters;
++	if (waiter == NULL || lock-&gt;holder &gt; 0)
+ 		return;
+ 
+-	if (name == NULL)
+-		name = &quot;mutex_sem&quot;;
++	// writer at head of queue?
++	if (waiter-&gt;writer) {
++		if (lock-&gt;reader_count == 0) {
++			// dequeue writer
++			lock-&gt;waiters = waiter-&gt;next;
++			if (lock-&gt;waiters != NULL)
++				lock-&gt;waiters-&gt;last = waiter-&gt;last;
+ 
+-	// We need to store the semaphore in &quot;waiters&quot;, as it is no sem anymore
+-	// Also, kernel mutex creation cannot fail anymore, but we could...
+-	m-&gt;waiters = (struct mutex_waiter *)create_sem(1, name);
+-	if ((sem_id)m-&gt;waiters &lt; B_OK)
+-		debugger(&quot;semaphore creation failed&quot;);
++			lock-&gt;holder = get_thread_id(waiter-&gt;thread);
++
++			// unblock thread
++			_kern_unblock_thread(get_thread_id(waiter-&gt;thread), B_OK);
++		}
++		return;
++	}
++
++	// wake up one or more readers
++	while ((waiter = lock-&gt;waiters) != NULL &amp;&amp; !waiter-&gt;writer) {
++		// dequeue reader
++		lock-&gt;waiters = waiter-&gt;next;
++		if (lock-&gt;waiters != NULL)
++			lock-&gt;waiters-&gt;last = waiter-&gt;last;
++
++		lock-&gt;reader_count++;
++
++		// unblock thread
++		_kern_unblock_thread(get_thread_id(waiter-&gt;thread), B_OK);
++	}
+ }
+ 
+ 
+ void
+-mutex_init_etc(mutex *m, const char *name, uint32 flags)
++rw_lock_init(rw_lock* lock, const char* name)
+ {
+-	if (m == NULL)
+-		return;
++	lock-&gt;name = name;
++	lock-&gt;waiters = NULL;
++	lock-&gt;holder = -1;
++	lock-&gt;reader_count = 0;
++	lock-&gt;writer_count = 0;
++	lock-&gt;owner_count = 0;
++	lock-&gt;flags = 0;
++}
+ 
+-	if (name == NULL)
+-		name = &quot;mutex_sem&quot;;
+ 
+-	m-&gt;waiters = (struct mutex_waiter *)create_sem(1, name);
+-	if ((sem_id)m-&gt;waiters &lt; B_OK)
+-		debugger(&quot;semaphore creation failed&quot;);
++void
++rw_lock_init_etc(rw_lock* lock, const char* name, uint32 flags)
++{
++	lock-&gt;name = (flags &amp; RW_LOCK_FLAG_CLONE_NAME) != 0 ? strdup(name) : name;
++	lock-&gt;waiters = NULL;
++	lock-&gt;holder = -1;
++	lock-&gt;reader_count = 0;
++	lock-&gt;writer_count = 0;
++	lock-&gt;owner_count = 0;
++	lock-&gt;flags = flags &amp; RW_LOCK_FLAG_CLONE_NAME;
+ }
+ 
+ 
+ void
+-mutex_destroy(mutex *mutex)
++rw_lock_destroy(rw_lock* lock)
+ {
+-	if (mutex == NULL)
+-		return;
++	char* name = (lock-&gt;flags &amp; RW_LOCK_FLAG_CLONE_NAME) != 0
++		? (char*)lock-&gt;name : NULL;
+ 
+-	if ((sem_id)mutex-&gt;waiters &gt;= 0) {
+-		delete_sem((sem_id)mutex-&gt;waiters);
+-		mutex-&gt;waiters = (struct mutex_waiter *)-1;
++	// unblock all waiters
++	AutoLocker&lt;ThreadSpinlock&gt; locker(sThreadSpinlock);
++
++#if KDEBUG
++	if (lock-&gt;waiters != NULL &amp;&amp; find_thread(NULL)
++		!= lock-&gt;holder) {
++		panic(&quot;rw_lock_destroy(): there are blocking threads, but the caller &quot;
++			&quot;doesn't hold the write lock (%p)&quot;, lock);
++
++		locker.Unlock();
++		if (rw_lock_write_lock(lock) != B_OK)
++			return;
++		locker.Lock();
+ 	}
++#endif
++
++	while (rw_lock_waiter* waiter = lock-&gt;waiters) {
++		// dequeue
++		lock-&gt;waiters = waiter-&gt;next;
++
++		// unblock thread
++		_kern_unblock_thread(get_thread_id(waiter-&gt;thread), B_ERROR);
++	}
++
++	lock-&gt;name = NULL;
++
++	locker.Unlock();
++
++	free(name);
+ }
+ 
+ 
+ status_t
+-_mutex_trylock(mutex *mutex)
++rw_lock_read_lock(rw_lock* lock)
+ {
+-	status_t status = acquire_sem_etc((sem_id)mutex-&gt;waiters, 1,
+-		B_RELATIVE_TIMEOUT, 0);
++#if KDEBUG_RW_LOCK_DEBUG
++	return rw_lock_write_lock(lock);
++#else
++	AutoLocker&lt;ThreadSpinlock&gt; locker(sThreadSpinlock);
+ 
+-#if KDEBUG
+-	if (status == B_OK)
+-		mutex-&gt;holder = find_thread(NULL);
++	if (lock-&gt;writer_count == 0) {
++		lock-&gt;reader_count++;
++		return B_OK;
++	}
++	if (lock-&gt;holder == find_thread(NULL)) {
++		lock-&gt;owner_count++;
++		return B_OK;
++	}
++
++	return rw_lock_wait(lock, false);
+ #endif
+-	return status;
+ }
+ 
+ 
+ status_t
+-_mutex_lock(mutex *mutex, bool threadsLocked)
++rw_lock_read_unlock(rw_lock* lock)
+ {
+-	if (mutex-&gt;waiters == NULL) {
+-		// MUTEX_INITIALIZER has been used; this is not thread-safe!
+-		mutex_init(mutex, mutex-&gt;name);
++#if KDEBUG_RW_LOCK_DEBUG
++	return rw_lock_write_unlock(lock);
++#else
++	AutoLocker&lt;ThreadSpinlock&gt; locker(sThreadSpinlock);
++
++	if (lock-&gt;holder == find_thread(NULL)) {
++		if (--lock-&gt;owner_count &gt; 0)
++			return B_OK;
++
++		// this originally has been a write lock
++		lock-&gt;writer_count--;
++		lock-&gt;holder = -1;
++
++		rw_lock_unblock(lock);
++		return B_OK;
+ 	}
+ 
+-	status_t status;
+-	do {
+-		status = acquire_sem((sem_id)mutex-&gt;waiters);
+-	} while (status == B_INTERRUPTED);
++	if (lock-&gt;reader_count &lt;= 0) {
++		panic(&quot;rw_lock_read_unlock(): lock %p not read-locked&quot;, lock);
++		return B_BAD_VALUE;
++	}
+ 
+-#if KDEBUG
+-	if (status == B_OK)
+-		mutex-&gt;holder = find_thread(NULL);
++	lock-&gt;reader_count--;
++
++	rw_lock_unblock(lock);
++	return B_OK;
+ #endif
++}
++
++
++status_t
++rw_lock_write_lock(rw_lock* lock)
++{
++	AutoLocker&lt;ThreadSpinlock&gt; locker(sThreadSpinlock);
++
++	if (lock-&gt;reader_count == 0 &amp;&amp; lock-&gt;writer_count == 0) {
++		lock-&gt;writer_count++;
++		lock-&gt;holder = find_thread(NULL);
++		lock-&gt;owner_count = 1;
++		return B_OK;
++	}
++	if (lock-&gt;holder == find_thread(NULL)) {
++		lock-&gt;owner_count++;
++		return B_OK;
++	}
++
++	lock-&gt;writer_count++;
++
++	status_t status = rw_lock_wait(lock, true);
++	if (status == B_OK) {
++		lock-&gt;holder = find_thread(NULL);
++		lock-&gt;owner_count = 1;
++	}
+ 	return status;
+ }
+ 
+ 
+-void
+-_mutex_unlock(mutex *mutex, bool threadsLocked)
++status_t
++rw_lock_write_unlock(rw_lock* lock)
+ {
+-#if KDEBUG
+-	mutex-&gt;holder = -1;
+-#endif
+-	release_sem((sem_id)mutex-&gt;waiters);
++	AutoLocker&lt;ThreadSpinlock&gt; locker(sThreadSpinlock);
++
++	if (find_thread(NULL) != lock-&gt;holder) {
++		panic(&quot;rw_lock_write_unlock(): lock %p not write-locked by this thread&quot;,
++			lock);
++		return B_BAD_VALUE;
++	}
++	if (--lock-&gt;owner_count &gt; 0)
++		return B_OK;
++
++	lock-&gt;writer_count--;
++	lock-&gt;holder = -1;
++
++	rw_lock_unblock(lock);
++
++	return B_OK;
+ }
+ 
+ 
+-//	#pragma mark -
++// #pragma mark -
+ 
+ 
+ void
+-rw_lock_init_etc(rw_lock *lock, const char *name, uint32 flags)
++mutex_init(mutex* lock, const char *name)
+ {
+-	if (lock == NULL)
+-		return;
+-
+-	if (name == NULL)
+-		name = &quot;r/w lock&quot;;
+-
+-	lock-&gt;waiters = (rw_lock_waiter*)create_sem(RW_MAX_READERS, name);
+-	if ((sem_id)lock-&gt;waiters &lt; B_OK)
+-		panic(&quot;r/w lock \&quot;%s\&quot; creation failed.&quot;, name);
++	lock-&gt;name = name;
++	lock-&gt;waiters = NULL;
++#if KDEBUG
++	lock-&gt;holder = -1;
++#else
++	lock-&gt;count = 0;
++#endif
++	lock-&gt;flags = 0;
+ }
+ 
+ 
+ void
+-rw_lock_init(rw_lock *lock, const char *name)
++mutex_init_etc(mutex* lock, const char *name, uint32 flags)
+ {
+-	rw_lock_init_etc(lock, name, 0);
++	lock-&gt;name = (flags &amp; MUTEX_FLAG_CLONE_NAME) != 0 ? strdup(name) : name;
++	lock-&gt;waiters = NULL;
++#if KDEBUG
++	lock-&gt;holder = -1;
++#else
++	lock-&gt;count = 0;
++#endif
++	lock-&gt;flags = flags &amp; MUTEX_FLAG_CLONE_NAME;
+ }
+ 
+ 
+ void
+-rw_lock_destroy(rw_lock *lock)
++mutex_destroy(mutex* lock)
+ {
+-	if (lock == NULL)
+-		return;
++	char* name = (lock-&gt;flags &amp; MUTEX_FLAG_CLONE_NAME) != 0
++		? (char*)lock-&gt;name : NULL;
+ 
+-	delete_sem((sem_id)lock-&gt;waiters);
++	// unblock all waiters
++	AutoLocker&lt;ThreadSpinlock&gt; locker(sThreadSpinlock);
++
++#if KDEBUG
++	if (lock-&gt;waiters != NULL &amp;&amp; find_thread(NULL)
++		!= lock-&gt;holder) {
++		panic(&quot;mutex_destroy(): there are blocking threads, but caller doesn't &quot;
++			&quot;hold the lock (%p)&quot;, lock);
++		if (_mutex_lock(lock, true) != B_OK)
++			return;
++	}
++#endif
++
++	while (mutex_waiter* waiter = lock-&gt;waiters) {
++		// dequeue
++		lock-&gt;waiters = waiter-&gt;next;
++
++		// unblock thread
++		_kern_unblock_thread(get_thread_id(waiter-&gt;thread), B_ERROR);
++	}
++
++	lock-&gt;name = NULL;
++
++	locker.Unlock();
++
++	free(name);
+ }
+ 
+ 
+ status_t
+-rw_lock_read_lock(rw_lock *lock)
++mutex_switch_lock(mutex* from, mutex* to)
+ {
+-	status_t status;
+-	do {
+-		status = acquire_sem((sem_id)lock-&gt;waiters);
+-	} while (status == B_INTERRUPTED);
+-	return status;
++	AutoLocker&lt;ThreadSpinlock&gt; locker(sThreadSpinlock);
++
++#if !KDEBUG
++	if (atomic_add(&amp;from-&gt;count, 1) &lt; -1)
++#endif
++		_mutex_unlock(from, true);
++
++	return mutex_lock_threads_locked(to);
+ }
+ 
+ 
+ status_t
+-rw_lock_read_unlock(rw_lock *lock)
++_mutex_lock(mutex* lock, bool threadsLocked)
+ {
+-	return release_sem((sem_id)lock-&gt;waiters);
++	// lock only, if !threadsLocked
++	AutoLocker&lt;ThreadSpinlock&gt; locker(sThreadSpinlock, false, !threadsLocked);
++
++	// Might have been released after we decremented the count, but before
++	// we acquired the spinlock.
++#if KDEBUG
++	if (lock-&gt;holder &lt; 0) {
++		lock-&gt;holder = find_thread(NULL);
++		return B_OK;
++	} else if (lock-&gt;holder == find_thread(NULL)) {
++		panic(&quot;_mutex_lock(): double lock of %p by thread %ld&quot;, lock,
++			lock-&gt;holder);
++	} else if (lock-&gt;holder == 0)
++		panic(&quot;_mutex_lock(): using unitialized lock %p&quot;, lock);
++#else
++	if ((lock-&gt;flags &amp; MUTEX_FLAG_RELEASED) != 0) {
++		lock-&gt;flags &amp;= ~MUTEX_FLAG_RELEASED;
++		return B_OK;
++	}
++#endif
++
++	// enqueue in waiter list
++	mutex_waiter waiter;
++	waiter.thread = get_current_thread();
++	waiter.next = NULL;
++
++	if (lock-&gt;waiters != NULL) {
++		lock-&gt;waiters-&gt;last-&gt;next = &waiter;
++	} else
++		lock-&gt;waiters = &waiter;
++
++	lock-&gt;waiters-&gt;last = &waiter;
++
++	// block
++	get_user_thread()-&gt;wait_status = 1;
++	locker.Unlock();
++
++	status_t error;
++	while ((error = _kern_block_thread(0, 0)) == B_INTERRUPTED) {
++	}
++
++	locker.Lock();
++
++#if KDEBUG
++	if (error == B_OK)
++		lock-&gt;holder = get_thread_id(waiter.thread);
++#endif
++
++	return error;
+ }
+ 
+ 
+-status_t
+-rw_lock_write_lock(rw_lock *lock)
++void
++_mutex_unlock(mutex* lock, bool threadsLocked)
+ {
+-	status_t status;
+-	do {
+-		status = acquire_sem_etc((sem_id)lock-&gt;waiters, RW_MAX_READERS, 0, 0);
+-	} while (status == B_INTERRUPTED);
+-	return status;
++	// lock only, if !threadsLocked
++	AutoLocker&lt;ThreadSpinlock&gt; locker(sThreadSpinlock, false, !threadsLocked);
++
++#if KDEBUG
++	if (find_thread(NULL) != lock-&gt;holder) {
++		panic(&quot;_mutex_unlock() failure: thread %ld is trying to release &quot;
++			&quot;mutex %p (current holder %ld)\n&quot;, find_thread(NULL),
++			lock, lock-&gt;holder);
++		return;
++	}
++#endif
++
++	mutex_waiter* waiter = lock-&gt;waiters;
++	if (waiter != NULL) {
++		// dequeue the first waiter
++		lock-&gt;waiters = waiter-&gt;next;
++		if (lock-&gt;waiters != NULL)
++			lock-&gt;waiters-&gt;last = waiter-&gt;last;
++
++		// unblock thread
++		_kern_unblock_thread(get_thread_id(waiter-&gt;thread), B_OK);
++
++#if KDEBUG
++		// Already set the holder to the unblocked thread. Besides that this
++		// actually reflects the current situation, setting it to -1 would
++		// cause a race condition, since another locker could think the lock
++		// is not held by anyone.
++		lock-&gt;holder = get_thread_id(waiter-&gt;thread);
++#endif
++	} else {
++		// We've acquired the spinlock before the locker that is going to wait.
++		// Just mark the lock as released.
++#if KDEBUG
++		lock-&gt;holder = -1;
++#else
++		lock-&gt;flags |= MUTEX_FLAG_RELEASED;
++#endif
++	}
+ }
+ 
+ 
+ status_t
+-rw_lock_write_unlock(rw_lock *lock)
++_mutex_trylock(mutex* lock)
+ {
+-	return release_sem_etc((sem_id)lock-&gt;waiters, RW_MAX_READERS, 0);
++#if KDEBUG
++	AutoLocker&lt;ThreadSpinlock&gt; _(sThreadSpinlock);
++
++	if (lock-&gt;holder &lt;= 0) {
++		lock-&gt;holder = find_thread(NULL);
++		return B_OK;
++	}
++#endif
++	return B_WOULD_BLOCK;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014931.html">[Haiku-commits] r29578 - in haiku/trunk/src/system: kernel	libroot/posix/pthread
+</A></li>
+	<LI>Next message: <A HREF="014933.html">[Haiku-commits] r29580 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/haiku
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14932">[ date ]</a>
+              <a href="thread.html#14932">[ thread ]</a>
+              <a href="subject.html#14932">[ subject ]</a>
+              <a href="author.html#14932">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

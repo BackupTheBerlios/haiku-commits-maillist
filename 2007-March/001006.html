@@ -1,0 +1,303 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20300 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20300%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on&In-Reply-To=%3C200703020709.l2279IMW012032%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001005.html">
+   <LINK REL="Next"  HREF="001009.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20300 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20300%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on&In-Reply-To=%3C200703020709.l2279IMW012032%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20300 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Mar  2 08:09:18 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001005.html">[Haiku-commits] r20299 - in	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs:	kernel_add_on server
+</A></li>
+        <LI>Next message: <A HREF="001009.html">[Haiku-commits] r20301 -	haiku/trunk/src/add-ons/kernel/file_systems/ntfs/libntfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1006">[ date ]</a>
+              <a href="thread.html#1006">[ thread ]</a>
+              <a href="subject.html#1006">[ subject ]</a>
+              <a href="author.html#1006">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-03-02 08:09:18 +0100 (Fri, 02 Mar 2007)
+New Revision: 20300
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20300&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20300&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.h
+Log:
+We fake read_stat() on the root node and read_fs_info() when the
+connection to the server is lost. The former is required by our mount
+command (it stat()s the mount point for some reason unknown to me). The
+latter is just to be a good citizen.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp	2007-03-02 01:45:58 UTC (rev 20299)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp	2007-03-02 07:09:18 UTC (rev 20300)
+@@ -2,6 +2,7 @@
+ 
+ #include &lt;errno.h&gt;
+ #include &lt;unistd.h&gt;
++#include &lt;sys/stat.h&gt;
+ 
+ #include &quot;AutoLocker.h&quot;
+ #include &quot;Compatibility.h&quot;
+@@ -178,7 +179,7 @@
+ status_t
+ Volume::PublishVNode(vnode_id vnid, fs_vnode node)
+ {
+-PRINT((&quot;publish_vnode(%ld, %lld)\n&quot;, fID, vnid));
++PRINT((&quot;publish_vnode(%ld, %lld, %p)\n&quot;, fID, vnid, node));
+ 	status_t error = publish_vnode(fID, vnid, node);
+ 	if (error == B_OK) {
+ 		if (IsMounting()) {
+@@ -312,33 +313,23 @@
+ status_t
+ Volume::ReadFSInfo(fs_info* info)
+ {
+-	// get a free port
+-	RequestPort* port = fFileSystem-&gt;GetPortPool()-&gt;AcquirePort();
+-	if (!port)
+-		return B_ERROR;
+-	PortReleaser _(fFileSystem-&gt;GetPortPool(), port);
++	// When the connection to the userland server is lost, we serve
++	// read_fs_info() requests manually.
++	status_t error = _ReadFSInfo(info);
++	if (error != B_OK &amp;&amp; fFileSystem-&gt;GetPortPool()-&gt;IsDisconnected()) {
++		WARN((&quot;Volume::Lookup(): connection lost, emulating lookup `.'\n&quot;));
+ 
+-	// prepare the request
+-	RequestAllocator allocator(port-&gt;GetPort());
+-	ReadFSInfoRequest* request;
+-	status_t error = AllocateRequest(allocator, &amp;request);
+-	if (error != B_OK)
+-		return error;
++		info-&gt;flags = B_FS_IS_PERSISTENT | B_FS_IS_READONLY;
++		info-&gt;block_size = 512;
++		info-&gt;io_size = 512;
++		info-&gt;total_blocks = 0;
++		info-&gt;free_blocks = 0;
++		strlcpy(info-&gt;volume_name, fFileSystem-&gt;GetName(),
++			sizeof(info-&gt;volume_name));
++		strlcat(info-&gt;volume_name, &quot;:disconnected&quot;, sizeof(info-&gt;volume_name));
+ 
+-	request-&gt;volume = fUserlandVolume;
+-
+-	// send the request
+-	KernelRequestHandler handler(this, READ_FS_INFO_REPLY);
+-	ReadFSInfoReply* reply;
+-	error = _SendRequest(port, &amp;allocator, &amp;handler, (Request**)&amp;reply);
+-	if (error != B_OK)
+-		return error;
+-	RequestReleaser requestReleaser(port, reply);
+-
+-	// process the reply
+-	if (reply-&gt;error != B_OK)
+-		return reply-&gt;error;
+-	*info = reply-&gt;info;
++		error = B_OK;
++	}
+ 	return error;
+ }
+ 
+@@ -1041,34 +1032,29 @@
+ status_t
+ Volume::ReadStat(fs_vnode node, struct stat* st)
+ {
+-	// get a free port
+-	RequestPort* port = fFileSystem-&gt;GetPortPool()-&gt;AcquirePort();
+-	if (!port)
+-		return B_ERROR;
+-	PortReleaser _(fFileSystem-&gt;GetPortPool(), port);
++	// When the connection to the userland server is lost, we serve
++	// read_stat(fRootNode) requests manually to allow clean unmounting.
++	status_t error = _ReadStat(node, st);
++	if (error != B_OK &amp;&amp; fFileSystem-&gt;GetPortPool()-&gt;IsDisconnected()
++		&amp;&amp; node == fRootNode) {
++		WARN((&quot;Volume::ReadStat(): connection lost, emulating stat for the &quot;
++			&quot;root node\n&quot;));
+ 
+-	// prepare the request
+-	RequestAllocator allocator(port-&gt;GetPort());
+-	ReadStatRequest* request;
+-	status_t error = AllocateRequest(allocator, &amp;request);
+-	if (error != B_OK)
+-		return error;
++		st-&gt;st_dev = fID;
++		st-&gt;st_ino = fRootID;
++		st-&gt;st_mode = ACCESSPERMS;
++		st-&gt;st_nlink = 1;
++		st-&gt;st_uid = 0;
++		st-&gt;st_gid = 0;
++		st-&gt;st_size = 512;
++		st-&gt;st_blksize = 512;
++		st-&gt;st_atime = 0;
++		st-&gt;st_mtime = 0;
++		st-&gt;st_ctime = 0;
++		st-&gt;st_crtime = 0;
+ 
+-	request-&gt;volume = fUserlandVolume;
+-	request-&gt;node = node;
+-
+-	// send the request
+-	KernelRequestHandler handler(this, READ_STAT_REPLY);
+-	ReadStatReply* reply;
+-	error = _SendRequest(port, &amp;allocator, &amp;handler, (Request**)&amp;reply);
+-	if (error != B_OK)
+-		return error;
+-	RequestReleaser requestReleaser(port, reply);
+-
+-	// process the reply
+-	if (reply-&gt;error != B_OK)
+-		return reply-&gt;error;
+-	*st = reply-&gt;st;
++		error = B_OK;
++	}
+ 	return error;
+ }
+ 
+@@ -2570,6 +2556,40 @@
+ 	return error;
+ }
+ 
++// _ReadFSInfo
++status_t
++Volume::_ReadFSInfo(fs_info* info)
++{
++	// get a free port
++	RequestPort* port = fFileSystem-&gt;GetPortPool()-&gt;AcquirePort();
++	if (!port)
++		return B_ERROR;
++	PortReleaser _(fFileSystem-&gt;GetPortPool(), port);
++
++	// prepare the request
++	RequestAllocator allocator(port-&gt;GetPort());
++	ReadFSInfoRequest* request;
++	status_t error = AllocateRequest(allocator, &amp;request);
++	if (error != B_OK)
++		return error;
++
++	request-&gt;volume = fUserlandVolume;
++
++	// send the request
++	KernelRequestHandler handler(this, READ_FS_INFO_REPLY);
++	ReadFSInfoReply* reply;
++	error = _SendRequest(port, &amp;allocator, &amp;handler, (Request**)&amp;reply);
++	if (error != B_OK)
++		return error;
++	RequestReleaser requestReleaser(port, reply);
++
++	// process the reply
++	if (reply-&gt;error != B_OK)
++		return reply-&gt;error;
++	*info = reply-&gt;info;
++	return error;
++}
++
+ // _Lookup
+ status_t
+ Volume::_Lookup(fs_vnode dir, const char* entryName, vnode_id* vnid, int* type)
+@@ -2645,6 +2665,41 @@
+ 	return error;
+ }
+ 
++// _ReadStat
++status_t
++Volume::_ReadStat(fs_vnode node, struct stat* st)
++{
++	// get a free port
++	RequestPort* port = fFileSystem-&gt;GetPortPool()-&gt;AcquirePort();
++	if (!port)
++		return B_ERROR;
++	PortReleaser _(fFileSystem-&gt;GetPortPool(), port);
++
++	// prepare the request
++	RequestAllocator allocator(port-&gt;GetPort());
++	ReadStatRequest* request;
++	status_t error = AllocateRequest(allocator, &amp;request);
++	if (error != B_OK)
++		return error;
++
++	request-&gt;volume = fUserlandVolume;
++	request-&gt;node = node;
++
++	// send the request
++	KernelRequestHandler handler(this, READ_STAT_REPLY);
++	ReadStatReply* reply;
++	error = _SendRequest(port, &amp;allocator, &amp;handler, (Request**)&amp;reply);
++	if (error != B_OK)
++		return error;
++	RequestReleaser requestReleaser(port, reply);
++
++	// process the reply
++	if (reply-&gt;error != B_OK)
++		return reply-&gt;error;
++	*st = reply-&gt;st;
++	return error;
++}
++
+ // _Close
+ status_t
+ Volume::_Close(fs_vnode node, fs_cookie cookie)
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.h	2007-03-02 01:45:58 UTC (rev 20299)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.h	2007-03-02 07:09:18 UTC (rev 20300)
+@@ -174,9 +174,11 @@
+ 			status_t			_Mount(const char* device, uint32 flags,
+ 									const char* parameters);
+ 			status_t			_Unmount();
++			status_t			_ReadFSInfo(fs_info* info);
+ 			status_t			_Lookup(fs_vnode dir, const char* entryName,
+ 									vnode_id* vnid, int* type);
+ 			status_t			_WriteVNode(fs_vnode node, bool reenter);
++			status_t			_ReadStat(fs_vnode node, struct stat* st);
+ 			status_t			_Close(fs_vnode node, fs_cookie cookie);
+ 			status_t			_FreeCookie(fs_vnode node, fs_cookie cookie);
+ 			status_t			_CloseDir(fs_vnode node, fs_vnode cookie);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001005.html">[Haiku-commits] r20299 - in	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs:	kernel_add_on server
+</A></li>
+	<LI>Next message: <A HREF="001009.html">[Haiku-commits] r20301 -	haiku/trunk/src/add-ons/kernel/file_systems/ntfs/libntfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1006">[ date ]</a>
+              <a href="thread.html#1006">[ thread ]</a>
+              <a href="subject.html#1006">[ subject ]</a>
+              <a href="author.html#1006">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

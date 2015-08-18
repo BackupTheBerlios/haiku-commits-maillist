@@ -1,0 +1,674 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32074 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32074%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200908031359.n73Dxlqp030165%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018686.html">
+   <LINK REL="Next"  HREF="018690.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32074 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32074%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200908031359.n73Dxlqp030165%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32074 - in haiku/trunk: headers/private/kernel	src/system/kernel">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Mon Aug  3 15:59:47 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018686.html">[Haiku-commits] r32073 - in haiku/trunk: headers/private/kernel	headers/private/kernel/arch headers/private/kernel/arch/x86	src/system/boot/loader src/system/boot/platform/bios_ia32	src/system/boot/platform/openfirmware/arch/ppc	src/system/boot/platform/u-boot src/system/kernel	src/system/kernel/arch/m68k src/system/kernel/arch/ppc	src/system/kernel/arch/x86 src/system/kernel/debug	src/system/kernel/slab src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="018690.html">[Haiku-commits] r32075 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18689">[ date ]</a>
+              <a href="thread.html#18689">[ thread ]</a>
+              <a href="subject.html#18689">[ subject ]</a>
+              <a href="author.html#18689">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-08-03 15:59:45 +0200 (Mon, 03 Aug 2009)
+New Revision: 32074
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32074&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32074&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/heap.h
+   haiku/trunk/src/system/kernel/heap.cpp
+Log:
+* Rework the heap locking strategy. Use a read-write lock for the area lock to
+  allow for more parallelism. Also introduce seperate locks for the bins and
+  for page allocation. This greatly reduces lock contention and reduces the
+  duration the locks are held due to them overall protecting less code. Now only
+  allocations of the same size hitting the same allocator or allocating larger
+  chunks of memory should block. Previously, basically any allocation and also
+  free would be mutually exclusive, making it scale pretty badely.
+* Added memalign_nogrow(). As it uses heap_memalign() anyway, there's no real
+  reason not to allow for an alignment.
+* Some cleanup.
+
+
+Modified: haiku/trunk/headers/private/kernel/heap.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/heap.h	2009-08-03 12:39:56 UTC (rev 32073)
++++ haiku/trunk/headers/private/kernel/heap.h	2009-08-03 13:59:45 UTC (rev 32074)
+@@ -41,8 +41,9 @@
+ extern &quot;C&quot; {
+ #endif
+ 
+-// malloc_nogrow disallows waiting for a grow to happen - only to be used by
+-// vm functions that may deadlock on a triggered area creation
++// malloc- and memalign_nogrow disallow waiting for a grow to happen - only to
++// be used by vm functions that may deadlock on a triggered area creation.
++void *memalign_nogrow(size_t alignment, size_t size);
+ void *malloc_nogrow(size_t size);
+ 
+ void *memalign(size_t alignment, size_t size);
+
+Modified: haiku/trunk/src/system/kernel/heap.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/heap.cpp	2009-08-03 12:39:56 UTC (rev 32073)
++++ haiku/trunk/src/system/kernel/heap.cpp	2009-08-03 13:59:45 UTC (rev 32074)
+@@ -88,13 +88,15 @@
+ } heap_page;
+ 
+ typedef struct heap_bin_s {
++	mutex		lock;
+ 	uint32		element_size;
+ 	uint16		max_free_count;
+ 	heap_page *	page_list; // sorted so that the desired page is always first
+ } heap_bin;
+ 
+ struct heap_allocator_s {
+-	mutex		lock;
++	rw_lock		area_lock;
++	mutex		page_lock;
+ 
+ 	const char *name;
+ 	uint32		bin_count;
+@@ -628,7 +630,7 @@
+ 
+ 
+ static bool
+-analyze_allocation_callers(heap_allocator* heap)
++analyze_allocation_callers(heap_allocator *heap)
+ {
+ 	// go through all the pages in all the areas
+ 	heap_area *area = heap-&gt;all_areas;
+@@ -661,7 +663,7 @@
+ 					info = (heap_leak_check_info *)(base + elementSize
+ 						- sizeof(heap_leak_check_info));
+ 
+-					caller_info* callerInfo = get_caller_info(info-&gt;caller);
++					caller_info *callerInfo = get_caller_info(info-&gt;caller);
+ 					if (callerInfo == NULL) {
+ 						kprintf(&quot;out of space for caller infos\n&quot;);
+ 						return 0;
+@@ -685,7 +687,7 @@
+ 				info = (heap_leak_check_info *)(base + pageCount
+ 					* heap-&gt;page_size - sizeof(heap_leak_check_info));
+ 
+-				caller_info* callerInfo = get_caller_info(info-&gt;caller);
++				caller_info *callerInfo = get_caller_info(info-&gt;caller);
+ 				if (callerInfo == NULL) {
+ 					kprintf(&quot;out of space for caller infos\n&quot;);
+ 					return false;
+@@ -710,7 +712,7 @@
+ dump_allocations_per_caller(int argc, char **argv)
+ {
+ 	bool sortBySize = true;
+-	heap_allocator* heap = NULL;
++	heap_allocator *heap = NULL;
+ 
+ 	for (int32 i = 1; i &lt; argc; i++) {
+ 		if (strcmp(argv[i], &quot;-c&quot;) == 0) {
+@@ -756,8 +758,8 @@
+ 		caller_info&amp; info = sCallerInfoTable[i];
+ 		kprintf(&quot;%10ld  %10ld  %#08lx&quot;, info.count, info.size, info.caller);
+ 
+-		const char* symbol;
+-		const char* imageName;
++		const char *symbol;
++		const char *imageName;
+ 		bool exactMatch;
+ 		addr_t baseAddress;
+ 
+@@ -780,7 +782,10 @@
+ static void
+ heap_validate_heap(heap_allocator *heap)
+ {
+-	mutex_lock(&amp;heap-&gt;lock);
++	ReadLocker areaReadLocker(heap-&gt;area_lock);
++	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++)
++		mutex_lock(&amp;heap-&gt;bins[i].lock);
++	MutexLocker pageLocker(heap-&gt;page_lock);
+ 
+ 	uint32 totalPageCount = 0;
+ 	uint32 totalFreePageCount = 0;
+@@ -862,7 +867,6 @@
+ 	// validate the bins
+ 	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++) {
+ 		heap_bin *bin = &amp;heap-&gt;bins[i];
+-
+ 		heap_page *lastPage = NULL;
+ 		heap_page *page = bin-&gt;page_list;
+ 		lastFreeCount = 0;
+@@ -938,7 +942,10 @@
+ 		}
+ 	}
+ 
+-	mutex_unlock(&amp;heap-&gt;lock);
++	pageLocker.Unlock();
++	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++)
++		mutex_unlock(&amp;heap-&gt;bins[i].lock);
++	areaReadLocker.Unlock();
+ }
+ #endif // PARANOID_HEAP_VALIDATION
+ 
+@@ -949,8 +956,6 @@
+ static void
+ heap_add_area(heap_allocator *heap, area_id areaID, addr_t base, size_t size)
+ {
+-	mutex_lock(&amp;heap-&gt;lock);
+-
+ 	heap_area *area = (heap_area *)base;
+ 	area-&gt;area = areaID;
+ 
+@@ -986,8 +991,10 @@
+ 	area-&gt;free_pages = &amp;area-&gt;page_table[0];
+ 	area-&gt;free_page_count = pageCount;
+ 	area-&gt;page_table[0].prev = NULL;
++	area-&gt;next = NULL;
+ 
+-	area-&gt;next = NULL;
++	WriteLocker areaWriteLocker(heap-&gt;area_lock);
++	MutexLocker pageLocker(heap-&gt;page_lock);
+ 	if (heap-&gt;areas == NULL) {
+ 		// it's the only (empty) area in that heap
+ 		area-&gt;prev = NULL;
+@@ -1018,13 +1025,14 @@
+ 	heap-&gt;total_pages += area-&gt;page_count;
+ 	heap-&gt;total_free_pages += area-&gt;free_page_count;
+ 
+-	if (areaID &gt;= B_OK) {
++	if (areaID &gt;= 0) {
+ 		// this later on deletable area is yet empty - the empty count will be
+ 		// decremented as soon as this area is used for the first time
+ 		heap-&gt;empty_areas++;
+ 	}
+ 
+-	mutex_unlock(&amp;heap-&gt;lock);
++	pageLocker.Unlock();
++	areaWriteLocker.Unlock();
+ 
+ 	dprintf(&quot;heap_add_area: area %ld added to %s heap %p - usable range 0x%08lx &quot;
+ 		&quot;- 0x%08lx\n&quot;, area-&gt;area, heap-&gt;name, heap, area-&gt;base,
+@@ -1033,11 +1041,8 @@
+ 
+ 
+ static status_t
+-heap_remove_area(heap_allocator *heap, heap_area *area, bool locked)
++heap_remove_area(heap_allocator *heap, heap_area *area)
+ {
+-	if (!locked)
+-		mutex_lock(&amp;heap-&gt;lock);
+-
+ 	if (area-&gt;free_page_count != area-&gt;page_count) {
+ 		panic(&quot;tried removing heap area that has still pages in use&quot;);
+ 		return B_ERROR;
+@@ -1075,12 +1080,10 @@
+ 	heap-&gt;total_pages -= area-&gt;page_count;
+ 	heap-&gt;total_free_pages -= area-&gt;free_page_count;
+ 
+-	if (!locked)
+-		mutex_unlock(&amp;heap-&gt;lock);
+-
+ 	dprintf(&quot;heap_remove_area: area %ld with range 0x%08lx - 0x%08lx removed &quot;
+ 		&quot;from %s heap %p\n&quot;, area-&gt;area, area-&gt;base, area-&gt;base + area-&gt;size,
+ 		heap-&gt;name, heap);
++
+ 	return B_OK;
+ }
+ 
+@@ -1114,6 +1117,7 @@
+ 			continue;
+ 
+ 		heap_bin *bin = &amp;heap-&gt;bins[heap-&gt;bin_count];
++		mutex_init(&amp;bin-&gt;lock, &quot;heap bin lock&quot;);
+ 		bin-&gt;element_size = binSize;
+ 		bin-&gt;max_free_count = heap-&gt;page_size / binSize;
+ 		bin-&gt;page_list = NULL;
+@@ -1126,14 +1130,15 @@
+ 	base += heap-&gt;bin_count * sizeof(heap_bin);
+ 	size -= heap-&gt;bin_count * sizeof(heap_bin);
+ 
+-	mutex_init(&amp;heap-&gt;lock, &quot;heap_mutex&quot;);
++	rw_lock_init(&amp;heap-&gt;area_lock, &quot;heap area rw lock&quot;);
++	mutex_init(&amp;heap-&gt;page_lock, &quot;heap page lock&quot;);
+ 
+ 	heap_add_area(heap, -1, base, size);
+ 	return heap;
+ }
+ 
+ 
+-static inline area_id
++static inline void
+ heap_free_pages_added(heap_allocator *heap, heap_area *area, uint32 pageCount)
+ {
+ 	area-&gt;free_page_count += pageCount;
+@@ -1170,29 +1175,15 @@
+ 		}
+ 	}
+ 
+-	// can and should we free this area?
+-	if (area-&gt;free_page_count == area-&gt;page_count &amp;&amp; area-&gt;area &gt;= B_OK) {
+-		if (heap-&gt;empty_areas &gt; 0) {
+-			// we already have at least another empty area, just free this one
+-			if (heap_remove_area(heap, area, true) == B_OK) {
+-				// we cannot delete the area here, because it would result
+-				// in calls to free, which would necessarily deadlock as we
+-				// are locked at this point
+-				return area-&gt;area;
+-			}
+-		}
+-
++	if (area-&gt;free_page_count == area-&gt;page_count &amp;&amp; area-&gt;area &gt;= 0)
+ 		heap-&gt;empty_areas++;
+-	}
+-
+-	return -1;
+ }
+ 
+ 
+ static inline void
+ heap_free_pages_removed(heap_allocator *heap, heap_area *area, uint32 pageCount)
+ {
+-	if (area-&gt;free_page_count == area-&gt;page_count &amp;&amp; area-&gt;area &gt;= B_OK) {
++	if (area-&gt;free_page_count == area-&gt;page_count &amp;&amp; area-&gt;area &gt;= 0) {
+ 		// this area was completely empty
+ 		heap-&gt;empty_areas--;
+ 	}
+@@ -1239,6 +1230,7 @@
+ static heap_page *
+ heap_allocate_contiguous_pages(heap_allocator *heap, uint32 pageCount)
+ {
++	MutexLocker pageLocker(heap-&gt;page_lock);
+ 	heap_area *area = heap-&gt;areas;
+ 	while (area) {
+ 		bool found = false;
+@@ -1286,10 +1278,14 @@
+ static void *
+ heap_raw_alloc(heap_allocator *heap, size_t size, uint32 binIndex)
+ {
++	TRACE((&quot;raw_alloc: heap %p; size %lu; bin %lu\n&quot;, heap, size, binIndex));
+ 	if (binIndex &lt; heap-&gt;bin_count) {
+ 		heap_bin *bin = &amp;heap-&gt;bins[binIndex];
++		MutexLocker binLocker(bin-&gt;lock);
++
+ 		heap_page *page = bin-&gt;page_list;
+ 		if (page == NULL) {
++			MutexLocker pageLocker(heap-&gt;page_lock);
+ 			heap_area *area = heap-&gt;areas;
+ 			if (area == NULL) {
+ 				TRACE((&quot;heap %p: no free pages to allocate %lu bytes\n&quot;, heap,
+@@ -1305,7 +1301,13 @@
+ 				page-&gt;next-&gt;prev = NULL;
+ 
+ 			heap_free_pages_removed(heap, area, 1);
++
++			if (page-&gt;in_use)
++				panic(&quot;got an in use page from the free pages list\n&quot;);
+ 			page-&gt;in_use = 1;
++
++			pageLocker.Unlock();
++
+ 			page-&gt;bin_index = binIndex;
+ 			page-&gt;free_count = bin-&gt;max_free_count;
+ 			page-&gt;empty_index = 0;
+@@ -1336,6 +1338,8 @@
+ 			page-&gt;next = page-&gt;prev = NULL;
+ 		}
+ 
++		binLocker.Unlock();
++
+ #if KERNEL_HEAP_LEAK_CHECK
+ 		heap_leak_check_info *info = (heap_leak_check_info *)((addr_t)address
+ 			+ bin-&gt;element_size - sizeof(heap_leak_check_info));
+@@ -1396,8 +1400,6 @@
+ 		panic(&quot;memalign() with an alignment which is not a power of 2\n&quot;);
+ #endif
+ 
+-	mutex_lock(&amp;heap-&gt;lock);
+-
+ #if KERNEL_HEAP_LEAK_CHECK
+ 	size += sizeof(heap_leak_check_info);
+ #endif
+@@ -1420,15 +1422,14 @@
+ 
+ 	void *address = heap_raw_alloc(heap, size, binIndex);
+ 
+-	TRACE((&quot;memalign(): asked to allocate %lu bytes, returning pointer %p\n&quot;,
+-		size, address));
+-
+ #if KERNEL_HEAP_LEAK_CHECK
+ 	size -= sizeof(heap_leak_check_info);
+ #endif
+ 
++	TRACE((&quot;memalign(): asked to allocate %lu bytes, returning pointer %p\n&quot;,
++		size, address));
++
+ 	T(Allocate((addr_t)address, size));
+-	mutex_unlock(&amp;heap-&gt;lock);
+ 	if (address == NULL)
+ 		return address;
+ 
+@@ -1453,8 +1454,7 @@
+ 	if (address == NULL)
+ 		return B_OK;
+ 
+-	mutex_lock(&amp;heap-&gt;lock);
+-
++	ReadLocker areaReadLocker(heap-&gt;area_lock);
+ 	heap_area *area = heap-&gt;all_areas;
+ 	while (area) {
+ 		// since the all_areas list is ordered by base with the biggest
+@@ -1476,7 +1476,6 @@
+ 
+ 	if (area == NULL) {
+ 		// this address does not belong to us
+-		mutex_unlock(&amp;heap-&gt;lock);
+ 		return B_ENTRY_NOT_FOUND;
+ 	}
+ 
+@@ -1490,19 +1489,18 @@
+ 
+ 	if (page-&gt;bin_index &gt; heap-&gt;bin_count) {
+ 		panic(&quot;free(): page %p: invalid bin_index %d\n&quot;, page, page-&gt;bin_index);
+-		mutex_unlock(&amp;heap-&gt;lock);
+ 		return B_ERROR;
+ 	}
+ 
+-	area_id areaToDelete = -1;
+ 	if (page-&gt;bin_index &lt; heap-&gt;bin_count) {
+ 		// small allocation
+ 		heap_bin *bin = &amp;heap-&gt;bins[page-&gt;bin_index];
++		MutexLocker binLocker(bin-&gt;lock);
++
+ 		if (((addr_t)address - area-&gt;base - page-&gt;index
+ 			* heap-&gt;page_size) % bin-&gt;element_size != 0) {
+ 			panic(&quot;free(): passed invalid pointer %p supposed to be in bin for &quot;
+ 				&quot;element size %ld\n&quot;, address, bin-&gt;element_size);
+-			mutex_unlock(&amp;heap-&gt;lock);
+ 			return B_ERROR;
+ 		}
+ 
+@@ -1515,7 +1513,6 @@
+ 				if (temp == address) {
+ 					panic(&quot;free(): address %p already exists in page free &quot;
+ 						&quot;list\n&quot;, address);
+-					mutex_unlock(&amp;heap-&gt;lock);
+ 					return B_ERROR;
+ 				}
+ 			}
+@@ -1525,7 +1522,6 @@
+ 		if (bin-&gt;element_size % 4 != 0) {
+ 			panic(&quot;free(): didn't expect a bin element size that is not a &quot;
+ 				&quot;multiple of 4\n&quot;);
+-			mutex_unlock(&amp;heap-&gt;lock);
+ 			return B_ERROR;
+ 		}
+ 
+@@ -1542,10 +1538,11 @@
+ 
+ 		if (page-&gt;free_count == bin-&gt;max_free_count) {
+ 			// we are now empty, remove the page from the bin list
++			MutexLocker pageLocker(heap-&gt;page_lock);
+ 			heap_unlink_page(page, &amp;bin-&gt;page_list);
+ 			page-&gt;in_use = 0;
+ 			heap_link_page(page, &amp;area-&gt;free_pages);
+-			areaToDelete = heap_free_pages_added(heap, area, 1);
++			heap_free_pages_added(heap, area, 1);
+ 		} else if (page-&gt;free_count == 1) {
+ 			// we need to add ourselfs to the page list of the bin
+ 			heap_link_page(page, &amp;bin-&gt;page_list);
+@@ -1572,6 +1569,8 @@
+ 		uint32 allocationID = page-&gt;allocation_id;
+ 		uint32 maxPages = area-&gt;page_count - page-&gt;index;
+ 		uint32 pageCount = 0;
++
++		MutexLocker pageLocker(heap-&gt;page_lock);
+ 		for (uint32 i = 0; i &lt; maxPages; i++) {
+ 			// loop until we find the end of this allocation
+ 			if (!page[i].in_use || page[i].bin_index != heap-&gt;bin_count
+@@ -1587,16 +1586,27 @@
+ 			pageCount++;
+ 		}
+ 
+-		areaToDelete = heap_free_pages_added(heap, area, pageCount);
++		heap_free_pages_added(heap, area, pageCount);
+ 	}
+ 
+ 	T(Free((addr_t)address));
+-	mutex_unlock(&amp;heap-&gt;lock);
++	areaReadLocker.Unlock();
+ 
+-	if (areaToDelete &gt;= B_OK) {
+-		// adding free pages caused an area to become empty and freeable that
+-		// we can now delete as we don't hold the heap lock anymore
+-		delete_area(areaToDelete);
++	if (heap-&gt;empty_areas &gt; 1) {
++		WriteLocker areaWriteLocker(heap-&gt;area_lock);
++		MutexLocker pageLocker(heap-&gt;page_lock);
++
++		area = heap-&gt;areas;
++		while (area != NULL &amp;&amp; heap-&gt;empty_areas &gt; 1) {
++			if (area-&gt;area &gt;= 0
++				&amp;&amp; area-&gt;free_page_count == area-&gt;page_count
++				&amp;&amp; heap_remove_area(heap, area) == B_OK) {
++				delete_area(area-&gt;area);
++				heap-&gt;empty_areas--;
++			}
++
++			area = area-&gt;next;
++		}
+ 	}
+ 
+ 	return B_OK;
+@@ -1616,19 +1626,29 @@
+ heap_realloc(heap_allocator *heap, void *address, void **newAddress,
+ 	size_t newSize)
+ {
+-	mutex_lock(&amp;heap-&gt;lock);
++	ReadLocker heapReadLocker(heap-&gt;area_lock);
+ 	heap_area *area = heap-&gt;all_areas;
+ 	while (area) {
+-		if ((addr_t)address &gt;= area-&gt;base
+-			&amp;&amp; (addr_t)address &lt; area-&gt;base + area-&gt;size)
++		// since the all_areas list is ordered by base with the biggest
++		// base at the top, we need only find the first area with a base
++		// smaller than our address to become our only candidate for
++		// reallocating
++		if (area-&gt;base &lt;= (addr_t)address) {
++			if ((addr_t)address &gt;= area-&gt;base + area-&gt;size) {
++				// the only candidate area doesn't contain the address,
++				// set it to NULL so we return below (none of the other areas
++				// can contain the address as the list is ordered)
++				area = NULL;
++			}
++
+ 			break;
++		}
+ 
+ 		area = area-&gt;all_next;
+ 	}
+ 
+ 	if (area == NULL) {
+ 		// this address does not belong to us
+-		mutex_unlock(&amp;heap-&gt;lock);
+ 		return B_ENTRY_NOT_FOUND;
+ 	}
+ 
+@@ -1639,7 +1659,6 @@
+ 	if (page-&gt;bin_index &gt; heap-&gt;bin_count) {
+ 		panic(&quot;realloc(): page %p: invalid bin_index %d\n&quot;, page,
+ 			page-&gt;bin_index);
+-		mutex_unlock(&amp;heap-&gt;lock);
+ 		return B_ERROR;
+ 	}
+ 
+@@ -1657,6 +1676,8 @@
+ 		uint32 allocationID = page-&gt;allocation_id;
+ 		uint32 maxPages = area-&gt;page_count - page-&gt;index;
+ 		maxSize = heap-&gt;page_size;
++
++		MutexLocker pageLocker(heap-&gt;page_lock);
+ 		for (uint32 i = 1; i &lt; maxPages; i++) {
+ 			if (!page[i].in_use || page[i].bin_index != heap-&gt;bin_count
+ 				|| page[i].allocation_id != allocationID)
+@@ -1667,7 +1688,7 @@
+ 		}
+ 	}
+ 
+-	mutex_unlock(&amp;heap-&gt;lock);
++	heapReadLocker.Unlock();
+ 
+ #if KERNEL_HEAP_LEAK_CHECK
+ 	newSize += sizeof(heap_leak_check_info);
+@@ -2001,11 +2022,11 @@
+ 
+ 
+ void *
+-malloc_nogrow(size_t size)
++memalign_nogrow(size_t alignment, size_t size)
+ {
+ 	// use dedicated memory in the grow thread by default
+ 	if (thread_get_current_thread_id() == sHeapGrowThread) {
+-		void *result = heap_memalign(sGrowHeap, 0, size);
++		void *result = heap_memalign(sGrowHeap, alignment, size);
+ 		if (!sAddGrowHeap &amp;&amp; heap_should_grow(sGrowHeap)) {
+ 			// hopefully the heap grower will manage to create a new heap
+ 			// before running out of private memory...
+@@ -2020,7 +2041,7 @@
+ 
+ 	// try public memory, there might be something available
+ 	heap_allocator *heap = sHeaps[heap_class_for(size)];
+-	void *result = heap_memalign(heap, 0, size);
++	void *result = heap_memalign(heap, alignment, size);
+ 	if (result != NULL)
+ 		return result;
+ 
+@@ -2035,6 +2056,13 @@
+ 
+ 
+ void *
++malloc_nogrow(size_t size)
++{
++	return memalign_nogrow(0, size);
++}
++
++
++void *
+ malloc(size_t size)
+ {
+ 	return memalign(0, size);
+@@ -2169,36 +2197,35 @@
+ 
+ 
+ void
+-deferred_free(void* block)
++deferred_free(void *block)
+ {
+ 	if (block == NULL)
+ 		return;
+ 
+-	DeferredFreeListEntry* entry = new(block) DeferredFreeListEntry;
++	DeferredFreeListEntry *entry = new(block) DeferredFreeListEntry;
+ 
+ 	InterruptsSpinLocker _(sDeferredFreeListLock);
+ 	sDeferredFreeList.Add(entry);
+ }
+ 
+ 
+-void*
++void *
+ malloc_referenced(size_t size)
+ {
+-	int32* referencedData = (int32*)malloc(size + 4);
++	int32 *referencedData = (int32 *)malloc(size + 4);
+ 	if (referencedData == NULL)
+ 		return NULL;
+ 
+ 	*referencedData = 1;
+-
+ 	return referencedData + 1;
+ }
+ 
+ 
+-void*
+-malloc_referenced_acquire(void* data)
++void *
++malloc_referenced_acquire(void *data)
+ {
+ 	if (data != NULL) {
+-		int32* referencedData = (int32*)data - 1;
++		int32 *referencedData = (int32 *)data - 1;
+ 		atomic_add(referencedData, 1);
+ 	}
+ 
+@@ -2207,12 +2234,12 @@
+ 
+ 
+ void
+-malloc_referenced_release(void* data)
++malloc_referenced_release(void *data)
+ {
+ 	if (data == NULL)
+ 		return;
+ 
+-	int32* referencedData = (int32*)data - 1;
++	int32 *referencedData = (int32 *)data - 1;
+ 	if (atomic_add(referencedData, -1) &lt; 1)
+ 		free(referencedData);
+ }
+@@ -2224,7 +2251,7 @@
+ 
+ 
+ void
+-deferred_delete(DeferredDeletable* deletable)
++deferred_delete(DeferredDeletable *deletable)
+ {
+ 	if (deletable == NULL)
+ 		return;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018686.html">[Haiku-commits] r32073 - in haiku/trunk: headers/private/kernel	headers/private/kernel/arch headers/private/kernel/arch/x86	src/system/boot/loader src/system/boot/platform/bios_ia32	src/system/boot/platform/openfirmware/arch/ppc	src/system/boot/platform/u-boot src/system/kernel	src/system/kernel/arch/m68k src/system/kernel/arch/ppc	src/system/kernel/arch/x86 src/system/kernel/debug	src/system/kernel/slab src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="018690.html">[Haiku-commits] r32075 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18689">[ date ]</a>
+              <a href="thread.html#18689">[ thread ]</a>
+              <a href="subject.html#18689">[ subject ]</a>
+              <a href="author.html#18689">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

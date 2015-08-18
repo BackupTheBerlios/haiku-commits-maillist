@@ -1,0 +1,154 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23036 - haiku/trunk/src/libs/compat/freebsd_network
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-December/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23036%20-%20haiku/trunk/src/libs/compat/freebsd_network&In-Reply-To=%3C200712011109.lB1B9wsk031119%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004911.html">
+   <LINK REL="Next"  HREF="004913.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23036 - haiku/trunk/src/libs/compat/freebsd_network</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23036%20-%20haiku/trunk/src/libs/compat/freebsd_network&In-Reply-To=%3C200712011109.lB1B9wsk031119%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23036 - haiku/trunk/src/libs/compat/freebsd_network">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sat Dec  1 12:09:58 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004911.html">[Haiku-commits] r23035 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+        <LI>Next message: <A HREF="004913.html">[Haiku-commits] r23037 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4912">[ date ]</a>
+              <a href="thread.html#4912">[ thread ]</a>
+              <a href="subject.html#4912">[ subject ]</a>
+              <a href="author.html#4912">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-12-01 12:09:58 +0100 (Sat, 01 Dec 2007)
+New Revision: 23036
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23036&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23036&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/libs/compat/freebsd_network/compat.c
+Log:
+* device_delete_child() now works differently from FreeBSD: in FreeBSD you can't just
+  call this function if you don't know if a device has a direct reference to one of
+  its children. Since we want to be able to delete the root without having any knowledge
+  about its children, we now detach everything first, and then delete the entries.
+  This fixes a possible crashing bug when a preloaded driver (used for network boot)
+  tried to acquire its resources again at a later point.
+* device_detach() and device_attach() now check if the device has an attach or detach
+  method at all.
+
+
+Modified: haiku/trunk/src/libs/compat/freebsd_network/compat.c
+===================================================================
+--- haiku/trunk/src/libs/compat/freebsd_network/compat.c	2007-12-01 10:18:27 UTC (rev 23035)
++++ haiku/trunk/src/libs/compat/freebsd_network/compat.c	2007-12-01 11:09:58 UTC (rev 23036)
+@@ -314,27 +314,40 @@
+ int
+ device_delete_child(device_t parent, device_t child)
+ {
++	int status;
++
+ 	if (child == NULL)
+ 		return 0;
+ 
+ 	if (parent != NULL)
+ 		list_remove_item(&amp;parent-&gt;children, child);
+ 
++	// We differentiate from the FreeBSD logic here - it will first delete
++	// the children, and will then detach the device.
++	// This has the problem that you cannot safely call device_delete_child()
++	// as you don't know if one of the children deletes its own children this
++	// way when it is detached.
++	// Therefore, we'll detach first, and then delete whatever is left.
++
+ 	parent = child;
++	child = NULL;
+ 
+-	while ((child = list_remove_head_item(&amp;parent-&gt;children)) != NULL) {
+-		device_delete_child(NULL, child);
++	// detach children
++	while ((child = list_get_next_item(&amp;parent-&gt;children, child)) != NULL) {
++		device_detach(child);
+ 	}
+ 
+-	if ((atomic_and(&amp;parent-&gt;flags, ~DEVICE_ATTACHED) &amp; DEVICE_ATTACHED) != 0
+-		&amp;&amp; parent-&gt;methods.detach != NULL) {
+-		int status = parent-&gt;methods.detach(parent);
+-		if (status != 0) {
+-			atomic_or(&amp;parent-&gt;flags, DEVICE_ATTACHED);
+-			return status;
+-		}
++	// detach device
++	status = device_detach(parent);
++	if (status != 0)
++		return status;
++
++	// delete children
++	while ((child = list_get_first_item(&amp;parent-&gt;children)) != NULL) {
++		device_delete_child(parent, child);
+ 	}
+ 
++	// delete device
+ 	if (parent-&gt;flags &amp; DEVICE_DESC_ALLOCED)
+ 		free((char *)parent-&gt;description);
+ 
+@@ -356,7 +369,8 @@
+ {
+ 	int result;
+ 
+-	if (device-&gt;driver == NULL)
++	if (device-&gt;driver == NULL
++		|| device-&gt;methods.attach == NULL)
+ 		return B_ERROR;
+ 
+ 	result = device-&gt;methods.attach(device);
+@@ -373,7 +387,8 @@
+ 	if (device-&gt;driver == NULL)
+ 		return B_ERROR;
+ 
+-	if ((atomic_and(&amp;device-&gt;flags, ~DEVICE_ATTACHED) &amp; DEVICE_ATTACHED) != 0) {
++	if ((atomic_and(&amp;device-&gt;flags, ~DEVICE_ATTACHED) &amp; DEVICE_ATTACHED) != 0
++		&amp;&amp; device-&gt;methods.detach != NULL) {
+ 		int result = device-&gt;methods.detach(device);
+ 		if (result != 0) {
+ 			atomic_or(&amp;device-&gt;flags, DEVICE_ATTACHED);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004911.html">[Haiku-commits] r23035 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+	<LI>Next message: <A HREF="004913.html">[Haiku-commits] r23037 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4912">[ date ]</a>
+              <a href="thread.html#4912">[ thread ]</a>
+              <a href="subject.html#4912">[ subject ]</a>
+              <a href="author.html#4912">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

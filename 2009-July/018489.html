@@ -1,0 +1,702 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31942 - haiku/trunk/src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31942%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200907292134.n6TLYrbo008338%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018488.html">
+   <LINK REL="Next"  HREF="018510.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31942 - haiku/trunk/src/system/kernel/debug</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31942%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200907292134.n6TLYrbo008338%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31942 - haiku/trunk/src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Jul 29 23:34:53 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018488.html">[Haiku-commits] r31941 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/arch/x86	src/system/kernel/slab src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="018510.html">[Haiku-commits] r31942 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18489">[ date ]</a>
+              <a href="thread.html#18489">[ thread ]</a>
+              <a href="subject.html#18489">[ subject ]</a>
+              <a href="author.html#18489">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-07-29 23:34:51 +0200 (Wed, 29 Jul 2009)
+New Revision: 31942
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31942&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31942&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/debug/tracing.cpp
+Log:
+mmlr + bonefish:
+Moved the static variables for managing the tracing buffer into a separate
+area. The area is mapped at one of a few possible physical addresses and can
+be found again when rebooting. This allows us to resurrect the tracing buffer
+from the previous session, which could help tremendously when tracking certain
+bugs (like triple faults). There's very little checking done yet, so it is
+probably not as robust as we would wish it to be.
+
+
+Modified: haiku/trunk/src/system/kernel/debug/tracing.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/tracing.cpp	2009-07-29 21:30:35 UTC (rev 31941)
++++ haiku/trunk/src/system/kernel/debug/tracing.cpp	2009-07-29 21:34:51 UTC (rev 31942)
+@@ -18,6 +18,7 @@
+ #include &lt;team.h&gt;
+ #include &lt;thread.h&gt;
+ #include &lt;util/AutoLock.h&gt;
++#include &lt;vm.h&gt;
+ 
+ 
+ struct tracing_stack_trace {
+@@ -47,23 +48,220 @@
+ static const size_t kTraceOutputBufferSize = 10240;
+ static const size_t kBufferSize = MAX_TRACE_SIZE / 4;
+ 
+-static trace_entry* sBuffer;
+-static trace_entry* sFirstEntry;
+-static trace_entry* sAfterLastEntry;
+-static uint32 sEntries;
+-static uint32 sWritten;
+-static spinlock sLock;
+-static char* sTraceOutputBuffer;
++static const addr_t kMetaDataBaseAddress		= 32 * 1024 * 1024;
++static const addr_t kMetaDataBaseEndAddress		= 128 * 1024 * 1024;
++static const addr_t kMetaDataAddressIncrement	= 8 * 1024 * 1024;
++static const uint32 kMetaDataMagic1 = 'Vali';
++static const uint32 kMetaDataMagic2 = 'dTra';
++static const uint32 kMetaDataMagic3 = 'cing';
+ 
+ 
++class TracingMetaData {
++public:
++	uint32			magic1;
++	trace_entry*	buffer;
++	trace_entry*	firstEntry;
++	trace_entry*	afterLastEntry;
++	uint32			entries;
++	uint32			magic2;
++	uint32			written;
++	spinlock		lock;
++	char*			traceOutputBuffer;
++	addr_t			physicalAddress;
++	uint32			magic3;
++
++	static status_t Create(TracingMetaData*&amp; _metaData)
++	{
++		// search meta data in memory (from previous session)
++		area_id area;
++		TracingMetaData* metaData;
++		status_t error = _CreateMetaDataArea(true, area, metaData);
++		if (error == B_OK) {
++			if (_InitPreviousTracingData(metaData)) {
++				_metaData = metaData;
++				return B_OK;
++			}
++
++			dprintf(&quot;Found previous tracing meta data, but failed to init.\n&quot;);
++
++			// invalidate the meta data
++			metaData-&gt;magic1 = 0;
++			metaData-&gt;magic2 = 0;
++			metaData-&gt;magic3 = 0;
++			delete_area(area);
++		} else
++			dprintf(&quot;No previous tracing meta data found.\n&quot;);
++
++		// no previous tracng data found -- create new one
++		error = _CreateMetaDataArea(false, area, metaData);
++		if (error != B_OK)
++			return error;
++
++		area = create_area(&quot;tracing log&quot;,
++			(void**)&amp;metaData-&gt;traceOutputBuffer, B_ANY_KERNEL_ADDRESS,
++			kTraceOutputBufferSize + MAX_TRACE_SIZE, B_CONTIGUOUS,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++		if (area &lt; 0)
++			return area;
++
++		// get the physical address
++		physical_entry physicalEntry;
++		if (get_memory_map(metaData-&gt;traceOutputBuffer, B_PAGE_SIZE,
++				&amp;physicalEntry, 1) == B_OK) {
++			metaData-&gt;physicalAddress = (addr_t)physicalEntry.address;
++		} else {
++			dprintf(&quot;TracingMetaData::Create(): failed to get physical address &quot;
++				&quot;of tracing buffer\n&quot;);
++			metaData-&gt;physicalAddress = 0;
++		}
++
++		metaData-&gt;buffer = (trace_entry*)(metaData-&gt;traceOutputBuffer
++			+ kTraceOutputBufferSize);
++		metaData-&gt;firstEntry = metaData-&gt;buffer;
++		metaData-&gt;afterLastEntry = metaData-&gt;buffer;
++
++		metaData-&gt;entries = 0;
++		metaData-&gt;written = 0;
++		B_INITIALIZE_SPINLOCK(&amp;metaData-&gt;lock);
++
++		metaData-&gt;magic1 = kMetaDataMagic1;
++		metaData-&gt;magic2 = kMetaDataMagic2;
++		metaData-&gt;magic3 = kMetaDataMagic3;
++
++		_metaData = metaData;
++		return B_OK;
++	}
++
++private:
++	static status_t _CreateMetaDataArea(bool findPrevious,
++		area_id&amp; _area, TracingMetaData*&amp; _metaData)
++	{
++		// search meta data in memory (from previous session)
++		TracingMetaData* metaData;
++		addr_t metaDataAddress = kMetaDataBaseAddress;
++		for (; metaDataAddress &lt;= kMetaDataBaseEndAddress;
++				metaDataAddress += kMetaDataAddressIncrement) {
++			area_id area = create_area_etc(B_SYSTEM_TEAM, &quot;tracing metadata&quot;,
++				(void**)&amp;metaData, B_ANY_KERNEL_ADDRESS, B_PAGE_SIZE,
++				B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++				metaDataAddress, CREATE_AREA_DONT_CLEAR);
++			if (area &lt; 0)
++				continue;
++
++			if (!findPrevious) {
++				_area = area;
++				_metaData = metaData;
++				return B_OK;
++			}
++
++			if (metaData-&gt;magic1 == kMetaDataMagic1
++				&amp;&amp; metaData-&gt;magic2 == kMetaDataMagic2
++				&amp;&amp; metaData-&gt;magic3 == kMetaDataMagic3) {
++				_area = area;
++				_metaData = metaData;
++				return B_OK;
++			}
++
++			delete_area(area);
++		}
++
++		return B_ENTRY_NOT_FOUND;
++	}
++
++	static bool _InitPreviousTracingData(TracingMetaData* metaData)
++	{
++		addr_t bufferStart
++			= (addr_t)metaData-&gt;traceOutputBuffer + kTraceOutputBufferSize;
++		addr_t bufferEnd = bufferStart + MAX_TRACE_SIZE;
++
++		if (bufferStart &gt; bufferEnd || (addr_t)metaData-&gt;buffer != bufferStart
++			|| (addr_t)metaData-&gt;firstEntry &lt; bufferStart
++			|| (addr_t)metaData-&gt;firstEntry + sizeof(trace_entry) &gt;= bufferEnd
++			|| (addr_t)metaData-&gt;afterLastEntry &lt; bufferStart
++			|| (addr_t)metaData-&gt;afterLastEntry &gt; bufferEnd
++			|| metaData-&gt;physicalAddress == 0) {
++			dprintf(&quot;Failed to init tracing meta data: Sanity checks &quot;
++				&quot;failed.\n&quot;);
++			return false;
++		}
++
++		// re-map the previous tracing buffer
++		void* buffer = metaData-&gt;traceOutputBuffer;
++		area_id area = create_area_etc(B_SYSTEM_TEAM, &quot;tracing log&quot;,
++			&amp;buffer, B_EXACT_ADDRESS, kTraceOutputBufferSize + MAX_TRACE_SIZE,
++			B_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++			metaData-&gt;physicalAddress, CREATE_AREA_DONT_CLEAR);
++		if (area &lt; 0) {
++			dprintf(&quot;Failed to init tracing meta data: Mapping tracing log &quot;
++				&quot;buffer failed: %s\n&quot;, strerror(area));
++			return false;
++		}
++
++		// TODO: More checks:
++		// * tracing entry counts
++		// * tracing entries (linked list)
++		// * tracing entries objects (vtables)
++
++		B_INITIALIZE_SPINLOCK(&amp;metaData-&gt;lock);
++
++		return true;
++	}
++};
++
++static TracingMetaData* sTracingMetaData;
++static TracingMetaData sDummyTracingMetaData;
++
++
++static inline trace_entry*
++Buffer()
++{
++	return sTracingMetaData-&gt;buffer;
++}
++
++
++static inline trace_entry*&amp;
++FirstEntry()
++{
++	return sTracingMetaData-&gt;firstEntry;
++}
++
++
++static inline trace_entry*&amp;
++AfterLastEntry()
++{
++	return sTracingMetaData-&gt;afterLastEntry;
++}
++
++
++static inline uint32&amp;
++Entries()
++{
++	return sTracingMetaData-&gt;entries;
++}
++
++
++static inline uint32&amp;
++Written()
++{
++	return sTracingMetaData-&gt;written;
++}
++
++
++static inline spinlock&amp;
++Lock()
++{
++	return sTracingMetaData-&gt;lock;
++}
++
++
+ static trace_entry*
+ next_entry(trace_entry* entry)
+ {
+ 	entry += entry-&gt;size;
+ 	if ((entry-&gt;flags &amp; WRAP_ENTRY) != 0)
+-		entry = sBuffer;
++		entry = Buffer();
+ 
+-	if (entry == sAfterLastEntry)
++	if (entry == AfterLastEntry())
+ 		return NULL;
+ 
+ 	return entry;
+@@ -73,12 +271,12 @@
+ static trace_entry*
+ previous_entry(trace_entry* entry)
+ {
+-	if (entry == sFirstEntry)
++	if (entry == FirstEntry())
+ 		return NULL;
+ 
+-	if (entry == sBuffer) {
++	if (entry == Buffer()) {
+ 		// beginning of buffer -- previous entry is a wrap entry
+-		entry = sBuffer + kBufferSize - entry-&gt;previous_size;
++		entry = Buffer() + kBufferSize - entry-&gt;previous_size;
+ 	}
+ 
+ 	return entry - entry-&gt;previous_size;
+@@ -88,16 +286,16 @@
+ static bool
+ free_first_entry()
+ {
+-	TRACE((&quot;  skip start %p, %lu*4 bytes\n&quot;, sFirstEntry, sFirstEntry-&gt;size));
++	TRACE((&quot;  skip start %p, %lu*4 bytes\n&quot;, FirstEntry(), FirstEntry()-&gt;size));
+ 
+-	trace_entry* newFirst = next_entry(sFirstEntry);
++	trace_entry* newFirst = next_entry(FirstEntry());
+ 
+-	if (sFirstEntry-&gt;flags &amp; BUFFER_ENTRY) {
++	if (FirstEntry()-&gt;flags &amp; BUFFER_ENTRY) {
+ 		// a buffer entry -- just skip it
+-	} else if (sFirstEntry-&gt;flags &amp; ENTRY_INITIALIZED) {
++	} else if (FirstEntry()-&gt;flags &amp; ENTRY_INITIALIZED) {
+ 		// fully initialized TraceEntry -- destroy it
+-		TraceEntry::FromTraceEntry(sFirstEntry)-&gt;~TraceEntry();
+-		sEntries--;
++		TraceEntry::FromTraceEntry(FirstEntry())-&gt;~TraceEntry();
++		Entries()--;
+ 	} else {
+ 		// Not fully initialized TraceEntry. We can't free it, since
+ 		// then it's constructor might still write into the memory and
+@@ -107,74 +305,74 @@
+ 	}
+ 
+ 	if (newFirst == NULL) {
+-		// everything is freed -- that practically this can't happen, if
++		// everything is freed -- practically this can't happen, if
+ 		// the buffer is large enough to hold three max-sized entries
+-		sFirstEntry = sAfterLastEntry = sBuffer;
++		FirstEntry() = AfterLastEntry() = Buffer();
+ 		TRACE((&quot;free_first_entry(): all entries freed!\n&quot;));
+ 	} else
+-		sFirstEntry = newFirst;
++		FirstEntry() = newFirst;
+ 
+ 	return true;
+ }
+ 
+ 
+-/*!	Makes sure we have needed * 4 bytes of memory at sAfterLastEntry.
++/*!	Makes sure we have needed * 4 bytes of memory at AfterLastEntry().
+ 	Returns \c false, if unable to free that much.
+ */
+ static bool
+ make_space(size_t needed)
+ {
+-	// we need space for sAfterLastEntry, too (in case we need to wrap around
++	// we need space for AfterLastEntry(), too (in case we need to wrap around
+ 	// later)
+ 	needed++;
+ 
+-	// If there's not enough space (free or occupied) after sAfterLastEntry,
++	// If there's not enough space (free or occupied) after AfterLastEntry(),
+ 	// we free all entries in that region and wrap around.
+-	if (sAfterLastEntry + needed &gt; sBuffer + kBufferSize) {
++	if (AfterLastEntry() + needed &gt; Buffer() + kBufferSize) {
+ 		TRACE((&quot;make_space(%lu), wrapping around: after last: %p\n&quot;, needed,
+-			sAfterLastEntry));
++			AfterLastEntry()));
+ 
+-		// Free all entries after sAfterLastEntry and one more at the beginning
++		// Free all entries after AfterLastEntry() and one more at the beginning
+ 		// of the buffer.
+-		while (sFirstEntry &gt; sAfterLastEntry) {
++		while (FirstEntry() &gt; AfterLastEntry()) {
+ 			if (!free_first_entry())
+ 				return false;
+ 		}
+-		if (sAfterLastEntry != sBuffer &amp;&amp; !free_first_entry())
++		if (AfterLastEntry() != Buffer() &amp;&amp; !free_first_entry())
+ 			return false;
+ 
+ 		// just in case free_first_entry() freed the very last existing entry
+-		if (sAfterLastEntry == sBuffer)
++		if (AfterLastEntry() == Buffer())
+ 			return true;
+ 
+ 		// mark as wrap entry and actually wrap around
+-		trace_entry* wrapEntry = sAfterLastEntry;
++		trace_entry* wrapEntry = AfterLastEntry();
+ 		wrapEntry-&gt;size = 0;
+ 		wrapEntry-&gt;flags = WRAP_ENTRY;
+-		sAfterLastEntry = sBuffer;
+-		sAfterLastEntry-&gt;previous_size = sBuffer + kBufferSize - wrapEntry;
++		AfterLastEntry() = Buffer();
++		AfterLastEntry()-&gt;previous_size = Buffer() + kBufferSize - wrapEntry;
+ 	}
+ 
+-	if (sFirstEntry &lt;= sAfterLastEntry) {
+-		// buffer is empty or the space after sAfterLastEntry is unoccupied
++	if (FirstEntry() &lt;= AfterLastEntry()) {
++		// buffer is empty or the space after AfterLastEntry() is unoccupied
+ 		return true;
+ 	}
+ 
+ 	// free the first entries, until there's enough space
+-	size_t space = sFirstEntry - sAfterLastEntry;
++	size_t space = FirstEntry() - AfterLastEntry();
+ 
+ 	if (space &lt; needed) {
+ 		TRACE((&quot;make_space(%lu), left %ld\n&quot;, needed, space));
+ 	}
+ 
+ 	while (space &lt; needed) {
+-		space += sFirstEntry-&gt;size;
++		space += FirstEntry()-&gt;size;
+ 
+ 		if (!free_first_entry())
+ 			return false;
+ 	}
+ 
+-	TRACE((&quot;  out: start %p, entries %ld\n&quot;, sFirstEntry, sEntries));
++	TRACE((&quot;  out: start %p, entries %ld\n&quot;, FirstEntry(), Entries()));
+ 
+ 	return true;
+ }
+@@ -183,31 +381,31 @@
+ static trace_entry*
+ allocate_entry(size_t size, uint16 flags)
+ {
+-	if (sAfterLastEntry == NULL || size == 0 || size &gt;= 65532)
++	if (AfterLastEntry() == NULL || size == 0 || size &gt;= 65532)
+ 		return NULL;
+ 
+-	InterruptsSpinLocker _(sLock);
++	InterruptsSpinLocker _(Lock());
+ 
+ 	size = (size + 3) &gt;&gt; 2;
+ 		// 4 byte aligned, don't store the lower 2 bits
+ 
+ 	TRACE((&quot;allocate_entry(%lu), start %p, end %p, buffer %p\n&quot;, size * 4,
+-		sFirstEntry, sAfterLastEntry, sBuffer));
++		FirstEntry(), AfterLastEntry(), Buffer()));
+ 
+ 	if (!make_space(size))
+ 		return NULL;
+ 
+-	trace_entry* entry = sAfterLastEntry;
++	trace_entry* entry = AfterLastEntry();
+ 	entry-&gt;size = size;
+ 	entry-&gt;flags = flags;
+-	sAfterLastEntry += size;
+-	sAfterLastEntry-&gt;previous_size = size;
++	AfterLastEntry() += size;
++	AfterLastEntry()-&gt;previous_size = size;
+ 
+ 	if (!(flags &amp; BUFFER_ENTRY))
+-		sEntries++;
++		Entries()++;
+ 
+ 	TRACE((&quot;  entry: %p, end %p, start %p, entries %ld\n&quot;, entry,
+-		sAfterLastEntry, sFirstEntry, sEntries));
++		AfterLastEntry(), FirstEntry(), Entries()));
+ 
+ 	return entry;
+ }
+@@ -327,7 +525,7 @@
+ {
+ #if ENABLE_TRACING
+ 	ToTraceEntry()-&gt;flags |= ENTRY_INITIALIZED;
+-	sWritten++;
++	Written()++;
+ #endif
+ }
+ 
+@@ -456,6 +654,20 @@
+ #endif
+ };
+ 
++
++class TracingLogStartEntry : public AbstractTraceEntry {
++	public:
++		TracingLogStartEntry()
++		{
++			Initialized();
++		}
++
++		virtual void AddDump(TraceOutput&amp; out)
++		{
++			out.Print(&quot;ktrace start&quot;);
++		}
++};
++
+ #endif	// ENABLE_TRACING
+ 
+ 
+@@ -715,7 +927,7 @@
+ TraceEntryIterator::Next()
+ {
+ 	if (fIndex == 0) {
+-		fEntry = _NextNonBufferEntry(sFirstEntry);
++		fEntry = _NextNonBufferEntry(FirstEntry());
+ 		fIndex = 1;
+ 	} else if (fEntry != NULL) {
+ 		fEntry = _NextNonBufferEntry(next_entry(fEntry));
+@@ -729,8 +941,8 @@
+ TraceEntry*
+ TraceEntryIterator::Previous()
+ {
+-	if (fIndex == (int32)sEntries + 1)
+-		fEntry = sAfterLastEntry;
++	if (fIndex == (int32)Entries() + 1)
++		fEntry = AfterLastEntry();
+ 
+ 	if (fEntry != NULL) {
+ 		fEntry = _PreviousNonBufferEntry(previous_entry(fEntry));
+@@ -747,8 +959,8 @@
+ 	if (index == fIndex)
+ 		return Current();
+ 
+-	if (index &lt;= 0 || index &gt; (int32)sEntries) {
+-		fIndex = (index &lt;= 0 ? 0 : sEntries + 1);
++	if (index &lt;= 0 || index &gt; (int32)Entries()) {
++		fIndex = (index &lt;= 0 ? 0 : Entries() + 1);
+ 		fEntry = NULL;
+ 		return NULL;
+ 	}
+@@ -764,11 +976,11 @@
+ 		fEntry = NULL;
+ 		fIndex = 0;
+ 	}
+-	if ((int32)sEntries + 1 - fIndex &lt; distance) {
+-		distance = sEntries + 1 - fIndex;
++	if ((int32)Entries() + 1 - fIndex &lt; distance) {
++		distance = Entries() + 1 - fIndex;
+ 		direction = -1;
+ 		fEntry = NULL;
+-		fIndex = sEntries + 1;
++		fIndex = Entries() + 1;
+ 	}
+ 
+ 	// iterate to the index
+@@ -822,7 +1034,7 @@
+ 	static uint32 _previousOutputFlags = 0;
+ 	static TraceEntryIterator iterator;
+ 
+-	// Note: start and index are Pascal-like indices (i.e. in [1, sEntries]).
++	// Note: start and index are Pascal-like indices (i.e. in [1, Entries()]).
+ 	int32 start = 0;	// special index: print the last count entries
+ 	int32 count = 0;
+ 	int32 maxToCheck = 0;
+@@ -862,8 +1074,8 @@
+ 			print_debugger_command_usage(argv[0]);
+ 			return 0;
+ 		}
+-		if (sWritten == 0 || sWritten != _previousWritten
+-			|| sEntries != _previousEntries) {
++		if (Written() == 0 || Written() != _previousWritten
++			|| Entries() != _previousEntries) {
+ 			kprintf(&quot;Can't continue iteration. \&quot;%s\&quot; has not been invoked &quot;
+ 				&quot;before, or there were new entries written since the last &quot;
+ 				&quot;invocation.\n&quot;, argv[0]);
+@@ -921,7 +1133,7 @@
+ 		if (maxToCheck == 0 || !hasFilter)
+ 			maxToCheck = count;
+ 		else if (maxToCheck &lt; 0)
+-			maxToCheck = sEntries;
++			maxToCheck = Entries();
+ 
+ 		// determine iteration direction
+ 		direction = (start &lt;= 0 || count &lt; 0 ? -1 : 1);
+@@ -931,14 +1143,14 @@
+ 			count = -count;
+ 		if (maxToCheck &lt; 0)
+ 			maxToCheck = -maxToCheck;
+-		if (maxToCheck &gt; (int32)sEntries)
+-			maxToCheck = sEntries;
++		if (maxToCheck &gt; (int32)Entries())
++			maxToCheck = Entries();
+ 		if (count &gt; maxToCheck)
+ 			count = maxToCheck;
+ 
+ 		// validate start
+-		if (start &lt;= 0 || start &gt; (int32)sEntries)
+-			start = max_c(1, sEntries);
++		if (start &lt;= 0 || start &gt; (int32)Entries())
++			start = max_c(1, Entries());
+ 	}
+ 
+ 	if (direction &lt; 0) {
+@@ -946,17 +1158,17 @@
+ 		lastToCheck = start;
+ 	} else {
+ 		firstToCheck = start;
+-		lastToCheck = min_c((int32)sEntries, start + maxToCheck - 1);
++		lastToCheck = min_c((int32)Entries(), start + maxToCheck - 1);
+ 	}
+ 
+ 	// reset the iterator, if something changed in the meantime
+-	if (sWritten == 0 || sWritten != _previousWritten
+-		|| sEntries != _previousEntries) {
++	if (Written() == 0 || Written() != _previousWritten
++		|| Entries() != _previousEntries) {
+ 		iterator.Reset();
+ 	}
+ 
+-	LazyTraceOutput out(sTraceOutputBuffer, kTraceOutputBufferSize,
+-		outputFlags);
++	LazyTraceOutput out(sTracingMetaData-&gt;traceOutputBuffer,
++		kTraceOutputBufferSize, outputFlags);
+ 
+ 	bool markedMatching = false;
+ 	int32 firstToDump = firstToCheck;
+@@ -1059,7 +1271,7 @@
+ 
+ 	kprintf(&quot;printed %ld entries within range %ld to %ld (%ld of %ld total, &quot;
+ 		&quot;%ld ever)\n&quot;, dumped, firstToCheck, lastToCheck,
+-		lastToCheck - firstToCheck + 1, sEntries, sWritten);
++		lastToCheck - firstToCheck + 1, Entries(), Written());
+ 
+ 	// store iteration state
+ 	_previousCount = count;
+@@ -1069,8 +1281,8 @@
+ 	_previousFirstChecked = firstToCheck;
+ 	_previousLastChecked = lastToCheck;
+ 	_previousDirection = direction;
+-	_previousWritten = sWritten;
+-	_previousEntries = sEntries;
++	_previousWritten = Written();
++	_previousEntries = Entries();
+ 	_previousOutputFlags = outputFlags;
+ 
+ 	return cont != 0 ? B_KDEBUG_CONT : 0;
+@@ -1197,7 +1409,7 @@
+ lock_tracing_buffer()
+ {
+ #if ENABLE_TRACING
+-	acquire_spinlock(&amp;sLock);
++	acquire_spinlock(&amp;Lock());
+ #endif
+ }
+ 
+@@ -1206,7 +1418,7 @@
+ unlock_tracing_buffer()
+ {
+ #if ENABLE_TRACING
+-	release_spinlock(&amp;sLock);
++	release_spinlock(&amp;Lock());
+ #endif
+ }
+ 
+@@ -1215,15 +1427,13 @@
+ tracing_init(void)
+ {
+ #if	ENABLE_TRACING
+-	area_id area = create_area(&quot;tracing log&quot;, (void**)&amp;sTraceOutputBuffer,
+-		B_ANY_KERNEL_ADDRESS, MAX_TRACE_SIZE + kTraceOutputBufferSize,
+-		B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+-	if (area &lt; B_OK)
+-		return area;
++	status_t result = TracingMetaData::Create(sTracingMetaData);
++	if (result != B_OK) {
++		sTracingMetaData = &sDummyTracingMetaData;
++		return result;
++	}
+ 
+-	sBuffer = (trace_entry*)(sTraceOutputBuffer + kTraceOutputBufferSize);
+-	sFirstEntry = sBuffer;
+-	sAfterLastEntry = sBuffer;
++	new(nothrow) TracingLogStartEntry();
+ 
+ 	add_debugger_command_etc(&quot;traced&quot;, &amp;dump_tracing_command,
+ 		&quot;Dump recorded trace entries&quot;,
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018488.html">[Haiku-commits] r31941 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/arch/x86	src/system/kernel/slab src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="018510.html">[Haiku-commits] r31942 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18489">[ date ]</a>
+              <a href="thread.html#18489">[ thread ]</a>
+              <a href="subject.html#18489">[ subject ]</a>
+              <a href="author.html#18489">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

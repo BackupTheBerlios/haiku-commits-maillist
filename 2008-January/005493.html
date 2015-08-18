@@ -1,0 +1,453 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23521 - haiku/trunk/src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23521%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200801141539.m0EFdjQk026460%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005489.html">
+   <LINK REL="Next"  HREF="005497.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23521 - haiku/trunk/src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23521%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200801141539.m0EFdjQk026460%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23521 - haiku/trunk/src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Jan 14 16:39:45 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005489.html">[Haiku-commits] r23520 - haiku/trunk/src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="005497.html">[Haiku-commits] r23522 - haiku/trunk/build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5493">[ date ]</a>
+              <a href="thread.html#5493">[ thread ]</a>
+              <a href="subject.html#5493">[ subject ]</a>
+              <a href="author.html#5493">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-01-14 16:39:44 +0100 (Mon, 14 Jan 2008)
+New Revision: 23521
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23521&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23521&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/debug/debug.cpp
+Log:
+* Sort the registered commands by name when entering KDL.
+* Don't execute a command anymore, if the given prefix is ambiguous.
+* Added tab completion for commands.
+* Added on-the-fly help while typing a command line. It is triggered
+  by pressing tab at a position after the space following the command.
+  It is implemented by calling the command with argument &quot;--help&quot;, which
+  doesn't work yet with most commands, but some already print their
+  usage in this case.
+
+
+Modified: haiku/trunk/src/system/kernel/debug/debug.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/debug.cpp	2008-01-14 14:04:35 UTC (rev 23520)
++++ haiku/trunk/src/system/kernel/debug/debug.cpp	2008-01-14 15:39:44 UTC (rev 23521)
+@@ -36,7 +36,11 @@
+ #include &lt;syslog.h&gt;
+ 
+ 
++static const char* const kKDLPrompt = &quot;kdebug&gt; &quot;;
++
+ extern &quot;C&quot; int kgets(char *buffer, int length);
++static int invoke_command(struct debugger_command *command, int argc,
++	char** argv);
+ 
+ typedef struct debugger_command {
+ 	struct debugger_command *next;
+@@ -93,12 +97,28 @@
+ #define distance(a, b) ((a) &lt; (b) ? (b) - (a) : (a) - (b))
+ 
+ 
++static debugger_command*
++next_command(debugger_command* command, const char* prefix, int prefixLen)
++{
++	if (command == NULL)
++		command = sCommands;
++	else
++		command = command-&gt;next;
++
++	while (command != NULL &amp;&amp; !strncmp(prefix, command-&gt;name, prefixLen) == 0)
++		command = command-&gt;next;
++
++	return command;
++}
++
++
+ static debugger_command *
+-find_command(char *name, bool partialMatch)
++find_command(const char *name, bool partialMatch, bool&amp; ambiguous)
+ {
+ 	debugger_command *command;
+-	int length;
+ 
++	ambiguous = false;
++
+ 	// search command by full name
+ 
+ 	for (command = sCommands; command != NULL; command = command-&gt;next) {
+@@ -109,13 +129,13 @@
+ 	// if it couldn't be found, search for a partial match
+ 
+ 	if (partialMatch) {
+-		length = strlen(name);
+-		if (length == 0)
+-			return NULL;
++		int length = strlen(name);
++		command = next_command(NULL, name, length);
++		if (command != NULL) {
++			if (next_command(command, name, length) == NULL)
++				return command;
+ 
+-		for (command = sCommands; command != NULL; command = command-&gt;next) {
+-			if (strncmp(name, command-&gt;name, length) == 0)
+-				return command;
++			ambiguous = true;
+ 		}
+ 	}
+ 
+@@ -144,30 +164,39 @@
+ 
+ 
+ static void
+-insert_char_into_line(char* buffer, int32&amp; position, int32&amp; length, char c)
++insert_chars_into_line(char* buffer, int32&amp; position, int32&amp; length,
++	const char* chars, int32 charCount)
+ {
+-	// make room for the new char in the buffer by moving the subsequent ones
+-	if (position &lt; length)
+-		memmove(buffer + position + 1, buffer + position, length - position);
++	// move the following chars to make room for the ones to insert
++	if (position &lt; length) {
++		memmove(buffer + position + charCount, buffer + position,
++			length - position);
++	}
+ 
+-	buffer[position++] = c;
+-	length++;
++	// insert chars
++	memcpy(buffer + position, chars, charCount);
++	int32 oldPosition = position;
++	position += charCount;
++	length += charCount;
+ 
+-	// print the char
+-	kputchar(c);
++	// print the new chars (and the following ones)
++	kprintf(&quot;%.*s&quot;, (int)(length - oldPosition),
++		buffer + oldPosition);
+ 
+-	// print the rest of the line again, if necessary
+-	if (position &lt; length) {
+-		for (int32 i = position; i &lt; length; i++)
+-			kputchar(buffer[i]);
+-
+-		// reposition the cursor
++	// reposition cursor, if necessary
++	if (position &lt; length)
+ 		kprintf(&quot;\x1b[%ldD&quot;, length - position);
+-	}
+ }
+ 
+ 
+ static void
++insert_char_into_line(char* buffer, int32&amp; position, int32&amp; length, char c)
++{
++	insert_chars_into_line(buffer, position, length, &amp;c, 1);
++}
++
++
++static void
+ remove_char_from_line(char* buffer, int32&amp; position, int32&amp; length)
+ {
+ 	if (position == length)
+@@ -192,8 +221,156 @@
+ }
+ 
+ 
++class LineEditingHelper {
++public:
++	virtual	~LineEditingHelper() {}
++
++	virtual	void TabCompletion(char* buffer, int32 capacity, int32&amp; position,
++		int32&amp; length) = 0;
++};
++
++
++class CommandLineEditingHelper : public LineEditingHelper {
++public:
++	CommandLineEditingHelper()
++	{
++	}
++
++	virtual	~CommandLineEditingHelper() {}
++
++	virtual	void TabCompletion(char* buffer, int32 capacity, int32&amp; position,
++		int32&amp; length)
++	{
++		// find the first space
++		char tmpChar = buffer[position];
++		buffer[position] = '\0';
++		char* firstSpace = strchr(buffer, ' ');
++		buffer[position] = tmpChar;
++
++		bool reprintLine = false;
++
++		if (firstSpace != NULL) {
++			// a complete command -- print its help
++
++			// get the command
++			tmpChar = *firstSpace;
++			*firstSpace = '\0';
++			bool ambiguous;
++			debugger_command* command = find_command(buffer, true, ambiguous);
++			*firstSpace = tmpChar;
++
++			if (command != NULL) {
++				kputchar('\n');
++
++				char* args[3] = { NULL, &quot;--help&quot;, NULL };
++				invoke_command(command, 2, args);
++			} else {
++				if (ambiguous)
++					kprintf(&quot;\nambiguous command\n&quot;);
++				else
++					kprintf(&quot;\nno such command\n&quot;);
++			}
++
++			reprintLine = true;
++		} else {
++			// a partial command -- look for completions
++
++			// check for possible completions
++			int32 count = 0;
++			int32 longestName = 0;
++			debugger_command* command = NULL;
++			int32 longestCommonPrefix = 0;
++			const char* previousCommandName = NULL;
++			while ((command = next_command(command, buffer, position))
++					!= NULL) {
++				count++;
++				int32 nameLength = strlen(command-&gt;name);
++				longestName = max_c(longestName, nameLength);
++
++				// updated the length of the longest common prefix of the
++				// commands
++				if (count == 1) {
++					longestCommonPrefix = longestName;
++				} else {
++					longestCommonPrefix = min_c(longestCommonPrefix,
++						nameLength);
++
++					for (int32 i = position; i &lt; longestCommonPrefix; i++) {
++						if (previousCommandName[i] != command-&gt;name[i]) {
++							longestCommonPrefix = i;
++							break;
++						}
++					}
++				}
++
++				previousCommandName = command-&gt;name;
++			}
++
++			if (count == 0) {
++				// no possible completions
++				kprintf(&quot;\nno completions\n&quot;);
++				reprintLine = true;
++			} else if (count == 1) {
++				// exactly one completion
++				command = next_command(NULL, buffer, position);
++
++				// check for sufficient space in the buffer
++				int32 neededSpace = longestName - position + 1;
++					// remainder of the name plus one space
++				// also consider the terminating null char
++				if (length + neededSpace + 1 &gt;= capacity)
++					return;
++
++				insert_chars_into_line(buffer, position, length,
++					command-&gt;name + position, longestName - position);
++				insert_char_into_line(buffer, position, length, ' ');
++			} else if (longestCommonPrefix &gt; position) {
++				// multiple possible completions with longer common prefix
++				// -- insert the remainder of the common prefix
++				
++				// check for sufficient space in the buffer
++				int32 neededSpace = longestCommonPrefix - position;
++				// also consider the terminating null char
++				if (length + neededSpace + 1 &gt;= capacity)
++					return;
++
++				insert_chars_into_line(buffer, position, length,
++					previousCommandName + position, neededSpace);
++			} else {
++				// multiple possible completions without longer common prefix
++				// -- print them all
++				kprintf(&quot;\n&quot;);
++				reprintLine = true;
++
++				int columns = 80 / (longestName + 2);
++				debugger_command* command = NULL;
++				int column = 0;
++				while ((command = next_command(command, buffer, position))
++						!= NULL) {
++					// spacing
++					if (column &gt; 0 &amp;&amp; column % columns == 0)
++						kputchar('\n');
++					column++;
++
++					kprintf(&quot;  %-*s&quot;, (int)longestName, command-&gt;name);
++				}
++				kputchar('\n');
++			}
++		}
++
++		// reprint the editing line, if necessary
++		if (reprintLine) {
++			kprintf(&quot;%s%.*s&quot;, kKDLPrompt, (int)length, buffer);
++			if (position &lt; length)
++				kprintf(&quot;\x1b[%ldD&quot;, length - position);
++		}
++	}
++};
++
++
+ static int
+-read_line(char *buffer, int32 maxLength)
++read_line(char *buffer, int32 maxLength,
++	LineEditingHelper* editingHelper = NULL)
+ {
+ 	int32 currentHistoryLine = sCurrentLine;
+ 	int32 position = 0;
+@@ -217,6 +394,14 @@
+ 				kputchar('\n');
+ 				done = true;
+ 				break;
++			case '\t':
++			{
++				if (editingHelper != NULL) {
++					editingHelper-&gt;TabCompletion(buffer, maxLength,
++						position, length);
++				}
++				break;
++			}
+ 			case 8: // backspace
+ 				if (position &gt; 0) {
+ 					kputs(&quot;\x1b[1D&quot;); // move to the left one
+@@ -471,8 +656,9 @@
+ 		struct debugger_command *cmd = NULL;
+ 		int argc;
+ 
+-		kprintf(&quot;kdebug&gt; &quot;);
+-		read_line(sLineBuffer[sCurrentLine], LINE_BUFFER_SIZE);
++		CommandLineEditingHelper editingHelper;
++		kprintf(kKDLPrompt);
++		read_line(sLineBuffer[sCurrentLine], LINE_BUFFER_SIZE, &amp;editingHelper);
+ 		parse_line(sLineBuffer[sCurrentLine], sArguments, &amp;argc, MAX_ARGS);
+ 
+ 		// We support calling last executed command again if
+@@ -482,12 +668,20 @@
+ 
+ 		sDebuggerOnCPU = smp_get_current_cpu();
+ 
++		bool ambiguous;
+ 		if (argc &gt; 0)
+-			cmd = find_command(sArguments[0], true);
++			cmd = find_command(sArguments[0], true, ambiguous);
+ 
+-		if (cmd == NULL)
+-			kprintf(&quot;unknown command, enter \&quot;help\&quot; to get a list of all supported commands\n&quot;);
+-		else {
++		if (cmd == NULL) {
++			if (ambiguous) {
++				kprintf(&quot;Ambiguous command. Use tab completion to get a list &quot;
++					&quot;of matching commands. Enter \&quot;help\&quot; to get a list of &quot;
++					&quot;all supported commands.\n&quot;);
++			} else {
++				kprintf(&quot;Unknown command. Enter \&quot;help\&quot; to get a list of all &quot;
++					&quot;supported commands.\n&quot;);
++			}
++		} else {
+ 			int rc = invoke_command(cmd, argc, sArguments);
+ 
+ 			if (rc == B_KDEBUG_QUIT)
+@@ -528,9 +722,10 @@
+ 	debugger_command *command, *specified = NULL;
+ 	const char *start = NULL;
+ 	int32 startLength = 0;
++	bool ambiguous;
+ 
+ 	if (argc &gt; 1) {
+-		specified = find_command(argv[1], false);
++		specified = find_command(argv[1], false, ambiguous);
+ 		if (specified == NULL) {
+ 			start = argv[1];
+ 			startLength = strlen(start);
+@@ -1012,6 +1207,28 @@
+ 
+ 	sCurrentKernelDebuggerMessage = message;
+ 
++	// bubble sort the commands
++	debugger_command* stopCommand = NULL;
++	while (stopCommand != sCommands) {
++		debugger_command** command = &sCommands;
++		while (true) {
++			debugger_command* nextCommand = (*command)-&gt;next;
++			if (nextCommand == stopCommand) {
++				stopCommand = *command;
++				break;
++			}
++
++			if (strcmp((*command)-&gt;name, nextCommand-&gt;name) &gt; 0) {
++				debugger_command* tmpCommand = nextCommand-&gt;next;
++				(*command)-&gt;next = nextCommand-&gt;next;
++				nextCommand-&gt;next = *command;
++				*command = nextCommand;
++			}
++
++			command = &amp;(*command)-&gt;next;
++		}
++	}
++
+ 	kernel_debugger_loop();
+ 
+ 	set_dprintf_enabled(dprintfState);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005489.html">[Haiku-commits] r23520 - haiku/trunk/src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="005497.html">[Haiku-commits] r23522 - haiku/trunk/build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5493">[ date ]</a>
+              <a href="thread.html#5493">[ thread ]</a>
+              <a href="subject.html#5493">[ subject ]</a>
+              <a href="author.html#5493">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

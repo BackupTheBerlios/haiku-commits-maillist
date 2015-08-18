@@ -1,0 +1,567 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32064 -	haiku/trunk/src/add-ons/media/plugins/ffmpeg
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32064%20-%0A%09haiku/trunk/src/add-ons/media/plugins/ffmpeg&In-Reply-To=%3C200908030935.n739ZXqe013308%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018660.html">
+   <LINK REL="Next"  HREF="018678.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32064 -	haiku/trunk/src/add-ons/media/plugins/ffmpeg</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32064%20-%0A%09haiku/trunk/src/add-ons/media/plugins/ffmpeg&In-Reply-To=%3C200908030935.n739ZXqe013308%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32064 -	haiku/trunk/src/add-ons/media/plugins/ffmpeg">stippi at mail.berlios.de
+       </A><BR>
+    <I>Mon Aug  3 11:35:33 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018660.html">[Haiku-commits] r32063 - haiku/trunk/build/jam
+</A></li>
+        <LI>Next message: <A HREF="018678.html">[Haiku-commits] r32065 - haiku/trunk/build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18677">[ date ]</a>
+              <a href="thread.html#18677">[ thread ]</a>
+              <a href="subject.html#18677">[ subject ]</a>
+              <a href="author.html#18677">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-08-03 11:35:30 +0200 (Mon, 03 Aug 2009)
+New Revision: 32064
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32064&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32064&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp
+   haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h
+   haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp
+   haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
+   haiku/trunk/src/add-ons/media/plugins/ffmpeg/EncoderTable.cpp
+Log:
+Implemented audio track encoding. There is something wrong with the PTS
+generation for the packets and how I set the time_base in the AVStream and
+AVStream-&gt;codec structures. This results in the audio streams of the written
+files to report a much too long duration.
+
+
+Modified: haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp	2009-08-01 17:10:34 UTC (rev 32063)
++++ haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp	2009-08-03 09:35:30 UTC (rev 32064)
+@@ -34,9 +34,13 @@
+ 	Encoder(),
+ 	fCodec(NULL),
+ 	fContext(avcodec_alloc_context()),
++	fCodecInitDone(false),
++
+ 	fFrame(avcodec_alloc_frame()),
+ 	fSwsContext(NULL),
+-	fCodecInitDone(false),
++
++	fFramesWritten(0),
++
+ 	fChunkBuffer(new(std::nothrow) uint8[kDefaultChunkBufferSize])
+ {
+ 	TRACE(&quot;AVCodecEncoder::AVCodecEncoder()\n&quot;);
+@@ -110,7 +114,13 @@
+ 	if (inputFormat == NULL)
+ 		return B_BAD_VALUE;
+ 
++	if (fCodecInitDone) {
++		fCodecInitDone = false;
++		avcodec_close(fContext);
++	}
++
+ 	fInputFormat = *inputFormat;
++	fFramesWritten = 0;
+ 
+ 	if (fInputFormat.type == B_MEDIA_RAW_VIDEO) {
+ 		// frame rate
+@@ -167,6 +177,68 @@
+ 			PIX_FMT_RGB32, fContext-&gt;width, fContext-&gt;height,
+ 			fContext-&gt;pix_fmt, SWS_BICUBIC, NULL, NULL, NULL);
+ 
++	} else if (fInputFormat.type == B_MEDIA_RAW_AUDIO) {
++		// frame rate
++		fContext-&gt;sample_rate = (int)fInputFormat.u.raw_audio.frame_rate;
++		fContext-&gt;time_base.den = (int)fInputFormat.u.raw_audio.frame_rate;
++		fContext-&gt;time_base.num = 1;
++		// channels
++		fContext-&gt;channels = fInputFormat.u.raw_audio.channel_count;
++		switch (fInputFormat.u.raw_audio.format) {
++			case media_raw_audio_format::B_AUDIO_FLOAT:
++				fContext-&gt;sample_fmt = SAMPLE_FMT_FLT;
++				break;
++			case media_raw_audio_format::B_AUDIO_DOUBLE:
++				fContext-&gt;sample_fmt = SAMPLE_FMT_DBL;
++				break;
++			case media_raw_audio_format::B_AUDIO_INT:
++				fContext-&gt;sample_fmt = SAMPLE_FMT_S32;
++				break;
++			case media_raw_audio_format::B_AUDIO_SHORT:
++				fContext-&gt;sample_fmt = SAMPLE_FMT_S16;
++				break;
++			case media_raw_audio_format::B_AUDIO_UCHAR:
++				fContext-&gt;sample_fmt = SAMPLE_FMT_U8;
++				break;
++
++			case media_raw_audio_format::B_AUDIO_CHAR:
++			default:
++				return B_MEDIA_BAD_FORMAT;
++				break;
++		}
++		if (fInputFormat.u.raw_audio.channel_mask == 0) {
++			// guess the channel mask...
++			switch (fInputFormat.u.raw_audio.channel_count) {
++				default:
++				case 2:
++					fContext-&gt;channel_layout = CH_LAYOUT_STEREO;
++					break;
++				case 1:
++					fContext-&gt;channel_layout = CH_LAYOUT_MONO;
++					break;
++				case 3:
++					fContext-&gt;channel_layout = CH_LAYOUT_SURROUND;
++					break;
++				case 4:
++					fContext-&gt;channel_layout = CH_LAYOUT_QUAD;
++					break;
++				case 5:
++					fContext-&gt;channel_layout = CH_LAYOUT_5POINT0;
++					break;
++				case 6:
++					fContext-&gt;channel_layout = CH_LAYOUT_5POINT1;
++					break;
++				case 8:
++					fContext-&gt;channel_layout = CH_LAYOUT_7POINT1;
++					break;
++				case 10:
++					fContext-&gt;channel_layout = CH_LAYOUT_7POINT1_WIDE;
++					break;
++			}
++		} else {
++			// The bits match 1:1 for media_multi_channels and FFmpeg defines.
++			fContext-&gt;channel_layout = fInputFormat.u.raw_audio.channel_mask;
++		}
+ 	} else {
+ 		return B_NOT_SUPPORTED;
+ 	}
+@@ -221,13 +293,80 @@
+ 
+ 
+ status_t
+-AVCodecEncoder::_EncodeAudio(const void* buffer, int64 frameCount,
++AVCodecEncoder::_EncodeAudio(const void* _buffer, int64 frameCount,
+ 	media_encode_info* info)
+ {
+-	TRACE(&quot;AVCodecEncoder::_EncodeAudio(%p, %lld, %p)\n&quot;, buffer, frameCount,
++	TRACE(&quot;AVCodecEncoder::_EncodeAudio(%p, %lld, %p)\n&quot;, _buffer, frameCount,
+ 		info);
+ 
+-	return B_NOT_SUPPORTED;
++	if (fChunkBuffer == NULL)
++		return B_NO_MEMORY;
++
++	status_t ret = B_OK;
++
++	const uint8* buffer = reinterpret_cast&lt;const uint8*&gt;(_buffer);
++
++	size_t inputSampleSize = fInputFormat.u.raw_audio.format
++		&amp; media_raw_audio_format::B_AUDIO_SIZE_MASK;
++	size_t inputFrameSize = inputSampleSize
++		* fInputFormat.u.raw_audio.channel_count;
++
++	size_t outSampleSize = av_get_bits_per_sample_format(
++		fContext-&gt;sample_fmt) / 8;
++	size_t outSize = outSampleSize * fContext-&gt;channels;
++	TRACE(&quot;  sampleSize: %ld/%ld, frameSize: %ld/%ld\n&quot;,
++		inputSampleSize, inputFrameSize, outSampleSize, outSize);
++
++	size_t bufferSize = frameCount * inputFrameSize;
++	bufferSize = min_c(bufferSize, kDefaultChunkBufferSize);
++
++	while (frameCount &gt; 0) {
++		if (frameCount &lt; fContext-&gt;frame_size) {
++			TRACE(&quot;  ERROR: too few frames left! (left: %lld, needed: %d)\n&quot;,
++				frameCount, fContext-&gt;frame_size);
++			// TODO: Handle this some way. Maybe use an av_fifo to buffer data?
++			return B_ERROR;
++		}
++
++		int chunkFrames = fContext-&gt;frame_size;
++
++		TRACE(&quot;  frames left: %lld, chunk frames: %d\n&quot;,
++			frameCount, chunkFrames);
++
++		// Encode one audio chunk/frame.
++		int usedBytes = avcodec_encode_audio(fContext, fChunkBuffer,
++			bufferSize, reinterpret_cast&lt;const short*&gt;(buffer));
++
++		if (usedBytes &lt; 0) {
++			TRACE(&quot;  avcodec_encode_video() failed: %d\n&quot;, usedBytes);
++			return B_ERROR;
++		}
++
++		// Setup media_encode_info, most important is the time stamp.
++		info-&gt;start_time = (bigtime_t)(fFramesWritten * 1000000LL
++			/ fInputFormat.u.raw_audio.frame_rate);
++
++		// Write the chunk
++		ret = WriteChunk(fChunkBuffer, usedBytes, info);
++		if (ret != B_OK)
++			break;
++
++		size_t framesWritten = usedBytes / inputFrameSize;
++		if (chunkFrames == 1) {
++			// For PCM data:
++			framesWritten = usedBytes / inputFrameSize;
++		} else {
++			// For encoded audio:
++			framesWritten = chunkFrames * inputFrameSize;
++		}
++
++		// Skip to next chunk of buffer.
++		fFramesWritten += framesWritten;
++		frameCount -= framesWritten;
++		buffer += usedBytes;
++	}
++
++	return ret;
+ }
+ 
+ 
+@@ -268,6 +407,10 @@
+ 			return B_ERROR;
+ 		}
+ 
++		// Setup media_encode_info, most important is the time stamp.
++		info-&gt;start_time = (bigtime_t)(fFramesWritten * 1000000LL
++			/ fInputFormat.u.raw_video.field_rate);
++
+ 		// Write the chunk
+ 		ret = WriteChunk(fChunkBuffer, usedBytes, info);
+ 		if (ret != B_OK)
+@@ -276,6 +419,7 @@
+ 		// Skip to the next frame (but usually, there is only one to encode
+ 		// for video).
+ 		frameCount--;
++		fFramesWritten++;
+ 		buffer = (const void*)((const uint8*)buffer + bufferSize);
+ 	}
+ 
+
+Modified: haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h	2009-08-01 17:10:34 UTC (rev 32063)
++++ haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h	2009-08-03 09:35:30 UTC (rev 32064)
+@@ -52,15 +52,15 @@
+ 			// TODO: Refactor common base class from AVCodec[De|En]Coder!
+ 			AVCodec*			fCodec;
+ 			AVCodecContext*		fContext;
++			bool				fCodecInitDone;
++
+ 			AVPicture			fSrcFrame;
+ 			AVPicture			fDstFrame;
+ 			AVFrame*			fFrame;
+ 			SwsContext*			fSwsContext;
+ 
+-			uint32				fAVCodecID;
++			int64				fFramesWritten;
+ 
+-			bool				fCodecInitDone;
+-
+ 			uint8*				fChunkBuffer;
+ };
+ 
+
+Modified: haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp	2009-08-01 17:10:34 UTC (rev 32063)
++++ haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp	2009-08-03 09:35:30 UTC (rev 32064)
+@@ -26,7 +26,7 @@
+ #include &quot;gfx_util.h&quot;
+ 
+ 
+-//#define TRACE_AVFORMAT_READER
++#define TRACE_AVFORMAT_READER
+ #ifdef TRACE_AVFORMAT_READER
+ #	define TRACE printf
+ #	define TRACE_IO(a...)
+@@ -674,7 +674,7 @@
+ 		*duration = (bigtime_t)(1000000LL * fStream-&gt;duration
+ 			* fStream-&gt;time_base.num / fStream-&gt;time_base.den);
+ 		TRACE(&quot;  stream duration: %lld, time_base %.4f (%d/%d)\n&quot;,
+-			*duration, av_q2d(fStream-&gt;time_base),
++			fStream-&gt;duration, av_q2d(fStream-&gt;time_base),
+ 			fStream-&gt;time_base.num, fStream-&gt;time_base.den);
+ 	} else if ((int64)fContext-&gt;duration != kNoPTSValue) {
+ 		*duration = (bigtime_t)(1000000LL * fContext-&gt;duration / AV_TIME_BASE);
+@@ -844,6 +844,8 @@
+ 		mediaHeader-&gt;destination = -1;
+ 		mediaHeader-&gt;time_source = -1;
+ 		mediaHeader-&gt;size_used = fPacket.size;
++//TRACE(&quot;  PTS: %lld (time_base.num: %d, .den: %d)\n&quot;,
++//fPacket.pts, fStream-&gt;time_base.num, fStream-&gt;time_base.den);
+ 		mediaHeader-&gt;start_time = (bigtime_t)(1000000.0 * fPacket.pts
+ 			/ av_q2d(fStream-&gt;time_base));
+ 		mediaHeader-&gt;file_pos = fPacket.pos;
+
+Modified: haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp	2009-08-01 17:10:34 UTC (rev 32063)
++++ haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatWriter.cpp	2009-08-03 09:35:30 UTC (rev 32064)
+@@ -30,7 +30,7 @@
+ #ifdef TRACE_AVFORMAT_WRITER
+ #	define TRACE printf
+ #	define TRACE_IO(a...)
+-#	define TRACE_PACKET(a...)
++#	define TRACE_PACKET printf
+ #else
+ #	define TRACE(a...)
+ #	define TRACE_IO(a...)
+@@ -75,6 +75,7 @@
+ 			// Since different threads may write to the target,
+ 			// we need to protect the file position and I/O by a lock.
+ 			BLocker*			fStreamLock;
++			int64				fChunksWritten;
+ };
+ 
+ 
+@@ -84,7 +85,8 @@
+ 	:
+ 	fContext(context),
+ 	fStream(NULL),
+-	fStreamLock(streamLock)
++	fStreamLock(streamLock),
++	fChunksWritten(0)
+ {
+ 	av_new_packet(&amp;fPacket, 0);
+ }
+@@ -118,6 +120,10 @@
+ 		// frame rate
+ 		fStream-&gt;codec-&gt;time_base.den = (int)format-&gt;u.raw_video.field_rate;
+ 		fStream-&gt;codec-&gt;time_base.num = 1;
++		fStream-&gt;r_frame_rate.den = (int)format-&gt;u.raw_video.field_rate;
++		fStream-&gt;r_frame_rate.num = 1;
++		fStream-&gt;time_base.den = (int)format-&gt;u.raw_video.field_rate;
++		fStream-&gt;time_base.num = 1;
+ 		// video size
+ 		fStream-&gt;codec-&gt;width = format-&gt;u.raw_video.display.line_width;
+ 		fStream-&gt;codec-&gt;height = format-&gt;u.raw_video.display.line_count;
+@@ -138,9 +144,75 @@
+ 		fStream-&gt;codec-&gt;pix_fmt = PIX_FMT_YUV420P;
+ 	} else if (format-&gt;type == B_MEDIA_RAW_AUDIO) {
+ 		avcodec_get_context_defaults2(fStream-&gt;codec, CODEC_TYPE_AUDIO);
+-		// TODO: ...
++		// channels
++		fStream-&gt;codec-&gt;channels = format-&gt;u.raw_audio.channel_count;
++		switch (format-&gt;u.raw_audio.format) {
++			case media_raw_audio_format::B_AUDIO_FLOAT:
++				fStream-&gt;codec-&gt;sample_fmt = SAMPLE_FMT_FLT;
++				break;
++			case media_raw_audio_format::B_AUDIO_DOUBLE:
++				fStream-&gt;codec-&gt;sample_fmt = SAMPLE_FMT_DBL;
++				break;
++			case media_raw_audio_format::B_AUDIO_INT:
++				fStream-&gt;codec-&gt;sample_fmt = SAMPLE_FMT_S32;
++				break;
++			case media_raw_audio_format::B_AUDIO_SHORT:
++				fStream-&gt;codec-&gt;sample_fmt = SAMPLE_FMT_S16;
++				break;
++			case media_raw_audio_format::B_AUDIO_UCHAR:
++				fStream-&gt;codec-&gt;sample_fmt = SAMPLE_FMT_U8;
++				break;
++
++			case media_raw_audio_format::B_AUDIO_CHAR:
++			default:
++				return B_MEDIA_BAD_FORMAT;
++				break;
++		}
++		if (format-&gt;u.raw_audio.channel_mask == 0) {
++			// guess the channel mask...
++			switch (format-&gt;u.raw_audio.channel_count) {
++				default:
++				case 2:
++					fStream-&gt;codec-&gt;channel_layout = CH_LAYOUT_STEREO;
++					break;
++				case 1:
++					fStream-&gt;codec-&gt;channel_layout = CH_LAYOUT_MONO;
++					break;
++				case 3:
++					fStream-&gt;codec-&gt;channel_layout = CH_LAYOUT_SURROUND;
++					break;
++				case 4:
++					fStream-&gt;codec-&gt;channel_layout = CH_LAYOUT_QUAD;
++					break;
++				case 5:
++					fStream-&gt;codec-&gt;channel_layout = CH_LAYOUT_5POINT0;
++					break;
++				case 6:
++					fStream-&gt;codec-&gt;channel_layout = CH_LAYOUT_5POINT1;
++					break;
++				case 8:
++					fStream-&gt;codec-&gt;channel_layout = CH_LAYOUT_7POINT1;
++					break;
++				case 10:
++					fStream-&gt;codec-&gt;channel_layout = CH_LAYOUT_7POINT1_WIDE;
++					break;
++			}
++		} else {
++			// The bits match 1:1 for media_multi_channels and FFmpeg defines.
++			fStream-&gt;codec-&gt;channel_layout = format-&gt;u.raw_audio.channel_mask;
++		}
++		// frame rate
++		fStream-&gt;codec-&gt;sample_rate = (int)format-&gt;u.raw_audio.frame_rate;
++		fStream-&gt;codec-&gt;time_base.den = (int)format-&gt;u.raw_audio.frame_rate;
++		fStream-&gt;codec-&gt;time_base.num = 1;
++		fStream-&gt;time_base.den = (int)format-&gt;u.raw_audio.frame_rate;
++		fStream-&gt;time_base.num = 1;
+ 	}
+ 
++	TRACE(&quot;  stream-&gt;time_base: (%d/%d), codec-&gt;time_base: (%d/%d))\n&quot;,
++		fStream-&gt;time_base.num, fStream-&gt;time_base.den,
++		fStream-&gt;codec-&gt;time_base.num, fStream-&gt;codec-&gt;time_base.den);
++
+ 	// TODO: This is a hack for now! Use avcodec_find_encoder_by_name()
+ 	// or something similar...
+ 	fStream-&gt;codec-&gt;codec_id = (CodecID)codecInfo-&gt;sub_id;
+@@ -153,8 +225,8 @@
+ AVFormatWriter::StreamCookie::WriteChunk(const void* chunkBuffer,
+ 	size_t chunkSize, media_encode_info* encodeInfo)
+ {
+-	TRACE_PACKET(&quot;AVFormatWriter::StreamCookie::WriteChunk(%p, %ld)\n&quot;,
+-		chunkBuffer, chunkSize);
++	TRACE_PACKET(&quot;AVFormatWriter::StreamCookie::WriteChunk(%p, %ld, &quot;
++		&quot;start_time: %lld)\n&quot;, chunkBuffer, chunkSize, encodeInfo-&gt;start_time);
+ 
+ 	BAutolock _(fStreamLock);
+ 
+@@ -164,6 +236,19 @@
+ 	fPacket.data = const_cast&lt;uint8_t*&gt;((const uint8_t*)chunkBuffer);
+ 	fPacket.size = chunkSize;
+ 
++	fPacket.pts = (encodeInfo-&gt;start_time
++		* fStream-&gt;time_base.den / fStream-&gt;time_base.num) / 1000000;
++	TRACE_PACKET(&quot;  PTS: %lld  (stream-&gt;time_base: (%d/%d), &quot;
++		&quot;codec-&gt;time_base: (%d/%d))\n&quot;, fPacket.pts,
++		fStream-&gt;time_base.num, fStream-&gt;time_base.den,
++		fStream-&gt;codec-&gt;time_base.num, fStream-&gt;codec-&gt;time_base.den);
++
++// From ffmpeg.c::do_audio_out():
++//	if (enc-&gt;coded_frame &amp;&amp; enc-&gt;coded_frame-&gt;pts != AV_NOPTS_VALUE)
++//		fPacket.pts = av_rescale_q(enc-&gt;coded_frame-&gt;pts,
++//		enc-&gt;time_base, ost-&gt;st-&gt;time_base);
++
++
+ #if 0
+ 	// TODO: Eventually, we need to write interleaved packets, but
+ 	// maybe we are only supposed to use this if we have actually
+@@ -280,12 +365,27 @@
+ 	if (fHeaderWritten)
+ 		return B_NOT_ALLOWED;
+ 
++	for (unsigned i = 0; i &lt; fContext-&gt;nb_streams; i++) {
++		AVStream* stream = fContext-&gt;streams[i];
++		TRACE(&quot;  stream[%u] time_base: (%d/%d), codec-&gt;time_base: (%d/%d)\n&quot;,
++			i, stream-&gt;time_base.num, stream-&gt;time_base.den,
++			stream-&gt;codec-&gt;time_base.num, stream-&gt;codec-&gt;time_base.den);
++	}
++
+ 	int result = av_write_header(fContext);
+ 	if (result &lt; 0)
+ 		TRACE(&quot;  av_write_header(): %d\n&quot;, result);
+ 	else
+ 		fHeaderWritten = true;
+ 
++	TRACE(&quot;  wrote header\n&quot;);
++	for (unsigned i = 0; i &lt; fContext-&gt;nb_streams; i++) {
++		AVStream* stream = fContext-&gt;streams[i];
++		TRACE(&quot;  stream[%u] time_base: (%d/%d), codec-&gt;time_base: (%d/%d)\n&quot;,
++			i, stream-&gt;time_base.num, stream-&gt;time_base.den,
++			stream-&gt;codec-&gt;time_base.num, stream-&gt;codec-&gt;time_base.den);
++	}
++
+ 	return result == 0 ? B_OK : B_ERROR;
+ }
+ 
+@@ -383,8 +483,8 @@
+ AVFormatWriter::WriteChunk(void* _cookie, const void* chunkBuffer,
+ 	size_t chunkSize, media_encode_info* encodeInfo)
+ {
+-	TRACE(&quot;AVFormatWriter::WriteChunk(%p, %ld, %p)\n&quot;, chunkBuffer, chunkSize,
+-		encodeInfo);
++	TRACE_PACKET(&quot;AVFormatWriter::WriteChunk(%p, %ld, %p)\n&quot;, chunkBuffer,
++		chunkSize, encodeInfo);
+ 
+ 	StreamCookie* cookie = reinterpret_cast&lt;StreamCookie*&gt;(_cookie);
+ 	return cookie-&gt;WriteChunk(chunkBuffer, chunkSize, encodeInfo);
+
+Modified: haiku/trunk/src/add-ons/media/plugins/ffmpeg/EncoderTable.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/ffmpeg/EncoderTable.cpp	2009-08-01 17:10:34 UTC (rev 32063)
++++ haiku/trunk/src/add-ons/media/plugins/ffmpeg/EncoderTable.cpp	2009-08-03 09:35:30 UTC (rev 32064)
+@@ -48,18 +48,18 @@
+ 		B_MEDIA_RAW_VIDEO,
+ 		B_MEDIA_ENCODED_VIDEO
+ 	},
+-//	{
+-//		{
+-//			&quot;MP3 Audio&quot;,
+-//			&quot;mp3&quot;,
+-//			0,
+-//			CODEC_ID_MP3,
+-//			{ 0 }
+-//		},
+-//		B_ANY_FORMAT_FAMILY,
+-//		B_MEDIA_RAW_AUDIO,
+-//		B_MEDIA_ENCODED_AUDIO
+-//	}
++	{
++		{
++			&quot;Raw Audio&quot;,
++			&quot;pcm&quot;,
++			0,
++			CODEC_ID_PCM_S16LE,
++			{ 0 }
++		},
++		B_ANY_FORMAT_FAMILY,
++		B_MEDIA_RAW_AUDIO,
++		B_MEDIA_ENCODED_AUDIO
++	}
+ };
+ 
+ const size_t gEncoderCount = sizeof(gEncoderTable) / sizeof(EncoderDescription);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018660.html">[Haiku-commits] r32063 - haiku/trunk/build/jam
+</A></li>
+	<LI>Next message: <A HREF="018678.html">[Haiku-commits] r32065 - haiku/trunk/build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18677">[ date ]</a>
+              <a href="thread.html#18677">[ thread ]</a>
+              <a href="subject.html#18677">[ subject ]</a>
+              <a href="author.html#18677">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

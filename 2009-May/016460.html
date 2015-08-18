@@ -1,0 +1,713 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30601 - haiku/trunk/src/apps/installer
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30601%20-%20haiku/trunk/src/apps/installer&In-Reply-To=%3C200905030935.n439ZjaA006587%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016459.html">
+   <LINK REL="Next"  HREF="016461.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30601 - haiku/trunk/src/apps/installer</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30601%20-%20haiku/trunk/src/apps/installer&In-Reply-To=%3C200905030935.n439ZjaA006587%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30601 - haiku/trunk/src/apps/installer">stippi at mail.berlios.de
+       </A><BR>
+    <I>Sun May  3 11:35:45 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016459.html">[Haiku-commits] r30600 - haiku/trunk/src/apps/installer
+</A></li>
+        <LI>Next message: <A HREF="016461.html">[Haiku-commits] r30602 - haiku/trunk/src/apps/installer
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16460">[ date ]</a>
+              <a href="thread.html#16460">[ thread ]</a>
+              <a href="subject.html#16460">[ subject ]</a>
+              <a href="author.html#16460">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-05-03 11:35:42 +0200 (Sun, 03 May 2009)
+New Revision: 30601
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30601&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30601&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/apps/installer/CopyEngine.cpp
+   haiku/trunk/src/apps/installer/CopyEngine.h
+Removed:
+   haiku/trunk/src/apps/installer/CopyEngine2.cpp
+   haiku/trunk/src/apps/installer/CopyEngine2.h
+Modified:
+   haiku/trunk/src/apps/installer/Jamfile
+   haiku/trunk/src/apps/installer/WorkerThread.cpp
+Log:
+Cleanup round 2:
+Renamed CopyEngine2 back to CopyEngine.
+
+
+Copied: haiku/trunk/src/apps/installer/CopyEngine.cpp (from rev 30598, haiku/trunk/src/apps/installer/CopyEngine2.cpp)
+===================================================================
+--- haiku/trunk/src/apps/installer/CopyEngine2.cpp	2009-05-03 07:40:22 UTC (rev 30598)
++++ haiku/trunk/src/apps/installer/CopyEngine.cpp	2009-05-03 09:35:42 UTC (rev 30601)
+@@ -0,0 +1,477 @@
++/*
++ * Copyright 2008-2009, Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;
++ *  All rights reserved. Distributed under the terms of the MIT License.
++ */
++
++#include &quot;CopyEngine.h&quot;
++
++#include &lt;new&gt;
++
++#include &lt;math.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++
++#include &lt;Directory.h&gt;
++#include &lt;fs_attr.h&gt;
++#include &lt;NodeInfo.h&gt;
++#include &lt;Path.h&gt;
++#include &lt;String.h&gt;
++#include &lt;SymLink.h&gt;
++
++#include &quot;AutoLocker.h&quot;
++#include &quot;InstallerWindow.h&quot;
++	// TODO: For PACKAGES_DIRECTORY and VAR_DIRECTORY, not so nice...
++
++using std::nothrow;
++
++
++CopyEngine::CopyEngine(const BMessenger&amp; messenger, BMessage* message)
++	:
++	fBufferQueue(),
++	fWriterThread(-1),
++	fQuitting(false),
++
++	fBytesRead(0),
++	fItemsCopied(0),
++	fTimeRead(0),
++
++	fBytesWritten(0),
++	fTimeWritten(0),
++
++	fBytesToCopy(0),
++	fItemsToCopy(0),
++
++	fCurrentTargetFolder(NULL),
++	fCurrentItem(NULL),
++
++	fMessenger(messenger),
++	fMessage(message)
++{
++	fWriterThread = spawn_thread(_WriteThreadEntry, &quot;buffer writer&quot;,
++		B_NORMAL_PRIORITY, this);
++
++	if (fWriterThread &gt;= B_OK)
++		resume_thread(fWriterThread);
++}
++
++
++CopyEngine::~CopyEngine()
++{
++	while (fBufferQueue.Size() &gt; 0)
++		snooze(10000);
++
++	fQuitting = true;
++	if (fWriterThread &gt;= B_OK) {
++		int32 exitValue;
++		wait_for_thread(fWriterThread, &amp;exitValue);
++	}
++
++	delete fMessage;
++}
++
++
++status_t
++CopyEngine::CopyFolder(const char* source, const char* destination,
++	BLocker* locker)
++{
++	fBytesRead = 0;
++	fItemsCopied = 0;
++	fTimeRead = 0;
++
++	fBytesWritten = 0;
++	fTimeWritten = 0;
++
++	fBytesToCopy = 0;
++	fItemsToCopy = 0;
++
++	fCurrentTargetFolder = NULL;
++	fCurrentItem = NULL;
++
++	int32 level = 0;
++	status_t ret = _CollectCopyInfo(source, level);
++	if (ret &lt; B_OK)
++		return ret;
++
++	if (fMessage) {
++		BMessage message(*fMessage);
++		message.AddString(&quot;status&quot;, &quot;Performing installation.&quot;);
++		fMessenger.SendMessage(&amp;message);
++	}
++
++printf(&quot;%lld bytes to read in %lld files\n&quot;, fBytesToCopy, fItemsToCopy);
++
++	level = 0;
++	return _CopyFolder(source, destination, level, locker);
++}
++
++
++status_t
++CopyEngine::CopyFile(const BEntry&amp; _source, const BEntry&amp; _destination,
++	BLocker* locker)
++{
++	AutoLocker&lt;BLocker&gt; lock(locker);
++	if (locker != NULL &amp;&amp; !lock.IsLocked()) {
++		// We are supposed to quit
++printf(&quot;CopyFile - cancled\n&quot;);
++		return B_CANCELED;
++	}
++
++	BFile source(&amp;_source, B_READ_ONLY);
++	status_t ret = source.InitCheck();
++	if (ret &lt; B_OK)
++		return ret;
++
++	BFile* destination = new (nothrow) BFile(&amp;_destination,
++		B_WRITE_ONLY | B_CREATE_FILE | B_ERASE_FILE);
++	ret = destination-&gt;InitCheck();
++	if (ret &lt; B_OK) {
++		delete destination;
++		return ret;
++	}
++
++	int32 loopIteration = 0;
++
++	while (true) {
++		if (fBufferQueue.Size() &gt;= BUFFER_COUNT) {
++			// the queue is &quot;full&quot;, just wait a bit, the
++			// write thread will empty it
++			snooze(1000);
++			continue;
++		}
++
++		// allocate buffer
++		Buffer* buffer = new (nothrow) Buffer(destination);
++		if (!buffer || !buffer-&gt;buffer) {
++			delete destination;
++			delete buffer;
++			fprintf(stderr, &quot;reading loop: out of memory\n&quot;);
++			return B_NO_MEMORY;
++		}
++
++		// fill buffer
++		ssize_t read = source.Read(buffer-&gt;buffer, buffer-&gt;size);
++		if (read &lt; 0) {
++			ret = (status_t)read;
++			fprintf(stderr, &quot;Failed to read data: %s\n&quot;, strerror(ret));
++			break;
++		}
++
++		fBytesRead += read;
++		loopIteration += 1;
++		if (loopIteration % 10 == 0)
++			_UpdateProgress();
++
++		buffer-&gt;deleteFile = read == 0;
++		if (read &gt; 0)
++			buffer-&gt;validBytes = (size_t)read;
++		else
++			buffer-&gt;validBytes = 0;
++
++		// enqueue the buffer
++		ret = fBufferQueue.Push(buffer);
++		if (ret &lt; B_OK) {
++			buffer-&gt;deleteFile = false;
++			delete buffer;
++			delete destination;
++			return ret;
++		}
++
++		// quit if done
++		if (read == 0)
++			break;
++	}
++
++	return ret;
++}
++
++
++// #pragma mark -
++
++
++status_t
++CopyEngine::_CollectCopyInfo(const char* _source, int32&amp; level)
++{
++	level++;
++
++	BDirectory source(_source);
++	status_t ret = source.InitCheck();
++	if (ret &lt; B_OK)
++		return ret;
++
++	BEntry entry;
++	while (source.GetNextEntry(&amp;entry) == B_OK) {
++		struct stat statInfo;
++		entry.GetStat(&amp;statInfo);
++
++		char name[B_FILE_NAME_LENGTH];
++		status_t ret = entry.GetName(name);
++		if (ret &lt; B_OK)
++			return ret;
++
++		if (!_ShouldCopyEntry(name, statInfo, level))
++			continue;
++
++		if (S_ISDIR(statInfo.st_mode)) {
++			// handle recursive directory copy
++			BPath srcFolder;
++			ret = entry.GetPath(&amp;srcFolder);
++			if (ret &lt; B_OK)
++				return ret;
++
++			ret = _CollectCopyInfo(srcFolder.Path(), level);
++			if (ret &lt; B_OK)
++				return ret;
++		} else if (S_ISLNK(statInfo.st_mode)) {
++			// link, ignore size
++		} else {
++			// file data
++			fBytesToCopy += statInfo.st_size;
++		}
++
++		fItemsToCopy++;
++	}
++
++	level--;
++	return B_OK;
++}
++
++
++status_t
++CopyEngine::_CopyFolder(const char* _source, const char* _destination,
++	int32&amp; level, BLocker* locker)
++{
++	level++;
++	fCurrentTargetFolder = _destination;
++
++	BDirectory source(_source);
++	status_t ret = source.InitCheck();
++	if (ret &lt; B_OK)
++		return ret;
++
++	ret = create_directory(_destination, 0777);
++	if (ret &lt; B_OK &amp;&amp; ret != B_FILE_EXISTS)
++		return ret;
++
++	BDirectory destination(_destination);
++	ret = destination.InitCheck();
++	if (ret &lt; B_OK)
++		return ret;
++
++	BEntry entry;
++	while (source.GetNextEntry(&amp;entry) == B_OK) {
++		AutoLocker&lt;BLocker&gt; lock(locker);
++		if (locker != NULL &amp;&amp; !lock.IsLocked()) {
++			// We are supposed to quit
++			return B_CANCELED;
++		}
++
++		char name[B_FILE_NAME_LENGTH];
++		status_t ret = entry.GetName(name);
++		if (ret &lt; B_OK)
++			return ret;
++
++		struct stat statInfo;
++		entry.GetStat(&amp;statInfo);
++
++		if (!_ShouldCopyEntry(name, statInfo, level))
++			continue;
++
++		fItemsCopied++;
++		fCurrentItem = name;
++		_UpdateProgress();
++
++		BEntry copy(&amp;destination, name);
++		bool copyAttributes = true;
++
++		if (S_ISDIR(statInfo.st_mode)) {
++			// handle recursive directory copy
++
++			if (copy.Exists()) {
++				// Do not overwrite attributes on folders that exist.
++				// This should work better when the install target already
++				// contains a Haiku installation.
++				copyAttributes = false;
++			}
++
++			BPath srcFolder;
++			ret = entry.GetPath(&amp;srcFolder);
++			if (ret &lt; B_OK)
++				return ret;
++
++			BPath dstFolder;
++			ret = copy.GetPath(&amp;dstFolder);
++			if (ret &lt; B_OK)
++				return ret;
++
++			if (locker != NULL)
++				lock.Unlock();
++
++			ret = _CopyFolder(srcFolder.Path(), dstFolder.Path(), level,
++				locker);
++			if (ret &lt; B_OK)
++				return ret;
++
++			if (locker != NULL &amp;&amp; !lock.Lock()) {
++				// We are supposed to quit
++				return B_CANCELED;
++			}
++		} else if (S_ISLNK(statInfo.st_mode)) {
++			// copy symbolic links
++			BSymLink srcLink(&amp;entry);
++			if (ret &lt; B_OK)
++				return ret;
++
++			char linkPath[B_PATH_NAME_LENGTH];
++			ssize_t read = srcLink.ReadLink(linkPath, B_PATH_NAME_LENGTH - 1);
++			if (read &lt; 0)
++				return (status_t)read;
++
++			// just in case it already exists...
++			copy.Remove();
++
++			BSymLink dstLink;
++			ret = destination.CreateSymLink(name, linkPath, &amp;dstLink);
++			if (ret &lt; B_OK)
++				return ret;
++		} else {
++			// copy file data
++			// NOTE: Do not pass the locker, we simply keep holding the lock!
++			ret = CopyFile(entry, copy);
++			if (ret &lt; B_OK)
++				return ret;
++		}
++
++		if (!copyAttributes)
++			continue;
++
++		// copy attributes
++		BNode sourceNode(&amp;entry);
++		BNode targetNode(&amp;copy);
++		char attrName[B_ATTR_NAME_LENGTH];
++		while (sourceNode.GetNextAttrName(attrName) == B_OK) {
++			attr_info info;
++			if (sourceNode.GetAttrInfo(attrName, &amp;info) &lt; B_OK)
++				continue;
++			size_t size = 4096;
++			uint8 buffer[size];
++			off_t offset = 0;
++			ssize_t read = sourceNode.ReadAttr(attrName, info.type,
++				offset, buffer, min_c(size, info.size));
++			// NOTE: It's important to still write the attribute even if
++			// we have read 0 bytes!
++			while (read &gt;= 0) {
++				targetNode.WriteAttr(attrName, info.type, offset, buffer, read);
++				offset += read;
++				read = sourceNode.ReadAttr(attrName, info.type,
++				offset, buffer, min_c(size, info.size - offset));
++				if (read == 0)
++					break;
++			}
++		}
++
++		// copy basic attributes
++		copy.SetPermissions(statInfo.st_mode);
++		copy.SetOwner(statInfo.st_uid);
++		copy.SetGroup(statInfo.st_gid);
++		copy.SetModificationTime(statInfo.st_mtime);
++		copy.SetCreationTime(statInfo.st_crtime);
++	}
++
++	level--;
++	return B_OK;
++}
++
++
++void
++CopyEngine::_UpdateProgress()
++{
++	if (fMessage != NULL) {
++		BMessage message(*fMessage);
++		float progress = 100.0 * fBytesRead / fBytesToCopy;
++		message.AddFloat(&quot;progress&quot;, progress);
++		message.AddInt32(&quot;current&quot;, fItemsCopied);
++		message.AddInt32(&quot;maximum&quot;, fItemsToCopy);
++		message.AddString(&quot;item&quot;, fCurrentItem);
++		message.AddString(&quot;folder&quot;, fCurrentTargetFolder);
++		fMessenger.SendMessage(&amp;message);
++	}
++}
++
++
++bool
++CopyEngine::_ShouldCopyEntry(const char* name, const struct stat&amp; statInfo,
++	int32 level) const
++{
++	if (level == 1 &amp;&amp; S_ISDIR(statInfo.st_mode)) {
++		if (strcmp(VAR_DIRECTORY, name) == 0) {
++			printf(&quot;ignoring '%s'.\n&quot;, name);
++			return false;
++		}
++		if (strcmp(PACKAGES_DIRECTORY, name) == 0) {
++			printf(&quot;ignoring '%s'.\n&quot;, name);
++			return false;
++		}
++	}
++	return true;
++}
++
++
++int32
++CopyEngine::_WriteThreadEntry(void* cookie)
++{
++	CopyEngine* engine = (CopyEngine*)cookie;
++	engine-&gt;_WriteThread();
++	return B_OK;
++}
++
++
++void
++CopyEngine::_WriteThread()
++{
++	bigtime_t bufferWaitTimeout = 100000;
++
++	while (!fQuitting) {
++
++		bigtime_t now = system_time();
++
++		Buffer* buffer;
++		status_t ret = fBufferQueue.Pop(&amp;buffer, bufferWaitTimeout);
++		if (ret == B_TIMED_OUT) {
++			// no buffer, timeout
++			continue;
++		} else if (ret == B_NO_INIT) {
++			// real error
++			return;
++		} else if (ret != B_OK) {
++			// no buffer, queue error
++			snooze(10000);
++			continue;
++		}
++
++		if (!buffer-&gt;deleteFile) {
++			ssize_t written = buffer-&gt;file-&gt;Write(buffer-&gt;buffer,
++				buffer-&gt;validBytes);
++			if (written != (ssize_t)buffer-&gt;validBytes) {
++				// TODO: this should somehow be propagated back
++				// to the main thread!
++				fprintf(stderr, &quot;Failed to write data: %s\n&quot;,
++					strerror((status_t)written));
++			}
++			fBytesWritten += written;
++		}
++
++		delete buffer;
++
++		// measure performance
++		fTimeWritten += system_time() - now;
++	}
++
++	double megaBytes = (double)fBytesWritten / (1024 * 1024);
++	double seconds = (fTimeWritten / 1000000);
++	if (seconds &gt; 0) {
++		printf(&quot;%.2f MB written (%.2f MB/s)\n&quot;, megaBytes,
++			megaBytes / seconds);
++	}
++}
++
++
+
+Copied: haiku/trunk/src/apps/installer/CopyEngine.h (from rev 30598, haiku/trunk/src/apps/installer/CopyEngine2.h)
+===================================================================
+--- haiku/trunk/src/apps/installer/CopyEngine2.h	2009-05-03 07:40:22 UTC (rev 30598)
++++ haiku/trunk/src/apps/installer/CopyEngine.h	2009-05-03 09:35:42 UTC (rev 30601)
+@@ -0,0 +1,103 @@
++/*
++ * Copyright 2008-2009, Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;
++ *  All rights reserved. Distributed under the terms of the MIT License.
++ */
++#ifndef COPY_ENGINE_H
++#define COPY_ENGINE_H
++
++
++#include &lt;stdlib.h&gt;
++
++#include &lt;Entry.h&gt;
++#include &lt;File.h&gt;
++#include &lt;Messenger.h&gt;
++
++#include &quot;BlockingQueue.h&quot;
++
++class BFile;
++class BLocker;
++class BMessage;
++class BMessenger;
++
++class CopyEngine {
++public:
++								CopyEngine(const BMessenger&amp; messenger,
++									BMessage* message);
++	virtual						~CopyEngine();
++
++			status_t			CopyFolder(const char* source,
++									const char* destination,
++									BLocker* locker = NULL);
++
++			status_t			CopyFile(const BEntry&amp; entry,
++									const BEntry&amp; destination,
++									BLocker* locker = NULL);
++
++private:
++			status_t			_CollectCopyInfo(const char* source,
++									int32&amp; level);
++			status_t			_CopyFolder(const char* source,
++									const char* destination,
++									int32&amp; level,
++									BLocker* locker = NULL);
++
++			bool				_ShouldCopyEntry(const char* name,
++									const struct stat&amp; statInfo,
++									int32 level) const;
++
++			void				_UpdateProgress();
++
++	static	int32				_WriteThreadEntry(void* cookie);
++			void				_WriteThread();
++
++private:
++			enum {
++				BUFFER_COUNT	= 16,
++				BUFFER_SIZE		= 1024 * 1024
++			};
++			struct Buffer {
++				Buffer(BFile* file)
++					: file(file)
++					, buffer(malloc(BUFFER_SIZE))
++					, size(BUFFER_SIZE)
++					, validBytes(0)
++					, deleteFile(false)
++				{
++				}
++				~Buffer()
++				{
++					if (deleteFile)
++						delete file;
++					free(buffer);
++				}
++				BFile*			file;
++				void*			buffer;
++				size_t			size;
++				size_t			validBytes;
++				bool			deleteFile;
++			};
++
++	BlockingQueue&lt;Buffer&gt;		fBufferQueue;
++
++			thread_id			fWriterThread;
++	volatile bool				fQuitting;
++
++			off_t				fBytesRead;
++			uint64				fItemsCopied;
++			bigtime_t			fTimeRead;
++
++			off_t				fBytesWritten;
++			bigtime_t			fTimeWritten;
++
++			off_t				fBytesToCopy;
++			uint64				fItemsToCopy;
++
++			const char*			fCurrentTargetFolder;
++			const char*			fCurrentItem;
++
++			BMessenger			fMessenger;
++			BMessage*			fMessage;
++};
++
++
++#endif // COPY_ENGINE_2_H
+
+Deleted: haiku/trunk/src/apps/installer/CopyEngine2.cpp
+
+Deleted: haiku/trunk/src/apps/installer/CopyEngine2.h
+
+Modified: haiku/trunk/src/apps/installer/Jamfile
+===================================================================
+--- haiku/trunk/src/apps/installer/Jamfile	2009-05-03 09:32:24 UTC (rev 30600)
++++ haiku/trunk/src/apps/installer/Jamfile	2009-05-03 09:35:42 UTC (rev 30601)
+@@ -4,7 +4,7 @@
+ SubDirHdrs [ FDirName $(HAIKU_TOP) src kits tracker ] ;
+ 
+ Application Installer : 
+-	CopyEngine2.cpp
++	CopyEngine.cpp
+ 	InstallerApp.cpp
+ 	InstallerWindow.cpp
+ 	PackageViews.cpp
+
+Modified: haiku/trunk/src/apps/installer/WorkerThread.cpp
+===================================================================
+--- haiku/trunk/src/apps/installer/WorkerThread.cpp	2009-05-03 09:32:24 UTC (rev 30600)
++++ haiku/trunk/src/apps/installer/WorkerThread.cpp	2009-05-03 09:35:42 UTC (rev 30601)
+@@ -23,7 +23,7 @@
+ #include &lt;VolumeRoster.h&gt;
+ 
+ #include &quot;AutoLocker.h&quot;
+-#include &quot;CopyEngine2.h&quot;
++#include &quot;CopyEngine.h&quot;
+ #include &quot;InstallerWindow.h&quot;
+ #include &quot;PackageViews.h&quot;
+ #include &quot;PartitionMenuItem.h&quot;
+@@ -246,7 +246,7 @@
+ 	entry_ref testRef;
+ 
+ 	BMessenger messenger(fWindow);
+-	CopyEngine2 engine(messenger, new BMessage(MSG_STATUS_MESSAGE));
++	CopyEngine engine(messenger, new BMessage(MSG_STATUS_MESSAGE));
+ 
+ 	PartitionMenuItem *targetItem = (PartitionMenuItem *)targetMenu-&gt;FindMarked();
+ 	PartitionMenuItem *srcItem = (PartitionMenuItem *)srcMenu-&gt;FindMarked();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016459.html">[Haiku-commits] r30600 - haiku/trunk/src/apps/installer
+</A></li>
+	<LI>Next message: <A HREF="016461.html">[Haiku-commits] r30602 - haiku/trunk/src/apps/installer
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16460">[ date ]</a>
+              <a href="thread.html#16460">[ thread ]</a>
+              <a href="subject.html#16460">[ subject ]</a>
+              <a href="author.html#16460">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

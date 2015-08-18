@@ -1,0 +1,799 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28624 - haiku/trunk/src/tools/fs_shell
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28624%20-%20haiku/trunk/src/tools/fs_shell&In-Reply-To=%3C200811121203.mACC3xkP029765%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013485.html">
+   <LINK REL="Next"  HREF="013487.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28624 - haiku/trunk/src/tools/fs_shell</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28624%20-%20haiku/trunk/src/tools/fs_shell&In-Reply-To=%3C200811121203.mACC3xkP029765%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28624 - haiku/trunk/src/tools/fs_shell">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Nov 12 13:03:59 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013485.html">[Haiku-commits] r28623 - haiku/trunk/src/system/boot
+</A></li>
+        <LI>Next message: <A HREF="013487.html">[Haiku-commits] r28625 - haiku/trunk/headers/posix/netinet
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13486">[ date ]</a>
+              <a href="thread.html#13486">[ thread ]</a>
+              <a href="subject.html#13486">[ subject ]</a>
+              <a href="author.html#13486">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-11-12 13:03:58 +0100 (Wed, 12 Nov 2008)
+New Revision: 28624
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28624&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28624&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/tools/fs_shell/fssh.cpp
+Log:
+* Added &quot;info&quot; command that prints the information of the fs_info structure.
+* Shuffled functions around to separate command functions from their support
+  functions.
+
+
+Modified: haiku/trunk/src/tools/fs_shell/fssh.cpp
+===================================================================
+--- haiku/trunk/src/tools/fs_shell/fssh.cpp	2008-11-12 02:36:03 UTC (rev 28623)
++++ haiku/trunk/src/tools/fs_shell/fssh.cpp	2008-11-12 12:03:58 UTC (rev 28624)
+@@ -23,6 +23,7 @@
+ #include &quot;fssh_dirent.h&quot;
+ #include &quot;fssh_errno.h&quot;
+ #include &quot;fssh_errors.h&quot;
++#include &quot;fssh_fs_info.h&quot;
+ #include &quot;fssh_module.h&quot;
+ #include &quot;fssh_node_monitor.h&quot;
+ #include &quot;fssh_stat.h&quot;
+@@ -253,6 +254,328 @@
+ CommandManager*	CommandManager::sManager = NULL;
+ 
+ 
++// #pragma mark - Command support functions
++
++
++static bool
++get_permissions(const char* modeString, fssh_mode_t&amp; _permissions)
++{
++	// currently only octal mode is supported
++	if (strlen(modeString) != 3)
++		return false;
++
++	fssh_mode_t permissions = 0;
++	for (int i = 0; i &lt; 3; i++) {
++		char c = modeString[i];
++		if (c &lt; '0' || c &gt; '7')
++			return false;
++		permissions = (permissions &lt;&lt; 3) | (c - '0');
++	}
++
++	_permissions = permissions;
++	return true;
++}
++
++
++static fssh_dev_t
++get_volume_id()
++{
++	struct fssh_stat st;
++	fssh_status_t error = _kern_read_stat(-1, kMountPoint, false, &amp;st,
++		sizeof(st));
++	if (error != FSSH_B_OK) {
++		fprintf(stderr, &quot;Error: Failed to stat() mount point: %s\n&quot;,
++			fssh_strerror(error));
++		return error;
++	}
++
++	return st.fssh_st_dev;
++}
++
++
++static const char *
++byte_string(int64_t numBlocks, int64_t blockSize)
++{
++	double blocks = 1. * numBlocks * blockSize;
++	static char string[64];
++
++	if (blocks &lt; 1024)
++		sprintf(string, &quot;%Ld&quot;, numBlocks * blockSize);
++	else {
++		const char* units[] = {&quot;K&quot;, &quot;M&quot;, &quot;G&quot;, NULL};
++		int i = -1;
++
++		do {
++			blocks /= 1024.0;
++			i++;
++		} while (blocks &gt;= 1024 &amp;&amp; units[i + 1]);
++
++		sprintf(string, &quot;%.1f%s&quot;, blocks, units[i]);
++	}
++
++	return string;
++}
++
++
++void
++print_flag(uint32_t deviceFlags, uint32_t testFlag, const char *yes,
++	const char *no)
++{
++	printf((deviceFlags &amp; testFlag) != 0 ? yes : no);
++}
++
++
++static void
++list_entry(const char* file, const char* name = NULL)
++{
++	// construct path, if a leaf name is given
++	std::string path;
++	if (name) {
++		path = file;
++		path += '/';
++		path += name;
++		file = path.c_str();
++	} else
++		name = file;
++
++	// stat the file
++	struct fssh_stat st;
++	fssh_status_t error = _kern_read_stat(-1, file, false, &amp;st, sizeof(st));
++	if (error != FSSH_B_OK) {
++		fprintf(stderr, &quot;Error: Failed to stat() \&quot;%s\&quot;: %s\n&quot;, file,
++			fssh_strerror(error));
++		return;
++	}
++
++	// get time
++	struct tm time;
++	time_t fileTime = st.fssh_st_mtime;
++	localtime_r(&amp;fileTime, &amp;time);
++
++	// get permissions
++	std::string permissions;
++	fssh_mode_t mode = st.fssh_st_mode;
++	// user
++	permissions += ((mode &amp; FSSH_S_IRUSR) ? 'r' : '-');
++	permissions += ((mode &amp; FSSH_S_IWUSR) ? 'w' : '-');
++	if (mode &amp; FSSH_S_ISUID)
++		permissions += 's';
++	else
++		permissions += ((mode &amp; FSSH_S_IXUSR) ? 'x' : '-');
++	// group
++	permissions += ((mode &amp; FSSH_S_IRGRP) ? 'r' : '-');
++	permissions += ((mode &amp; FSSH_S_IWGRP) ? 'w' : '-');
++	if (mode &amp; FSSH_S_ISGID)
++		permissions += 's';
++	else
++		permissions += ((mode &amp; FSSH_S_IXGRP) ? 'x' : '-');
++	// others
++	permissions += ((mode &amp; FSSH_S_IROTH) ? 'r' : '-');
++	permissions += ((mode &amp; FSSH_S_IWOTH) ? 'w' : '-');
++	permissions += ((mode &amp; FSSH_S_IXOTH) ? 'x' : '-');
++
++	// get file type
++	char fileType = '?';
++	if (FSSH_S_ISREG(mode)) {
++		fileType = '-';
++	} else if (FSSH_S_ISLNK(mode)) {
++		fileType = 'l';
++	} else if (FSSH_S_ISBLK(mode)) {
++		fileType = 'b';
++	} else if (FSSH_S_ISDIR(mode)) {
++		fileType = 'd';
++	} else if (FSSH_S_ISCHR(mode)) {
++		fileType = 'c';
++	} else if (FSSH_S_ISFIFO(mode)) {
++		fileType = 'f';
++	} else if (FSSH_S_ISINDEX(mode)) {
++		fileType = 'i';
++	}
++
++	// get link target
++	std::string nameSuffix;
++	if (FSSH_S_ISLNK(mode)) {
++		char buffer[FSSH_B_PATH_NAME_LENGTH];
++		fssh_size_t size = sizeof(buffer) - 1;
++		error = _kern_read_link(-1, file, buffer, &amp;size);
++		if (error != FSSH_B_OK)
++			snprintf(buffer, sizeof(buffer), &quot;(%s)&quot;, fssh_strerror(error));
++
++		buffer[size] = '\0';
++		nameSuffix += &quot; -&gt; &quot;;
++		nameSuffix += buffer;
++	}
++
++	printf(&quot;%c%s %2d %2d %10lld %d-%02d-%02d %02d:%02d:%02d %s%s\n&quot;,
++		fileType, permissions.c_str(), (int)st.fssh_st_uid, (int)st.fssh_st_gid,
++		st.fssh_st_size,
++		1900 + time.tm_year, 1 + time.tm_mon, time.tm_mday,
++		time.tm_hour, time.tm_min, time.tm_sec,
++		name, nameSuffix.c_str());
++}
++
++
++static fssh_status_t
++create_dir(const char *path, bool createParents)
++{
++	// stat the entry
++	struct fssh_stat st;
++	fssh_status_t error = _kern_read_stat(-1, path, false, &amp;st, sizeof(st));
++	if (error == FSSH_B_OK) {
++		if (createParents &amp;&amp; FSSH_S_ISDIR(st.fssh_st_mode))
++			return FSSH_B_OK;
++
++		fprintf(stderr, &quot;Error: Cannot make dir, entry \&quot;%s\&quot; is in the way.\n&quot;,
++			path);
++		return FSSH_B_FILE_EXISTS;
++	}
++
++	// the dir doesn't exist yet
++	// if we shall create all parents, do that first
++	if (createParents) {
++		// create the parent dir path
++		// eat the trailing '/'s
++		int len = strlen(path);
++		while (len &gt; 0 &amp;&amp; path[len - 1] == '/')
++			len--;
++
++		// eat the last path component
++		while (len &gt; 0 &amp;&amp; path[len - 1] != '/')
++			len--;
++
++		// eat the trailing '/'s
++		while (len &gt; 0 &amp;&amp; path[len - 1] == '/')
++			len--;
++
++		// Now either nothing remains, which means we had a single component,
++		// a root subdir -- in those cases we can just fall through (we should
++		// actually never be here in case of the root dir, but anyway) -- or
++		// there is something left, which we can call a parent directory and
++		// try to create it.
++		if (len &gt; 0) {
++			char *parentPath = (char*)malloc(len + 1);
++			if (!parentPath) {
++				fprintf(stderr, &quot;Error: Failed to allocate memory for parent &quot;
++					&quot;path.\n&quot;);
++				return FSSH_B_NO_MEMORY;
++			}
++			memcpy(parentPath, path, len);
++			parentPath[len] = '\0';
++
++			error = create_dir(parentPath, createParents);
++
++			free(parentPath);
++
++			if (error != FSSH_B_OK)
++				return error;
++		}
++	}
++
++	// make the directory
++	error = _kern_create_dir(-1,
++		path, (FSSH_S_IRWXU | FSSH_S_IRWXG | FSSH_S_IRWXO) &amp; ~sUmask);
++	if (error != FSSH_B_OK) {
++		fprintf(stderr, &quot;Error: Failed to make directory \&quot;%s\&quot;: %s\n&quot;, path,
++			fssh_strerror(error));
++		return error;
++	}
++
++	return FSSH_B_OK;
++}
++
++
++static fssh_status_t remove_entry(int dir, const char *entry, bool recursive,
++	bool force);
++
++
++static fssh_status_t
++remove_dir_contents(int parentDir, const char *name, bool force)
++{
++	// open the dir
++	int dir = _kern_open_dir(parentDir, name);
++	if (dir &lt; 0) {
++		fprintf(stderr, &quot;Error: Failed to open dir \&quot;%s\&quot;: %s\n&quot;, name,
++			fssh_strerror(dir));
++		return dir;
++	}
++
++	fssh_status_t error = FSSH_B_OK;
++
++	// iterate through the entries
++	fssh_ssize_t numRead;
++	char buffer[sizeof(fssh_dirent) + FSSH_B_FILE_NAME_LENGTH];
++	fssh_dirent *entry = (fssh_dirent*)buffer;
++	while ((numRead = _kern_read_dir(dir, entry, sizeof(buffer), 1)) &gt; 0) {
++		// skip &quot;.&quot; and &quot;..&quot;
++		if (strcmp(entry-&gt;d_name, &quot;.&quot;) == 0 || strcmp(entry-&gt;d_name, &quot;..&quot;) == 0)
++			continue;
++
++		error = remove_entry(dir, entry-&gt;d_name, true, force);
++		if (error != FSSH_B_OK)
++			break;
++	}
++
++	if (numRead &lt; 0) {
++		fprintf(stderr, &quot;Error: Failed to read directory \&quot;%s\&quot;: %s\n&quot;, name,
++			fssh_strerror(numRead));
++		error = numRead;
++	}
++
++	// close
++	_kern_close(dir);
++
++	return error;
++}
++
++
++static fssh_status_t
++remove_entry(int dir, const char *entry, bool recursive, bool force)
++{
++	// stat the file
++	struct fssh_stat st;
++	fssh_status_t error = _kern_read_stat(dir, entry, false, &amp;st, sizeof(st));
++	if (error != FSSH_B_OK) {
++		if (force &amp;&amp; error == FSSH_B_ENTRY_NOT_FOUND)
++			return FSSH_B_OK;
++
++		fprintf(stderr, &quot;Error: Failed to remove \&quot;%s\&quot;: %s\n&quot;, entry,
++			fssh_strerror(error));
++		return error;
++	}
++
++	if (FSSH_S_ISDIR(st.fssh_st_mode)) {
++		if (!recursive) {
++			fprintf(stderr, &quot;Error: \&quot;%s\&quot; is a directory.\n&quot;, entry);
++				// TODO: get the full path
++			return FSSH_EISDIR;
++		}
++
++		// remove the contents
++		error = remove_dir_contents(dir, entry, force);
++		if (error != FSSH_B_OK)
++			return error;
++
++		// remove the directory
++		error = _kern_remove_dir(dir, entry);
++		if (error != FSSH_B_OK) {
++			fprintf(stderr, &quot;Error: Failed to remove directory \&quot;%s\&quot;: %s\n&quot;,
++				entry, fssh_strerror(error));
++			return error;
++		}
++	} else {
++		// remove the entry
++		error = _kern_unlink(dir, entry);
++		if (error != FSSH_B_OK) {
++			fprintf(stderr, &quot;Error: Failed to remove entry \&quot;%s\&quot;: %s\n&quot;, entry,
++				fssh_strerror(error));
++			return error;
++		}
++	}
++
++	return FSSH_B_OK;
++}
++
++
+ // #pragma mark - Commands
+ 
+ 
+@@ -281,26 +604,6 @@
+ }
+ 
+ 
+-static bool
+-get_permissions(const char* modeString, fssh_mode_t&amp; _permissions)
+-{
+-	// currently only octal mode is supported
+-	if (strlen(modeString) != 3)
+-		return false;
+-
+-	fssh_mode_t permissions = 0;
+-	for (int i = 0; i &lt; 3; i++) {
+-		char c = modeString[i];
+-		if (c &lt; '0' || c &gt; '7')
+-			return false;
+-		permissions = (permissions &lt;&lt; 3) | (c - '0');
+-	}
+-
+-	_permissions = permissions;
+-	return true;
+-}
+-
+-
+ static fssh_status_t
+ command_chmod(int argc, const char* const* argv)
+ {
+@@ -372,6 +675,43 @@
+ 
+ 
+ static fssh_status_t
++command_info(int argc, const char* const* argv)
++{
++	fssh_dev_t volumeID = get_volume_id();
++	if (volumeID &lt; 0)
++		return volumeID;
++
++	fssh_fs_info info;
++	fssh_status_t status = _kern_read_fs_info(volumeID, &amp;info);
++	if (status != FSSH_B_OK)
++		return status;
++
++	printf(&quot;root inode:   %lld\n&quot;, info.root);
++	printf(&quot;flags:        &quot;);
++	print_flag(info.flags, FSSH_B_FS_HAS_QUERY, &quot;Q&quot;, &quot;-&quot;);
++	print_flag(info.flags, FSSH_B_FS_HAS_ATTR, &quot;A&quot;, &quot;-&quot;);
++	print_flag(info.flags, FSSH_B_FS_HAS_MIME, &quot;M&quot;, &quot;-&quot;);
++	print_flag(info.flags, FSSH_B_FS_IS_SHARED, &quot;S&quot;, &quot;-&quot;);
++	print_flag(info.flags, FSSH_B_FS_IS_PERSISTENT, &quot;P&quot;, &quot;-&quot;);
++	print_flag(info.flags, FSSH_B_FS_IS_REMOVABLE, &quot;R&quot;, &quot;-&quot;);
++	print_flag(info.flags, FSSH_B_FS_IS_READONLY, &quot;-&quot;, &quot;W&quot;);
++
++	printf(&quot;\nblock size:   %lld\n&quot;, info.block_size);
++	printf(&quot;I/O size:     %lld\n&quot;, info.io_size);
++	printf(&quot;total size:   %s (%lld blocks)\n&quot;,
++		byte_string(info.total_blocks, info.block_size), info.total_blocks);
++	printf(&quot;free size:    %s (%lld blocks)\n&quot;,
++		byte_string(info.free_blocks, info.block_size), info.free_blocks);
++	printf(&quot;total nodes:  %lld\n&quot;, info.total_nodes);
++	printf(&quot;free nodes:   %lld\n&quot;, info.free_nodes);
++	printf(&quot;volume name:  %s\n&quot;, info.volume_name);
++	printf(&quot;fs name:      %s\n&quot;, info.fsh_name);
++
++	return FSSH_B_OK;
++}
++
++
++static fssh_status_t
+ command_ln(int argc, const char* const* argv)
+ {
+ 	bool force = false;
+@@ -480,96 +820,6 @@
+ }
+ 
+ 
+-static void
+-list_entry(const char* file, const char* name = NULL)
+-{
+-	// construct path, if a leaf name is given
+-	std::string path;
+-	if (name) {
+-		path = file;
+-		path += '/';
+-		path += name;
+-		file = path.c_str();
+-	} else
+-		name = file;
+-
+-	// stat the file
+-	struct fssh_stat st;
+-	fssh_status_t error = _kern_read_stat(-1, file, false, &amp;st, sizeof(st));
+-	if (error != FSSH_B_OK) {
+-		fprintf(stderr, &quot;Error: Failed to stat() \&quot;%s\&quot;: %s\n&quot;, file,
+-			fssh_strerror(error));
+-		return;
+-	}
+-
+-	// get time
+-	struct tm time;
+-	time_t fileTime = st.fssh_st_mtime;
+-	localtime_r(&amp;fileTime, &amp;time);
+-
+-	// get permissions
+-	std::string permissions;
+-	fssh_mode_t mode = st.fssh_st_mode;
+-	// user
+-	permissions += ((mode &amp; FSSH_S_IRUSR) ? 'r' : '-');
+-	permissions += ((mode &amp; FSSH_S_IWUSR) ? 'w' : '-');
+-	if (mode &amp; FSSH_S_ISUID)
+-		permissions += 's';
+-	else
+-		permissions += ((mode &amp; FSSH_S_IXUSR) ? 'x' : '-');
+-	// group
+-	permissions += ((mode &amp; FSSH_S_IRGRP) ? 'r' : '-');
+-	permissions += ((mode &amp; FSSH_S_IWGRP) ? 'w' : '-');
+-	if (mode &amp; FSSH_S_ISGID)
+-		permissions += 's';
+-	else
+-		permissions += ((mode &amp; FSSH_S_IXGRP) ? 'x' : '-');
+-	// others
+-	permissions += ((mode &amp; FSSH_S_IROTH) ? 'r' : '-');
+-	permissions += ((mode &amp; FSSH_S_IWOTH) ? 'w' : '-');
+-	permissions += ((mode &amp; FSSH_S_IXOTH) ? 'x' : '-');
+-
+-	// get file type
+-	char fileType = '?';
+-	if (FSSH_S_ISREG(mode)) {
+-		fileType = '-';
+-	} else if (FSSH_S_ISLNK(mode)) {
+-		fileType = 'l';
+-	} else if (FSSH_S_ISBLK(mode)) {
+-		fileType = 'b';
+-	} else if (FSSH_S_ISDIR(mode)) {
+-		fileType = 'd';
+-	} else if (FSSH_S_ISCHR(mode)) {
+-		fileType = 'c';
+-	} else if (FSSH_S_ISFIFO(mode)) {
+-		fileType = 'f';
+-	} else if (FSSH_S_ISINDEX(mode)) {
+-		fileType = 'i';
+-	}
+-
+-	// get link target
+-	std::string nameSuffix;
+-	if (FSSH_S_ISLNK(mode)) {
+-		char buffer[FSSH_B_PATH_NAME_LENGTH];
+-		fssh_size_t size = sizeof(buffer) - 1;
+-		error = _kern_read_link(-1, file, buffer, &amp;size);
+-		if (error != FSSH_B_OK)
+-			snprintf(buffer, sizeof(buffer), &quot;(%s)&quot;, fssh_strerror(error));
+-
+-		buffer[size] = '\0';
+-		nameSuffix += &quot; -&gt; &quot;;
+-		nameSuffix += buffer;
+-	}
+-
+-	printf(&quot;%c%s %2d %2d %10lld %d-%02d-%02d %02d:%02d:%02d %s%s\n&quot;,
+-		fileType, permissions.c_str(), (int)st.fssh_st_uid, (int)st.fssh_st_gid,
+-		st.fssh_st_size,
+-		1900 + time.tm_year, 1 + time.tm_mon, time.tm_mday,
+-		time.tm_hour, time.tm_min, time.tm_sec,
+-		name, nameSuffix.c_str());
+-}
+-
+-
+ static fssh_status_t
+ command_ls(int argc, const char* const* argv)
+ {
+@@ -633,75 +883,6 @@
+ 
+ 
+ static fssh_status_t
+-create_dir(const char *path, bool createParents)
+-{
+-	// stat the entry
+-	struct fssh_stat st;
+-	fssh_status_t error = _kern_read_stat(-1, path, false, &amp;st, sizeof(st));
+-	if (error == FSSH_B_OK) {
+-		if (createParents &amp;&amp; FSSH_S_ISDIR(st.fssh_st_mode))
+-			return FSSH_B_OK;
+-
+-		fprintf(stderr, &quot;Error: Cannot make dir, entry \&quot;%s\&quot; is in the way.\n&quot;,
+-			path);
+-		return FSSH_B_FILE_EXISTS;
+-	}
+-
+-	// the dir doesn't exist yet
+-	// if we shall create all parents, do that first
+-	if (createParents) {
+-		// create the parent dir path
+-		// eat the trailing '/'s
+-		int len = strlen(path);
+-		while (len &gt; 0 &amp;&amp; path[len - 1] == '/')
+-			len--;
+-
+-		// eat the last path component
+-		while (len &gt; 0 &amp;&amp; path[len - 1] != '/')
+-			len--;
+-
+-		// eat the trailing '/'s
+-		while (len &gt; 0 &amp;&amp; path[len - 1] == '/')
+-			len--;
+-
+-		// Now either nothing remains, which means we had a single component,
+-		// a root subdir -- in those cases we can just fall through (we should
+-		// actually never be here in case of the root dir, but anyway) -- or
+-		// there is something left, which we can call a parent directory and
+-		// try to create it.
+-		if (len &gt; 0) {
+-			char *parentPath = (char*)malloc(len + 1);
+-			if (!parentPath) {
+-				fprintf(stderr, &quot;Error: Failed to allocate memory for parent &quot;
+-					&quot;path.\n&quot;);
+-				return FSSH_B_NO_MEMORY;
+-			}
+-			memcpy(parentPath, path, len);
+-			parentPath[len] = '\0';
+-
+-			error = create_dir(parentPath, createParents);
+-
+-			free(parentPath);
+-
+-			if (error != FSSH_B_OK)
+-				return error;
+-		}
+-	}
+-
+-	// make the directory
+-	error = _kern_create_dir(-1,
+-		path, (FSSH_S_IRWXU | FSSH_S_IRWXG | FSSH_S_IRWXO) &amp; ~sUmask);
+-	if (error != FSSH_B_OK) {
+-		fprintf(stderr, &quot;Error: Failed to make directory \&quot;%s\&quot;: %s\n&quot;, path,
+-			fssh_strerror(error));
+-		return error;
+-	}
+-
+-	return FSSH_B_OK;
+-}
+-
+-
+-static fssh_status_t
+ command_mkdir(int argc, const char* const* argv)
+ {
+ 	bool createParents = false;
+@@ -752,22 +933,6 @@
+ }
+ 
+ 
+-static fssh_dev_t
+-get_volume_id()
+-{
+-	struct fssh_stat st;
+-	fssh_status_t error = _kern_read_stat(-1, kMountPoint, false, &amp;st,
+-		sizeof(st));
+-	if (error != FSSH_B_OK) {
+-		fprintf(stderr, &quot;Error: Failed to stat() mount point: %s\n&quot;,
+-			fssh_strerror(error));
+-		return error;
+-	}
+-
+-	return st.fssh_st_dev;
+-}
+-
+-
+ static fssh_status_t
+ command_mkindex(int argc, const char* const* argv)
+ {
+@@ -858,99 +1023,7 @@
+ }
+ 
+ 
+-static fssh_status_t remove_entry(int dir, const char *entry, bool recursive,
+-	bool force);
+-
+-
+ static fssh_status_t
+-remove_dir_contents(int parentDir, const char *name, bool force)
+-{
+-	// open the dir
+-	int dir = _kern_open_dir(parentDir, name);
+-	if (dir &lt; 0) {
+-		fprintf(stderr, &quot;Error: Failed to open dir \&quot;%s\&quot;: %s\n&quot;, name,
+-			fssh_strerror(dir));
+-		return dir;
+-	}
+-
+-	fssh_status_t error = FSSH_B_OK;
+-
+-	// iterate through the entries
+-	fssh_ssize_t numRead;
+-	char buffer[sizeof(fssh_dirent) + FSSH_B_FILE_NAME_LENGTH];
+-	fssh_dirent *entry = (fssh_dirent*)buffer;
+-	while ((numRead = _kern_read_dir(dir, entry, sizeof(buffer), 1)) &gt; 0) {
+-		// skip &quot;.&quot; and &quot;..&quot;
+-		if (strcmp(entry-&gt;d_name, &quot;.&quot;) == 0 || strcmp(entry-&gt;d_name, &quot;..&quot;) == 0)
+-			continue;
+-
+-		error = remove_entry(dir, entry-&gt;d_name, true, force);
+-		if (error != FSSH_B_OK)
+-			break;
+-	}
+-
+-	if (numRead &lt; 0) {
+-		fprintf(stderr, &quot;Error: Failed to read directory \&quot;%s\&quot;: %s\n&quot;, name,
+-			fssh_strerror(numRead));
+-		error = numRead;
+-	}
+-
+-	// close
+-	_kern_close(dir);
+-
+-	return error;
+-}
+-
+-
+-static fssh_status_t
+-remove_entry(int dir, const char *entry, bool recursive, bool force)
+-{
+-	// stat the file
+-	struct fssh_stat st;
+-	fssh_status_t error = _kern_read_stat(dir, entry, false, &amp;st, sizeof(st));
+-	if (error != FSSH_B_OK) {
+-		if (force &amp;&amp; error == FSSH_B_ENTRY_NOT_FOUND)
+-			return FSSH_B_OK;
+-
+-		fprintf(stderr, &quot;Error: Failed to remove \&quot;%s\&quot;: %s\n&quot;, entry,
+-			fssh_strerror(error));
+-		return error;
+-	}
+-
+-	if (FSSH_S_ISDIR(st.fssh_st_mode)) {
+-		if (!recursive) {
+-			fprintf(stderr, &quot;Error: \&quot;%s\&quot; is a directory.\n&quot;, entry);
+-				// TODO: get the full path
+-			return FSSH_EISDIR;
+-		}
+-
+-		// remove the contents
+-		error = remove_dir_contents(dir, entry, force);
+-		if (error != FSSH_B_OK)
+-			return error;
+-
+-		// remove the directory
+-		error = _kern_remove_dir(dir, entry);
+-		if (error != FSSH_B_OK) {
+-			fprintf(stderr, &quot;Error: Failed to remove directory \&quot;%s\&quot;: %s\n&quot;,
+-				entry, fssh_strerror(error));
+-			return error;
+-		}
+-	} else {
+-		// remove the entry
+-		error = _kern_unlink(dir, entry);
+-		if (error != FSSH_B_OK) {
+-			fprintf(stderr, &quot;Error: Failed to remove entry \&quot;%s\&quot;: %s\n&quot;, entry,
+-				fssh_strerror(error));
+-			return error;
+-		}
+-	}
+-
+-	return FSSH_B_OK;
+-}
+-
+-
+-static fssh_status_t
+ command_rm(int argc, char **argv)
+ {
+ 	bool recursive = false;
+@@ -1021,6 +1094,7 @@
+ 		command_chmod,		&quot;chmod&quot;,		&quot;change file permissions&quot;,
+ 		command_cp,			&quot;cp&quot;,			&quot;copy files and directories&quot;,
+ 		command_help,		&quot;help&quot;,			&quot;list supported commands&quot;,
++		command_info,		&quot;info&quot;,			&quot;prints volume informations&quot;,
+ 		command_ln,			&quot;ln&quot;,			&quot;create a hard or symbolic link&quot;,
+ 		command_ls,			&quot;ls&quot;,			&quot;list files or directories&quot;,
+ 		command_mkdir,		&quot;mkdir&quot;,		&quot;create directories&quot;,
+@@ -1420,7 +1494,6 @@
+ 	if (startOffset != 0 || endOffset != -1)
+ 		add_file_restriction(device, startOffset, endOffset);
+ 
+-
+ 	// start the action
+ 	int result;
+ 	if (initialize) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013485.html">[Haiku-commits] r28623 - haiku/trunk/src/system/boot
+</A></li>
+	<LI>Next message: <A HREF="013487.html">[Haiku-commits] r28625 - haiku/trunk/headers/posix/netinet
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13486">[ date ]</a>
+              <a href="thread.html#13486">[ thread ]</a>
+              <a href="subject.html#13486">[ subject ]</a>
+              <a href="author.html#13486">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

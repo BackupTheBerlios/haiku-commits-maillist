@@ -1,0 +1,539 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24335 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24335%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200803091756.m29HuTkY023675%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006704.html">
+   <LINK REL="Next"  HREF="006703.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24335 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24335%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200803091756.m29HuTkY023675%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24335 - in haiku/trunk: headers/private/kernel	src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Mar  9 18:56:29 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006704.html">[Haiku-commits] r24334 - haiku/trunk/src/system/libroot/posix/locale
+</A></li>
+        <LI>Next message: <A HREF="006703.html">[Haiku-commits] r24336 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6702">[ date ]</a>
+              <a href="thread.html#6702">[ thread ]</a>
+              <a href="subject.html#6702">[ subject ]</a>
+              <a href="author.html#6702">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-03-09 18:56:27 +0100 (Sun, 09 Mar 2008)
+New Revision: 24335
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24335&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24335&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/team.h
+   haiku/trunk/headers/private/kernel/thread_types.h
+   haiku/trunk/src/system/kernel/team.cpp
+   haiku/trunk/src/system/kernel/thread.cpp
+Log:
+Process groups are now reference-counted. Processes in a group as well
+as the death entries of a deceased processes that were in this group
+and have not yet been reaped hold references to the group, so that it
+won't be deleted until the group is empty and all gone group members
+have been reaped. This fixes #1799 at last.
+
+
+Modified: haiku/trunk/headers/private/kernel/team.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/team.h	2008-03-09 17:47:52 UTC (rev 24334)
++++ haiku/trunk/headers/private/kernel/team.h	2008-03-09 17:56:27 UTC (rev 24335)
+@@ -17,7 +17,7 @@
+ team_id team_create_team(const char *path, const char *name, char **args,
+ 			int argc, char **envp, int envc, int priority);
+ status_t wait_for_team(team_id id, status_t *returnCode);
+-void team_remove_team(struct team *team, struct process_group **_freeGroup);
++void team_remove_team(struct team *team);
+ void team_delete_team(struct team *team);
+ struct process_group *team_get_process_group_locked(
+ 			struct process_session *session, pid_t id);
+
+Modified: haiku/trunk/headers/private/kernel/thread_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/thread_types.h	2008-03-09 17:47:52 UTC (rev 24334)
++++ haiku/trunk/headers/private/kernel/thread_types.h	2008-03-09 17:56:27 UTC (rev 24335)
+@@ -80,6 +80,7 @@
+ 	struct process_group *next;		// next in hash
+ 	struct process_session *session;
+ 	pid_t				id;
++	int32				refs;
+ 	struct team			*teams;
+ 	bool				orphaned;
+ };
+@@ -115,6 +116,7 @@
+ struct job_control_entry : DoublyLinkedListLinkImpl&lt;job_control_entry&gt; {
+ 	job_control_state	state;		// current team job control state
+ 	thread_id			thread;		// main thread ID == team ID
++	bool				has_group_ref;
+ 
+ 	// valid while state != JOB_CONTROL_STATE_DEAD
+ 	struct team*		team;
+@@ -124,6 +126,13 @@
+ 	status_t			status;
+ 	uint16				reason;
+ 	uint16				signal;
++
++	job_control_entry();
++	~job_control_entry();
++
++	void InitDeadState();
++
++	job_control_entry&amp; operator=(const job_control_entry&amp; other);
+ };
+ 
+ typedef DoublyLinkedList&lt;job_control_entry&gt; JobControlEntryList;
+
+Modified: haiku/trunk/src/system/kernel/team.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/team.cpp	2008-03-09 17:47:52 UTC (rev 24334)
++++ haiku/trunk/src/system/kernel/team.cpp	2008-03-09 17:56:27 UTC (rev 24335)
+@@ -19,6 +19,7 @@
+ 
+ #include &lt;elf.h&gt;
+ #include &lt;file_cache.h&gt;
++#include &lt;heap.h&gt;
+ #include &lt;int.h&gt;
+ #include &lt;kernel.h&gt;
+ #include &lt;kimage.h&gt;
+@@ -620,29 +621,21 @@
+ }
+ 
+ 
+-/*!	You must hold the team lock when calling this function. */
+ static void
+-insert_group_into_session(struct process_session *session, struct process_group *group)
++deferred_delete_process_group(struct process_group *group)
+ {
+ 	if (group == NULL)
+ 		return;
+ 
+-	group-&gt;session = session;
+-	hash_insert(sGroupHash, group);
+-	session-&gt;group_count++;
+-}
++	// remove_group_from_session() keeps this pointer around
++	// only if the session can be freed as well
++	if (group-&gt;session) {
++		TRACE((&quot;deferred_delete_process_group(): frees session %ld\n&quot;,
++			group-&gt;session-&gt;id));
++		deferred_free(group-&gt;session);
++	}
+ 
+-
+-/*!	You must hold the team lock when calling this function. */
+-static void
+-insert_team_into_group(struct process_group *group, struct team *team)
+-{
+-	team-&gt;group = group;
+-	team-&gt;group_id = group-&gt;id;
+-	team-&gt;session_id = group-&gt;session-&gt;id;
+-
+-	team-&gt;group_next = group-&gt;teams;
+-	group-&gt;teams = team;
++	deferred_free(group);
+ }
+ 
+ 
+@@ -668,23 +661,84 @@
+ }
+ 
+ 
+-/*!	Removes the team from the group. If that group becomes therefore
+-	unused, it will set \a _freeGroup to point to the group - otherwise
+-	it will be \c NULL.
+-	It cannot be freed here because this function has to be called
+-	with having the team lock held.
++/*!	Team lock must be held.
++*/
++static void
++acquire_process_group_ref(pid_t groupID)
++{
++	process_group* group = team_get_process_group_locked(NULL, groupID);
++	if (group == NULL) {
++		panic(&quot;acquire_process_group_ref(): unknown group ID: %ld&quot;, groupID);
++		return;
++	}
+ 
++	group-&gt;refs++;
++}
++
++
++/*!	Team lock must be held.
++*/
++static void
++release_process_group_ref(pid_t groupID)
++{
++	process_group* group = team_get_process_group_locked(NULL, groupID);
++	if (group == NULL) {
++		panic(&quot;release_process_group_ref(): unknown group ID: %ld&quot;, groupID);
++		return;
++	}
++
++	if (group-&gt;refs &lt;= 0) {
++		panic(&quot;release_process_group_ref(%ld): ref count already 0&quot;, groupID);
++		return;
++	}
++
++	if (--group-&gt;refs &gt; 0)
++		return;
++
++	// group is no longer used
++
++	remove_group_from_session(group);
++	deferred_delete_process_group(group);
++}
++
++
++/*!	You must hold the team lock when calling this function. */
++static void
++insert_group_into_session(struct process_session *session, struct process_group *group)
++{
++	if (group == NULL)
++		return;
++
++	group-&gt;session = session;
++	hash_insert(sGroupHash, group);
++	session-&gt;group_count++;
++}
++
++
++/*!	You must hold the team lock when calling this function. */
++static void
++insert_team_into_group(struct process_group *group, struct team *team)
++{
++	team-&gt;group = group;
++	team-&gt;group_id = group-&gt;id;
++	team-&gt;session_id = group-&gt;session-&gt;id;
++
++	team-&gt;group_next = group-&gt;teams;
++	group-&gt;teams = team;
++	acquire_process_group_ref(group-&gt;id);
++}
++
++
++/*!	Removes the team from the group.
++
+ 	\param team the team that'll be removed from it's group
+-	\param _freeGroup points to the group to be freed or NULL
+ */
+ static void
+-remove_team_from_group(struct team *team, struct process_group **_freeGroup)
++remove_team_from_group(struct team *team)
+ {
+ 	struct process_group *group = team-&gt;group;
+ 	struct team *current, *last = NULL;
+ 
+-	*_freeGroup = NULL;
+-
+ 	// the team must be in any team to let this function have any effect
+ 	if  (group == NULL)
+ 		return;
+@@ -705,13 +759,7 @@
+ 	team-&gt;group = NULL;
+ 	team-&gt;group_next = NULL;
+ 
+-	if (group-&gt;teams != NULL)
+-		return;
+-
+-	// we can remove this group as it is no longer used
+-
+-	remove_group_from_session(group);
+-	*_freeGroup = group;
++	release_process_group_ref(group-&gt;id);
+ }
+ 
+ 
+@@ -723,6 +771,7 @@
+ 		return NULL;
+ 
+ 	group-&gt;id = id;
++	group-&gt;refs = 0;
+ 	group-&gt;session = NULL;
+ 	group-&gt;teams = NULL;
+ 	group-&gt;orphaned = true;
+@@ -1095,7 +1144,6 @@
+ 	char * const *env, int32 priority, uint32 flags,
+ 	port_id errorPort, uint32 errorToken, bool kernel)
+ {
+-	struct process_group *group;
+ 	struct team *team, *parent;
+ 	const char *threadName;
+ 	thread_id thread;
+@@ -1221,14 +1269,13 @@
+ 	state = disable_interrupts();
+ 	GRAB_TEAM_LOCK();
+ 
+-	remove_team_from_group(team, &amp;group);
++	remove_team_from_group(team);
+ 	remove_team_from_parent(parent, team);
+ 	hash_remove(sTeamHash, team);
+ 
+ 	RELEASE_TEAM_LOCK();
+ 	restore_interrupts(state);
+ 
+-	team_delete_process_group(group);
+ 	delete_team_struct(team);
+ 
+ 	return status;
+@@ -1381,7 +1428,6 @@
+ {
+ 	struct thread *parentThread = thread_get_current_thread();
+ 	struct team *parentTeam = parentThread-&gt;team, *team;
+-	struct process_group *group = NULL;
+ 	struct fork_arg *forkArgs;
+ 	struct area_info info;
+ 	thread_id threadID;
+@@ -1490,14 +1536,13 @@
+ 	state = disable_interrupts();
+ 	GRAB_TEAM_LOCK();
+ 
+-	remove_team_from_group(team, &amp;group);
++	remove_team_from_group(team);
+ 	remove_team_from_parent(parentTeam, team);
+ 	hash_remove(sTeamHash, team);
+ 
+ 	RELEASE_TEAM_LOCK();
+ 	restore_interrupts(state);
+ 
+-	team_delete_process_group(group);
+ 	delete_team_struct(team);
+ 
+ 	return status;
+@@ -1565,6 +1610,57 @@
+ }
+ 
+ 
++job_control_entry::job_control_entry()
++	:
++	has_group_ref(false)
++{
++}
++
++
++job_control_entry::~job_control_entry()
++{
++	if (has_group_ref) {
++		InterruptsSpinLocker locker(team_spinlock);
++		release_process_group_ref(group_id);
++	}
++}
++
++
++/*!	Team and thread lock must be held.
++*/
++void
++job_control_entry::InitDeadState()
++{
++	if (team != NULL) {
++		struct thread* thread = team-&gt;main_thread;
++		group_id = team-&gt;group_id;
++		this-&gt;thread = thread-&gt;id;
++		status = thread-&gt;exit.status;
++		reason = thread-&gt;exit.reason;
++		signal = thread-&gt;exit.signal;
++		team = NULL;
++		acquire_process_group_ref(group_id);
++		has_group_ref = true;
++	}
++}
++
++
++job_control_entry&amp;
++job_control_entry::operator=(const job_control_entry&amp; other)
++{
++	state = other.state;
++	thread = other.thread;
++	has_group_ref = false;
++	team = other.team;
++	group_id = other.group_id;
++	status = other.status;
++	reason = other.reason;
++	signal = other.signal;
++
++	return *this;
++}
++
++
+ /*! This is the kernel backend for waitpid(). It is a bit more powerful when it
+ 	comes to the reason why a thread has died than waitpid() can be.
+ */
+@@ -2041,11 +2137,9 @@
+ /*!	Removes the specified team from the global team hash, and from its parent.
+ 	It also moves all of its children up to the parent.
+ 	You must hold the team lock when you call this function.
+-	If \a _freeGroup is set to a value other than \c NULL, it must be freed
+-	from the calling function.
+ */
+ void
+-team_remove_team(struct team *team, struct process_group **_freeGroup)
++team_remove_team(struct team *team)
+ {
+ 	struct team *parent = team-&gt;parent;
+ 
+@@ -2109,7 +2203,7 @@
+ 	reparent_children(team);
+ 
+ 	// remove us from our process group
+-	remove_team_from_group(team, _freeGroup);
++	remove_team_from_group(team);
+ 
+ 	// remove us from our parent
+ 	remove_team_from_parent(parent, team);
+@@ -2870,7 +2964,6 @@
+ 
+ 	status_t status = B_OK;
+ 	struct process_group *freeGroup = NULL;
+-	struct process_group *freeGroup2 = NULL;
+ 
+ 	InterruptsSpinLocker locker(team_spinlock);
+ 
+@@ -2893,7 +2986,7 @@
+ 			if (targetGroup != NULL) {
+ 				// In case of processID == groupID we have to free the
+ 				// allocated group.
+-				freeGroup2 = group;
++				freeGroup = group;
+ 			} else if (processID == groupID) {
+ 				// We created a new process group, let us insert it into the
+ 				// team's session.
+@@ -2905,7 +2998,7 @@
+ 				// we got a group, let's move the team there
+ 				process_group* oldGroup = team-&gt;group;
+ 
+-				remove_team_from_group(team, &amp;freeGroup);
++				remove_team_from_group(team);
+ 				insert_team_into_group(targetGroup, team);
+ 
+ 				// Update the &quot;orphaned&quot; flag of all potentially affected
+@@ -2953,7 +3046,6 @@
+ 	}
+ 
+ 	team_delete_process_group(freeGroup);
+-	team_delete_process_group(freeGroup2);
+ 
+ 	return status == B_OK ? groupID : status;
+ }
+@@ -2964,7 +3056,7 @@
+ {
+ 	struct team *team = thread_get_current_thread()-&gt;team;
+ 	struct process_session *session;
+-	struct process_group *group, *freeGroup = NULL;
++	struct process_group *group;
+ 	cpu_status state;
+ 	bool failed = false;
+ 
+@@ -2987,7 +3079,7 @@
+ 
+ 	// this may have changed since the check above
+ 	if (!is_process_group_leader(team)) {
+-		remove_team_from_group(team, &amp;freeGroup);
++		remove_team_from_group(team);
+ 
+ 		insert_group_into_session(session, group);
+ 		insert_team_into_group(group, team);
+@@ -3001,8 +3093,7 @@
+ 		team_delete_process_group(group);
+ 		free(session);
+ 		return B_NOT_ALLOWED;
+-	} else
+-		team_delete_process_group(freeGroup);
++	}
+ 
+ 	return team-&gt;group_id;
+ }
+
+Modified: haiku/trunk/src/system/kernel/thread.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/thread.cpp	2008-03-09 17:47:52 UTC (rev 24334)
++++ haiku/trunk/src/system/kernel/thread.cpp	2008-03-09 17:56:27 UTC (rev 24335)
+@@ -1192,7 +1192,6 @@
+ {
+ 	cpu_status state;
+ 	struct thread *thread = thread_get_current_thread();
+-	struct process_group *freeGroup = NULL;
+ 	struct team *team = thread-&gt;team;
+ 	thread_id parentID = -1;
+ 	bool deleteTeam = false;
+@@ -1261,12 +1260,7 @@
+ 			team-&gt;job_control_entry = NULL;
+ 
+ 			if (death != NULL) {
+-				death-&gt;team = NULL;
+-				death-&gt;group_id = team-&gt;group_id;
+-				death-&gt;thread = thread-&gt;id;
+-				death-&gt;status = thread-&gt;exit.status;
+-				death-&gt;reason = thread-&gt;exit.reason;
+-				death-&gt;signal = thread-&gt;exit.signal;
++				death-&gt;InitDeadState();
+ 
+ 				// team_set_job_control_state() already moved our entry
+ 				// into the parent's list. We just check the soft limit of
+@@ -1281,7 +1275,7 @@
+ 			} else
+ 				RELEASE_THREAD_LOCK();
+ 
+-			team_remove_team(team, &amp;freeGroup);
++			team_remove_team(team);
+ 
+ 			send_signal_etc(parentID, SIGCHLD,
+ 				SIGNAL_FLAG_TEAMS_LOCKED | B_DO_NOT_RESCHEDULE);
+@@ -1324,15 +1318,6 @@
+ 
+ 	// delete the team if we're its main thread
+ 	if (deleteTeam) {
+-		// TODO: Deleting the process group is actually a problem. According to
+-		// the POSIX standard the process should become a zombie and live on
+-		// until it is reaped. Hence the process group would continue to exist
+-		// for that time as well. That is moving processes to it (setpgid())
+-		// should work. This can actually happen e.g. when executing something
+-		// like &quot;echo foobar | wc&quot; in the shell. The built-in &quot;echo&quot; could
+-		// exit() even before setpgid() has been invoked for the &quot;wc&quot; child.
+-		// Cf. bug #1799.
+-		team_delete_process_group(freeGroup);
+ 		team_delete_team(team);
+ 
+ 		// we need to delete any death entry that made it to here
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006704.html">[Haiku-commits] r24334 - haiku/trunk/src/system/libroot/posix/locale
+</A></li>
+	<LI>Next message: <A HREF="006703.html">[Haiku-commits] r24336 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6702">[ date ]</a>
+              <a href="thread.html#6702">[ thread ]</a>
+              <a href="subject.html#6702">[ subject ]</a>
+              <a href="author.html#6702">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

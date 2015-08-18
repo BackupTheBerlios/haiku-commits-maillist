@@ -1,0 +1,1080 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r19893 - haiku/trunk/src/kits/tracker
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19893%20-%20haiku/trunk/src/kits/tracker&In-Reply-To=%3C200701211803.l0LI3nks030091%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000360.html">
+   <LINK REL="Next"  HREF="000362.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r19893 - haiku/trunk/src/kits/tracker</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19893%20-%20haiku/trunk/src/kits/tracker&In-Reply-To=%3C200701211803.l0LI3nks030091%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r19893 - haiku/trunk/src/kits/tracker">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sun Jan 21 19:03:49 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000360.html">[Haiku-commits] r19892 - haiku/trunk/src/add-ons/kernel/file_systems/nfs
+</A></li>
+        <LI>Next message: <A HREF="000362.html">[Haiku-commits] r19894 - haiku/trunk/src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#361">[ date ]</a>
+              <a href="thread.html#361">[ thread ]</a>
+              <a href="subject.html#361">[ subject ]</a>
+              <a href="author.html#361">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-01-21 19:03:47 +0100 (Sun, 21 Jan 2007)
+New Revision: 19893
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=19893&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=19893&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/kits/tracker/AutoMounter.cpp
+   haiku/trunk/src/kits/tracker/AutoMounter.h
+Log:
+* Implemented the AutoMounter for Haiku - it's barely tested at this point, but
+  at least mounting/unmounting seems to work. This fixes bug #191.
+* Also changed the way how Tracker automatically mounts/unmounts volumes: it now
+  only differentiates between removable and fixed storage, not between initial
+  scan at boot, and periodical scans during runtime. Also removed all HFS stuff.
+* Got rid of _INCLUDES_CLASS_DEVICE_MAP for the BeOS build.
+
+
+Modified: haiku/trunk/src/kits/tracker/AutoMounter.cpp
+===================================================================
+--- haiku/trunk/src/kits/tracker/AutoMounter.cpp	2007-01-21 16:41:14 UTC (rev 19892)
++++ haiku/trunk/src/kits/tracker/AutoMounter.cpp	2007-01-21 18:03:47 UTC (rev 19893)
+@@ -41,6 +41,13 @@
+ #include &quot;Tracker.h&quot;
+ #include &quot;TrackerSettings.h&quot;
+ 
++#ifdef __HAIKU__
++#	include &lt;DiskDeviceRoster.h&gt;
++#	include &lt;DiskDevice.h&gt;
++#	include &lt;DiskDeviceList.h&gt;
++#	include &lt;fs_volume.h&gt;
++#endif
++
+ #include &lt;Alert.h&gt;
+ #include &lt;fs_info.h&gt;
+ #include &lt;Message.h&gt;
+@@ -52,42 +59,555 @@
+ #include &lt;string.h&gt;
+ 
+ 
+-static const uint32 kStartPolling = 'strp';
+-#if _INCLUDES_CLASS_DEVICE_MAP
+ static const char *kAutoMounterSettings = &quot;automounter_settings&quot;;
++
++
++#ifdef __HAIKU__
++//	#pragma mark - Haiku Disk Device API
++
++static const uint32 kMsgInitialScan = 'insc';
++
++
++AutoMounter::AutoMounter()
++	: BLooper(&quot;AutoMounter&quot;, B_LOW_PRIORITY),
++	fNormalMode(kRestorePreviousVolumes),
++	fRemovableMode(kAllVolumes)
++{
++	if (!BootedInSafeMode()) {
++		_ReadSettings();
++	} else {
++		// defeat automounter in safe mode, don't even care about the settings
++		fNormalMode = kNoVolumes;
++		fRemovableMode = kNoVolumes;
++	}
++
++	if (PostMessage(kMsgInitialScan) != B_OK)
++		debug_printf(&quot;AutoMounter: OH NO!\n&quot;);
++}
++
++
++AutoMounter::~AutoMounter()
++{
++}
++
++
++void
++AutoMounter::_MountVolumes(mount_mode normal, mount_mode removable)
++{
++	if (normal == kNoVolumes &amp;&amp; removable == kNoVolumes)
++		return;
++
++	class InitialMountVisitor : public BDiskDeviceVisitor {
++		public:
++			InitialMountVisitor(mount_mode normalMode, mount_mode removableMode,
++					BMessage&amp; previous)
++				:
++				fNormalMode(normalMode),
++				fRemovableMode(removableMode),
++				fPrevious(previous)
++			{
++			}
++
++			virtual
++			~InitialMountVisitor()
++			{
++			}
++
++			virtual bool
++			Visit(BDiskDevice* device)
++			{
++				return Visit(device, 0);
++			}
++
++			virtual bool
++			Visit(BPartition* partition, int32 level)
++			{
++				mount_mode mode = partition-&gt;Device()-&gt;IsRemovableMedia()
++					? fRemovableMode : fNormalMode;
++				if (mode == kNoVolumes
++					|| partition-&gt;IsMounted()
++					|| !partition-&gt;ContainsFileSystem())
++					return false;
++
++				if (mode == kRestorePreviousVolumes) {
++					// mount all volumes that were stored in the settings file
++					const char *volumeName;
++					BPath path;
++					if (partition-&gt;GetPath(&amp;path) != B_OK
++						|| partition-&gt;ContentName() == NULL
++						|| fPrevious.FindString(path.Path(), &amp;volumeName) != B_OK
++						|| strcmp(volumeName, partition-&gt;ContentName()))
++						return false;
++				} else if (mode == kOnlyBFSVolumes) {
++					if (partition-&gt;ContentType() == NULL
++						|| strcmp(partition-&gt;ContentType(), &quot;BFS&quot;))
++						return false;
++				}
++
++				partition-&gt;Mount();
++				return false;
++			}
++
++		private:
++			mount_mode	fNormalMode;
++			mount_mode	fRemovableMode;
++			BMessage&amp;	fPrevious;
++	} visitor(normal, removable, fSettings);
++
++	BDiskDeviceList devices;
++	status_t status = devices.Fetch();
++	if (status == B_OK)
++		devices.VisitEachPartition(&amp;visitor);
++}
++
++
++void
++AutoMounter::_MountVolume(BMessage *message)
++{
++	int32 id;
++	if (message-&gt;FindInt32(&quot;id&quot;, &amp;id) != B_OK)
++		return;
++
++	BDiskDeviceRoster roster;
++	BPartition *partition;
++	BDiskDevice device;
++	if (roster.GetPartitionWithID(id, &amp;device, &amp;partition) != B_OK)
++		return;
++
++	status_t status = partition-&gt;Mount();
++	if (status &lt; B_OK) {
++		BString string;
++		string &lt;&lt; &quot;Error mounting volume. (&quot; &lt;&lt; strerror(status) &lt;&lt; &quot;)&quot;;
++			(new BAlert(&quot;&quot;, string.String(), &quot;OK&quot;))-&gt;Go(0);
++	}
++}
++
++
++bool
++AutoMounter::_ForceUnmount(const char* name, status_t error)
++{
++	BString text;
++	text &lt;&lt; &quot;Could not unmount disk \&quot;&quot; &lt;&lt; name &lt;&lt; &quot;\&quot;:\n\t&quot; &lt;&lt; strerror(error);
++	text &lt;&lt; &quot;\n\nShould I force unmounting the disk?\n\n&quot;
++		&quot;Note: if an application is currently writing to the volume, unmounting&quot;
++		&quot; it now might result in loss of data.\n&quot;;
++
++	int32 choice = (new BAlert(&quot;&quot;, text.String(), &quot;Cancel&quot;, &quot;Force Unmount&quot;, NULL,
++		B_WIDTH_AS_USUAL, B_WARNING_ALERT))-&gt;Go();
++
++	return choice == 1;
++}
++
++
++void
++AutoMounter::_ReportUnmountError(const char* name, status_t error)
++{
++	BString text;
++	text &lt;&lt; &quot;Could not unmount disk \&quot;&quot; &lt;&lt; name &lt;&lt; &quot;\&quot;:\n\t&quot; &lt;&lt; strerror(error);
++
++	(new BAlert(&quot;&quot;, text.String(), &quot;OK&quot;, NULL, NULL, B_WIDTH_AS_USUAL, 
++		B_WARNING_ALERT))-&gt;Go(NULL);
++}
++
++
++void
++AutoMounter::_UnmountAndEjectVolume(BMessage *message)
++{
++	int32 id;
++	if (message-&gt;FindInt32(&quot;id&quot;, &amp;id) == B_OK) {
++		BDiskDeviceRoster roster;
++		BPartition *partition;
++		BDiskDevice device;
++		if (roster.GetPartitionWithID(id, &amp;device, &amp;partition) != B_OK)
++			return;
++
++		status_t status = partition-&gt;Unmount();
++		if (status &lt; B_OK) {
++			if (!_ForceUnmount(partition-&gt;ContentName(), status))
++				return;
++
++			status = partition-&gt;Unmount(B_FORCE_UNMOUNT);
++		}
++
++		if (status &lt; B_OK)
++			_ReportUnmountError(partition-&gt;ContentName(), status);
++
++		return;
++	}
++
++	// see if we got a dev_t
++
++	dev_t device;
++	if (message-&gt;FindInt32(&quot;device_id&quot;, &amp;device) != B_OK)
++		return;
++
++	BVolume volume(device);
++	status_t status = volume.InitCheck();
++
++	char name[B_FILE_NAME_LENGTH];
++	if (status == B_OK)
++		status = volume.GetName(name);
++	if (status &lt; B_OK)
++		snprintf(name, sizeof(name), &quot;device:%ld&quot;, device);
++
++	BDirectory mountPoint;
++	if (status == B_OK)
++		status = volume.GetRootDirectory(&amp;mountPoint);
++
++	BPath path;
++	if (status == B_OK)
++		status = path.SetTo(&amp;mountPoint, &quot;.&quot;);
++
++	if (status == B_OK) {
++		status = fs_unmount_volume(path.Path(), 0);
++		if (status &lt; B_OK) {
++			if (!_ForceUnmount(name, status))
++				return;
++
++			status = fs_unmount_volume(path.Path(), B_FORCE_UNMOUNT);
++		}
++	}
++
++	if (status == B_OK)
++		rmdir(path.Path());
++
++	if (status &lt; B_OK)
++		_ReportUnmountError(name, status);
++}
++
++
++void
++AutoMounter::_FromMode(mount_mode mode, bool&amp; all, bool&amp; bfs, bool&amp; restore)
++{
++	all = bfs = restore = false;
++
++	switch (mode) {
++		case kAllVolumes:
++			all = true;
++			break;
++		case kOnlyBFSVolumes:
++			bfs = true;
++			break;
++		case kRestorePreviousVolumes:
++			restore = true;
++			break;
++
++		default:
++			break;
++	}
++}
++
++
++AutoMounter::mount_mode
++AutoMounter::_ToMode(bool all, bool bfs, bool restore)
++{
++	if (all)
++		return kAllVolumes;
++	if (bfs)
++		return kOnlyBFSVolumes;
++	if (restore)
++		return kRestorePreviousVolumes;
++
++	return kNoVolumes;
++}
++
++
++void
++AutoMounter::_ReadSettings()
++{
++	BPath directoryPath;
++	if (FSFindTrackerSettingsDir(&amp;directoryPath) != B_OK)
++		return;
++
++	BPath path(directoryPath);
++	path.Append(kAutoMounterSettings);
++	fPrefsFile.SetTo(path.Path(), O_RDWR);
++
++	if (fPrefsFile.InitCheck() != B_OK) {
++		// no prefs file yet, create a new one
++
++		BDirectory dir(directoryPath.Path());
++		dir.CreateFile(kAutoMounterSettings, &amp;fPrefsFile);
++		return;
++	}
++
++	ssize_t settingsSize = (ssize_t)fPrefsFile.Seek(0, SEEK_END);
++	if (settingsSize == 0)
++		return;
++
++	ASSERT(settingsSize != 0);
++	char *buffer = new char[settingsSize];
++
++	fPrefsFile.Seek(0, 0);
++	if (fPrefsFile.Read(buffer, (size_t)settingsSize) != settingsSize) {
++		PRINT((&quot;error reading automounter settings\n&quot;));
++		delete [] buffer;
++		return;
++	}
++
++	BMessage message('stng');
++	status_t result = message.Unflatten(buffer);
++	if (result != B_OK) {
++		PRINT((&quot;error %s unflattening settings, size %d\n&quot;, strerror(result), 
++			settingsSize));
++		delete [] buffer;
++		return;
++	}
++
++	delete [] buffer;
++
++	_UpdateSettingsFromMessage(&amp;message);
++	GetSettings(&amp;fSettings);
++}
++
++
++void
++AutoMounter::_WriteSettings()
++{
++	if (fPrefsFile.InitCheck() != B_OK)
++		return;
++
++	BMessage message('stng');
++	GetSettings(&amp;message);
++
++	ssize_t settingsSize = message.FlattenedSize();
++
++	char *buffer = new char[settingsSize];
++	status_t result = message.Flatten(buffer, settingsSize);
++
++	fPrefsFile.Seek(0, 0);
++	result = fPrefsFile.Write(buffer, (size_t)settingsSize);
++	if (result != settingsSize)
++		PRINT((&quot;error writing settings, %s\n&quot;, strerror(result)));
++
++	delete [] buffer;
++}
++
++
++void
++AutoMounter::_UpdateSettingsFromMessage(BMessage* message)
++{
++	// auto mounter settings
++
++	bool all, bfs, restore;
++	if (message-&gt;FindBool(&quot;autoMountAll&quot;, &amp;all) != B_OK)
++		all = true;
++	if (message-&gt;FindBool(&quot;autoMountAllBFS&quot;, &amp;bfs) != B_OK)
++		bfs = false;
++
++	fRemovableMode = _ToMode(all, bfs, false);
++
++	// initial mount settings
++
++	if (message-&gt;FindBool(&quot;initialMountAll&quot;, &amp;all) != B_OK)
++		all = false;
++	if (message-&gt;FindBool(&quot;initialMountAllBFS&quot;, &amp;bfs) != B_OK)
++		bfs = false;
++	if (message-&gt;FindBool(&quot;initialMountRestore&quot;, &amp;restore) != B_OK)
++		restore = true;
++
++	fNormalMode = _ToMode(all, bfs, restore);
++}
++
++
++void
++AutoMounter::GetSettings(BMessage *message)
++{
++	message-&gt;MakeEmpty();
++
++	bool all, bfs, restore;
++
++	_FromMode(fNormalMode, all, bfs, restore);
++	message-&gt;AddBool(&quot;initialMountAll&quot;, all);
++	message-&gt;AddBool(&quot;initialMountAllBFS&quot;, bfs);
++	message-&gt;AddBool(&quot;initialMountRestore&quot;, restore);
++
++	_FromMode(fRemovableMode, all, bfs, restore);
++	message-&gt;AddBool(&quot;autoMountAll&quot;, all);
++	message-&gt;AddBool(&quot;autoMountAllBFS&quot;, bfs);
++
++	// Save mounted volumes so we can optionally mount them on next
++	// startup
++	BVolumeRoster volumeRoster;
++	BVolume volume;
++	while (volumeRoster.GetNextVolume(&amp;volume) == B_OK) {
++        fs_info info;
++        if (fs_stat_dev(volume.Device(), &amp;info) == 0
++			&amp;&amp; info.flags &amp; (B_FS_IS_REMOVABLE | B_FS_IS_PERSISTENT))
++			message-&gt;AddString(info.device_name, info.volume_name);
++	}
++}
++
++
++void
++AutoMounter::MessageReceived(BMessage *message)
++{
++	switch (message-&gt;what) {
++		case kMsgInitialScan:
++			_MountVolumes(fNormalMode, fRemovableMode);
++			break;
++
++		case kMountVolume:
++			_MountVolume(message);
++			break;
++
++		case kUnmountVolume:
++			_UnmountAndEjectVolume(message);
++			break;
++
++		case kSetAutomounterParams:
++		{
++			bool rescanNow = false;
++			message-&gt;FindBool(&quot;rescanNow&quot;, &amp;rescanNow);
++
++			_UpdateSettingsFromMessage(message);
++			GetSettings(&amp;fSettings);
++			_WriteSettings();
++
++			if (rescanNow)
++				_MountVolumes(fNormalMode, fRemovableMode);
++			break;
++		}
++
++		case kMountAllNow:
++			_MountVolumes(kAllVolumes, kAllVolumes);
++			break;
++
++#if 0
++		case B_NODE_MONITOR:
++		{
++			int32 opcode;
++			if (message-&gt;FindInt32(&quot;opcode&quot;, &amp;opcode) != B_OK)
++				break;
++
++			switch (opcode) {
++				//	The name of a mount point has changed
++				case B_ENTRY_MOVED: {
++					WRITELOG((&quot;*** Received Mount Point Renamed Notification&quot;));
++
++					const char *newName;
++					if (message-&gt;FindString(&quot;name&quot;, &amp;newName) != B_OK) {
++						WRITELOG((&quot;ERROR: Couldn't find name field in update message&quot;));
++						PRINT_OBJECT(*message);
++						break ;
++					}
++
++					//
++					// When the node monitor reports a move, it gives the
++					// parent device and inode that moved.  The problem is 
++					// that  the inode is the inode of root *in* the filesystem,
++					// which is generally always the same number for every 
++					// filesystem of a type.
++					//
++					// What we'd really like is the device that the moved	
++					// volume is mounted on.  Find this by using the 
++					// *new* name and directory, and then stat()ing that to
++					// find the device.
++					//
++					dev_t parentDevice;
++					if (message-&gt;FindInt32(&quot;device&quot;, &amp;parentDevice) != B_OK) {
++						WRITELOG((&quot;ERROR: Couldn't find 'device' field in update&quot;
++							&quot; message&quot;));
++						PRINT_OBJECT(*message);
++						break;
++					}
++
++					ino_t toDirectory;	
++					if (message-&gt;FindInt64(&quot;to directory&quot;, &amp;toDirectory)!=B_OK){
++						WRITELOG((&quot;ERROR: Couldn't find 'to directory' field in update&quot;
++						  &quot;message&quot;));
++						PRINT_OBJECT(*message);
++						break;
++					}
++
++					entry_ref root_entry(parentDevice, toDirectory, newName);
++
++					BNode entryNode(&amp;root_entry);
++					if (entryNode.InitCheck() != B_OK) {
++						WRITELOG((&quot;ERROR: Couldn't create mount point entry node: %s/n&quot;, 
++							strerror(entryNode.InitCheck())));
++						break;
++					}	
++
++					node_ref mountPointNode;
++					if (entryNode.GetNodeRef(&amp;mountPointNode) != B_OK) {
++						WRITELOG((&quot;ERROR: Couldn't get node ref for new mount point&quot;));
++						break;
++					}
++
++					WRITELOG((&quot;Attempt to rename device %li to %s&quot;, mountPointNode.device,
++						newName));
++
++					Partition *partition = FindPartition(mountPointNode.device);
++					if (partition != NULL) {
++						WRITELOG((&quot;Found device, changing name.&quot;));
++
++						BVolume mountVolume(partition-&gt;VolumeDeviceID());
++						BDirectory mountDir;
++						mountVolume.GetRootDirectory(&amp;mountDir);
++						BPath dirPath(&amp;mountDir, 0);
++
++						partition-&gt;SetMountedAt(dirPath.Path());
++						partition-&gt;SetVolumeName(newName);					
++						break;
++					} else {
++						WRITELOG((&quot;ERROR: Device %li does not appear to be present&quot;,
++							mountPointNode.device));
++					}
++				}
++			}
++			break;
++		}
+ #endif
+ 
++		default:
++			BLooper::MessageReceived(message);
++			break;
++	}
++}
++
++
++bool
++AutoMounter::QuitRequested()
++{
++	if (!BootedInSafeMode()) {
++		// don't write out settings in safe mode - this would overwrite the
++		// normal, non-safe mode settings
++		_WriteSettings();
++	}
++
++	return true;
++}
++
++
++#else	// !__HAIKU__
++//	#pragma mark - R5 DeviceMap API
++
++static const uint32 kStartPolling = 'strp';
++
++static BMessage gSettingsMessage;
++static bool gSilentAutoMounter;
++
+ struct OneMountFloppyParams {
+ 	status_t result;
+ };
+ 
+-#if _INCLUDES_CLASS_DEVICE_MAP
+-static bool gSilentAutoMounter;
+-#endif
+-static BMessage gSettingsMessage;
++struct MountPartitionParams {
++	int32 uniqueID;
++	status_t result;
++};
+ 
+ 
+ #if xDEBUG
+ static Partition *
+-DumpPartition(Partition *_DEVICE_MAP_ONLY(partition), void*)
++DumpPartition(Partition *partition, void*)
+ {
+-#if _INCLUDES_CLASS_DEVICE_MAP
+ 	partition-&gt;Dump();
+-#endif
+ 	return 0;
+ }
+ #endif
+ 
+ 
+-#if _INCLUDES_CLASS_DEVICE_MAP
+-
+-
+-struct MountPartitionParams {
+-	int32 uniqueID;
+-	status_t result;
+-};
+-
+-
+ /** Sets the Tracker Shell's AutoMounter to monitor a node.
+  *  n.b. Get's the one AutoMounter and uses Tracker's _special_ WatchNode.
+  *
+@@ -302,7 +822,65 @@
+ }
+ 
+ 
++struct UnmountDeviceParams {
++	dev_t device;
++	status_t result;
++};
++
++
+ static Partition *
++UnmountIfMatchingID(Partition *partition, void *castToParams)
++{
++	UnmountDeviceParams *params = (UnmountDeviceParams *)castToParams;
++
++	if (partition-&gt;VolumeDeviceID() == params-&gt;device) {
++		TTracker *tracker = dynamic_cast&lt;TTracker *&gt;(be_app);
++		if (tracker &amp;&amp; tracker-&gt;QueryActiveForDevice(params-&gt;device)) {
++			BString text;
++			text &lt;&lt; &quot;To unmount &quot; &lt;&lt; partition-&gt;VolumeName() &lt;&lt; &quot; some query &quot;
++			&quot;windows have to be closed. Would you like to close the query &quot;
++			&quot;windows?&quot;;
++			if ((new BAlert(&quot;&quot;, text.String(), &quot;Cancel&quot;, &quot;Close and unmount&quot;, NULL,
++				B_WIDTH_FROM_LABEL))-&gt;Go() == 0)
++				return partition;
++			tracker-&gt;CloseActiveQueryWindows(params-&gt;device);
++		}
++
++		params-&gt;result = partition-&gt;Unmount();
++		Device *device = partition-&gt;GetDevice();
++		bool deviceHasMountedPartitions = false;
++
++		if (params-&gt;result == B_OK &amp;&amp; device-&gt;Removable()) {
++			for (int32 sessionIndex = 0; ; sessionIndex++) {
++				Session *session = device-&gt;SessionAt(sessionIndex);
++				if (!session)
++					break;
++
++				for (int32 partitionIndex = 0; ; partitionIndex++) {
++					Partition *partition = session-&gt;PartitionAt(partitionIndex);
++					if (!partition)
++						break;
++
++					if (partition-&gt;Mounted() == kMounted) {
++						deviceHasMountedPartitions = true;
++						break;
++					}
++				}
++			}
++
++			if (!deviceHasMountedPartitions
++				&amp;&amp; TrackerSettings().EjectWhenUnmounting())
++				params-&gt;result = partition-&gt;GetDevice()-&gt;Eject();
++		}
++
++		return partition;
++	}
++
++	return NULL;
++}
++
++
++static Partition *
+ NotifyFloppyNotMountable(Partition *partition, void *)
+ {
+ 	if (partition-&gt;Mounted() != kMounted
+@@ -316,9 +894,16 @@
+ }
+ 
+ 
+-#endif // #if _INCLUDES_CLASS_DEVICE_MAP
++static Device *
++FindFloppyDevice(Device *device, void *)
++{
++	if (device-&gt;IsFloppy())
++		return device;
+ 
++	return 0;
++}
+ 
++
+ #ifdef MOUNT_MENU_IN_DESKBAR
+ 
+ // just for testing
+@@ -351,35 +936,32 @@
+ #endif // #ifdef MOUNT_MENU_IN_DESKBAR
+ 
+ 
+-AutoMounter::AutoMounter(bool _DEVICE_MAP_ONLY(checkRemovableOnly),
+-	bool _DEVICE_MAP_ONLY(checkCDs), bool _DEVICE_MAP_ONLY(checkFloppies),
+-	bool _DEVICE_MAP_ONLY(checkOtherRemovable), bool _DEVICE_MAP_ONLY(autoMountRemovablesOnly),
+-	bool _DEVICE_MAP_ONLY(autoMountAll), bool _DEVICE_MAP_ONLY(autoMountAllBFS),
+-	bool _DEVICE_MAP_ONLY(autoMountAllHFS),
+-	bool initialMountAll, bool initialMountAllBFS, bool initialMountRestore,
+-	bool initialMountAllHFS)
+-	:	BLooper(&quot;DirPoller&quot;, B_LOW_PRIORITY),
+-		fInitialMountAll(initialMountAll),
+-		fInitialMountAllBFS(initialMountAllBFS),
+-		fInitialMountRestore(initialMountRestore),
+-		fInitialMountAllHFS(initialMountAllHFS),
+-		fSuspended(false),
+-		fQuitting(false)
++AutoMounter::AutoMounter(bool checkRemovableOnly, bool checkCDs,
++		bool checkFloppies, bool checkOtherRemovable, bool autoMountRemovablesOnly,
++		bool autoMountAll, bool autoMountAllBFS, bool autoMountAllHFS,
++		bool initialMountAll, bool initialMountAllBFS, bool initialMountRestore,
++		bool initialMountAllHFS)
++	: BLooper(&quot;AutoMounter&quot;, B_LOW_PRIORITY),
++	fInitialMountAll(initialMountAll),
++	fInitialMountAllBFS(initialMountAllBFS),
++	fInitialMountRestore(initialMountRestore),
++	fInitialMountAllHFS(initialMountAllHFS),
++	fSuspended(false),
++	fQuitting(false)
+ {
+-#if _INCLUDES_CLASS_DEVICE_MAP
+ 	fScanParams.shortestRescanHartbeat = 5000000;
+ 	fScanParams.checkFloppies = checkFloppies;
+ 	fScanParams.checkCDROMs = checkCDs;
+ 	fScanParams.checkOtherRemovable = checkOtherRemovable;
+ 	fScanParams.removableOrUnknownOnly = checkRemovableOnly;
+-	
++
+ 	fAutomountParams.mountAllFS = autoMountAll;
+ 	fAutomountParams.mountBFS = autoMountAllBFS;
+ 	fAutomountParams.mountHFS = autoMountAllHFS;
+ 	fAutomountParams.mountRemovableDisksOnly = autoMountRemovablesOnly;
+ 
+ 	gSilentAutoMounter = true;
+-	
++
+ 	if (!BootedInSafeMode()) {
+ 		ReadSettings();
+ 		thread_id rescan = spawn_thread(AutoMounter::InitialRescanBinder, 
+@@ -398,7 +980,6 @@
+ 
+ 	//	Watch mount/unmount
+ 	TTracker::WatchNode(0, B_WATCH_MOUNT, this);
+-#endif
+ }
+ 
+ 
+@@ -407,29 +988,23 @@
+ }
+ 
+ 
+-Partition* AutoMounter::FindPartition(dev_t _DEVICE_MAP_ONLY(dev))
++Partition* AutoMounter::FindPartition(dev_t dev)
+ {
+-#if _INCLUDES_CLASS_DEVICE_MAP
+ 	FindPartitionByDeviceIDParams params;
+ 	params.dev = dev;
+ 	return fList.EachMountedPartition(FindPartitionByDeviceID, &amp;params);
+-#else
+-	return NULL;
+-#endif
+ }
+ 
+ 
+ void 
+ AutoMounter::RescanDevices()
+ {
+-#if _INCLUDES_CLASS_DEVICE_MAP
+ 	stop_watching(this);
+ 	fList.RescanDevices(true);
+ 	fList.UpdateMountingInfo();
+ 	fList.EachMountedPartition(TryWatchMountPoint, 0);
+ 	TTracker::WatchNode(0, B_WATCH_MOUNT, this);
+ 	fList.EachMountedPartition(TryWatchMountPoint, 0);
+-#endif
+ }
+ 
+ 
+@@ -437,21 +1012,15 @@
+ AutoMounter::MessageReceived(BMessage *message)
+ {
+ 	switch (message-&gt;what) {
+-#if _INCLUDES_CLASS_DEVICE_MAP
+ 		case kAutomounterRescan:
+ 			RescanDevices();
+ 			break;
+ 
+ 		case kStartPolling:	
+ 			// PRINT((&quot;starting the automounter\n&quot;));
+-			
++
+ 			fScanThread = spawn_thread(AutoMounter::WatchVolumeBinder, 
+-#if DEBUG				
+-				&quot;HiroshiLikesAtomountScan&quot;,	// long story
+-#else
+-				&quot;AutomountScan&quot;,
+-#endif				
+-				B_LOW_PRIORITY, this);
++				&quot;AutomountScan&quot;, B_LOW_PRIORITY, this);
+ 			resume_thread(fScanThread);
+ 			break;
+ 
+@@ -464,13 +1033,13 @@
+ 			break;
+ 
+ 		case kSetAutomounterParams:
+-			{
+-				bool rescanNow = false;
+-				message-&gt;FindBool(&quot;rescanNow&quot;, &amp;rescanNow);
+-				SetParams(message, rescanNow);
+-				WriteSettings();
+-				break;
+-			}
++		{
++			bool rescanNow = false;
++			message-&gt;FindBool(&quot;rescanNow&quot;, &amp;rescanNow);
++			SetParams(message, rescanNow);
++			WriteSettings();
++			break;
++		}
+ 
+ 		case kMountAllNow:
+ 			RescanDevices();
+@@ -490,142 +1059,137 @@
+ 			break;
+ 
+ 		case B_NODE_MONITOR:
+-			{
+-				int32 opcode;
+-				if (message-&gt;FindInt32(&quot;opcode&quot;, &amp;opcode) != B_OK)
++		{
++			int32 opcode;
++			if (message-&gt;FindInt32(&quot;opcode&quot;, &amp;opcode) != B_OK)
++				break;
++
++			switch (opcode) {
++				case B_DEVICE_MOUNTED: {
++					WRITELOG((&quot;** Received Device Mounted Notification&quot;));
++					dev_t device;
++					if (message-&gt;FindInt32(&quot;new device&quot;, &amp;device) == B_OK) {
++						Partition *partition =  FindPartition(device);
++						if (partition == NULL || partition-&gt;Mounted() != kMounted) {
++							WRITELOG((&quot;Device %i not in device list.  Someone mounted it outside &quot;
++								&quot;of Tracker&quot;, device));
++
++							//
++							// This is the worst case.  Someone has mounted
++							// something from outside of tracker.  
++							// Unfortunately, there's no easy way to tell which
++							// partition was just mounted (or if we even know about the device),
++							// so stop watching all nodes, rescan to see what is now mounted,
++							// and start watching again.
++							//
++							RescanDevices();
++						} else
++							WRITELOG((&quot;Found partition\n&quot;));
++					} else {
++						WRITELOG((&quot;ERROR: Could not find mounted device ID in message&quot;));
++						PRINT_OBJECT(*message);
++					}
++
+ 					break;
+-	
+-				switch (opcode) {
+-					case B_DEVICE_MOUNTED: {
+-						WRITELOG((&quot;** Received Device Mounted Notification&quot;));
+-						dev_t device;
+-						if (message-&gt;FindInt32(&quot;new device&quot;, &amp;device) == B_OK) {
+-							Partition *partition =  FindPartition(device);
+-							if (partition == NULL || partition-&gt;Mounted() != kMounted) {
+-								WRITELOG((&quot;Device %i not in device list.  Someone mounted it outside &quot;
+-									&quot;of Tracker&quot;, device));
+-		
+-								//
+-								// This is the worst case.  Someone has mounted
+-								// something from outside of tracker.  
+-								// Unfortunately, there's no easy way to tell which
+-								// partition was just mounted (or if we even know about the device),
+-								// so stop watching all nodes, rescan to see what is now mounted,
+-								// and start watching again.
+-								//
+-								RescanDevices();
+-							} else
+-								WRITELOG((&quot;Found partition\n&quot;));
+-						} else {
+-							WRITELOG((&quot;ERROR: Could not find mounted device ID in message&quot;));
+-							PRINT_OBJECT(*message);
+-						}
+-	
++				}
++
++				case B_DEVICE_UNMOUNTED: {
++					WRITELOG((&quot;*** Received Device Unmounted Notification&quot;));
++					dev_t device;
++					if (message-&gt;FindInt32(&quot;device&quot;, &amp;device) == B_OK) {
++						Partition *partition = FindPartition(device);
++
++						if (partition != 0) {
++							WRITELOG((&quot;Found device in device list. Updating state to unmounted.&quot;));
++							partition-&gt;SetMountState(kNotMounted);
++						} else
++							WRITELOG((&quot;Unmounted device %i was not in device list&quot;, device));
++					} else {
++						WRITELOG((&quot;ERROR: Could not find unmounted device ID in message&quot;));
++						PRINT_OBJECT(*message);
++					}
++
++					break;
++				}	
++
++				//	The name of a mount point has changed
++				case B_ENTRY_MOVED: {
++					WRITELOG((&quot;*** Received Mount Point Renamed Notification&quot;));
++
++					const char *newName;
++					if (message-&gt;FindString(&quot;name&quot;, &amp;newName) != B_OK) {
++						WRITELOG((&quot;ERROR: Couldn't find name field in update message&quot;));
++						PRINT_OBJECT(*message);
++						break ;
++					}
++
++					//
++					// When the node monitor reports a move, it gives the
++					// parent device and inode that moved.  The problem is 
++					// that  the inode is the inode of root *in* the filesystem,
++					// which is generally always the same number for every 
++					// filesystem of a type.
++					//
++					// What we'd really like is the device that the moved	
++					// volume is mounted on.  Find this by using the 
++					// *new* name and directory, and then stat()ing that to
++					// find the device.
++					//
++					dev_t parentDevice;
++					if (message-&gt;FindInt32(&quot;device&quot;, &amp;parentDevice) != B_OK) {
++						WRITELOG((&quot;ERROR: Couldn't find 'device' field in update&quot;
++							&quot; message&quot;));
++						PRINT_OBJECT(*message);
+ 						break;
+ 					}
+-	
+-	
+-					case B_DEVICE_UNMOUNTED: {
+-						WRITELOG((&quot;*** Received Device Unmounted Notification&quot;));
+-						dev_t device;
+-						if (message-&gt;FindInt32(&quot;device&quot;, &amp;device) == B_OK) {
+-							Partition *partition = FindPartition(device);
+-	
+-							if (partition != 0) {
+-								WRITELOG((&quot;Found device in device list. Updating state to unmounted.&quot;));
+-								partition-&gt;SetMountState(kNotMounted);
+-							} else
+-								WRITELOG((&quot;Unmounted device %i was not in device list&quot;, device));
+-						} else {
+-							WRITELOG((&quot;ERROR: Could not find unmounted device ID in message&quot;));
+-							PRINT_OBJECT(*message);
+-						}
+-	
++
++					ino_t toDirectory;	
++					if (message-&gt;FindInt64(&quot;to directory&quot;, &amp;toDirectory)!=B_OK){
++						WRITELOG((&quot;ERROR: Couldn't find 'to directory' field in update&quot;
++						  &quot;message&quot;));
++						PRINT_OBJECT(*message);
+ 						break;
++					}
++
++					entry_ref root_entry(parentDevice, toDirectory, newName);
++
++					BNode entryNode(&amp;root_entry);
++					if (entryNode.InitCheck() != B_OK) {
++						WRITELOG((&quot;ERROR: Couldn't create mount point entry node: %s/n&quot;, 
++							strerror(entryNode.InitCheck())));
++						break;
+ 					}	
+-	
+-	
+-					//	The name of a mount point has changed
+-					case B_ENTRY_MOVED: {
+-						WRITELOG((&quot;*** Received Mount Point Renamed Notification&quot;));
+-					
+-						const char *newName;
+-						if (message-&gt;FindString(&quot;name&quot;, &amp;newName) != B_OK) {
+-							WRITELOG((&quot;ERROR: Couldn't find name field in update message&quot;));
+-							PRINT_OBJECT(*message);
+-							break ;
+-						}
+-	
+-						//
+-						// When the node monitor reports a move, it gives the
+-						// parent device and inode that moved.  The problem is 
+-						// that  the inode is the inode of root *in* the filesystem,
+-						// which is generally always the same number for every 
+-						// filesystem of a type.
+-						//
+-						// What we'd really like is the device that the moved	
+-						// volume is mounted on.  Find this by using the 
+-						// *new* name and directory, and then stat()ing that to
+-						// find the device.
+-						//
+-						dev_t parentDevice;
+-						if (message-&gt;FindInt32(&quot;device&quot;, &amp;parentDevice) != B_OK) {
+-							WRITELOG((&quot;ERROR: Couldn't find 'device' field in update&quot;
+-								&quot; message&quot;));
+-							PRINT_OBJECT(*message);
+-							break;
+-						}
+-		
+-						ino_t toDirectory;	
+-						if (message-&gt;FindInt64(&quot;to directory&quot;, &amp;toDirectory)!=B_OK){
+-							WRITELOG((&quot;ERROR: Couldn't find 'to directory' field in update&quot;
+-							  &quot;message&quot;));
+-							PRINT_OBJECT(*message);
+
+[... truncated: 789 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000360.html">[Haiku-commits] r19892 - haiku/trunk/src/add-ons/kernel/file_systems/nfs
+</A></li>
+	<LI>Next message: <A HREF="000362.html">[Haiku-commits] r19894 - haiku/trunk/src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#361">[ date ]</a>
+              <a href="thread.html#361">[ thread ]</a>
+              <a href="subject.html#361">[ subject ]</a>
+              <a href="author.html#361">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

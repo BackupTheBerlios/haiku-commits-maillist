@@ -1,0 +1,186 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r33202 - haiku/trunk/src/servers/midi
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r33202%20-%20haiku/trunk/src/servers/midi&In-Reply-To=%3C200909201018.n8KAIEdk013657%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020716.html">
+   <LINK REL="Next"  HREF="020724.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r33202 - haiku/trunk/src/servers/midi</H1>
+    <B>phoudoin at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r33202%20-%20haiku/trunk/src/servers/midi&In-Reply-To=%3C200909201018.n8KAIEdk013657%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r33202 - haiku/trunk/src/servers/midi">phoudoin at mail.berlios.de
+       </A><BR>
+    <I>Sun Sep 20 12:18:14 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020716.html">[Haiku-commits] r33191 - in haiku/trunk/src/preferences:	appearance backgrounds bluetooth cpufrequency	datatranslations devices dun filetypes fonts joysticks	keyboard keymap locale mail media mouse network network_old	print screen screensaver sou
+</A></li>
+        <LI>Next message: <A HREF="020724.html">[Haiku-commits] r33203 - in haiku/trunk/src/apps: activitymonitor	autoraise diskusage gradients launchbox networkstatus pairs	screenshot sudoku webwatch
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20723">[ date ]</a>
+              <a href="thread.html#20723">[ thread ]</a>
+              <a href="subject.html#20723">[ subject ]</a>
+              <a href="author.html#20723">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: phoudoin
+Date: 2009-09-20 12:18:11 +0200 (Sun, 20 Sep 2009)
+New Revision: 33202
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=33202&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=33202&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/midi/DeviceWatcher.cpp
+   haiku/trunk/src/servers/midi/DeviceWatcher.h
+Log:
+* Move initial devices scan again in a thread, to avoid deadlock.
+* Check that path is indeed a file, not a directory
+* Contrary to what BeBook say, we can't delete BLocalMidi* endpoints, 
+  but only Release() them like all others endpoints. Avoid midi_server to 
+  panic when a device is removed.
+
+
+Modified: haiku/trunk/src/servers/midi/DeviceWatcher.cpp
+===================================================================
+--- haiku/trunk/src/servers/midi/DeviceWatcher.cpp	2009-09-20 02:11:34 UTC (rev 33201)
++++ haiku/trunk/src/servers/midi/DeviceWatcher.cpp	2009-09-20 10:18:11 UTC (rev 33202)
+@@ -21,6 +21,7 @@
+ #include &lt;Roster.h&gt;
+ #include &lt;PathMonitor.h&gt;
+ 
++#include &lt;stdio.h&gt;
+ #include &lt;new&gt;
+ using std::nothrow;
+ 
+@@ -30,6 +31,7 @@
+ 
+ 
+ const char *kDevicesRoot = &quot;/dev/midi&quot;;
++// const char *kDevicesRoot = &quot;/Data/tmp&quot;;
+ 
+ 
+ class DeviceEndpoints {
+@@ -88,9 +90,17 @@
+ DeviceWatcher::Start()
+ {
+ 	// Do an initial scan
+-    _ScanDevices(kDevicesRoot);
+ 
+-	// Okay, now just watch for any change
++	// We need to do this from a separate thread, otherwise we will deadlock.
++	// The reason is that we instantiate a BMidiRoster object, which sends a
++	// message to the midi_server to register itself, and blocks until it gets
++	// a response. But since we _are_ the midi_server we will never be able to
++	// send that response if our main thread is already blocking.
++	
++    resume_thread(spawn_thread(_InitialDevicesScanThread,
++		&quot;Initial devices scan&quot;, B_NORMAL_PRIORITY, this));
++
++	// And watch for any change
+ 	return BPathMonitor::StartWatching(kDevicesRoot, B_ENTRY_CREATED
+ 		| B_ENTRY_REMOVED | B_ENTRY_MOVED | B_WATCH_FILES_ONLY
+ 		| B_WATCH_RECURSIVELY, this);
+@@ -136,9 +146,20 @@
+ // #pragma mark -
+ 
+ 
++/* static  */
++int32 
++DeviceWatcher::_InitialDevicesScanThread(void* data)
++{
++	((DeviceWatcher*) data)-&gt;_ScanDevices(kDevicesRoot);
++	return 0;
++}
++
++
+ void 
+ DeviceWatcher::_ScanDevices(const char* path)
+ {
++	// printf(&quot;DeviceWatcher::_ScanDevices(\&quot;%s\&quot;);\n&quot;, path);
++	
+ 	BDirectory dir(path);
+ 	if (dir.InitCheck() != B_OK)
+ 		return;
+@@ -158,6 +179,13 @@
+ void
+ DeviceWatcher::_AddDevice(const char* path)
+ {
++	// printf(&quot;DeviceWatcher::_AddDevice(\&quot;%s\&quot;);\n&quot;, path);
++
++	BEntry entry(path);
++	if (! entry.IsFile())
++		// Invalid path !
++		return;
++
+ 	if ( fDeviceEndpointsMap.ContainsKey(path) )
+ 		// Already known
+ 		return;
+@@ -166,8 +194,6 @@
+ 	if (fd &lt; 0)
+ 		return;
+ 		
+-	// printf(&quot;DeviceWatcher::_AddDevice(\&quot;%s\&quot;);\n&quot;, path);
+-
+ 	
+ 	MidiPortConsumer* consumer = new MidiPortConsumer(fd, path);
+ 	_SetIcons(consumer);
+@@ -198,8 +224,8 @@
+ 	deviceEndpoints-&gt;fConsumer-&gt;Unregister();
+ 	deviceEndpoints-&gt;fProducer-&gt;Unregister();
+ 
+-	delete deviceEndpoints-&gt;fConsumer;
+-	delete deviceEndpoints-&gt;fProducer;
++	deviceEndpoints-&gt;fConsumer-&gt;Release();
++	deviceEndpoints-&gt;fProducer-&gt;Release();
+ 
+ 	fDeviceEndpointsMap.Remove(path);
+ }
+
+Modified: haiku/trunk/src/servers/midi/DeviceWatcher.h
+===================================================================
+--- haiku/trunk/src/servers/midi/DeviceWatcher.h	2009-09-20 02:11:34 UTC (rev 33201)
++++ haiku/trunk/src/servers/midi/DeviceWatcher.h	2009-09-20 10:18:11 UTC (rev 33202)
+@@ -30,6 +30,7 @@
+ 	status_t	Stop();
+ 
+ private:
++	static int32 _InitialDevicesScanThread(void* data);
+ 	void _ScanDevices(const char* path);
+ 	void _AddDevice(const char* path);
+ 	void _RemoveDevice(const char* path);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020716.html">[Haiku-commits] r33191 - in haiku/trunk/src/preferences:	appearance backgrounds bluetooth cpufrequency	datatranslations devices dun filetypes fonts joysticks	keyboard keymap locale mail media mouse network network_old	print screen screensaver sou
+</A></li>
+	<LI>Next message: <A HREF="020724.html">[Haiku-commits] r33203 - in haiku/trunk/src/apps: activitymonitor	autoraise diskusage gradients launchbox networkstatus pairs	screenshot sudoku webwatch
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20723">[ date ]</a>
+              <a href="thread.html#20723">[ thread ]</a>
+              <a href="subject.html#20723">[ subject ]</a>
+              <a href="author.html#20723">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

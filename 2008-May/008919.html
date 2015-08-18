@@ -1,0 +1,954 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25546 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25546%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200805181934.m4IJYQ8i030806%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008914.html">
+   <LINK REL="Next"  HREF="008920.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25546 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25546%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200805181934.m4IJYQ8i030806%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25546 - haiku/trunk/src/add-ons/kernel/busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun May 18 21:34:26 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008914.html">[Haiku-commits] r25545 -	haiku/trunk/src/tests/system/kernel/device_manager/playground
+</A></li>
+        <LI>Next message: <A HREF="008920.html">[Haiku-commits] r25547 - haiku/trunk/headers/os/drivers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8919">[ date ]</a>
+              <a href="thread.html#8919">[ thread ]</a>
+              <a href="subject.html#8919">[ subject ]</a>
+              <a href="author.html#8919">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-05-18 21:34:25 +0200 (Sun, 18 May 2008)
+New Revision: 25546
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25546&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25546&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+Log:
+* Completely rework how transfer finishing is implemented. It is now using
+  pretty much the same strategy as UHCI. This does not leverage the done queue
+  the hardware provides us, but as it saves a lot of other overhead and allows
+  the structures to be smaller I think it is overall worth it.
+* Removed now unnecessary stuff from the transfer descriptor struct.
+* Directly acknowledge the done head interrupt as we do not use it either.
+* Activate control endpoints by removing the skip bit when a transfer is scheduled.
+* Correct the way the first descriptor is determined (the current tail becomes
+  the first descriptor while the current first descriptor becomes the tail).
+* Remove the head_logical_descriptor field from the endpoint structure, as this
+  would simply get out of sync with the first td with no real way of updating.
+* Stub out RemoveTransferFromEndpoint() as this needs reworking.
+* Correct CreateDescriptorChain() signature and implement the method.
+* Add ReadDescriptorChain() and ReadActualLength() to process finished transfers.
+* Prepare for actual data transfers by renaming/regrouping transfer types.
+* Fully clear out the new tail when switching (for the sake of it)
+* Add some helpers and definitions to the hardware header.
+* Add debugging facilities.
+
+With all this transfers can now actually be scheduled and they are processed
+when done. This brings control transfers to a usable state so setting the
+device address and reading out/setting the configuration works. That means you
+can now view your device using usb_dev_info, but since any other transfer type
+besides control transfers isn't implemented yet the device will most probably
+not yet do anything useful.
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2008-05-18 14:22:56 UTC (rev 25545)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2008-05-18 19:34:25 UTC (rev 25546)
+@@ -383,19 +383,19 @@
+ 		return fRootHub-&gt;ProcessTransfer(this, transfer);
+ 
+ 	uint32 type = transfer-&gt;TransferPipe()-&gt;Type();
+-	if ((type &amp; USB_OBJECT_CONTROL_PIPE)) {
+-		TRACE((&quot;usb_ohci: submitting control request\n&quot;));
+-		return _SubmitControlTransfer(transfer);
++	if (type &amp; USB_OBJECT_CONTROL_PIPE) {
++		TRACE((&quot;usb_ohci: submitting request\n&quot;));
++		return _SubmitRequest(transfer);
+ 	}
+ 
+-	if ((type &amp; USB_OBJECT_BULK_PIPE)) {
+-		TRACE((&quot;usb_ohci: submitting bulk transfer\n&quot;));
+-		return _SubmitBulkTransfer(transfer);
++	if ((type &amp; USB_OBJECT_BULK_PIPE) || (type &amp; USB_OBJECT_INTERRUPT_PIPE)) {
++		TRACE((&quot;usb_ohci: submitting bulk/interrupt transfer\n&quot;));
++		return _SubmitTransfer(transfer);
+ 	}
+ 
+-	if (((type &amp; USB_OBJECT_ISO_PIPE) || (type &amp; USB_OBJECT_INTERRUPT_PIPE))) {
+-		TRACE((&quot;usb_ohci: submitting periodic transfer\n&quot;));
+-		return _SubmitPeriodicTransfer(transfer);
++	if (type &amp; USB_OBJECT_ISO_PIPE) {
++		TRACE((&quot;usb_ohci: submitting isochronous transfer\n&quot;));
++		return _SubmitIsochronousTransfer(transfer);
+ 	}
+ 
+ 	TRACE_ERROR((&quot;usb_ohci: tried to submit transfer for unknown pipe&quot;
+@@ -425,8 +425,6 @@
+ 			}
+ 
+ 			// Clear the endpoint
+-			current-&gt;endpoint-&gt;head_logical_descriptor
+-				= current-&gt;endpoint-&gt;tail_logical_descriptor;
+ 			current-&gt;endpoint-&gt;head_physical_descriptor
+ 				= current-&gt;endpoint-&gt;tail_physical_descriptor;
+ 
+@@ -729,7 +727,8 @@
+ 
+ 	if (status &amp; OHCI_WRITEBACK_DONE_HEAD) {
+ 		TRACE((&quot;usb_ohci: transfer descriptors processed\n&quot;));
+-		// Acknowledge it in the finisher thread, not here.
++		fHcca-&gt;done_head = 0;
++		acknowledge |= OHCI_WRITEBACK_DONE_HEAD;
+ 		result = B_INVOKE_SCHEDULER;
+ 		finishTransfers = true;
+ 	}
+@@ -764,10 +763,10 @@
+ 
+ status_t
+ OHCI::_AddPendingTransfer(Transfer *transfer,
+-	ohci_endpoint_descriptor *endpoint, ohci_general_td *firstDescriptor,
+-	ohci_general_td *dataDescriptor, bool directionIn)
++	ohci_endpoint_descriptor *endpoint, ohci_general_td *dataDescriptor,
++	ohci_general_td *lastDescriptor, bool directionIn)
+ {
+-	if (!transfer || !endpoint || !firstDescriptor)
++	if (!transfer || !endpoint || !lastDescriptor)
+ 		return B_BAD_VALUE;
+ 
+ 	transfer_data *data = new(std::nothrow) transfer_data;
+@@ -782,8 +781,10 @@
+ 
+ 	data-&gt;transfer = transfer;
+ 	data-&gt;endpoint = endpoint;
+-	data-&gt;first_descriptor = firstDescriptor;
++	// the current tail will become the fist descriptor
++	data-&gt;first_descriptor = (ohci_general_td *)endpoint-&gt;tail_logical_descriptor;
+ 	data-&gt;data_descriptor = dataDescriptor;
++	data-&gt;last_descriptor = lastDescriptor;
+ 	data-&gt;incoming = directionIn;
+ 	data-&gt;canceled = false;
+ 	data-&gt;link = NULL;
+@@ -813,40 +814,6 @@
+ }
+ 
+ 
+-status_t
+-OHCI::_UnlinkTransfer(transfer_data *transfer)
+-{
+-	if (!Lock())
+-		return B_ERROR;
+-
+-	if (transfer == fFirstTransfer) {
+-		// It was the first element
+-		fFirstTransfer = fFirstTransfer-&gt;link;
+-		if (transfer == fLastTransfer) {
+-			// Also the only one
+-			fLastTransfer = NULL;
+-		}
+-	} else {
+-		transfer_data *current = fFirstTransfer-&gt;link;
+-		transfer_data *previous = fFirstTransfer;
+-		while (current != NULL) {
+-			if (current == transfer) {
+-				previous-&gt;link = current-&gt;link;
+-				if (current == fLastTransfer)
+-					fLastTransfer = previous;
+-				break;
+-			}
+-
+-			previous = current;
+-			current = current-&gt;link;
+-		}
+-	}
+-
+-	Unlock();
+-	return B_OK;
+-}
+-
+-
+ int32
+ OHCI::_FinishThread(void *data)
+ {
+@@ -868,134 +835,188 @@
+ 		if (semCount &gt; 0)
+ 			acquire_sem_etc(fFinishTransfersSem, semCount, B_RELATIVE_TIMEOUT, 0);
+ 
+-		uint32 doneList = fHcca-&gt;done_head &amp; ~OHCI_DONE_INTERRUPTS;
+-		// If done_head is zero, there are no processed descriptors
+-		// in the done list and we have been woken up by CancelQueuedTransfers
+-		// or CancelQueuedIsochronousTransfers in order to do some clean up.
+-		if (doneList) {
+-			// Pull out the done list and reverse its order
+-			// for both general and isochronous descriptors
+-			ohci_general_td *current = NULL;
+-			ohci_general_td *top = NULL;
+-			ohci_isochronous_td *isoCurrent = NULL;
+-			ohci_isochronous_td *isoTop = NULL;
+-			while (doneList != 0) {
+-				current = NULL; //_FindDescriptorInHash(doneList);
+-				if (current != NULL) {
+-					doneList = current-&gt;next_physical_descriptor;
+-					current-&gt;next_done_descriptor = (void *)top;
+-					top = current;
+-					continue;
++		if (!Lock())
++			continue;
++
++		TRACE((&quot;usb_ohci: finishing transfers (first transfer: %p; last&quot;
++			&quot; transfer: %p)\n&quot;, fFirstTransfer, fLastTransfer));
++		transfer_data *lastTransfer = NULL;
++		transfer_data *transfer = fFirstTransfer;
++		Unlock();
++
++		while (transfer) {
++			bool transferDone = false;
++			ohci_general_td *descriptor = transfer-&gt;first_descriptor;
++			status_t callbackStatus = B_OK;
++
++			while (descriptor) {
++				uint32 status = OHCI_TD_GET_CONDITION_CODE(descriptor-&gt;flags);
++				if (status == OHCI_TD_CONDITION_NOT_ACCESSED) {
++					// td is still active
++					TRACE((&quot;usb_ohci: td %p still active\n&quot;, descriptor));
++					break;
+ 				}
+ 
+-				isoCurrent = NULL; //_FindIsoDescriptorInHash(doneList);
+-				if (isoCurrent != NULL) {
+-					doneList = isoCurrent-&gt;next_physical_descriptor;
+-					isoCurrent-&gt;next_done_descriptor = (void *)isoTop;
+-					isoTop = isoCurrent;
+-					continue;
++				if (status != OHCI_TD_CONDITION_NO_ERROR) {
++					// an error occured, but we must ensure that the td
++					// was actually done
++					ohci_endpoint_descriptor *endpoint = transfer-&gt;endpoint;
++					if (endpoint-&gt;head_physical_descriptor &amp; OHCI_ENDPOINT_HALTED) {
++						// the endpoint is halted, this guaratees us that this
++						// descriptor has passed (we don't know if the endpoint
++						// was halted because of this td, but we do not need
++						// to know, as when it was halted by another td this
++						// still ensures that this td was handled before).
++						TRACE_ERROR((&quot;usb_ohci: td error: 0x%08lx\n&quot;, status));
++
++						switch (status) {
++							case OHCI_TD_CONDITION_CRC_ERROR:
++							case OHCI_TD_CONDITION_BIT_STUFFING:
++							case OHCI_TD_CONDITION_TOGGLE_MISMATCH:
++								callbackStatus = B_DEV_CRC_ERROR;
++								break;
++
++							case OHCI_TD_CONDITION_STALL:
++								callbackStatus = B_DEV_STALLED;
++								break;
++
++							case OHCI_TD_CONDITION_NO_RESPONSE:
++								callbackStatus = B_TIMED_OUT;
++								break;
++
++							case OHCI_TD_CONDITION_PID_CHECK_FAILURE:
++								callbackStatus = B_DEV_BAD_PID;
++								break;
++
++							case OHCI_TD_CONDITION_UNEXPECTED_PID:
++								callbackStatus = B_DEV_UNEXPECTED_PID;
++								break;
++
++							case OHCI_TD_CONDITION_DATA_OVERRUN:
++								callbackStatus = B_DEV_DATA_OVERRUN;
++								break;
++
++							case OHCI_TD_CONDITION_DATA_UNDERRUN:
++								callbackStatus = B_DEV_DATA_UNDERRUN;
++								break;
++
++							case OHCI_TD_CONDITION_BUFFER_OVERRUN:
++								callbackStatus = B_DEV_FIFO_OVERRUN;
++								break;
++
++							case OHCI_TD_CONDITION_BUFFER_UNDERRUN:
++								callbackStatus = B_DEV_FIFO_UNDERRUN;
++								break;
++
++							default:
++								callbackStatus = B_ERROR;
++								break;
++						}
++
++						transferDone = true;
++						break;
++					} else {
++						// an error occured but the endpoint is not halted so
++						// the td is in fact still active
++						TRACE((&quot;usb_ohci: td %p active with error\n&quot;, descriptor));
++						break;
++					}
+ 				}
+ 
+-				TRACE_ERROR((&quot;usb_ohci: address 0x%08lx not found!\n&quot;, doneList));
+-				break;
+-			}
++				// the td has complete without an error
++				TRACE((&quot;usb_ohci: td %p done\n&quot;, descriptor));
+ 
+-			// Acknowledge the interrupt
+-			// TODO: Move the acknowledgement in the interrupt handler.
+-			// The done_head value can be passed through a shared variable.
+-			fHcca-&gt;done_head = 0;
+-			_WriteReg(OHCI_INTERRUPT_STATUS, OHCI_WRITEBACK_DONE_HEAD);
++				if (descriptor == transfer-&gt;last_descriptor
++					|| descriptor-&gt;buffer_physical != 0) {
++					// this is the last td of the transfer or a short packet
++					callbackStatus = B_OK;
++					transferDone = true;
++					break;
++				}
+ 
+-			// Process isochronous list first
+-			for (isoCurrent = isoTop; isoCurrent != NULL; isoCurrent
+-				= (ohci_isochronous_td *)isoCurrent-&gt;next_done_descriptor) {
+-				// TODO: Process isochronous descriptors
++				descriptor
++					= (ohci_general_td *)descriptor-&gt;next_logical_descriptor;
+ 			}
+ 
+-			// Now process the general list
+-			for (current = top; current != NULL;) {
+-				ohci_general_td *next
+-					= (ohci_general_td *)current-&gt;next_done_descriptor;
++			if (!transferDone) {
++				lastTransfer = transfer;
++				transfer = transfer-&gt;link;
++				continue;
++			}
+ 
+-				transfer_data *transfer = (transfer_data *)current-&gt;transfer;
+-				if (transfer-&gt;canceled) {
+-					// Clear canceled transfer later on
+-					current = next;
+-					continue;
+-				}
++			// remove the transfer from the list first so we are sure
++			// it doesn't get canceled while we still process it
++			transfer_data *next = transfer-&gt;link;
++			if (Lock()) {
++				if (lastTransfer)
++					lastTransfer-&gt;link = transfer-&gt;link;
+ 
+-				bool transferDone = false;
+-				status_t callbackStatus = B_OK;
+-				uint32 conditionCode = OHCI_TD_GET_CONDITION_CODE(current-&gt;flags);
+-				if (conditionCode != OHCI_NO_ERROR) {
+-					// Endpoint is halted: unlink all descriptors belonging to
+-					// the failed transfer from the endpoint and restart the
+-					// endpoint.
+-					// NOTE: There can(should) not be more than one
+-					// invalid descriptor from the same transfer in the
+-					// done list, as the controller halts the endpoint right
+-					// away if a descriptor fails. This means that, if we reversed
+-					// the order of the done list (which we did), there is
+-					// no reason to look for more failed descriptors in the
+-					// done list from the same transfer, as *BSD code does.
+-					TRACE_ERROR((&quot;usb_ohci: transfer failed! ohci error code: %lu\n&quot;,
+-						conditionCode));
++				if (transfer == fFirstTransfer)
++					fFirstTransfer = transfer-&gt;link;
++				if (transfer == fLastTransfer)
++					fLastTransfer = lastTransfer;
+ 
+-					// Remove remaining descriptors from the same transfer
+-					if (!current-&gt;is_last)
+-						_RemoveTransferFromEndpoint(transfer);
++				transfer-&gt;link = NULL;
++				Unlock();
++			}
+ 
+-					// TODO: Fix the following with the appropriate error
+-					callbackStatus = B_DEV_MULTIPLE_ERRORS;
+-					transferDone = true;
+-				} else if (current-&gt;is_last)
+-					transferDone = true;
++			// break the descriptor chain on the last descriptor
++			transfer-&gt;last_descriptor-&gt;next_logical_descriptor = NULL;
++			TRACE((&quot;usb_ohci: transfer %p done\n&quot;, transfer));
+ 
+-				if (transferDone) {
+-					size_t actualLength = 0;
+-					if (callbackStatus == B_OK) {
+-						if (transfer-&gt;data_descriptor &amp;&amp; transfer-&gt;incoming) {
+-							// Read data out
+-						} else {
+-							// How much was transfered?
+-						}
++			// if canceled the callback has already been called
++			if (!transfer-&gt;canceled) {
++				size_t actualLength = 0;
++				if (callbackStatus == B_OK) {
++					if (transfer-&gt;data_descriptor &amp;&amp; transfer-&gt;incoming) {
++						// data to read out
++						iovec *vector = transfer-&gt;transfer-&gt;Vector();
++						size_t vectorCount = transfer-&gt;transfer-&gt;VectorCount();
+ 
+-						if (transfer-&gt;transfer-&gt;IsFragmented()) {
+-							// TODO
+-						}
++						transfer-&gt;transfer-&gt;PrepareKernelAccess();
++						actualLength = _ReadDescriptorChain(
++							transfer-&gt;data_descriptor,
++							vector, vectorCount);
++					} else {
++						// read the actual length that was sent
++						actualLength = _ReadActualLength(
++							transfer-&gt;first_descriptor);
+ 					}
+ 
+-					_UnlinkTransfer(transfer);
+-					transfer-&gt;transfer-&gt;Finished(callbackStatus, actualLength);
+-					next = (ohci_general_td *)current-&gt;next_done_descriptor;
+-					_FreeDescriptorChain(transfer-&gt;first_descriptor);
++					if (transfer-&gt;transfer-&gt;IsFragmented()) {
++						// this transfer may still have data left
++						TRACE((&quot;usb_ohci: advancing fragmented transfer\n&quot;));
++						transfer-&gt;transfer-&gt;AdvanceByFragment(actualLength);
++						if (transfer-&gt;transfer-&gt;VectorLength() &gt; 0) {
++							TRACE((&quot;usb_ohci: still %ld bytes left on transfer\n&quot;,
++								transfer-&gt;transfer-&gt;VectorLength()));
++							// TODO actually resubmit the transfer
++						}
+ 
+-					delete transfer-&gt;transfer;
+-					delete transfer;
++						// the transfer is done, but we already set the
++						// actualLength with AdvanceByFragment()
++						actualLength = 0;
++					}
+ 				}
+ 
+-				current = next;
++				transfer-&gt;transfer-&gt;Finished(callbackStatus, actualLength);
+ 			}
+-		}
+ 
+-		// Quickly look for canceled transfer before we go back to sleep
+-		transfer_data *current = fFirstTransfer;
+-		while (current) {
+-			transfer_data *next = current-&gt;link;
+-			if (current-&gt;canceled) {
+-				_UnlinkTransfer(current);
+-				_FreeDescriptorChain(current-&gt;first_descriptor);
+-				delete current-&gt;transfer;
+-				delete current;
+-			}
+-			current = next;
++			// free the descriptors
++			_FreeDescriptorChain(transfer-&gt;first_descriptor);
++			// TODO: in case of cancel/error adjust the endpoint head and
++			// restart the endpoint by clearing the halt
++
++			delete transfer-&gt;transfer;
++			delete transfer;
++			transfer = next;
+ 		}
+ 	}
+ }
+ 
+ 
+ status_t
+-OHCI::_SubmitControlTransfer(Transfer *transfer)
++OHCI::_SubmitRequest(Transfer *transfer)
+ {
+ 	usb_request_data *requestData = transfer-&gt;RequestData();
+ 	bool directionIn = (requestData-&gt;RequestType &amp; USB_REQTYPE_DEVICE_IN) &gt; 0;
+@@ -1008,9 +1029,9 @@
+ 	}
+ 
+ 	setupDescriptor-&gt;flags = OHCI_TD_DIRECTION_PID_SETUP
+-		| OHCI_TD_NO_CONDITION_CODE
++		| OHCI_TD_SET_CONDITION_CODE(OHCI_TD_CONDITION_NOT_ACCESSED)
+ 		| OHCI_TD_TOGGLE_0
+-		| OHCI_TD_SET_DELAY_INTERRUPT(7);
++		| OHCI_TD_SET_DELAY_INTERRUPT(OHCI_TD_INTERRUPT_NONE);
+ 
+ 	ohci_general_td *statusDescriptor = _CreateGeneralDescriptor(0);
+ 	if (!statusDescriptor) {
+@@ -1021,9 +1042,9 @@
+ 
+ 	statusDescriptor-&gt;flags
+ 		= (directionIn ? OHCI_TD_DIRECTION_PID_OUT : OHCI_TD_DIRECTION_PID_IN)
+-		| OHCI_TD_NO_CONDITION_CODE
++		| OHCI_TD_SET_CONDITION_CODE(OHCI_TD_CONDITION_NOT_ACCESSED)
+ 		| OHCI_TD_TOGGLE_1
+-		| OHCI_TD_SET_DELAY_INTERRUPT(0);
++		| OHCI_TD_SET_DELAY_INTERRUPT(OHCI_TD_INTERRUPT_IMMEDIATE);
+ 
+ 	iovec vector;
+ 	vector.iov_base = requestData;
+@@ -1057,8 +1078,8 @@
+ 	// Append Transfer
+ 	ohci_endpoint_descriptor *endpoint
+ 		= (ohci_endpoint_descriptor *)transfer-&gt;TransferPipe()-&gt;ControllerCookie();
+-	result = _AddPendingTransfer(transfer, endpoint, setupDescriptor,
+-		dataDescriptor,	directionIn);
++	result = _AddPendingTransfer(transfer, endpoint, dataDescriptor,
++		statusDescriptor, directionIn);
+ 	if (result &lt; B_OK) {
+ 		TRACE_ERROR((&quot;usb_ohci: failed to add pending transfer\n&quot;));
+ 		_FreeDescriptorChain(setupDescriptor);
+@@ -1069,13 +1090,14 @@
+ 	_SwitchEndpointTail(endpoint, setupDescriptor, statusDescriptor);
+ 
+ 	// Tell the controller to process the control list
++	endpoint-&gt;flags &amp;= ~OHCI_ENDPOINT_SKIP;
+ 	_WriteReg(OHCI_COMMAND_STATUS, OHCI_CONTROL_LIST_FILLED);
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-OHCI::_SubmitBulkTransfer(Transfer *transfer)
++OHCI::_SubmitTransfer(Transfer *transfer)
+ {
+ 	// TODO
+ 	return B_ERROR;
+@@ -1083,7 +1105,7 @@
+ 
+ 
+ status_t
+-OHCI::_SubmitPeriodicTransfer(Transfer *transfer)
++OHCI::_SubmitIsochronousTransfer(Transfer *transfer)
+ {
+ 	return B_ERROR;
+ }
+@@ -1104,32 +1126,29 @@
+ 	tail-&gt;next_logical_descriptor = first-&gt;next_logical_descriptor;
+ 
+ 	// the first descriptor becomes the new tail
+-	tail = first;
+-	tail-&gt;buffer_size = 0;
+-	tail-&gt;buffer_logical = NULL;
+-	tail-&gt;next_logical_descriptor = NULL;
+-	_LinkDescriptors(last, tail);
++	first-&gt;flags = 0;
++	first-&gt;buffer_physical = 0;
++	first-&gt;next_physical_descriptor = 0;
++	first-&gt;last_physical_byte_address = 0;
++	first-&gt;buffer_size = 0;
++	first-&gt;buffer_logical = NULL;
++	first-&gt;next_logical_descriptor = NULL;
++	_LinkDescriptors(last, first);
+ 
+ 	// update the endpoint tail pointer to reflect the change
+-	endpoint-&gt;tail_logical_descriptor = tail;
+-	endpoint-&gt;tail_physical_descriptor = (uint32)tail-&gt;physical_address;
++	endpoint-&gt;tail_logical_descriptor = first;
++	endpoint-&gt;tail_physical_descriptor = (uint32)first-&gt;physical_address;
++
++#if 0
++	_PrintEndpoint(endpoint);
++	_PrintDescriptorChain(tail);
++#endif
+ }
+ 
+ 
+ void
+ OHCI::_RemoveTransferFromEndpoint(transfer_data *transfer)
+ {
+-	// TODO: Add lock for endpoint
+-	ohci_endpoint_descriptor *endpoint = transfer-&gt;endpoint;
+-	ohci_general_td *next = (ohci_general_td *)endpoint-&gt;head_logical_descriptor;
+-
+-	// Find the first descriptor of a different transfer.
+-	// Worst scenario we get the dummy descriptor
+-	while ((transfer_data *)next-&gt;transfer == transfer)
+-		next = (ohci_general_td *)next-&gt;next_logical_descriptor;
+-	// Update head
+-	endpoint-&gt;head_logical_descriptor = next;
+-	endpoint-&gt;head_physical_descriptor = next-&gt;physical_address;
+ }
+ 
+ 
+@@ -1148,7 +1167,6 @@
+ 
+ 	endpoint-&gt;flags = OHCI_ENDPOINT_SKIP;
+ 	endpoint-&gt;physical_address = (addr_t)physicalAddress;
+-	endpoint-&gt;head_logical_descriptor = NULL;
+ 	endpoint-&gt;head_physical_descriptor = 0;
+ 	endpoint-&gt;tail_logical_descriptor = NULL;
+ 	endpoint-&gt;tail_physical_descriptor = 0;
+@@ -1256,16 +1274,15 @@
+ 		return B_ERROR;
+ 	} else {
+ 		ohci_general_td *tail = _CreateGeneralDescriptor(0);
+-		endpoint-&gt;head_logical_descriptor = tail;
+ 		endpoint-&gt;tail_logical_descriptor = tail;
+ 		endpoint-&gt;head_physical_descriptor = tail-&gt;physical_address;
+ 		endpoint-&gt;tail_physical_descriptor = tail-&gt;physical_address;
+ 	}
+ 
+ 	if (!_LockEndpoints()) {
+-		if (endpoint-&gt;head_logical_descriptor) {
++		if (endpoint-&gt;tail_logical_descriptor) {
+ 			_FreeGeneralDescriptor(
+-				(ohci_general_td *)endpoint-&gt;head_logical_descriptor);
++				(ohci_general_td *)endpoint-&gt;tail_logical_descriptor);
+ 		}
+ 
+ 		_FreeEndpoint(endpoint);
+@@ -1352,9 +1369,42 @@
+ 
+ status_t
+ OHCI::_CreateDescriptorChain(ohci_general_td **_firstDescriptor,
+-	ohci_general_td **_lastDescriptor, uint8 direction, size_t bufferSize)
++	ohci_general_td **_lastDescriptor, uint32 direction, size_t bufferSize)
+ {
+-	return B_ERROR;
++	size_t blockSize = 8192;
++	int32 descriptorCount = (bufferSize + blockSize - 1) / blockSize;
++	if (descriptorCount == 0)
++		descriptorCount = 1;
++
++	ohci_general_td *firstDescriptor = NULL;
++	ohci_general_td *lastDescriptor = *_firstDescriptor;
++	for (int32 i = 0; i &lt; descriptorCount; i++) {
++		ohci_general_td *descriptor = _CreateGeneralDescriptor(
++			min_c(blockSize, bufferSize));
++
++		if (!descriptor) {
++			_FreeDescriptorChain(firstDescriptor);
++			return B_NO_MEMORY;
++		}
++
++		descriptor-&gt;flags = direction
++			| OHCI_TD_SET_CONDITION_CODE(OHCI_TD_CONDITION_NOT_ACCESSED)
++			| OHCI_TD_TOGGLE_CARRY
++			| OHCI_TD_SET_DELAY_INTERRUPT(OHCI_TD_INTERRUPT_NONE);
++
++		// link to previous
++		if (lastDescriptor)
++			_LinkDescriptors(lastDescriptor, descriptor);
++
++		bufferSize -= blockSize;
++		lastDescriptor = descriptor;
++		if (!firstDescriptor)
++			firstDescriptor = descriptor;
++	}
++
++	*_firstDescriptor = firstDescriptor;
++	*_lastDescriptor = lastDescriptor;
++	return B_OK;
+ }
+ 
+ 
+@@ -1427,6 +1477,87 @@
+ }
+ 
+ 
++size_t
++OHCI::_ReadDescriptorChain(ohci_general_td *topDescriptor, iovec *vector,
++	size_t vectorCount)
++{
++	ohci_general_td *current = topDescriptor;
++	size_t actualLength = 0;
++	size_t vectorIndex = 0;
++	size_t vectorOffset = 0;
++	size_t bufferOffset = 0;
++
++	while (current &amp;&amp; OHCI_TD_GET_CONDITION_CODE(current-&gt;flags)
++		!= OHCI_TD_CONDITION_NOT_ACCESSED) {
++		if (!current-&gt;buffer_logical)
++			break;
++
++		size_t bufferSize = current-&gt;buffer_size;
++		if (current-&gt;buffer_physical != 0) {
++			bufferSize = current-&gt;last_physical_byte_address
++				- current-&gt;buffer_physical + 1;
++		}
++
++		while (true) {
++			size_t length = min_c(bufferSize - bufferOffset,
++				vector[vectorIndex].iov_len - vectorOffset);
++
++			TRACE((&quot;usb_ohci: copying %ld bytes to vectorOffset %ld from&quot;
++				&quot; bufferOffset %ld at index %ld of %ld\n&quot;, length, vectorOffset,
++				bufferOffset, vectorIndex, vectorCount));
++			memcpy((uint8 *)vector[vectorIndex].iov_base + vectorOffset,
++				(uint8 *)current-&gt;buffer_logical + bufferOffset, length);
++
++			actualLength += length;
++			vectorOffset += length;
++			bufferOffset += length;
++
++			if (vectorOffset &gt;= vector[vectorIndex].iov_len) {
++				if (++vectorIndex &gt;= vectorCount) {
++					TRACE((&quot;usb_ohci: read descriptor chain (%ld bytes, no more vectors)\n&quot;, actualLength));
++					return actualLength;
++				}
++
++				vectorOffset = 0;
++			}
++
++			if (bufferOffset &gt;= bufferSize) {
++				bufferOffset = 0;
++				break;
++			}
++		}
++
++		current = (ohci_general_td *)current-&gt;next_logical_descriptor;
++	}
++
++	TRACE((&quot;usb_ohci: read descriptor chain (%ld bytes)\n&quot;, actualLength));
++	return actualLength;
++}
++
++
++size_t
++OHCI::_ReadActualLength(ohci_general_td *topDescriptor)
++{
++	ohci_general_td *current = topDescriptor;
++	size_t actualLength = 0;
++
++	while (current &amp;&amp; OHCI_TD_GET_CONDITION_CODE(current-&gt;flags)
++		!= OHCI_TD_CONDITION_NOT_ACCESSED) {
++		size_t length = current-&gt;buffer_size;
++		if (current-&gt;buffer_physical != 0) {
++			length = current-&gt;last_physical_byte_address
++				- current-&gt;buffer_physical + 1;
++		}
++
++		actualLength += length;
++		current = (ohci_general_td *)current-&gt;next_logical_descriptor;
++	}
++
++	TRACE((&quot;usb_ohci: read actual length (%ld bytes)\n&quot;, actualLength));
++	return actualLength;
++}
++
++
+ void
+ OHCI::_LinkDescriptors(ohci_general_td *first, ohci_general_td *second)
+ {
+@@ -1476,3 +1607,36 @@
+ {
+ 	return *(volatile uint32 *)(fOperationalRegisters + reg);
+ }
++
++
++void
++OHCI::_PrintEndpoint(ohci_endpoint_descriptor *endpoint)
++{
++	dprintf(&quot;usb_ohci: endpoint %p\n&quot;, endpoint);
++	dprintf(&quot;\tflags........... 0x%08lx\n&quot;, endpoint-&gt;flags);
++	dprintf(&quot;\ttail_physical... 0x%08lx\n&quot;, endpoint-&gt;tail_physical_descriptor);
++	dprintf(&quot;\thead_physical... 0x%08lx\n&quot;, endpoint-&gt;head_physical_descriptor);
++	dprintf(&quot;\tnext_physical... 0x%08lx\n&quot;, endpoint-&gt;next_physical_endpoint);
++	dprintf(&quot;\tphysical........ 0x%08lx\n&quot;, endpoint-&gt;physical_address);
++	dprintf(&quot;\ttail_logical.... %p\n&quot;, endpoint-&gt;tail_logical_descriptor);
++	dprintf(&quot;\tnext_logical.... %p\n&quot;, endpoint-&gt;next_logical_endpoint);
++}
++
++
++void
++OHCI::_PrintDescriptorChain(ohci_general_td *topDescriptor)
++{
++	while (topDescriptor) {
++		dprintf(&quot;usb_ohci: descriptor %p\n&quot;, topDescriptor);
++		dprintf(&quot;\tflags........... 0x%08lx\n&quot;, topDescriptor-&gt;flags);
++		dprintf(&quot;\tbuffer_physical. 0x%08lx\n&quot;, topDescriptor-&gt;buffer_physical);
++		dprintf(&quot;\tnext_physical... 0x%08lx\n&quot;, topDescriptor-&gt;next_physical_descriptor);
++		dprintf(&quot;\tlast_byte....... 0x%08lx\n&quot;, topDescriptor-&gt;last_physical_byte_address);
++		dprintf(&quot;\tphysical........ 0x%08lx\n&quot;, topDescriptor-&gt;physical_address);
++		dprintf(&quot;\tbuffer_size..... %lu\n&quot;, topDescriptor-&gt;buffer_size);
++		dprintf(&quot;\tbuffer_logical.. %p\n&quot;, topDescriptor-&gt;buffer_logical);
++		dprintf(&quot;\tnext_logical.... %p\n&quot;, topDescriptor-&gt;next_logical_descriptor);
++
++		topDescriptor = (ohci_general_td *)topDescriptor-&gt;next_logical_descriptor;
++	}
++}
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2008-05-18 14:22:56 UTC (rev 25545)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2008-05-18 19:34:25 UTC (rev 25546)
+@@ -24,6 +24,7 @@
+ 	ohci_endpoint_descriptor	*endpoint;
+ 	ohci_general_td				*first_descriptor;
+ 	ohci_general_td				*data_descriptor;
++	ohci_general_td				*last_descriptor;
+ 	bool						incoming;
+ 	bool						canceled;
+ 	transfer_data_s				*link;
+@@ -63,8 +64,8 @@
+ 		// Transfer functions
+ 		status_t					_AddPendingTransfer(Transfer *transfer,
+ 										ohci_endpoint_descriptor *endpoint,
+-										ohci_general_td *first,
+-										ohci_general_td *data,
++										ohci_general_td *dataDescriptor,
++										ohci_general_td *lastDescriptor,
+ 										bool directionIn);
+ 		status_t					_CancelQueuedIsochronousTransfers(
+ 										Pipe *pipe, bool force);
+@@ -73,9 +74,10 @@
+ static	int32						_FinishThread(void *data);
+ 		void						_FinishTransfers();
+ 
+-		status_t					_SubmitControlTransfer(Transfer *transfer);
+-		status_t					_SubmitBulkTransfer(Transfer *transfer);
+-		status_t					_SubmitPeriodicTransfer(Transfer *transfer);
++		status_t					_SubmitRequest(Transfer *transfer);
++		status_t					_SubmitTransfer(Transfer *transfer);
++		status_t					_SubmitIsochronousTransfer(
++										Transfer *transfer);
+ 
+ 		void						_SwitchEndpointTail(
+ 										ohci_endpoint_descriptor *endpoint,
+@@ -101,15 +103,19 @@
+ 		status_t					_CreateDescriptorChain(
+ 										ohci_general_td **firstDescriptor,
+ 										ohci_general_td **lastDescriptor,
+-										uint8 direction,
++										uint32 direction,
+ 										size_t bufferSize);
+ 		void						_FreeDescriptorChain(
+ 										ohci_general_td *topDescriptor);
+ 
+ 		size_t						_WriteDescriptorChain(
+ 										ohci_general_td *topDescriptor,
+-										iovec *vector,
+-										size_t vectorCount);
++										iovec *vector, size_t vectorCount);
++		size_t						_ReadDescriptorChain(
++										ohci_general_td *topDescriptor,
++										iovec *vector, size_t vectorCount);
++		size_t						_ReadActualLength(
++										ohci_general_td *topDescriptor);
+ 
+ 		void						_LinkDescriptors(ohci_general_td *first,
+ 										ohci_general_td *second);
+@@ -126,6 +132,12 @@
+ inline	void						_WriteReg(uint32 reg, uint32 value);
+ inline	uint32						_ReadReg(uint32 reg);
+ 
++		// Debug functions
++		void						_PrintEndpoint(
++										ohci_endpoint_descriptor *endpoint);
++		void						_PrintDescriptorChain(
++										ohci_general_td *topDescriptor);
++
+ static	pci_module_info				*sPCIModule;
+ 		pci_info					*fPCIInfo;
+ 		Stack						*fStack;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2008-05-18 14:22:56 UTC (rev 25545)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2008-05-18 19:34:25 UTC (rev 25546)
+@@ -207,7 +207,7 @@
+ //	Root Hub port status (n) register (section 7.4.4)
+ // --------------------------------
+ 
+-#define	OHCI_RH_PORT_STATUS(n)		(0x50 + (n) * 4)// 1 based indexing
++#define	OHCI_RH_PORT_STATUS(n)		(0x54 + (n) * 4)// 0 based indexing
+ #define	OHCI_RH_PORTSTATUS_CCS		0x00000001		// Current Connection Status
+ #define	OHCI_RH_PORTSTATUS_PES		0x00000002		// Port Enable Status
+ #define	OHCI_RH_PORTSTATUS_PSS		0x00000004		// Port Suspend Status
+@@ -301,7 +301,6 @@
+ 	// Software part
+ 	addr_t	physical_address;			// Physical pointer to this address
+ 	void	*tail_logical_descriptor;	// Queue tail logical pointer
+-	void	*head_logical_descriptor;	// Queue head logical pointer
+ 	void	*next_logical_endpoint;		// Logical pointer to the next endpoint
+ } ohci_endpoint_descriptor;
+ 
+@@ -342,9 +341,6 @@
+ 	size_t	buffer_size;				// Size of the buffer
+ 	void	*buffer_logical;			// Logical pointer to the buffer
+ 	void	*next_logical_descriptor;	// Logical pointer next descriptor
+-	void	*next_done_descriptor;		// Used for the done descriptor list
+-	void	*transfer;					// Pointer to the transfer_data
+-	bool	is_last;					// Last descriptor of the transfer
+ } ohci_general_td;
+ 
+ #define	OHCI_BUFFER_ROUNDING			0x00040000
+@@ -354,7 +350,6 @@
+ #define	OHCI_TD_DIRECTION_PID_IN		0x00100000
+ #define	OHCI_TD_GET_DELAY_INTERRUPT(x)	(((x) &gt;&gt; 21) &amp; 7)
+ #define	OHCI_TD_SET_DELAY_INTERRUPT(x)	((x) &lt;&lt; 21)
+-#define	OHCI_TD_NO_INTERRUPT			0x00e00000
+ #define	OHCI_TD_INTERRUPT_MASK			0x00e00000
+ #define	OHCI_TD_TOGGLE_CARRY			0x00000000
+ #define	OHCI_TD_TOGGLE_0				0x02000000
+@@ -362,8 +357,26 @@
+ #define	OHCI_TD_TOGGLE_MASK				0x03000000
+ #define	OHCI_TD_GET_ERROR_COUNT(x)		(((x) &gt;&gt; 26) &amp; 3)
+ #define	OHCI_TD_GET_CONDITION_CODE(x)	((x) &gt;&gt; 28)
+-#define	OHCI_TD_NO_CONDITION_CODE		0xf0000000
++#define	OHCI_TD_SET_CONDITION_CODE(x)	((x) &lt;&lt; 28)
++#define	OHCI_TD_CONDITION_CODE_MASK		0xf0000000
+ 
++#define OHCI_TD_INTERRUPT_IMMEDIATE			0x00
++#define OHCI_TD_INTERRUPT_NONE				0x07
++
++#define OHCI_TD_CONDITION_NO_ERROR			0x00
++#define OHCI_TD_CONDITION_CRC_ERROR			0x01
++#define OHCI_TD_CONDITION_BIT_STUFFING		0x02
++#define OHCI_TD_CONDITION_TOGGLE_MISMATCH	0x03
++#define OHCI_TD_CONDITION_STALL				0x04
++#define OHCI_TD_CONDITION_NO_RESPONSE		0x05
++#define OHCI_TD_CONDITION_PID_CHECK_FAILURE	0x06
++#define OHCI_TD_CONDITION_UNEXPECTED_PID	0x07
++#define OHCI_TD_CONDITION_DATA_OVERRUN		0x08
++#define OHCI_TD_CONDITION_DATA_UNDERRUN		0x09
++#define OHCI_TD_CONDITION_BUFFER_OVERRUN	0x0c
++#define OHCI_TD_CONDITION_BUFFER_UNDERRUN	0x0d
++#define OHCI_TD_CONDITION_NOT_ACCESSED		0x0f
++
+ #define OHCI_GENERAL_TD_ALIGN 16
+ 
+ // --------------------------------
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008914.html">[Haiku-commits] r25545 -	haiku/trunk/src/tests/system/kernel/device_manager/playground
+</A></li>
+	<LI>Next message: <A HREF="008920.html">[Haiku-commits] r25547 - haiku/trunk/headers/os/drivers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8919">[ date ]</a>
+              <a href="thread.html#8919">[ thread ]</a>
+              <a href="subject.html#8919">[ subject ]</a>
+              <a href="author.html#8919">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

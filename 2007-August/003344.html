@@ -1,0 +1,478 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21803 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21803%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200708022144.l72Litjv025621%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003343.html">
+   <LINK REL="Next"  HREF="003345.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21803 - haiku/trunk/src/system/kernel</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21803%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200708022144.l72Litjv025621%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21803 - haiku/trunk/src/system/kernel">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug  2 23:44:55 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003343.html">[Haiku-commits] r21802 - in haiku/trunk: . build/jam	src/add-ons/kernel/drivers/graphics/vmware	src/add-ons/kernel/drivers/input/usb_hid	src/add-ons/kernel/drivers/network/stack	src/add-ons/media/media-add-ons/esound_sink	src/add-ons/media/media-add-ons/multi_audio	src/add-ons/media/media-add-ons/usb_webcam	src/apps/networkstatus src/apps/pulse src/apps/resedit	src/apps/stylededit src/bin/bash/lib/glob	src/bin/bash/lib/readline src/bin/bash/lib/sh	src/bin/desklink src/bin/network/arp src/bin/network/ftp	src/bin/network/ifconfig src/bin/network/nc	src/bin/network/ping src/bin/network/ppp_up	src/bin/network/pppconfig src/bin/network/route	src/bin/network/traceroute src/bin/pcmcia-cs src/kits/support	src/kits/textencoding src/kits/textencoding/libiconv	src/kits/tracker src/preferences/keyboard	src/preferences/media src/preferences/sounds	src/preferences/virtualmemory src/tools/bfs_shell
+</A></li>
+        <LI>Next message: <A HREF="003345.html">[Haiku-commits] r21804 -	haiku/trunk/src/add-ons/mail_daemon/inbound_protocols/pop3
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3344">[ date ]</a>
+              <a href="thread.html#3344">[ thread ]</a>
+              <a href="subject.html#3344">[ subject ]</a>
+              <a href="author.html#3344">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-08-02 23:44:54 +0200 (Thu, 02 Aug 2007)
+New Revision: 21803
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21803&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21803&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/module.cpp
+Log:
+* Made the module code more robust against putting more module reference
+  than you own - instead of crashing some time later, it will now panic as
+  soon as it can.
+* No longer put the module image for B_KEEP_LOADED modules - essentially,
+  that feature was broken.
+* Now use the RecursiveLocker in favour of manual locking where appropriate.
+  This actually fixed two locking bugs in error code paths.
+* Applied a patch by Fran?\195?\167ois Revol: open_module_list() did not work
+  when the prefix was already inside a module (as opposed to a directory
+  on disk). The current solution is not as efficient, but that can be
+  fixed by improving the iterator code.
+
+
+Modified: haiku/trunk/src/system/kernel/module.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/module.cpp	2007-08-02 21:13:56 UTC (rev 21802)
++++ haiku/trunk/src/system/kernel/module.cpp	2007-08-02 21:44:54 UTC (rev 21803)
+@@ -9,22 +9,23 @@
+ /** Manages kernel add-ons and their exported modules. */
+ 
+ 
++#include &lt;kmodule.h&gt;
++
++#include &lt;errno.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/stat.h&gt;
++
+ #include &lt;boot_device.h&gt;
+ #include &lt;elf.h&gt;
+-#include &lt;kmodule.h&gt;
+ #include &lt;lock.h&gt;
+ #include &lt;vfs.h&gt;
+-
+ #include &lt;boot/elf.h&gt;
+ #include &lt;fs/KPath.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ #include &lt;util/khash.h&gt;
+ 
+-#include &lt;errno.h&gt;
+-#include &lt;stdlib.h&gt;
+-#include &lt;string.h&gt;
+-#include &lt;sys/stat.h&gt;
+ 
+-
+ //#define TRACE_MODULE
+ #ifdef TRACE_MODULE
+ #	define TRACE(x) dprintf x
+@@ -227,20 +228,6 @@
+ }
+ 
+ 
+-static inline void
+-inc_module_ref_count(struct module *module)
+-{
+-	module-&gt;ref_count++;
+-}
+-
+-
+-static inline void
+-dec_module_ref_count(struct module *module)
+-{
+-	module-&gt;ref_count--;
+-}
+-
+-
+ /** Try to load the module image at the specified location.
+  *	If it could be loaded, it returns B_OK, and stores a pointer
+  *	to the module_image object in &quot;_moduleImage&quot;.
+@@ -311,24 +298,23 @@
+ {
+ 	TRACE((&quot;unload_module_image(image = %p, path = %s)\n&quot;, moduleImage, path));
+ 
+-	recursive_lock_lock(&amp;sModulesLock);
++	RecursiveLocker locker(sModulesLock);
+ 
+ 	if (moduleImage == NULL) {
+ 		// if no image was specified, lookup it up in the hash table
+ 		moduleImage = (module_image *)hash_lookup(sModuleImagesHash, path);
+-		if (moduleImage == NULL) {
+-			recursive_lock_unlock(&amp;sModulesLock);
++		if (moduleImage == NULL)
+ 			return B_ENTRY_NOT_FOUND;
+-		}
+ 	}
+ 
+ 	if (moduleImage-&gt;ref_count != 0) {
+-		FATAL((&quot;Can't unload %s due to ref_cnt = %ld\n&quot;, moduleImage-&gt;path, moduleImage-&gt;ref_count));
++		FATAL((&quot;Can't unload %s due to ref_cnt = %ld\n&quot;, moduleImage-&gt;path,
++			moduleImage-&gt;ref_count));
+ 		return B_ERROR;
+ 	}
+ 
+ 	hash_remove(sModuleImagesHash, moduleImage);
+-	recursive_lock_unlock(&amp;sModulesLock);
++	locker.Unlock();
+ 
+ 	unload_kernel_add_on(moduleImage-&gt;image);
+ 	free(moduleImage-&gt;path);
+@@ -357,24 +343,21 @@
+ {
+ 	struct module_image *image;
+ 
+-	TRACE((&quot;get_module_image(path = \&quot;%s\&quot;, _image = %p)\n&quot;, path, _image));
++	TRACE((&quot;get_module_image(path = \&quot;%s\&quot;, loadIfNeeded = %d)\n&quot;, path,
++		loadIfNeeded));
+ 
+-	recursive_lock_lock(&amp;sModulesLock);
++	RecursiveLocker _(sModulesLock);
+ 
+ 	image = (module_image *)hash_lookup(sModuleImagesHash, path);
+ 	if (image == NULL) {
+ 		status_t status = load_module_image(path, &amp;image);
+-		if (status &lt; B_OK) {
+-			recursive_lock_unlock(&amp;sModulesLock);
++		if (status &lt; B_OK)
+ 			return status;
+-		}
+ 	}
+ 
+ 	atomic_add(&amp;image-&gt;ref_count, 1);
+ 	*_image = image;
+ 
+-	recursive_lock_unlock(&amp;sModulesLock);
+-
+ 	return B_OK;
+ }
+ 
+@@ -451,7 +434,8 @@
+ 	module_info **info;
+ 	int index = 0, match = B_ENTRY_NOT_FOUND;
+ 
+-	TRACE((&quot;check_module_image(path = \&quot;%s\&quot;, searchedName = \&quot;%s\&quot;)\n&quot;, path, searchedName));
++	TRACE((&quot;check_module_image(path = \&quot;%s\&quot;, searchedName = \&quot;%s\&quot;)\n&quot;, path,
++		searchedName));
+ 
+ 	if (get_module_image(path, &amp;image) &lt; B_OK)
+ 		return B_ENTRY_NOT_FOUND;
+@@ -468,7 +452,8 @@
+ 	// The module we looked for couldn't be found, so we can unload the
+ 	// loaded module at this point
+ 	if (match != B_OK) {
+-		TRACE((&quot;check_module_file: unloading module file \&quot;%s\&quot; (not used yet)\n&quot;, path));
++		TRACE((&quot;check_module_file: unloading module file \&quot;%s\&quot; (not used yet)\n&quot;,
++			path));
+ 		unload_module_image(image, path);
+ 	}
+ 
+@@ -517,14 +502,15 @@
+ static status_t
+ put_dependent_modules(struct module *module)
+ {
++	module_image *image = module-&gt;module_image;
+ 	module_dependency *dependencies;
+-	int32 i = 0;
+ 
+-	if (module-&gt;module_image == NULL
+-		|| (dependencies = module-&gt;module_image-&gt;dependencies) == NULL)
++	// built-in modules don't have a module_image structure
++	if (image == NULL
++		|| (dependencies = image-&gt;dependencies) == NULL)
+ 		return B_OK;
+ 
+-	for (; dependencies[i].name != NULL; i++) {
++	for (int32 i = 0; dependencies[i].name != NULL; i++) {
+ 		status_t status = put_module(dependencies[i].name);
+ 		if (status &lt; B_OK)
+ 			return status;
+@@ -537,20 +523,22 @@
+ static status_t
+ get_dependent_modules(struct module *module)
+ {
++	module_image *image = module-&gt;module_image;
+ 	module_dependency *dependencies;
+-	int32 i = 0;
+ 
+ 	// built-in modules don't have a module_image structure
+-	if (module-&gt;module_image == NULL
+-		|| (dependencies = module-&gt;module_image-&gt;dependencies) == NULL)
++	if (image == NULL
++		|| (dependencies = image-&gt;dependencies) == NULL)
+ 		return B_OK;
+ 
+ 	TRACE((&quot;resolving module dependencies...\n&quot;));
+ 
+-	for (; dependencies[i].name != NULL; i++) {
+-		status_t status = get_module(dependencies[i].name, dependencies[i].info);
++	for (int32 i = 0; dependencies[i].name != NULL; i++) {
++		status_t status = get_module(dependencies[i].name,
++			dependencies[i].info);
+ 		if (status &lt; B_OK) {
+-			TRACE((&quot;loading dependent module \&quot;%s\&quot; failed!\n&quot;, dependencies[i].name));
++			dprintf(&quot;loading dependent module %s of %s failed!\n&quot;,
++				dependencies[i].name, module-&gt;name);
+ 			return status;
+ 		}
+ 	}
+@@ -651,10 +639,11 @@
+ 				module-&gt;state = MODULE_LOADED;
+ 
+ 				put_dependent_modules(module);
+-				return 0;
++				return B_OK;
+ 			}
+ 
+-			FATAL((&quot;Error unloading module %s (%s)\n&quot;, module-&gt;name, strerror(status)));
++			FATAL((&quot;Error unloading module %s (%s)\n&quot;, module-&gt;name,
++				strerror(status)));
+ 
+ 			module-&gt;state = MODULE_ERROR;
+ 			module-&gt;flags |= B_KEEP_LOADED;
+@@ -941,10 +930,14 @@
+ 		char path[B_FILE_NAME_LENGTH];
+ 		const char *name, *suffix;
+ 		if (moduleImage-&gt;info[0]
+-			&amp;&amp; (suffix = strstr(name = moduleImage-&gt;info[0]-&gt;name, image-&gt;name)) != NULL) {
+-			// even if strlcpy() is used here, it's by no means safe against buffer overflows
+-			size_t length = strlcpy(path, &quot;/boot/beos/system/add-ons/kernel/&quot;, sizeof(path));
+-			strlcpy(path + length, name, strlen(image-&gt;name) + 1 + (suffix - name));
++			&amp;&amp; (suffix = strstr(name = moduleImage-&gt;info[0]-&gt;name,
++					image-&gt;name)) != NULL) {
++			// even if strlcpy() is used here, it's by no means safe
++			// against buffer overflows
++			size_t length = strlcpy(path, &quot;/boot/beos/system/add-ons/kernel/&quot;,
++				sizeof(path));
++			strlcpy(path + length, name, strlen(image-&gt;name)
++				+ 1 + (suffix - name));
+ 
+ 			moduleImage-&gt;path = strdup(path);
+ 		} else
+@@ -1070,7 +1063,8 @@
+ 	if (sModulesHash == NULL)
+ 		return B_NO_MEMORY;
+ 
+-	sModuleImagesHash = hash_init(MODULE_HASH_SIZE, 0, module_image_compare, module_image_hash);
++	sModuleImagesHash = hash_init(MODULE_HASH_SIZE, 0, module_image_compare,
++		module_image_hash);
+ 	if (sModuleImagesHash == NULL)
+ 		return B_NO_MEMORY;
+ 
+@@ -1082,13 +1076,16 @@
+ 
+ 	for (image = args-&gt;preloaded_images; image != NULL; image = image-&gt;next) {
+ 		status_t status = register_preloaded_module_image(image);
+-		if (status != B_OK)
+-			dprintf(&quot;Could not register image \&quot;%s\&quot;: %s\n&quot;, image-&gt;name, strerror(status));
++		if (status != B_OK) {
++			dprintf(&quot;Could not register image \&quot;%s\&quot;: %s\n&quot;, image-&gt;name,
++				strerror(status));
++		}
+ 	}
+ 
+ 	// ToDo: set sDisableUserAddOns from kernel_args!
+ 
+-	add_debugger_command(&quot;modules&quot;, &amp;dump_modules, &quot;list all known &amp; loaded modules&quot;);
++	add_debugger_command(&quot;modules&quot;, &amp;dump_modules,
++		&quot;list all known &amp; loaded modules&quot;);
+ 
+ 	return B_OK;
+ }
+@@ -1145,6 +1142,18 @@
+ 			if (sDisableUserAddOns &amp;&amp; i &gt;= FIRST_USER_MODULE_PATH)
+ 				break;
+ 
++			// Copy base path onto the iterator stack
++			char *path = strdup(sModulePaths[i]);
++			if (path == NULL)
++				continue;
++				
++			size_t length = strlen(path);
++
++			// TODO: it would currently be nicer to use the commented
++			// version below, but the iterator won't work if the prefix
++			// is inside a module then.
++			// It works this way, but should be done better.
++#if 0
+ 			// Build path component: base path + '/' + prefix
+ 			size_t length = strlen(sModulePaths[i]);
+ 			char *path = (char *)malloc(length + iterator-&gt;prefix_length + 2);
+@@ -1158,6 +1167,7 @@
+ 			path[length] = '/';
+ 			memcpy(path + length + 1, iterator-&gt;prefix,
+ 				iterator-&gt;prefix_length + 1);
++#endif
+ 
+ 			iterator_push_path_on_stack(iterator, path, length + 1);
+ 		}
+@@ -1203,7 +1213,7 @@
+ 	free(iterator-&gt;prefix);
+ 	free(iterator);
+ 
+-	return 0;
++	return B_OK;
+ }
+ 
+ 
+@@ -1235,7 +1245,8 @@
+ 	iterator-&gt;status = status;
+ 	recursive_lock_unlock(&amp;sModulesLock);
+ 
+-	TRACE((&quot;read_next_module_name: finished with status %s\n&quot;, strerror(status)));
++	TRACE((&quot;read_next_module_name: finished with status %s\n&quot;,
++		strerror(status)));
+ 	return status;
+ }
+ 
+@@ -1262,7 +1273,7 @@
+ 	status_t status = B_ENTRY_NOT_FOUND;
+ 	uint32 offset = *_cookie;
+ 
+-	recursive_lock_lock(&amp;sModulesLock);
++	RecursiveLocker _(sModulesLock);
+ 
+ 	hash_iterator iterator;
+ 	hash_open(sModulesHash, &amp;iterator);
+@@ -1280,7 +1291,6 @@
+ 	}
+ 
+ 	hash_close(sModulesHash, &amp;iterator, false);
+-	recursive_lock_unlock(&amp;sModulesLock);
+ 
+ 	return status;
+ }
+@@ -1298,7 +1308,7 @@
+ 	if (path == NULL)
+ 		return B_BAD_VALUE;
+ 
+-	recursive_lock_lock(&amp;sModulesLock);
++	RecursiveLocker _(sModulesLock);
+ 
+ 	module = (struct module *)hash_lookup(sModulesHash, path);
+ 
+@@ -1307,7 +1317,7 @@
+ 		module = search_module(path);
+ 		if (module == NULL) {
+ 			FATAL((&quot;module: Search for %s failed.\n&quot;, path));
+-			goto err;
++			return B_ENTRY_NOT_FOUND;
+ 		}
+ 	}
+ 
+@@ -1320,7 +1330,7 @@
+ 		 * is unloaded).
+ 		 */
+ 		if (get_module_image(module-&gt;file, &amp;moduleImage) &lt; B_OK)
+-			goto err;
++			return B_ENTRY_NOT_FOUND;
+ 
+ 		// (re)set in-memory data for the loaded module
+ 		module-&gt;info = moduleImage-&gt;info[module-&gt;offset];
+@@ -1339,17 +1349,15 @@
+ 		status = B_OK;
+ 
+ 	if (status == B_OK) {
+-		inc_module_ref_count(module);
++		if (module-&gt;ref_count &lt; 0)
++			panic(&quot;argl %s&quot;, path);
++		module-&gt;ref_count++;
+ 		*_info = module-&gt;info;
+-	} else if ((module-&gt;flags &amp; B_BUILT_IN_MODULE) == 0)
++	} else if ((module-&gt;flags &amp; B_BUILT_IN_MODULE) == 0
++		&amp;&amp; (module-&gt;flags &amp; B_KEEP_LOADED) == 0)
+ 		put_module_image(module-&gt;module_image);
+ 
+-	recursive_lock_unlock(&amp;sModulesLock);
+ 	return status;
+-
+-err:
+-	recursive_lock_unlock(&amp;sModulesLock);
+-	return B_ENTRY_NOT_FOUND;
+ }
+ 
+ 
+@@ -1360,25 +1368,23 @@
+ 
+ 	TRACE((&quot;put_module(path = %s)\n&quot;, path));
+ 
+-	recursive_lock_lock(&amp;sModulesLock);
++	RecursiveLocker _(sModulesLock);
+ 
+ 	module = (struct module *)hash_lookup(sModulesHash, path);
+ 	if (module == NULL) {
+-		FATAL((&quot;module: We don't seem to have a reference to module %s\n&quot;, path));
+-		recursive_lock_unlock(&amp;sModulesLock);
++		FATAL((&quot;module: We don't seem to have a reference to module %s\n&quot;,
++			path));
+ 		return B_BAD_VALUE;
+ 	}
+-	
++
++	if (module-&gt;ref_count == 0)
++		panic(&quot;module %s has no references.\n&quot;, path);
++
+ 	if ((module-&gt;flags &amp; B_KEEP_LOADED) == 0) {
+-		dec_module_ref_count(module);
+-
+-		if (module-&gt;ref_count == 0)
++		if (--module-&gt;ref_count == 0)
+ 			uninit_module(module);
+-	}
+-
+-	if ((module-&gt;flags &amp; B_BUILT_IN_MODULE) == 0)
++	} else if ((module-&gt;flags &amp; B_BUILT_IN_MODULE) == 0)
+ 		put_module_image(module-&gt;module_image);
+ 
+-	recursive_lock_unlock(&amp;sModulesLock);
+ 	return B_OK;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003343.html">[Haiku-commits] r21802 - in haiku/trunk: . build/jam	src/add-ons/kernel/drivers/graphics/vmware	src/add-ons/kernel/drivers/input/usb_hid	src/add-ons/kernel/drivers/network/stack	src/add-ons/media/media-add-ons/esound_sink	src/add-ons/media/media-add-ons/multi_audio	src/add-ons/media/media-add-ons/usb_webcam	src/apps/networkstatus src/apps/pulse src/apps/resedit	src/apps/stylededit src/bin/bash/lib/glob	src/bin/bash/lib/readline src/bin/bash/lib/sh	src/bin/desklink src/bin/network/arp src/bin/network/ftp	src/bin/network/ifconfig src/bin/network/nc	src/bin/network/ping src/bin/network/ppp_up	src/bin/network/pppconfig src/bin/network/route	src/bin/network/traceroute src/bin/pcmcia-cs src/kits/support	src/kits/textencoding src/kits/textencoding/libiconv	src/kits/tracker src/preferences/keyboard	src/preferences/media src/preferences/sounds	src/preferences/virtualmemory src/tools/bfs_shell
+</A></li>
+	<LI>Next message: <A HREF="003345.html">[Haiku-commits] r21804 -	haiku/trunk/src/add-ons/mail_daemon/inbound_protocols/pop3
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3344">[ date ]</a>
+              <a href="thread.html#3344">[ thread ]</a>
+              <a href="subject.html#3344">[ subject ]</a>
+              <a href="author.html#3344">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

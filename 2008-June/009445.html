@@ -1,0 +1,238 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25861 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25861%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200806081319.m58DJYpW030747%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009444.html">
+   <LINK REL="Next"  HREF="009446.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25861 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25861%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200806081319.m58DJYpW030747%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25861 - haiku/trunk/src/add-ons/kernel/busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun Jun  8 15:19:34 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009444.html">[Haiku-commits] r25860 - haiku/trunk/src/apps/installer
+</A></li>
+        <LI>Next message: <A HREF="009446.html">[Haiku-commits] r25862 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9445">[ date ]</a>
+              <a href="thread.html#9445">[ thread ]</a>
+              <a href="subject.html#9445">[ subject ]</a>
+              <a href="author.html#9445">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-06-08 15:19:33 +0200 (Sun, 08 Jun 2008)
+New Revision: 25861
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25861&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25861&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+Log:
+When canceling transfers, do not call the callbacks with the lock held. This
+prevents deadlocks in cases where a new transfer is scheduled from within the
+cancel callback. This is an edge case, as generally you don't want to schedule
+anything when explicitly canceling transfers, but there are a valid use cases
+when you cancel because of a timeout and then have to reset the device for
+example. Note that this hides bug #2353, where the cancel case is probably
+not handled correctly.
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp	2008-06-08 12:09:10 UTC (rev 25860)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp	2008-06-08 13:19:33 UTC (rev 25861)
+@@ -888,9 +888,15 @@
+ 	if (!Lock())
+ 		return B_ERROR;
+ 
++	struct transfer_entry {
++		Transfer *			transfer;
++		transfer_entry *	next;
++	};
++
++	transfer_entry *list = NULL;
+ 	transfer_data *current = fFirstTransfer;
+ 	while (current) {
+-		if (current-&gt;transfer-&gt;TransferPipe() == pipe) {
++		if (current-&gt;transfer &amp;&amp; current-&gt;transfer-&gt;TransferPipe() == pipe) {
+ 			// clear the active bit so the descriptors are canceled
+ 			ehci_qtd *descriptor = (ehci_qtd *)current-&gt;queue_head-&gt;element_log;
+ 			while (descriptor) {
+@@ -902,7 +908,14 @@
+ 				// if the transfer is canceled by force, the one causing the
+ 				// cancel is probably not the one who initiated the transfer
+ 				// and the callback is likely not safe anymore
+-				current-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++				transfer_entry *entry
++					= (transfer_entry *)malloc(sizeof(transfer_entry));
++				if (entry != NULL) {
++					entry-&gt;transfer = current-&gt;transfer;
++					current-&gt;transfer = NULL;
++					entry-&gt;next = list;
++					list = entry;
++				}
+ 			}
+ 
+ 			current-&gt;canceled = true;
+@@ -913,6 +926,14 @@
+ 
+ 	Unlock();
+ 
++	while (list != NULL) {
++		transfer_entry *next = list-&gt;next;
++		list-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++		delete list-&gt;transfer;
++		free(list);
++		list = next;
++	}
++
+ 	// notify the finisher so it can clean up the canceled transfers
+ 	release_sem_etc(fFinishTransfersSem, 1, B_DO_NOT_RESCHEDULE);
+ 	return B_OK;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2008-06-08 12:09:10 UTC (rev 25860)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2008-06-08 13:19:33 UTC (rev 25861)
+@@ -426,9 +426,15 @@
+ 	if (!Lock())
+ 		return B_ERROR;
+ 
++	struct transfer_entry {
++		Transfer *			transfer;
++		transfer_entry *	next;
++	};
++
++	transfer_entry *list = NULL;
+ 	transfer_data *current = fFirstTransfer;
+ 	while (current) {
+-		if (current-&gt;transfer-&gt;TransferPipe() == pipe) {
++		if (current-&gt;transfer &amp;&amp; current-&gt;transfer-&gt;TransferPipe() == pipe) {
+ 			// Check if the skip bit is already set
+ 			if (!(current-&gt;endpoint-&gt;flags &amp; OHCI_ENDPOINT_SKIP)) {
+ 				current-&gt;endpoint-&gt;flags |= OHCI_ENDPOINT_SKIP;
+@@ -445,7 +451,14 @@
+ 				// If the transfer is canceled by force, the one causing the
+ 				// cancel is probably not the one who initiated the transfer
+ 				// and the callback is likely not safe anymore
+-				current-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++				transfer_entry *entry
++					= (transfer_entry *)malloc(sizeof(transfer_entry));
++				if (entry != NULL) {
++					entry-&gt;transfer = current-&gt;transfer;
++					current-&gt;transfer = NULL;
++					entry-&gt;next = list;
++					list = entry;
++				}
+ 			}
+ 			current-&gt;canceled = true;
+ 		}
+@@ -454,6 +467,14 @@
+ 
+ 	Unlock();
+ 
++	while (list != NULL) {
++		transfer_entry *next = list-&gt;next;
++		list-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++		delete list-&gt;transfer;
++		free(list);
++		list = next;
++	}
++
+ 	// notify the finisher so it can clean up the canceled transfers
+ 	release_sem_etc(fFinishTransfersSem, 1, B_DO_NOT_RESCHEDULE);
+ 	return B_OK;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2008-06-08 12:09:10 UTC (rev 25860)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2008-06-08 13:19:33 UTC (rev 25861)
+@@ -614,9 +614,15 @@
+ 	if (!Lock())
+ 		return B_ERROR;
+ 
++	struct transfer_entry {
++		Transfer *			transfer;
++		transfer_entry *	next;
++	};
++
++	transfer_entry *list = NULL;
+ 	transfer_data *current = fFirstTransfer;
+ 	while (current) {
+-		if (current-&gt;transfer-&gt;TransferPipe() == pipe) {
++		if (current-&gt;transfer &amp;&amp; current-&gt;transfer-&gt;TransferPipe() == pipe) {
+ 			// clear the active bit so the descriptors are canceled
+ 			uhci_td *descriptor = current-&gt;first_descriptor;
+ 			while (descriptor) {
+@@ -628,7 +634,14 @@
+ 				// if the transfer is canceled by force, the one causing the
+ 				// cancel is probably not the one who initiated the transfer
+ 				// and the callback is likely not safe anymore
+-				current-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++				transfer_entry *entry
++					= (transfer_entry *)malloc(sizeof(transfer_entry));
++				if (entry != NULL) {
++					entry-&gt;transfer = current-&gt;transfer;
++					current-&gt;transfer = NULL;
++					entry-&gt;next = list;
++					list = entry;
++				}
+ 			}
+ 
+ 			current-&gt;canceled = true;
+@@ -638,6 +651,14 @@
+ 
+ 	Unlock();
+ 
++	while (list != NULL) {
++		transfer_entry *next = list-&gt;next;
++		list-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++		delete list-&gt;transfer;
++		free(list);
++		list = next;
++	}
++
+ 	// notify the finisher so it can clean up the canceled transfers
+ 	release_sem_etc(fFinishTransfersSem, 1, B_DO_NOT_RESCHEDULE);
+ 	return B_OK;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009444.html">[Haiku-commits] r25860 - haiku/trunk/src/apps/installer
+</A></li>
+	<LI>Next message: <A HREF="009446.html">[Haiku-commits] r25862 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9445">[ date ]</a>
+              <a href="thread.html#9445">[ thread ]</a>
+              <a href="subject.html#9445">[ subject ]</a>
+              <a href="author.html#9445">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,254 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22438 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22438%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200710041636.l94GabDX026454%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004134.html">
+   <LINK REL="Next"  HREF="004136.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22438 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22438%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200710041636.l94GabDX026454%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22438 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Oct  4 18:36:37 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004134.html">[Haiku-commits] r22437 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+        <LI>Next message: <A HREF="004136.html">[Haiku-commits] r22439 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4135">[ date ]</a>
+              <a href="thread.html#4135">[ thread ]</a>
+              <a href="subject.html#4135">[ subject ]</a>
+              <a href="author.html#4135">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-10-04 18:36:35 +0200 (Thu, 04 Oct 2007)
+New Revision: 22438
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22438&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22438&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* vm_remove_all_page_mappings() now returns an accumulation of the flags of
+  the unmapped page.
+* This is needed by everyone who calls this to make sure modifications to a
+  page aren't ignored. Namely, the page scanner and the page thief were
+  affected.
+* Cleaned up locking the page's cache a bit in page_thief(); there is now
+  a helper class that takes care of everything.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm.h	2007-10-04 15:11:48 UTC (rev 22437)
++++ haiku/trunk/headers/private/kernel/vm.h	2007-10-04 16:36:35 UTC (rev 22438)
+@@ -130,7 +130,7 @@
+ bool vm_test_map_modification(struct vm_page *page);
+ int32 vm_test_map_activation(struct vm_page *page, bool *_modified);
+ void vm_clear_map_flags(struct vm_page *page, uint32 flags);
+-void vm_remove_all_page_mappings(struct vm_page *page);
++void vm_remove_all_page_mappings(struct vm_page *page, uint32 *_flags);
+ status_t vm_unmap_pages(struct vm_area *area, addr_t base, size_t length);
+ status_t vm_map_page(struct vm_area *area, struct vm_page *page, addr_t address,
+ 			uint32 protection);
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-10-04 15:11:48 UTC (rev 22437)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-10-04 16:36:35 UTC (rev 22438)
+@@ -2433,9 +2433,14 @@
+ }
+ 
+ 
++/*!	Removes all mappings from a page.
++	After you've called this function, the page is unmapped from memory.
++	The accumulated page flags of all mappings can be found in \a _flags.
++*/
+ void
+-vm_remove_all_page_mappings(vm_page *page)
++vm_remove_all_page_mappings(vm_page *page, uint32 *_flags)
+ {
++	uint32 accumulatedFlags = 0;
+ 	MutexLocker locker(sMappingLock);
+ 
+ 	vm_page_mappings queue;
+@@ -2446,13 +2451,19 @@
+ 	while ((mapping = iterator.Next()) != NULL) {
+ 		vm_area *area = mapping-&gt;area;
+ 		vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
++		addr_t physicalAddress;
++		uint32 flags;
+ 
+ 		map-&gt;ops-&gt;lock(map);
+ 		addr_t base = area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+ 		map-&gt;ops-&gt;unmap(map, base, base + (B_PAGE_SIZE - 1));
++		map-&gt;ops-&gt;flush(map);
++		map-&gt;ops-&gt;query(map, base, &amp;physicalAddress, &amp;flags);
+ 		map-&gt;ops-&gt;unlock(map);
+ 
+ 		area-&gt;mappings.Remove(mapping);
++
++		accumulatedFlags |= flags;
+ 	}
+ 
+ 	locker.Unlock();
+@@ -2462,6 +2473,9 @@
+ 	while ((mapping = queue.RemoveHead()) != NULL) {
+ 		free(mapping);
+ 	}
++
++	if (_flags != NULL)
++		*_flags = accumulatedFlags;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-10-04 15:11:48 UTC (rev 22437)
++++ haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-10-04 16:36:35 UTC (rev 22438)
+@@ -139,7 +139,15 @@
+ 		page-&gt;usage_count--;
+ 
+ 	if (page-&gt;usage_count &lt; 0) {
+-		vm_remove_all_page_mappings(page);
++		uint32 flags;
++		vm_remove_all_page_mappings(page, &amp;flags);
++
++		// recheck eventual last minute changes
++		if ((flags &amp; PAGE_MODIFIED) != 0 &amp;&amp; page-&gt;state != PAGE_STATE_MODIFIED)
++			vm_page_set_state(page, PAGE_STATE_MODIFIED);
++		if ((flags &amp; PAGE_ACCESSED) != 0 &amp;&amp; ++page-&gt;usage_count &gt;= 0)
++			return false;
++
+ 		if (page-&gt;state == PAGE_STATE_MODIFIED)
+ 			vm_page_schedule_write_page(page);
+ 		else
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-10-04 15:11:48 UTC (rev 22437)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-10-04 16:36:35 UTC (rev 22438)
+@@ -842,34 +842,67 @@
+ 
+ 			// try to lock the page's cache
+ 
+-			vm_cache* cache = vm_cache_acquire_page_cache_ref(page);
+-			if (cache == NULL)
++			class PageCacheTryLocker {
++			public:
++				PageCacheTryLocker(vm_page *page)
++					: fIsLocked(false)
++				{
++					fCache = vm_cache_acquire_page_cache_ref(page);
++					if (fCache != NULL
++						&amp;&amp; mutex_trylock(&amp;fCache-&gt;lock) == B_OK) {
++						if (fCache == page-&gt;cache)
++							fIsLocked = true;
++						else
++							mutex_unlock(&amp;fCache-&gt;lock);
++					}
++				}
++
++				~PageCacheTryLocker()
++				{
++					if (fIsLocked)
++						mutex_unlock(&amp;fCache-&gt;lock);
++						
++					vm_cache_release_ref(fCache);
++				}
++
++				bool IsLocked() { return fIsLocked; }
++
++			private:
++				vm_cache *fCache;
++				bool fIsLocked;
++			} cacheLocker(page);
++			
++			if (!cacheLocker.IsLocked())
+ 				continue;
+ 
+-			if (mutex_trylock(&amp;cache-&gt;lock) != B_OK) {
+-				vm_cache_release_ref(cache);
+-				continue;
+-			}
+ 			if (page-&gt;state != PAGE_STATE_INACTIVE) {
+ 				// TODO: if this is an active page (as in stealActive), we need
+ 				// to unmap it and check if it's modified in an atomic operation.
+ 				// For now, we'll just ignore it, even though this might let
+ 				// vm_page_allocate_page() wait forever...
+-				mutex_unlock(&amp;cache-&gt;lock);
+-				vm_cache_release_ref(cache);
+ 				continue;
+ 			}
+ 
++			// recheck eventual last minute changes
++			uint32 flags;
++			vm_remove_all_page_mappings(page, &amp;flags);
++			if ((flags &amp; PAGE_MODIFIED) != 0) {
++				// page was modified, don't steal it
++				vm_page_set_state(page, PAGE_STATE_MODIFIED);
++				continue;
++			} else if ((flags &amp; PAGE_ACCESSED) != 0) {
++				// page is in active use, don't steal it
++				vm_page_set_state(page, PAGE_STATE_ACTIVE);
++				continue;
++			}
++
+ 			// we can now steal this page
+ 
+ 			//dprintf(&quot;  steal page %p from cache %p\n&quot;, page, cache);
+-			vm_remove_all_page_mappings(page);
+-			vm_cache_remove_page(cache, page);
++
++			vm_cache_remove_page(page-&gt;cache, page);
+ 			vm_page_set_state(page, PAGE_STATE_FREE);
+ 			steal--;
+-
+-			mutex_unlock(&amp;cache-&gt;lock);
+-			vm_cache_release_ref(cache);
+ 		}
+ 	}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004134.html">[Haiku-commits] r22437 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+	<LI>Next message: <A HREF="004136.html">[Haiku-commits] r22439 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4135">[ date ]</a>
+              <a href="thread.html#4135">[ thread ]</a>
+              <a href="subject.html#4135">[ subject ]</a>
+              <a href="author.html#4135">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

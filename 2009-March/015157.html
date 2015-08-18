@@ -1,0 +1,204 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29722 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29722%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse&In-Reply-To=%3C200903260112.n2Q1CDDG014636%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015194.html">
+   <LINK REL="Next"  HREF="015158.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29722 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29722%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse&In-Reply-To=%3C200903260112.n2Q1CDDG014636%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29722 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Mar 26 02:12:13 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015194.html">[Haiku-commits] r29721 - in haiku/trunk: headers/private/kernel src/system/kernel src/system/kernel/scheduler
+</A></li>
+        <LI>Next message: <A HREF="015158.html">[Haiku-commits] r29723 - in haiku/trunk/src/add-ons/screen_savers:	. simpleclock
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15157">[ date ]</a>
+              <a href="thread.html#15157">[ thread ]</a>
+              <a href="subject.html#15157">[ subject ]</a>
+              <a href="author.html#15157">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-03-26 02:12:11 +0100 (Thu, 26 Mar 2009)
+New Revision: 29722
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29722&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29722&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.h
+Log:
+Implemented WriteStat() (backend for chown(), chmod(), utime(), truncate()).
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.cpp	2009-03-26 00:58:20 UTC (rev 29721)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.cpp	2009-03-26 01:12:11 UTC (rev 29722)
+@@ -397,7 +397,10 @@
+ 
+ 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_ACCESS, fFS-&gt;ops.access);
+ 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_READ_STAT, fFS-&gt;ops.getattr);
+-// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_WRITE_STAT, fFS-&gt;ops.wstat);
++	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_WRITE_STAT,
++		fFS-&gt;ops.chmod != NULL || fFS-&gt;ops.chown != NULL
++		|| fFS-&gt;ops.truncate != NULL | fFS-&gt;ops.utimens != NULL
++		|| fFS-&gt;ops.utime != NULL);
+ 
+ 	// file operations
+  	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_CREATE, fFS-&gt;ops.create);
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp	2009-03-26 00:58:20 UTC (rev 29721)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp	2009-03-26 01:12:11 UTC (rev 29722)
+@@ -10,6 +10,7 @@
+ #include &lt;algorithm&gt;
+ 
+ #include &lt;fs_info.h&gt;
++#include &lt;NodeMonitor.h&gt;
+ 
+ #include &lt;AutoDeleter.h&gt;
+ 
+@@ -892,10 +893,82 @@
+ 
+ 
+ status_t
+-FUSEVolume::WriteStat(void* node, const struct stat *st, uint32 mask)
++FUSEVolume::WriteStat(void* _node, const struct stat* st, uint32 mask)
+ {
+-	// TODO: Implement!
+-	return B_UNSUPPORTED;
++	FUSENode* node = (FUSENode*)_node;
++PRINT((&quot;FUSEVolume::WriteStat(%p (%lld), %p, %#lx)\n&quot;, node, node-&gt;id, st,
++mask));
++
++	// lock the directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
++	AutoLocker&lt;Locker&gt; locker(fLock);
++
++	// get a path for the node
++	char path[B_PATH_NAME_LENGTH];
++	size_t pathLen;
++	status_t error = _BuildPath(node, path, pathLen);
++	if (error != B_OK)
++		RETURN_ERROR(error);
++
++	locker.Unlock();
++
++	// permissions
++	if ((mask &amp; B_STAT_MODE) != 0) {
++		int fuseError = fuse_fs_chmod(fFS, path, st-&gt;st_mode);
++		if (fuseError != 0)
++			RETURN_ERROR(fuseError);
++	}
++
++	// owner
++	if ((mask &amp; (B_STAT_UID | B_STAT_GID)) != 0) {
++		uid_t uid = (mask &amp; B_STAT_UID) != 0 ? st-&gt;st_uid : (uid_t)-1;
++		gid_t gid = (mask &amp; B_STAT_GID) != 0 ? st-&gt;st_gid : (gid_t)-1;
++		int fuseError = fuse_fs_chown(fFS, path, uid, gid);
++		if (fuseError != 0)
++			RETURN_ERROR(fuseError);
++	}
++
++	// size
++	if ((mask &amp; B_STAT_SIZE) != 0) {
++		// truncate
++		int fuseError = fuse_fs_truncate(fFS, path, st-&gt;st_size);
++		if (fuseError != 0)
++			RETURN_ERROR(fuseError);
++	}
++
++	// access/modification time
++	if ((mask &amp; (B_STAT_ACCESS_TIME | B_STAT_MODIFICATION_TIME)) != 0) {
++		timespec tv[2] = {
++			{st-&gt;st_atime, 0},
++			{st-&gt;st_mtime, 0}
++		};
++
++		// If either time is not specified, we need to stat the file to get the
++		// current value.
++		if ((mask &amp; (B_STAT_ACCESS_TIME | B_STAT_MODIFICATION_TIME))
++				!= (B_STAT_ACCESS_TIME | B_STAT_MODIFICATION_TIME)) {
++			struct stat currentStat;
++			int fuseError = fuse_fs_getattr(fFS, path, &amp;currentStat);
++			if (fuseError != 0)
++				RETURN_ERROR(fuseError);
++
++			if ((mask &amp; B_STAT_ACCESS_TIME) == 0)
++				tv[0].tv_sec = currentStat.st_atime;
++			else
++				tv[1].tv_sec = currentStat.st_mtime;
++		}
++
++		int fuseError = fuse_fs_utimens(fFS, path, tv);
++		if (fuseError != 0)
++			RETURN_ERROR(fuseError);
++	}
++
++// TODO: Node monitoring!
++
++	return B_OK;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.h	2009-03-26 00:58:20 UTC (rev 29721)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.h	2009-03-26 01:12:11 UTC (rev 29722)
+@@ -83,7 +83,7 @@
+ 
+ 	virtual	status_t			Access(void* node, int mode);
+ 	virtual	status_t			ReadStat(void* node, struct stat* st);
+-	virtual	status_t			WriteStat(void* node, const struct stat *st,
++	virtual	status_t			WriteStat(void* node, const struct stat* st,
+ 									uint32 mask);
+ 
+ 	// files
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015194.html">[Haiku-commits] r29721 - in haiku/trunk: headers/private/kernel src/system/kernel src/system/kernel/scheduler
+</A></li>
+	<LI>Next message: <A HREF="015158.html">[Haiku-commits] r29723 - in haiku/trunk/src/add-ons/screen_savers:	. simpleclock
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15157">[ date ]</a>
+              <a href="thread.html#15157">[ thread ]</a>
+              <a href="subject.html#15157">[ subject ]</a>
+              <a href="author.html#15157">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

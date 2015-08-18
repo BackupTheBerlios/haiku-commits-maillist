@@ -1,0 +1,212 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24792 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24792%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200804041402.m34E2Vjq029726%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007460.html">
+   <LINK REL="Next"  HREF="007466.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24792 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24792%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200804041402.m34E2Vjq029726%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24792 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Apr  4 16:02:31 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007460.html">[Haiku-commits] r24791 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+        <LI>Next message: <A HREF="007466.html">[Haiku-commits] r24793 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7461">[ date ]</a>
+              <a href="thread.html#7461">[ thread ]</a>
+              <a href="subject.html#7461">[ subject ]</a>
+              <a href="author.html#7461">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-04-04 16:02:30 +0200 (Fri, 04 Apr 2008)
+New Revision: 24792
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24792&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24792&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/block_cache.cpp
+Log:
+* If BFS's Journal::_WriteTransactionToLog() noticed there wasn't enough free
+  space left for the new log entry, it did call cache_sync_transaction(), and
+  then just assumed the space would be ready. But since the transaction could
+  have been written before that call by the block writer, and since the
+  _TransactionWritten() hook is now called asynchronously,
+  cache_sync_transaction() actually has to flush all pending TRANSACTION_WRITTEN
+  notifications before returning to the caller.
+* To implement this, block_cache now publishs a condition variable, and
+  wait_for_notifications() adds a fake notification that signals that one.
+  Since the notifications are handled in FIFO order, this guarantees that
+  the previous TRANSACTION_WRITTEN hook is done.
+* notify_transaction_listeners() could accidently delete notifications that
+  still had pending signals. Now, it will defer the deletion to the notification
+  thread instead in that case. This should fix bug #2008.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-04-04 13:54:18 UTC (rev 24791)
++++ haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-04-04 14:02:30 UTC (rev 24792)
+@@ -15,6 +15,7 @@
+ #include &lt;KernelExport.h&gt;
+ #include &lt;fs_cache.h&gt;
+ 
++#include &lt;condition_variable.h&gt;
+ #include &lt;lock.h&gt;
+ #include &lt;vm_low_memory.h&gt;
+ #include &lt;slab/Slab.h&gt;
+@@ -114,6 +115,7 @@
+ 	bool			read_only;
+ 
+ 	NotificationList pending_notifications;
++	ConditionVariable&lt;block_cache&gt; condition_variable;
+ 	bool			deleting;
+ 
+ 	block_cache(int fd, off_t numBlocks, size_t blockSize, bool readOnly);
+@@ -351,7 +353,7 @@
+ 	cache_notification &amp;notification, int32 events,
+ 	transaction_notification_hook hook, void *data)
+ {
+-	notification.transaction_id = transaction-&gt;id;
++	notification.transaction_id = transaction != NULL ? transaction-&gt;id : -1;
+ 	notification.events_pending = 0;
+ 	notification.events = events;
+ 	notification.hook = hook;
+@@ -414,8 +416,14 @@
+ 
+ 		if ((listener-&gt;events &amp; event) != 0)
+ 			add_notification(cache, listener, event, removeListeners);
+-		else if (removeListeners)
+-			delete listener;
++		else if (removeListeners) {
++			// we might need to defer the deletion if its currently in use
++			MutexLocker locker(sNotificationsLock);
++			if (listener-&gt;events_pending != 0)
++				listener-&gt;delete_after_event = true;
++			else
++				delete listener;
++		}
+ 	}
+ }
+ 
+@@ -552,6 +560,8 @@
+ 	sCaches.Add(this);
+ 	mutex_unlock(&amp;sCachesLock);
+ 
++	condition_variable.Publish(this, &quot;cache transaction sync&quot;);
++
+ 	buffer_cache = create_object_cache_etc(&quot;block cache buffers&quot;, blockSize,
+ 		8, 0, CACHE_LARGE_SLAB, NULL, NULL, NULL, NULL);
+ 	if (buffer_cache == NULL)
+@@ -574,6 +584,7 @@
+ }
+ 
+ 
++//! Should be called with the cache's lock held.
+ block_cache::~block_cache()
+ {
+ 	deleting = true;
+@@ -582,6 +593,8 @@
+ 
+ 	benaphore_destroy(&amp;lock);
+ 
++	condition_variable.Unpublish();
++
+ 	mutex_lock(&amp;sCachesLock);
+ 	sCaches.Remove(this);
+ 	mutex_unlock(&amp;sCachesLock);
+@@ -1340,6 +1353,30 @@
+ #endif	// DEBUG_BLOCK_CACHE
+ 
+ 
++static void
++notify_sync(int32 transactionID, int32 event, void *_cache)
++{
++	block_cache *cache = (block_cache *)_cache;
++
++	cache-&gt;condition_variable.NotifyOne();
++}
++
++
++static void
++wait_for_notifications(block_cache *cache)
++{
++	// add sync notification
++	cache_notification notification;
++	set_notification(NULL, notification, TRANSACTION_WRITTEN, notify_sync,
++		cache);
++	add_notification(cache, &amp;notification, TRANSACTION_WRITTEN, false);
++
++	// wait for condition
++	ConditionVariableEntry&lt;block_cache&gt; entry;
++	entry.Wait(cache);
++}
++
++
+ static block_cache *
+ get_next_locked_block_cache(block_cache *last)
+ {
+@@ -1417,6 +1454,10 @@
+ }
+ 
+ 
++/*!	Flushes all pending notifications by calling the appropriate hook
++	functions.
++	Must not be called with a cache lock held.
++*/
+ static void
+ flush_pending_notifications()
+ {
+@@ -1644,6 +1685,11 @@
+ 	}
+ 
+ 	hash_close(cache-&gt;transaction_hash, &amp;iterator, false);
++	locker.Unlock();
++
++	wait_for_notifications(cache);
++		// make sure that all pending TRANSACTION_WRITTEN notifications
++		// are handled after we return
+ 	return B_OK;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007460.html">[Haiku-commits] r24791 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+	<LI>Next message: <A HREF="007466.html">[Haiku-commits] r24793 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7461">[ date ]</a>
+              <a href="thread.html#7461">[ thread ]</a>
+              <a href="subject.html#7461">[ subject ]</a>
+              <a href="author.html#7461">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,146 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23751 - haiku/trunk/src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23751%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200801261912.m0QJCNTQ012901%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005786.html">
+   <LINK REL="Next"  HREF="005789.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23751 - haiku/trunk/src/system/kernel/debug</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23751%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200801261912.m0QJCNTQ012901%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23751 - haiku/trunk/src/system/kernel/debug">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sat Jan 26 20:12:23 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005786.html">[Haiku-commits] r23750 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="005789.html">[Haiku-commits] r23752 - in haiku/trunk/3rdparty/mmu_man/themes: .	addons
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5788">[ date ]</a>
+              <a href="thread.html#5788">[ thread ]</a>
+              <a href="subject.html#5788">[ subject ]</a>
+              <a href="author.html#5788">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-01-26 20:12:22 +0100 (Sat, 26 Jan 2008)
+New Revision: 23751
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23751&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23751&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/debug/debug.cpp
+Log:
+Add concurency handling when entering the kernel debugger. Previously there
+was a race condition when more than one CPU would enter the debugger at the
+same time (or rather before one CPU could stop all the others). We now use the
+inDebugger variable to tell if someone is already in the debugger and then
+only process inter CPU messages and retry entering the debugger.
+Since sending the synchronous broadcast most of the time hung over here with
+SMP enabled I removed the synchronous flag and added a simple spin to give the
+other CPUs a chance to process the halt request. Added comments that explain
+the reasons and a ToDo to revert to synchronous delivery once we fixed the
+problem. The kernel debugger is now usable on my quad core.
+
+Modified: haiku/trunk/src/system/kernel/debug/debug.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/debug.cpp	2008-01-26 18:45:35 UTC (rev 23750)
++++ haiku/trunk/src/system/kernel/debug/debug.cpp	2008-01-26 19:12:22 UTC (rev 23751)
+@@ -576,8 +576,6 @@
+ 			line = sLineBuffer[sCurrentLine];
+ 		}
+ 
+-		sDebuggerOnCPU = smp_get_current_cpu();
+-
+ 		int rc = evaluate_debug_command(line);
+ 
+ 		if (rc == B_KDEBUG_QUIT)
+@@ -1043,23 +1041,43 @@
+ void
+ kernel_debugger(const char *message)
+ {
+-	static vint32 inDebugger;
++	static vint32 inDebugger = 0;
+ 	cpu_status state;
+ 	bool dprintfState;
+ 
+ 	state = disable_interrupts();
+-	atomic_add(&amp;inDebugger, 1);
++	while (atomic_add(&amp;inDebugger, 1) &gt; 0) {
++		// The debugger is already running, find out where...
++		if (sDebuggerOnCPU != smp_get_current_cpu()) {
++			// Some other CPU must have entered the debugger and tried to halt
++			// us. Process ICIs to ensure we get the halt request. Then we are
++			// blocking there until everyone leaves the debugger and we can
++			// try to enter it again.
++			atomic_add(&amp;inDebugger, -1);
++			smp_intercpu_int_handler();
++		} else {
++			// We are re-entering the debugger on the same CPU.
++			break;
++		}
++	}
+ 
+ 	arch_debug_save_registers(&amp;dbg_register_file[smp_get_current_cpu()][0]);
+ 	dprintfState = set_dprintf_enabled(true);
+ 
+-	if (sDebuggerOnCPU != smp_get_current_cpu()) {
+-		// First entry, halt all of the other cpus
++	if (sDebuggerOnCPU != smp_get_current_cpu() &amp;&amp; smp_get_num_cpus() &gt; 1) {
++		// First entry on a MP system, send a halt request to all of the other
++		// CPUs but don't block here if they currently can't process it.
++		// Should they try to enter the debugger they will be cought in the
++		// loop above.
++		// ToDo: investigate why we sometimes hang here with SMP_MSG_FLAG_SYNC
++		// and readd that flag and remove the spin below when it's fixed.
++		smp_send_broadcast_ici(SMP_MSG_CPU_HALT, 0, 0, 0,
++			(void *)&amp;inDebugger, 0);
+ 
+-		// XXX need to flush current smp mailbox to make sure this goes
+-		// through. Otherwise it'll hang
+-		smp_send_broadcast_ici(SMP_MSG_CPU_HALT, 0, 0, 0, (void *)&amp;inDebugger,
+-			SMP_MSG_FLAG_SYNC);
++		// Delay a bit to give other CPUs the chance to process the halt
++		// request. Otherwise we could get debug output of other CPUs mixed
++		// into our own when enabling debug output below.
++		spin(50000);
+ 	}
+ 
+ 	if (sBlueScreenOutput) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005786.html">[Haiku-commits] r23750 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="005789.html">[Haiku-commits] r23752 - in haiku/trunk/3rdparty/mmu_man/themes: .	addons
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5788">[ date ]</a>
+              <a href="thread.html#5788">[ thread ]</a>
+              <a href="subject.html#5788">[ subject ]</a>
+              <a href="author.html#5788">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

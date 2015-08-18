@@ -1,0 +1,615 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28514 - in haiku/trunk/src: system/kernel/cache	tests/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28514%20-%20in%20haiku/trunk/src%3A%20system/kernel/cache%0A%09tests/system/kernel/cache&In-Reply-To=%3C200811051352.mA5DqYvJ012845%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013281.html">
+   <LINK REL="Next"  HREF="013286.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28514 - in haiku/trunk/src: system/kernel/cache	tests/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28514%20-%20in%20haiku/trunk/src%3A%20system/kernel/cache%0A%09tests/system/kernel/cache&In-Reply-To=%3C200811051352.mA5DqYvJ012845%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28514 - in haiku/trunk/src: system/kernel/cache	tests/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Nov  5 14:52:34 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013281.html">[Haiku-commits] r28513 - haiku/trunk/src/tests/add-ons/kernel
+</A></li>
+        <LI>Next message: <A HREF="013286.html">[Haiku-commits] r28515 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13285">[ date ]</a>
+              <a href="thread.html#13285">[ thread ]</a>
+              <a href="subject.html#13285">[ subject ]</a>
+              <a href="author.html#13285">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-11-05 14:52:34 +0100 (Wed, 05 Nov 2008)
+New Revision: 28514
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28514&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28514&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/block_cache.cpp
+   haiku/trunk/src/tests/system/kernel/cache/block_cache_test.cpp
+Log:
+* cache_detach_sub_transaction(), and cache_abort_sub_transaction() now support
+  discarded blocks correctly as well.
+* cache_detach_sub_transaction() left cached_block::original_data unchanged even
+  if the parent data was to become current (in case the sub transaction didn't
+  change the block yet). This could cause outdated blocks to be written back.
+* cache_detach_sub_transaction() also set cached_block::previous_transaction
+  for all blocks, not just the ones with a previous transaction. This could
+  cause blocks to be written twice for no reason.
+* cache_start_sub_transaction() did not change the num_blocks count for
+  discarded blocks.
+* block_cache_discard() now panics if the block was already changed in the
+  current transaction.
+* Improved test application, added more tests, revealing the above bugs in
+  cache_detach_sub_transaction().
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-11-05 11:54:09 UTC (rev 28513)
++++ haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-11-05 13:52:34 UTC (rev 28514)
+@@ -566,6 +566,8 @@
+ static void
+ flush_pending_notifications(block_cache* cache)
+ {
++	ASSERT_LOCKED_MUTEX(&amp;sCachesLock);
++
+ 	while (true) {
+ 		MutexLocker locker(sNotificationsLock);
+ 
+@@ -1203,12 +1205,12 @@
+ 		if (cleared)
+ 			memset(block-&gt;current_data, 0, cache-&gt;block_size);
+ 
+-		if (!block-&gt;is_dirty)
++		if (!block-&gt;is_dirty) {
+ 			cache-&gt;num_dirty_blocks++;
++			block-&gt;is_dirty = true;
++				// mark the block as dirty
++		}
+ 
+-		block-&gt;is_dirty = true;
+-			// mark the block as dirty
+-
+ 		TB(Get(cache, block));
+ 		return block-&gt;current_data;
+ 	}
+@@ -2112,9 +2114,13 @@
+ 			// need to write back pending changes
+ 			write_cached_block(cache, block);
+ 		}
++		if (block-&gt;discard) {
++			cache-&gt;DiscardBlock(block);
++			transaction-&gt;main_num_blocks--;
++			continue;
++		}
+ 
+-		if (block-&gt;original_data != NULL &amp;&amp; block-&gt;parent_data != NULL
+-			&amp;&amp; block-&gt;parent_data != block-&gt;current_data) {
++		if (block-&gt;original_data != NULL &amp;&amp; block-&gt;parent_data != NULL) {
+ 			// free the original data if the parent data of the transaction
+ 			// will be made current - but keep them otherwise
+ 			cache-&gt;Free(block-&gt;original_data);
+@@ -2137,10 +2143,10 @@
+ 		if (block-&gt;parent_data != NULL) {
+ 			// move the block to the previous transaction list
+ 			transaction-&gt;blocks.Add(block);
++			block-&gt;previous_transaction = transaction;
+ 			block-&gt;parent_data = NULL;
+ 		}
+ 
+-		block-&gt;previous_transaction = transaction;
+ 		block-&gt;transaction_next = NULL;
+ 	}
+ 
+@@ -2200,6 +2206,7 @@
+ 		}
+ 
+ 		block-&gt;parent_data = NULL;
++		block-&gt;discard = false;
+ 	}
+ 
+ 	// all subsequent changes will go into the main transaction
+@@ -2242,6 +2249,7 @@
+ 				transaction-&gt;first_block = next;
+ 
+ 			cache-&gt;DiscardBlock(block);
++			transaction-&gt;num_blocks--;
+ 			continue;
+ 		}
+ 		if (transaction-&gt;has_sub_transaction
+@@ -2556,6 +2564,12 @@
+ 			cache-&gt;unused_blocks.Remove(block);
+ 			cache-&gt;RemoveBlock(block);
+ 		} else {
++			if (block-&gt;transaction != NULL &amp;&amp; block-&gt;parent_data != NULL
++				&amp;&amp; block-&gt;parent_data != block-&gt;current_data) {
++				panic(&quot;Discarded block %Ld has already been changed in this &quot;
++					&quot;transaction!&quot;, blockNumber);
++			}
++
+ 			// mark it as discarded (in the current transaction only, if any)
+ 			block-&gt;discard = true;
+ 		}
+
+Modified: haiku/trunk/src/tests/system/kernel/cache/block_cache_test.cpp
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/cache/block_cache_test.cpp	2008-11-05 11:54:09 UTC (rev 28513)
++++ haiku/trunk/src/tests/system/kernel/cache/block_cache_test.cpp	2008-11-05 13:52:34 UTC (rev 28514)
+@@ -13,17 +13,29 @@
+ #undef read_pos
+ 
+ 
+-#define MAX_BLOCKS	100
++#define MAX_BLOCKS				100
++#define BLOCK_CHANGED_IN_MAIN	(1L &lt;&lt; 28)
++#define BLOCK_CHANGED_IN_SUB	(2L &lt;&lt; 28)
+ 
++#define TEST_BLOCKS(number, count) \
++	test_blocks(number, count, __LINE__)
++
+ #define TEST_BLOCK_DATA(block, number, type) \
+ 	if ((block)-&gt;type ## _data != NULL &amp;&amp; gBlocks[(number)]. type == 0) \
+-		error(&quot;Block %Ld: &quot; #type &quot; should be NULL!&quot;, (number)); \
++		error(line, &quot;Block %Ld: &quot; #type &quot; should be NULL!&quot;, (number)); \
+ 	if ((block)-&gt;type ## _data != NULL &amp;&amp; gBlocks[(number)]. type != 0 \
+ 		&amp;&amp; *(int32*)(block)-&gt;type ## _data != gBlocks[(number)]. type) { \
+-		error(&quot;Block %Ld: &quot; #type &quot; wrong (%ld should be %ld)!&quot;, (number), \
+-			*(int32*)(block)-&gt;type ## _data, gBlocks[(number)]. type); \
++		error(line, &quot;Block %Ld: &quot; #type &quot; wrong (0x%lx should be 0x%lx)!&quot;, \
++			(number), *(int32*)(block)-&gt;type ## _data, \
++			gBlocks[(number)]. type); \
+ 	}
+ 
++#define TEST_ASSERT(statement) \
++	if (!(statement)) { \
++		error(__LINE__, &quot;Assertion failed: &quot; #statement); \
++	}
++
++
+ struct test_block {
+ 	int32	current;
+ 	int32	original;
+@@ -45,14 +57,68 @@
+ block_cache* gCache;
+ size_t gBlockSize;
+ int32 gTest;
++int32 gSubTest;
+ const char* gTestName;
+ 
+ 
++void
++error(int32 line, const char* format, ...)
++{
++	va_list args;
++	va_start(args, format);
++
++	fprintf(stderr, &quot;ERROR IN TEST LINE %ld: &quot;, line);
++	vfprintf(stderr, format, args);
++	fprintf(stderr, &quot;\n&quot;);
++
++	va_end(args);
++
++	char cacheString[32];
++	sprintf(cacheString, &quot;%p&quot;, gCache);
++	char* argv[4];
++	argv[0] = &quot;dump&quot;;
++	argv[1] = &quot;-bt&quot;;
++	argv[2] = cacheString;
++	argv[3] = NULL;
++	dump_cache(3, argv);
++
++	exit(1);
++}
++
++
++void
++or_block(void* block, int32 value)
++{
++	int32* data = (int32*)block;
++	*data |= value;
++}
++
++
++void
++set_block(void* block, int32 value)
++{
++	int32* data = (int32*)block;
++	*data = value;
++}
++
++
++void
++reset_block(void* block, int32 index)
++{
++	int32* data = (int32*)block;
++	*data = index + 1;
++}
++
++
+ ssize_t
+ block_cache_write_pos(int fd, off_t offset, const void* buffer, size_t size)
+ {
+-	//printf(&quot;write: %Ld, %p, %lu\n&quot;, offset, buffer, size);
+-	gBlocks[offset / gBlockSize].written = true;
++	int32 index = offset / gBlockSize;
++
++	gBlocks[index].written = true;
++	if (!gBlocks[index].write)
++		error(__LINE__, &quot;Block %ld should not be written!\n&quot;, index);
++
+ 	return size;
+ }
+ 
+@@ -60,11 +126,12 @@
+ ssize_t
+ block_cache_read_pos(int fd, off_t offset, void* buffer, size_t size)
+ {
+-	//printf(&quot;read: %Ld, %p, %lu\n&quot;, offset, buffer, size);
++	int32 index = offset / gBlockSize;
++
+ 	memset(buffer, 0xcc, size);
+-	int32* value = (int32*)buffer;
+-	*value = offset / gBlockSize + 1;
+-	gBlocks[offset / gBlockSize].read = true;
++	reset_block(buffer, index);
++	if (!gBlocks[index].read)
++		error(__LINE__, &quot;Block %ld should not be written!\n&quot;, index);
+ 
+ 	return size;
+ }
+@@ -83,48 +150,25 @@
+ 
+ 
+ void
+-error(const char* format, ...)
++test_blocks(off_t number, int32 count, int32 line)
+ {
+-	va_list args;
+-	va_start(args, format);
++	printf(&quot;  %ld\n&quot;, gSubTest++);
+ 
+-	fprintf(stderr, &quot;ERROR: &quot;);
+-	vfprintf(stderr, format, args);
+-	fprintf(stderr, &quot;\n&quot;);
+-
+-	va_end(args);
+-
+-	char cacheString[32];
+-	sprintf(cacheString, &quot;%p&quot;, gCache);
+-	char* argv[4];
+-	argv[0] = &quot;dump&quot;;
+-	argv[1] = &quot;-bt&quot;;
+-	argv[2] = cacheString;
+-	argv[3] = NULL;
+-	dump_cache(3, argv);
+-
+-	exit(1);
+-}
+-
+-
+-void
+-test_blocks(off_t number, int32 count)
+-{
+ 	for (int32 i = 0; i &lt; count; i++, number++) {
+ 		MutexLocker locker(&amp;gCache-&gt;lock);
+ 
+ 		cached_block* block = (cached_block*)hash_lookup(gCache-&gt;hash, &amp;number);
+ 		if (block == NULL) {
+ 			if (gBlocks[number].present)
+-				error(&quot;Block %Ld not found!&quot;, number);
++				error(line, &quot;Block %Ld not found!&quot;, number);
+ 			continue;
+ 		}
+ 		if (!gBlocks[number].present)
+-			error(&quot;Block %Ld is present, but should not!&quot;, number);
++			error(line, &quot;Block %Ld is present, but should not!&quot;, number);
+ 
+ 		if (block-&gt;is_dirty != gBlocks[number].is_dirty) {
+-			error(&quot;Block %Ld: dirty bit differs (%d should be %d)!&quot;, number,
+-				block-&gt;is_dirty, gBlocks[number].is_dirty);
++			error(line, &quot;Block %Ld: dirty bit differs (%d should be %d)!&quot;,
++				number, block-&gt;is_dirty, gBlocks[number].is_dirty);
+ 		}
+ #if 0
+ 		if (block-&gt;unused != gBlocks[number].unused) {
+@@ -133,11 +177,11 @@
+ 		}
+ #endif
+ 		if (block-&gt;discard != gBlocks[number].discard) {
+-			error(&quot;Block %Ld: discard bit differs (%d should be %d)!&quot;, number,
+-				block-&gt;discard, gBlocks[number].discard);
++			error(line, &quot;Block %Ld: discard bit differs (%d should be %d)!&quot;,
++				number, block-&gt;discard, gBlocks[number].discard);
+ 		}
+ 		if (gBlocks[number].write &amp;&amp; !gBlocks[number].written)
+-			error(&quot;Block %Ld: has not been written yet!&quot;, number);
++			error(line, &quot;Block %Ld: has not been written yet!&quot;, number);
+ 
+ 		TEST_BLOCK_DATA(block, number, current);
+ 		TEST_BLOCK_DATA(block, number, original);
+@@ -147,25 +191,18 @@
+ 
+ 
+ void
+-test_block(off_t block)
+-{
+-	test_blocks(block, 1);
+-}
+-
+-
+-void
+ stop_test(void)
+ {
+ 	if (gCache == NULL)
+ 		return;
+-	test_blocks(0, MAX_BLOCKS);
++	TEST_BLOCKS(0, MAX_BLOCKS);
+ 
+ 	block_cache_delete(gCache, true);
+ }
+ 
+ 
+ void
+-start_test(int32 test, const char* name, bool init = false)
++start_test(const char* name, bool init = false)
+ {
+ 	if (init) {
+ 		stop_test();
+@@ -177,33 +214,99 @@
+ 		init_test_blocks();
+ 	}
+ 
+-	gTest = test;
++	gTest++;
+ 	gTestName = name;
++	gSubTest = 1;
++
+ 	printf(&quot;----------- Test %ld%s%s -----------\n&quot;, gTest,
+ 		gTestName[0] ? &quot; - &quot; : &quot;&quot;, gTestName);
+ }
+ 
+ 
++/*!	Changes block 1 in main, block 2 if touchedInMain is \c true.
++	Changes block 0 in sub, discards block 2.
++	Performs two block tests.
++*/
++void
++basic_test_discard_in_sub(int32 id, bool touchedInMain)
++{
++	void* block;
++
++	gBlocks[1].present = true;
++	gBlocks[1].read = true;
++	gBlocks[1].is_dirty = true;
++	gBlocks[1].original = gBlocks[1].current;
++	gBlocks[1].current |= BLOCK_CHANGED_IN_MAIN;
++
++	block = block_cache_get_writable(gCache, 1, id);
++	or_block(block, BLOCK_CHANGED_IN_MAIN);
++	block_cache_put(gCache, 1);
++
++	TEST_BLOCKS(0, 2);
++
++	if (touchedInMain) {
++		gBlocks[2].present = true;
++		gBlocks[2].is_dirty = true;
++		gBlocks[2].current |= BLOCK_CHANGED_IN_MAIN;
++
++		block = block_cache_get_empty(gCache, 2, id);
++		reset_block(block, 2);
++		or_block(block, BLOCK_CHANGED_IN_MAIN);
++		block_cache_put(gCache, 2);
++	}
++
++	cache_start_sub_transaction(gCache, id);
++
++	gBlocks[0].present = true;
++	gBlocks[0].read = true;
++	gBlocks[0].is_dirty = true;
++	if ((gBlocks[0].current &amp; BLOCK_CHANGED_IN_MAIN) != 0)
++		gBlocks[0].parent = gBlocks[0].current;
++	else
++		gBlocks[0].original = gBlocks[0].current;
++	gBlocks[0].current |= BLOCK_CHANGED_IN_SUB;
++
++	gBlocks[1].parent = gBlocks[1].current;
++
++	block = block_cache_get_writable(gCache, 0, id);
++	or_block(block, BLOCK_CHANGED_IN_SUB);
++	block_cache_put(gCache, 0);
++
++	gBlocks[2].discard = true;
++
++	block_cache_discard(gCache, 2, 1);
++
++	TEST_BLOCKS(0, 2);
++
++	gBlocks[0].is_dirty = false;
++	gBlocks[0].write = true;
++	gBlocks[1].is_dirty = false;
++	gBlocks[1].write = true;
++	gBlocks[2].present = false;
++}
++
++
+ int
+ main(int argc, char** argv)
+ {
+ 	block_cache_init();
+ 
+-	const void* block;
++	void* block;
++	int32 id;
+ 
+ 	// TODO: test transaction-less block caches
+ 	// TODO: test read-only block caches
+ 
+ 	// Test transactions and block caches
+ 
+-	start_test(1, &quot;Discard simple&quot;, true);
++	start_test(&quot;Discard in main&quot;, true);
+ 
+-	int32 id = cache_start_transaction(gCache);
++	id = cache_start_transaction(gCache);
+ 
+ 	gBlocks[0].present = true;
+ 	gBlocks[0].read = true;
+ 
+-	block = block_cache_get(gCache, 0);
++	block_cache_get(gCache, 0);
+ 	block_cache_put(gCache, 0);
+ 
+ 	gBlocks[1].present = true;
+@@ -222,6 +325,109 @@
+ 	cache_end_transaction(gCache, id, NULL, NULL);
+ 	cache_sync_transaction(gCache, id);
+ 
++	start_test(&quot;Discard in sub&quot;, true);
++
++	id = cache_start_transaction(gCache);
++
++	basic_test_discard_in_sub(id, false);
++	TEST_ASSERT(cache_blocks_in_sub_transaction(gCache, id) == 1);
++
++	cache_end_transaction(gCache, id, NULL, NULL);
++	cache_sync_transaction(gCache, id);
++
++	start_test(&quot;Discard in sub, present in main&quot;, true);
++
++	id = cache_start_transaction(gCache);
++
++	basic_test_discard_in_sub(id, true);
++
++	cache_end_transaction(gCache, id, NULL, NULL);
++	cache_sync_transaction(gCache, id);
++
++	start_test(&quot;Discard in sub, changed in main, abort sub&quot;, true);
++
++	id = cache_start_transaction(gCache);
++
++	basic_test_discard_in_sub(id, true);
++	TEST_ASSERT(cache_blocks_in_sub_transaction(gCache, id) == 1);
++
++	gBlocks[0].current &amp;= ~BLOCK_CHANGED_IN_SUB;
++	gBlocks[2].present = true;
++	gBlocks[2].is_dirty = false;
++	gBlocks[2].write = true;
++	gBlocks[2].discard = false;
++
++	cache_abort_sub_transaction(gCache, id);
++	cache_end_transaction(gCache, id, NULL, NULL);
++	cache_sync_transaction(gCache, id);
++
++	start_test(&quot;Discard in sub, changed in main, new sub&quot;, true);
++
++	id = cache_start_transaction(gCache);
++
++	basic_test_discard_in_sub(id, true);
++
++	cache_start_sub_transaction(gCache, id);
++	cache_end_transaction(gCache, id, NULL, NULL);
++	cache_sync_transaction(gCache, id);
++
++	start_test(&quot;Discard in sub, changed in main, detach sub&quot;, true);
++
++	id = cache_start_transaction(gCache);
++
++	basic_test_discard_in_sub(id, true);
++
++	id = cache_detach_sub_transaction(gCache, id, NULL, NULL);
++
++	gBlocks[0].is_dirty = true;
++	gBlocks[0].write = false;
++	gBlocks[1].is_dirty = true;
++	gBlocks[1].write = false;
++
++	TEST_BLOCKS(0, 2);
++
++	gBlocks[0].is_dirty = false;
++	gBlocks[0].write = true;
++	gBlocks[1].is_dirty = false;
++	gBlocks[1].write = true;
++
++	cache_end_transaction(gCache, id, NULL, NULL);
++	cache_sync_transaction(gCache, id);
++
++	start_test(&quot;Discard in sub, all changed in main, detach sub&quot;, true);
++
++	id = cache_start_transaction(gCache);
++
++	gBlocks[0].present = true;
++	gBlocks[0].read = true;
++	gBlocks[0].is_dirty = true;
++	gBlocks[0].original = gBlocks[0].current;
++	gBlocks[0].current |= BLOCK_CHANGED_IN_MAIN;
++
++	block = block_cache_get_writable(gCache, 0, id);
++	or_block(block, BLOCK_CHANGED_IN_MAIN);
++	block_cache_put(gCache, 0);
++
++	basic_test_discard_in_sub(id, true);
++
++	id = cache_detach_sub_transaction(gCache, id, NULL, NULL);
++
++	gBlocks[0].is_dirty = true;
++	gBlocks[0].write = false;
++	gBlocks[0].original |= BLOCK_CHANGED_IN_MAIN;
++	gBlocks[1].is_dirty = true;
++	gBlocks[1].write = false;
++
++	TEST_BLOCKS(0, 2);
++
++	gBlocks[0].is_dirty = false;
++	gBlocks[0].write = true;
++	gBlocks[1].is_dirty = false;
++	gBlocks[1].write = true;
++
++	cache_end_transaction(gCache, id, NULL, NULL);
++	cache_sync_transaction(gCache, id);
++
+ 	stop_test();
+ 	return 0;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013281.html">[Haiku-commits] r28513 - haiku/trunk/src/tests/add-ons/kernel
+</A></li>
+	<LI>Next message: <A HREF="013286.html">[Haiku-commits] r28515 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13285">[ date ]</a>
+              <a href="thread.html#13285">[ thread ]</a>
+              <a href="subject.html#13285">[ subject ]</a>
+              <a href="author.html#13285">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

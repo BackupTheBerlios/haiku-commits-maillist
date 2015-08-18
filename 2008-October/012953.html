@@ -1,0 +1,505 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28287 - in haiku/trunk:	headers/private/kernel/arch/x86 src/system/kernel/arch/x86
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28287%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/arch/x86%20src/system/kernel/arch/x86&In-Reply-To=%3C200810221512.m9MFCaq7031024%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012952.html">
+   <LINK REL="Next"  HREF="012954.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28287 - in haiku/trunk:	headers/private/kernel/arch/x86 src/system/kernel/arch/x86</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28287%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/arch/x86%20src/system/kernel/arch/x86&In-Reply-To=%3C200810221512.m9MFCaq7031024%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28287 - in haiku/trunk:	headers/private/kernel/arch/x86 src/system/kernel/arch/x86">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Oct 22 17:12:36 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012952.html">[Haiku-commits] r28286 - haiku/trunk/src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="012954.html">[Haiku-commits] r28288 - in haiku/trunk: . build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12953">[ date ]</a>
+              <a href="thread.html#12953">[ thread ]</a>
+              <a href="subject.html#12953">[ subject ]</a>
+              <a href="author.html#12953">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-10-22 17:12:32 +0200 (Wed, 22 Oct 2008)
+New Revision: 28287
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28287&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28287&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h
+   haiku/trunk/src/system/kernel/arch/x86/arch_cpu.cpp
+   haiku/trunk/src/system/kernel/arch/x86/arch_thread.cpp
+   haiku/trunk/src/system/kernel/arch/x86/arch_vm.cpp
+   haiku/trunk/src/system/kernel/arch/x86/arch_vm_translation_map.cpp
+   haiku/trunk/src/system/kernel/arch/x86/x86_paging.h
+Log:
+When switching to a kernel thread we no longer set the page directory.
+This is not necessary, since userland teams' page directories also
+contain the kernel mappings, and avoids unnecessary TLB flushes. To make
+that possible the vm_translation_map_arch_info objects are reference
+counted now.
+
+This optimization reduces the kernel time of the Haiku build on my
+machine with SMP disabled a few percent, but interestingly the total
+time decreases only marginally. Haven't tested with SMP yet, but for
+full impact CPU affinity would be needed.
+
+
+Modified: haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h	2008-10-22 14:55:33 UTC (rev 28286)
++++ haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h	2008-10-22 15:12:32 UTC (rev 28287)
+@@ -238,6 +238,8 @@
+ 	int model;
+ 	int extended_model;
+ 
++	struct vm_translation_map_arch_info* active_translation_map;
++
+ 	// local TSS for this cpu
+ 	struct tss tss;
+ 	struct tss double_fault_tss;
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_cpu.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_cpu.cpp	2008-10-22 14:55:33 UTC (rev 28286)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_cpu.cpp	2008-10-22 15:12:32 UTC (rev 28287)
+@@ -22,12 +22,15 @@
+ #include &lt;smp.h&gt;
+ #include &lt;tls.h&gt;
+ #include &lt;vm.h&gt;
++#include &lt;vm_address_space.h&gt;
++#include &lt;vm_types.h&gt;
+ 
+ #include &lt;arch_system_info.h&gt;
+ #include &lt;arch/x86/selector.h&gt;
+ #include &lt;boot/kernel_args.h&gt;
+ 
+ #include &quot;interrupts.h&quot;
++#include &quot;x86_paging.h&quot;
+ 
+ 
+ #define DUMP_FEATURE_STRING 1
+@@ -539,6 +542,10 @@
+ 	// (a fixed number of used GDT entries)
+ 	//i386_selector_init(gGDT);  // pass the new gdt
+ 
++
++	vm_translation_map_arch_info* kernelArchTranslationMap
++		= vm_kernel_address_space()-&gt;translation_map.arch_data;
++
+ 	// setup task-state segments
+ 	for (i = 0; i &lt; args-&gt;num_cpus; i++) {
+ 		// initialize the regular and double fault tss stored in the per-cpu
+@@ -553,6 +560,10 @@
+ 
+ 		// initialize the double fault tss
+ 		init_double_fault(i);
++
++		// init active translation map
++		gCPU[i].arch.active_translation_map = kernelArchTranslationMap;
++		kernelArchTranslationMap-&gt;AddReference();
+ 	}
+ 
+ 	// set the current hardware task on cpu 0
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_thread.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_thread.cpp	2008-10-22 14:55:33 UTC (rev 28286)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_thread.cpp	2008-10-22 15:12:32 UTC (rev 28287)
+@@ -12,10 +12,12 @@
+ 
+ #include &lt;arch/user_debugger.h&gt;
+ #include &lt;arch_cpu.h&gt;
++#include &lt;cpu.h&gt;
+ #include &lt;debug.h&gt;
+ #include &lt;kernel.h&gt;
+ #include &lt;ksignal.h&gt;
+ #include &lt;int.h&gt;
++#include &lt;team.h&gt;
+ #include &lt;thread.h&gt;
+ #include &lt;tls.h&gt;
+ #include &lt;tracing.h&gt;
+@@ -336,21 +338,6 @@
+ void
+ arch_thread_context_switch(struct thread *from, struct thread *to)
+ {
+-	addr_t newPageDirectory;
+-
+-#if 0
+-	int i;
+-
+-	dprintf(&quot;arch_thread_context_switch: cpu %d 0x%x -&gt; 0x%x, aspace 0x%x -&gt; 0x%x, old stack = 0x%x:0x%x, stack = 0x%x:0x%x\n&quot;,
+-		smp_get_current_cpu(), t_from-&gt;id, t_to-&gt;id,
+-		t_from-&gt;team-&gt;address_space, t_to-&gt;team-&gt;address_space,
+-		t_from-&gt;arch_info.current_stack.ss, t_from-&gt;arch_info.current_stack.esp,
+-		t_to-&gt;arch_info.current_stack.ss, t_to-&gt;arch_info.current_stack.esp);
+-#endif
+-#if 0
+-	for (i = 0; i &lt; 11; i++)
+-		dprintf(&quot;*esp[%d] (0x%x) = 0x%x\n&quot;, i, ((unsigned int *)new_at-&gt;esp + i), *((unsigned int *)new_at-&gt;esp + i));
+-#endif
+ 	i386_set_tss_and_kstack(to-&gt;kernel_stack_top);
+ 
+ 	// set TLS GDT entry to the current thread - since this action is
+@@ -358,24 +345,30 @@
+ 	if (to-&gt;user_local_storage != 0)
+ 		set_tls_context(to);
+ 
+-	newPageDirectory = (addr_t)x86_next_page_directory(from, to);
++	struct cpu_ent* cpuData = to-&gt;cpu;
++	vm_translation_map_arch_info* activeMap
++		= cpuData-&gt;arch.active_translation_map;
++	vm_address_space* toAddressSpace = to-&gt;team-&gt;address_space;
+ 
+-	ASSERT((newPageDirectory % B_PAGE_SIZE) == 0);
+-
+-	if (newPageDirectory != 0) {
++	addr_t newPageDirectory;
++	vm_translation_map_arch_info* toMap;
++	if (toAddressSpace != NULL
++		&amp;&amp; (toMap = toAddressSpace-&gt;translation_map.arch_data) != activeMap) {
+ 		// update on which CPUs the address space is used
+-		int cpu = smp_get_current_cpu();
+-		if (vm_address_space* addressSpace = from-&gt;team-&gt;address_space) {
+-			atomic_and(&amp;addressSpace-&gt;translation_map.arch_data-&gt;active_on_cpus,
+-				~((uint32)1 &lt;&lt; cpu));
+-		}
++		int cpu = cpuData-&gt;cpu_num;
++		atomic_and(&amp;activeMap-&gt;active_on_cpus, ~((uint32)1 &lt;&lt; cpu));
++		atomic_or(&amp;toMap-&gt;active_on_cpus, (uint32)1 &lt;&lt; cpu);
+ 
+-		if (vm_address_space* addressSpace = to-&gt;team-&gt;address_space) {
+-			atomic_or(&amp;addressSpace-&gt;translation_map.arch_data-&gt;active_on_cpus,
+-				(uint32)1 &lt;&lt; cpu);
+-		}
+-	}
++		// assign the new map to the CPU
++		activeMap-&gt;RemoveReference();
++		toMap-&gt;AddReference();
++		cpuData-&gt;arch.active_translation_map = toMap;
+ 
++		// get the new page directory
++		newPageDirectory = (addr_t)toMap-&gt;pgdir_phys;
++	} else
++		newPageDirectory = 0;
++
+ 	gX86SwapFPUFunc(from-&gt;arch_info.fpu_state, to-&gt;arch_info.fpu_state);
+ 	i386_context_switch(&amp;from-&gt;arch_info, &amp;to-&gt;arch_info, newPageDirectory);
+ }
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_vm.cpp	2008-10-22 14:55:33 UTC (rev 28286)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_vm.cpp	2008-10-22 15:12:32 UTC (rev 28287)
+@@ -388,19 +388,14 @@
+ void
+ arch_vm_aspace_swap(struct vm_address_space *from, struct vm_address_space *to)
+ {
+-	int cpu = smp_get_current_cpu();
+-	if (from != NULL) {
+-		atomic_and(&amp;from-&gt;translation_map.arch_data-&gt;active_on_cpus,
+-			~((uint32)1 &lt;&lt; cpu));
+-	}
+-
+-	if (to != NULL &amp;&amp; to != vm_kernel_address_space()) {
+-		atomic_or(&amp;to-&gt;translation_map.arch_data-&gt;active_on_cpus,
+-			(uint32)1 &lt;&lt; cpu);
+-	}
+-
+-	i386_swap_pgdir((addr_t)i386_translation_map_get_pgdir(
+-		&amp;to-&gt;translation_map));
++	// This functions is only invoked when a userland thread is in the process
++	// of dying. It switches to the kernel team and does whatever cleanup is
++	// necessary (in case it is the team's main thread, it will delete the
++	// team).
++	// It is however not necessary to change the page directory. Userland team's
++	// page directories include all kernel mappings as well. Furthermore our
++	// arch specific translation map data objects are ref-counted, so they won't
++	// go away as long as they are still used on any CPU.
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_vm_translation_map.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_vm_translation_map.cpp	2008-10-22 14:55:33 UTC (rev 28286)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_vm_translation_map.cpp	2008-10-22 15:12:32 UTC (rev 28287)
+@@ -41,7 +41,33 @@
+ static page_directory_entry *sKernelPhysicalPageDirectory = NULL;
+ static page_directory_entry *sKernelVirtualPageDirectory = NULL;
+ 
+-static vm_translation_map *sTMapList;
++
++// Accessor class to reuse the SinglyLinkedListLink of DeferredDeletable for
++// vm_translation_map_arch_info.
++struct ArchTMapGetLink {
++private:
++	typedef SinglyLinkedListLink&lt;vm_translation_map_arch_info&gt; Link;
++
++public:
++	inline Link* operator()(vm_translation_map_arch_info* element) const
++	{
++		return (Link*)element-&gt;GetSinglyLinkedListLink();
++	}
++
++	inline const Link* operator()(
++		const vm_translation_map_arch_info* element) const
++	{
++		return (const Link*)element-&gt;GetSinglyLinkedListLink();
++	}
++
++};
++
++
++typedef SinglyLinkedList&lt;vm_translation_map_arch_info, ArchTMapGetLink&gt;
++	ArchTMapList;
++
++
++static ArchTMapList sTMapList;
+ static spinlock sTMapListLock;
+ 
+ #define CHATTY_TMAP 0
+@@ -69,13 +95,13 @@
+ void
+ x86_update_all_pgdirs(int index, page_directory_entry e)
+ {
+-	vm_translation_map *entry;
+ 	unsigned int state = disable_interrupts();
+ 
+ 	acquire_spinlock(&amp;sTMapListLock);
+ 
+-	for(entry = sTMapList; entry != NULL; entry = entry-&gt;next)
+-		entry-&gt;arch_data-&gt;pgdir_virt[index] = e;
++	ArchTMapList::Iterator it = sTMapList.GetIterator();
++	while (vm_translation_map_arch_info* info = it.Next())
++		info-&gt;pgdir_virt[index] = e;
+ 
+ 	release_spinlock(&amp;sTMapListLock);
+ 	restore_interrupts(state);
+@@ -143,45 +169,48 @@
+ }
+ 
+ 
+-static void
+-destroy_tmap(vm_translation_map *map)
++vm_translation_map_arch_info::vm_translation_map_arch_info()
++	:
++	pgdir_virt(NULL),
++	ref_count(1)
+ {
+-	int state;
+-	vm_translation_map *entry;
+-	vm_translation_map *last = NULL;
+-	unsigned int i;
++}
+ 
+-	if (map == NULL)
+-		return;
+ 
+-	// remove it from the tmap list
+-	state = disable_interrupts();
+-	acquire_spinlock(&amp;sTMapListLock);
++vm_translation_map_arch_info::~vm_translation_map_arch_info()
++{
++	// free the page dir
++	free(pgdir_virt);
++}
+ 
+-	// TODO: How about using a doubly linked list?
+-	entry = sTMapList;
+-	while (entry != NULL) {
+-		if (entry == map) {
+-			if (last != NULL)
+-				last-&gt;next = entry-&gt;next;
+-			else
+-				sTMapList = entry-&gt;next;
+ 
+-			break;
+-		}
+-		last = entry;
+-		entry = entry-&gt;next;
+-	}
++void
++vm_translation_map_arch_info::Delete()
++{
++	// remove from global list
++	InterruptsSpinLocker locker(sTMapListLock);
++	sTMapList.Remove(this);
++	locker.Unlock();
+ 
+-	release_spinlock(&amp;sTMapListLock);
+-	restore_interrupts(state);
++	if (are_interrupts_enabled())
++		delete this;
++	else
++		deferred_delete(this);
++}
+ 
++
++static void
++destroy_tmap(vm_translation_map *map)
++{
++	if (map == NULL)
++		return;
++
+ 	if (map-&gt;arch_data-&gt;page_mapper != NULL)
+ 		map-&gt;arch_data-&gt;page_mapper-&gt;Delete();
+ 
+ 	if (map-&gt;arch_data-&gt;pgdir_virt != NULL) {
+ 		// cycle through and free all of the user space pgtables
+-		for (i = VADDR_TO_PDENT(USER_BASE);
++		for (uint32 i = VADDR_TO_PDENT(USER_BASE);
+ 				i &lt;= VADDR_TO_PDENT(USER_BASE + (USER_SIZE - 1)); i++) {
+ 			addr_t pgtable_addr;
+ 			vm_page *page;
+@@ -194,10 +223,10 @@
+ 				vm_page_set_state(page, PAGE_STATE_FREE);
+ 			}
+ 		}
+-		free(map-&gt;arch_data-&gt;pgdir_virt);
+ 	}
+ 
+-	free(map-&gt;arch_data);
++	map-&gt;arch_data-&gt;RemoveReference();
++
+ 	recursive_lock_destroy(&amp;map-&gt;lock);
+ }
+ 
+@@ -710,11 +739,10 @@
+ 	CObjectDeleter&lt;recursive_lock&gt; lockDeleter(&amp;map-&gt;lock,
+ 		&amp;recursive_lock_destroy);
+ 
+-	map-&gt;arch_data = (vm_translation_map_arch_info*)
+-		malloc(sizeof(vm_translation_map_arch_info));
++	map-&gt;arch_data = new(std::nothrow) vm_translation_map_arch_info;
+ 	if (map-&gt;arch_data == NULL)
+ 		return B_NO_MEMORY;
+-	MemoryDeleter archInfoDeleter(map-&gt;arch_data);
++	ObjectDeleter&lt;vm_translation_map_arch_info&gt; archInfoDeleter(map-&gt;arch_data);
+ 
+ 	map-&gt;arch_data-&gt;active_on_cpus = 0;
+ 	map-&gt;arch_data-&gt;num_invalidate_pages = 0;
+@@ -763,8 +791,7 @@
+ 			sKernelVirtualPageDirectory + FIRST_KERNEL_PGDIR_ENT,
+ 			NUM_KERNEL_PGDIR_ENTS * sizeof(page_directory_entry));
+ 
+-		map-&gt;next = sTMapList;
+-		sTMapList = map;
++		sTMapList.Add(map-&gt;arch_data);
+ 
+ 		release_spinlock(&amp;sTMapListLock);
+ 		restore_interrupts(state);
+@@ -805,7 +832,7 @@
+ 		args-&gt;arch_args.vir_pgdir;
+ 
+ 	B_INITIALIZE_SPINLOCK(&amp;sTMapListLock);
+-	sTMapList = NULL;
++	new (&amp;sTMapList) ArchTMapList;
+ 
+ // TODO: Select the best page mapper!
+ 	large_memory_physical_page_ops_init(args, &amp;tmap_ops);
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/x86_paging.h
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/x86_paging.h	2008-10-22 14:55:33 UTC (rev 28286)
++++ haiku/trunk/src/system/kernel/arch/x86/x86_paging.h	2008-10-22 15:12:32 UTC (rev 28287)
+@@ -10,7 +10,10 @@
+ 
+ #include &lt;SupportDefs.h&gt;
+ 
++#include &lt;heap.h&gt;
++#include &lt;int.h&gt;
+ 
++
+ #define PAGE_INVALIDATE_CACHE_SIZE 64
+ 
+ #define ADDR_SHIFT(x) ((x)&gt;&gt;12)
+@@ -52,17 +55,26 @@
+ } page_directory_entry;
+ 
+ 
+-typedef struct vm_translation_map_arch_info {
++struct vm_translation_map_arch_info : DeferredDeletable {
+ 	struct page_directory_entry*		pgdir_virt;
+ 	struct page_directory_entry*		pgdir_phys;
+ 	TranslationMapPhysicalPageMapper*	page_mapper;
++	vint32 ref_count;
+ 	vint32 active_on_cpus;
+ 		// mask indicating on which CPUs the map is currently used
+ 	int num_invalidate_pages;
+ 	addr_t pages_to_invalidate[PAGE_INVALIDATE_CACHE_SIZE];
+-} vm_translation_map_arch_info;
+ 
++								vm_translation_map_arch_info();
++	virtual						~vm_translation_map_arch_info();
+ 
++	inline	void				AddReference();
++	inline	void				RemoveReference();
++
++			void				Delete();
++};
++
++
+ void x86_early_prepare_page_tables(page_table_entry* pageTables, addr_t address,
+ 		size_t size);
+ void x86_put_pgtable_in_pgdir(page_directory_entry* entry,
+@@ -100,4 +112,19 @@
+ }
+ 
+ 
++inline void
++vm_translation_map_arch_info::AddReference()
++{
++	atomic_add(&amp;ref_count, 1);
++}
++
++
++inline void
++vm_translation_map_arch_info::RemoveReference()
++{
++	if (atomic_add(&amp;ref_count, -1) == 1)
++		Delete();
++}
++
++
+ #endif	// _KERNEL_ARCH_X86_PAGING_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012952.html">[Haiku-commits] r28286 - haiku/trunk/src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="012954.html">[Haiku-commits] r28288 - in haiku/trunk: . build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12953">[ date ]</a>
+              <a href="thread.html#12953">[ thread ]</a>
+              <a href="subject.html#12953">[ subject ]</a>
+              <a href="author.html#12953">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

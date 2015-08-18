@@ -1,0 +1,795 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32967 - haiku/trunk/src/apps/installer
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32967%20-%20haiku/trunk/src/apps/installer&In-Reply-To=%3C200909061723.n86HNdx9030731%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020411.html">
+   <LINK REL="Next"  HREF="020414.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32967 - haiku/trunk/src/apps/installer</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32967%20-%20haiku/trunk/src/apps/installer&In-Reply-To=%3C200909061723.n86HNdx9030731%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32967 - haiku/trunk/src/apps/installer">stippi at mail.berlios.de
+       </A><BR>
+    <I>Sun Sep  6 19:23:39 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020411.html">[Haiku-commits] r32966 - haiku/trunk/src/apps/people
+</A></li>
+        <LI>Next message: <A HREF="020414.html">[Haiku-commits] r32968 - in haiku/trunk/docs/userguide: en	en/applications images images/gui-images
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20412">[ date ]</a>
+              <a href="thread.html#20412">[ thread ]</a>
+              <a href="subject.html#20412">[ subject ]</a>
+              <a href="author.html#20412">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-09-06 19:23:31 +0200 (Sun, 06 Sep 2009)
+New Revision: 32967
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32967&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32967&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/installer/CopyEngine.cpp
+   haiku/trunk/src/apps/installer/CopyEngine.h
+   haiku/trunk/src/apps/installer/Jamfile
+   haiku/trunk/src/apps/installer/ProgressReporter.cpp
+   haiku/trunk/src/apps/installer/ProgressReporter.h
+   haiku/trunk/src/apps/installer/UnzipEngine.cpp
+   haiku/trunk/src/apps/installer/UnzipEngine.h
+   haiku/trunk/src/apps/installer/WorkerThread.cpp
+   haiku/trunk/src/apps/installer/WorkerThread.h
+Log:
+* Finished ProgressReporter
+* Integrated ProgressReporter into CopyEngine and UnzipEngine.
+* Integrated unzipping to main installer engine. Since there are currently no
+  .zip files in the _packages_ folder (and not even a _packages_ folder
+  itself), this is completely invisible, but it works.
+
+TODO: Adjust the build system to optionally copy packages into _packages_
+instead of extracting them. Like for the CD build profile mode.
+
+
+Modified: haiku/trunk/src/apps/installer/CopyEngine.cpp
+===================================================================
+--- haiku/trunk/src/apps/installer/CopyEngine.cpp	2009-09-06 16:38:00 UTC (rev 32966)
++++ haiku/trunk/src/apps/installer/CopyEngine.cpp	2009-09-06 17:23:31 UTC (rev 32967)
+@@ -22,19 +22,22 @@
+ #include &quot;InstallerWindow.h&quot;
+ 	// TODO: For PACKAGES_DIRECTORY and VAR_DIRECTORY, not so nice...
+ #include &quot;SemaphoreLocker.h&quot;
++#include &quot;ProgressReporter.h&quot;
+ 
+ 
+ using std::nothrow;
+ 
+ 
+-CopyEngine::CopyEngine(const BMessenger&amp; messenger, BMessage* message)
++CopyEngine::CopyEngine(ProgressReporter* reporter)
+ 	:
+ 	fBufferQueue(),
+ 	fWriterThread(-1),
+ 	fQuitting(false),
+ 
+ 	fBytesRead(0),
++	fLastBytesRead(0),
+ 	fItemsCopied(0),
++	fLastItemsCopied(0),
+ 	fTimeRead(0),
+ 
+ 	fBytesWritten(0),
+@@ -46,8 +49,7 @@
+ 	fCurrentTargetFolder(NULL),
+ 	fCurrentItem(NULL),
+ 
+-	fMessenger(messenger),
+-	fMessage(message)
++	fProgressReporter(reporter)
+ {
+ 	fWriterThread = spawn_thread(_WriteThreadEntry, &quot;buffer writer&quot;,
+ 		B_NORMAL_PRIORITY, this);
+@@ -73,16 +75,19 @@
+ 		int32 exitValue;
+ 		wait_for_thread(fWriterThread, &amp;exitValue);
+ 	}
+-
+-	delete fMessage;
+ }
+ 
+ 
+ void
+ CopyEngine::ResetTargets()
+ {
++	// TODO: One could subtract the bytes/items which were added to the
++	// ProgressReporter before resetting them...
++
+ 	fBytesRead = 0;
++	fLastBytesRead = 0;
+ 	fItemsCopied = 0;
++	fLastItemsCopied = 0;
+ 	fTimeRead = 0;
+ 
+ 	fBytesWritten = 0;
+@@ -93,12 +98,6 @@
+ 
+ 	fCurrentTargetFolder = NULL;
+ 	fCurrentItem = NULL;
+-
+-	if (fMessage) {
+-		BMessage message(*fMessage);
+-		message.AddString(&quot;status&quot;, &quot;Collecting copy information.&quot;);
+-		fMessenger.SendMessage(&amp;message);
+-	}
+ }
+ 
+ 
+@@ -106,7 +105,10 @@
+ CopyEngine::CollectTargets(const char* source, sem_id cancelSemaphore)
+ {
+ 	int32 level = 0;
+-	return _CollectCopyInfo(source, level, cancelSemaphore);
++	status_t ret = _CollectCopyInfo(source, level, cancelSemaphore);
++	if (ret == B_OK &amp;&amp; fProgressReporter != NULL)
++		fProgressReporter-&gt;AddItems(fItemsToCopy, fBytesToCopy);
++	return ret;
+ }
+ 
+ 
+@@ -114,14 +116,6 @@
+ CopyEngine::CopyFolder(const char* source, const char* destination,
+ 	sem_id cancelSemaphore)
+ {
+-	printf(&quot;%lld bytes to read in %lld files\n&quot;, fBytesToCopy, fItemsToCopy);
+-
+-	if (fMessage) {
+-		BMessage message(*fMessage);
+-		message.AddString(&quot;status&quot;, &quot;Performing installation.&quot;);
+-		fMessenger.SendMessage(&amp;message);
+-	}
+-
+ 	int32 level = 0;
+ 	return _CopyFolder(source, destination, level, cancelSemaphore);
+ }
+@@ -475,16 +469,23 @@
+ void
+ CopyEngine::_UpdateProgress()
+ {
+-	if (fMessage != NULL) {
+-		BMessage message(*fMessage);
+-		float progress = 100.0 * fBytesRead / fBytesToCopy;
+-		message.AddFloat(&quot;progress&quot;, progress);
+-		message.AddInt32(&quot;current&quot;, fItemsCopied);
+-		message.AddInt32(&quot;maximum&quot;, fItemsToCopy);
+-		message.AddString(&quot;item&quot;, fCurrentItem);
+-		message.AddString(&quot;folder&quot;, fCurrentTargetFolder);
+-		fMessenger.SendMessage(&amp;message);
++	if (fProgressReporter == NULL)
++		return;
++
++	uint64 items = 0;
++	if (fLastItemsCopied &lt; fItemsCopied) {
++		items = fItemsCopied - fLastItemsCopied;
++		fLastItemsCopied = fItemsCopied;
+ 	}
++
++	off_t bytes = 0;
++	if (fLastBytesRead &lt; fBytesRead) {
++		bytes = fBytesRead - fLastBytesRead;
++		fLastBytesRead = fBytesRead;
++	}
++
++	fProgressReporter-&gt;ItemsWritten(items, bytes, fCurrentItem,
++		fCurrentTargetFolder);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/apps/installer/CopyEngine.h
+===================================================================
+--- haiku/trunk/src/apps/installer/CopyEngine.h	2009-09-06 16:38:00 UTC (rev 32966)
++++ haiku/trunk/src/apps/installer/CopyEngine.h	2009-09-06 17:23:31 UTC (rev 32967)
+@@ -15,14 +15,12 @@
+ #include &quot;BlockingQueue.h&quot;
+ 
+ class BFile;
+-class BMessage;
+-class BMessenger;
++class ProgressReporter;
+ 
+ 
+ class CopyEngine {
+ public:
+-								CopyEngine(const BMessenger&amp; messenger,
+-									BMessage* message);
++								CopyEngine(ProgressReporter* reporter);
+ 	virtual						~CopyEngine();
+ 
+ 			void				ResetTargets();
+@@ -93,7 +91,9 @@
+ 	volatile bool				fQuitting;
+ 
+ 			off_t				fBytesRead;
++			uint64				fLastBytesRead;
+ 			uint64				fItemsCopied;
++			uint64				fLastItemsCopied;
+ 			bigtime_t			fTimeRead;
+ 
+ 			off_t				fBytesWritten;
+@@ -105,8 +105,7 @@
+ 			const char*			fCurrentTargetFolder;
+ 			const char*			fCurrentItem;
+ 
+-			BMessenger			fMessenger;
+-			BMessage*			fMessage;
++			ProgressReporter*	fProgressReporter;
+ };
+ 
+ 
+
+Modified: haiku/trunk/src/apps/installer/Jamfile
+===================================================================
+--- haiku/trunk/src/apps/installer/Jamfile	2009-09-06 16:38:00 UTC (rev 32966)
++++ haiku/trunk/src/apps/installer/Jamfile	2009-09-06 17:23:31 UTC (rev 32967)
+@@ -9,6 +9,7 @@
+ 	InstallerWindow.cpp
+ 	PackageViews.cpp
+ 	PartitionMenuItem.cpp
++	ProgressReporter.cpp
+ 	UnzipEngine.cpp
+ 	WorkerThread.cpp
+ 	: be tracker translation libshared.a $(TARGET_LIBSTDC++)
+
+Modified: haiku/trunk/src/apps/installer/ProgressReporter.cpp
+===================================================================
+--- haiku/trunk/src/apps/installer/ProgressReporter.cpp	2009-09-06 16:38:00 UTC (rev 32966)
++++ haiku/trunk/src/apps/installer/ProgressReporter.cpp	2009-09-06 17:23:31 UTC (rev 32967)
+@@ -5,28 +5,19 @@
+ 
+ #include &quot;ProgressReporter.h&quot;
+ 
+-#include &lt;new&gt;
+-
+-#include &lt;math.h&gt;
+ #include &lt;stdio.h&gt;
+-#include &lt;string.h&gt;
+ 
+ 
+-using std::nothrow;
+-
+-
+ ProgressReporter::ProgressReporter(const BMessenger&amp; messenger,
+ 		BMessage* message)
+ 	:
+-	fBytesRead(0),
+-	fItemsCopied(0),
+-	fTimeRead(0),
++	fStartTime(0),
+ 
++	fBytesToWrite(0),
+ 	fBytesWritten(0),
+-	fTimeWritten(0),
+ 
+-	fBytesToCopy(0),
+-	fItemsToCopy(0),
++	fItemsToWrite(0),
++	fItemsWritten(0),
+ 
+ 	fMessenger(messenger),
+ 	fMessage(message)
+@@ -43,15 +34,11 @@
+ void
+ ProgressReporter::Reset()
+ {
+-	fBytesRead = 0;
+-	fItemsCopied = 0;
+-	fTimeRead = 0;
+-
++	fBytesToWrite = 0;
+ 	fBytesWritten = 0;
+-	fTimeWritten = 0;
+ 
+-	fBytesToCopy = 0;
+-	fItemsToCopy = 0;
++	fItemsToWrite = 0;
++	fItemsWritten = 0;
+ 
+ 	if (fMessage) {
+ 		BMessage message(*fMessage);
+@@ -64,22 +51,35 @@
+ void
+ ProgressReporter::AddItems(uint64 count, off_t bytes)
+ {
+-	// TODO ...
++	fBytesToWrite += bytes;
++	fItemsToWrite += count;
+ }
+ 
+ 
+ void
+ ProgressReporter::StartTimer()
+ {
+-	// TODO ...
++	fStartTime = system_time();
++
++	printf(&quot;%lld bytes to write in %lld files\n&quot;, fBytesToWrite,
++		fItemsToWrite);
++
++	if (fMessage) {
++		BMessage message(*fMessage);
++		message.AddString(&quot;status&quot;, &quot;Performing installation.&quot;);
++		fMessenger.SendMessage(&amp;message);
++	}
+ }
+ 
+ 
+ void
+-ProgressReporter::ItemsCopied(uint64 items, off_t bytes, const char* itemName,
+-	const char* targetFolder)
++ProgressReporter::ItemsWritten(uint64 items, off_t bytes,
++	const char* itemName, const char* targetFolder)
+ {
+-	// TODO ...
++	fItemsWritten += items;
++	fBytesWritten += bytes;
++
++	_UpdateProgress(itemName, targetFolder);
+ }
+ 
+ 
+@@ -87,14 +87,17 @@
+ ProgressReporter::_UpdateProgress(const char* itemName,
+ 	const char* targetFolder)
+ {
+-	if (fMessage != NULL) {
+-		BMessage message(*fMessage);
+-		float progress = 100.0 * fBytesRead / fBytesToCopy;
+-		message.AddFloat(&quot;progress&quot;, progress);
+-		message.AddInt32(&quot;current&quot;, fItemsCopied);
+-		message.AddInt32(&quot;maximum&quot;, fItemsToCopy);
+-		message.AddString(&quot;item&quot;, itemName);
+-		message.AddString(&quot;folder&quot;, targetFolder);
+-		fMessenger.SendMessage(&amp;message);
+-	}
++	if (fMessage == NULL)
++		return;
++
++	// TODO: Could add time to finish calculation here...
++
++	BMessage message(*fMessage);
++	float progress = 100.0 * fBytesWritten / fBytesToWrite;
++	message.AddFloat(&quot;progress&quot;, progress);
++	message.AddInt32(&quot;current&quot;, fItemsWritten);
++	message.AddInt32(&quot;maximum&quot;, fItemsToWrite);
++	message.AddString(&quot;item&quot;, itemName);
++	message.AddString(&quot;folder&quot;, targetFolder);
++	fMessenger.SendMessage(&amp;message);
+ }
+
+Modified: haiku/trunk/src/apps/installer/ProgressReporter.h
+===================================================================
+--- haiku/trunk/src/apps/installer/ProgressReporter.h	2009-09-06 16:38:00 UTC (rev 32966)
++++ haiku/trunk/src/apps/installer/ProgressReporter.h	2009-09-06 17:23:31 UTC (rev 32967)
+@@ -21,24 +21,24 @@
+ 
+ 			void				StartTimer();
+ 
+-			void				ItemsCopied(uint64 items, off_t bytes,
++			void				ItemsWritten(uint64 items, off_t bytes,
+ 									const char* itemName,
+ 									const char* targetFolder);
+ 
++			// TODO: Perhaps move cancelling here as well...
++
+ private:
+ 			void				_UpdateProgress(const char* itemName,
+ 									const char* targetFolder);
+ 
+ private:
+-			off_t				fBytesRead;
+-			uint64				fItemsCopied;
+-			bigtime_t			fTimeRead;
++			bigtime_t			fStartTime;
+ 
++			off_t				fBytesToWrite;
+ 			off_t				fBytesWritten;
+-			bigtime_t			fTimeWritten;
+ 
+-			off_t				fBytesToCopy;
+-			uint64				fItemsToCopy;
++			uint64				fItemsToWrite;
++			uint64				fItemsWritten;
+ 
+ 			BMessenger			fMessenger;
+ 			BMessage*			fMessage;
+
+Modified: haiku/trunk/src/apps/installer/UnzipEngine.cpp
+===================================================================
+--- haiku/trunk/src/apps/installer/UnzipEngine.cpp	2009-09-06 16:38:00 UTC (rev 32966)
++++ haiku/trunk/src/apps/installer/UnzipEngine.cpp	2009-09-06 17:23:31 UTC (rev 32967)
+@@ -21,12 +21,13 @@
+ 
+ #include &quot;CommandPipe.h&quot;
+ #include &quot;SemaphoreLocker.h&quot;
++#include &quot;ProgressReporter.h&quot;
+ 
+ 
+ using std::nothrow;
+ 
+ 
+-UnzipEngine::UnzipEngine(const BMessenger&amp; messenger, BMessage* message,
++UnzipEngine::UnzipEngine(ProgressReporter* reporter,
+ 		sem_id cancelSemaphore)
+ 	:
+ 	fPackage(&quot;&quot;),
+@@ -34,11 +35,12 @@
+ 
+ 	fBytesToUncompress(0),
+ 	fBytesUncompressed(0),
++	fLastBytesUncompressed(0),
+ 	fItemsToUncompress(0),
+ 	fItemsUncompressed(0),
++	fLastItemsUncompressed(0),
+ 
+-	fMessenger(messenger),
+-	fMessage(message),
++	fProgressReporter(reporter),
+ 	fCancelSemaphore(cancelSemaphore)
+ {
+ }
+@@ -46,7 +48,6 @@
+ 
+ UnzipEngine::~UnzipEngine()
+ {
+-	delete fMessage;
+ }
+ 
+ 
+@@ -60,8 +61,10 @@
+ 
+ 	fBytesToUncompress = 0;
+ 	fBytesUncompressed = 0;
++	fLastBytesUncompressed = 0;
+ 	fItemsToUncompress = 0;
+ 	fItemsUncompressed = 0;
++	fLastItemsUncompressed = 0;
+ 
+ 	BPrivate::BCommandPipe commandPipe;
+ 	status_t ret = commandPipe.AddArg(&quot;unzip&quot;);
+@@ -95,12 +98,6 @@
+ 	if (fItemsToUncompress == 0)
+ 		return B_NO_INIT;
+ 
+-	if (fMessage) {
+-		BMessage message(*fMessage);
+-		message.AddString(&quot;status&quot;, &quot;Extracting package.&quot;);
+-		fMessenger.SendMessage(&amp;message);
+-	}
+-
+ 	BPrivate::BCommandPipe commandPipe;
+ 	status_t ret = commandPipe.AddArg(&quot;unzip&quot;);
+ 	if (ret == B_OK)
+@@ -155,19 +152,6 @@
+ status_t
+ UnzipEngine::_ReadLineListing(const BString&amp; line)
+ {
+-//	static const char* kListingFormat = &quot;%llu files, %llu bytes uncompressed, &quot;
+-//		&quot;%llu bytes compressed: %f%%&quot;;
+-//
+-//	uint64 bytesCompressed;
+-//	float compresssionRatio;
+-//	if (sscanf(line.String(), kListingFormat, &amp;fItemsToUncompress,
+-//		&amp;fBytesToUncompress, &amp;bytesCompressed, &amp;compresssionRatio) != 4) {
+-//		fBytesToUncompress = 0;
+-//		fItemsToUncompress = 0;
+-//		fprintf(stderr, &quot;error reading command output: %s\n&quot;, line.String());
+-//		return B_ERROR;
+-//	}
+-
+ 	static const char* kListingFormat = &quot;%llu  %s %s   %s\n&quot;;
+ 
+ 	const char* string = line.String();
+@@ -197,7 +181,7 @@
+ 			if (destination.Append(itemPath.String()) == B_OK) {
+ 				BEntry test(destination.Path());
+ 				if (test.Exists() &amp;&amp; test.IsDirectory()) {
+-					printf(&quot;ignoring %s\n&quot;, itemPath.String());
++//					printf(&quot;ignoring %s\n&quot;, itemPath.String());
+ 					itemCount = 0;
+ 				}
+ 			}
+@@ -205,8 +189,8 @@
+ 
+ 		fItemsToUncompress += itemCount;
+ 
+-		printf(&quot;item %s with %llu bytes to %s\n&quot;, itemName.String(),
+-			bytes, itemPath.String());
++//		printf(&quot;item %s with %llu bytes to %s\n&quot;, itemName.String(),
++//			bytes, itemPath.String());
+ 
+ 		fEntrySizeMap.Put(itemName.String(), bytes);
+ 	} else {
+@@ -243,8 +227,8 @@
+ 			fBytesUncompressed += bytes;
+ 		}
+ 
+-		printf(&quot;%llu extracted %s to %s (%llu)\n&quot;, fItemsUncompressed,
+-			itemName.String(), itemPath.String(), bytes);
++//		printf(&quot;%llu extracted %s to %s (%llu)\n&quot;, fItemsUncompressed,
++//			itemName.String(), itemPath.String(), bytes);
+ 
+ 		_UpdateProgress(itemName.String(), itemPath.String());
+ 	} else {
+@@ -258,14 +242,20 @@
+ void
+ UnzipEngine::_UpdateProgress(const char* item, const char* targetFolder)
+ {
+-	if (fMessage != NULL) {
+-		BMessage message(*fMessage);
+-		float progress = 100.0 * fBytesUncompressed / fBytesToUncompress;
+-		message.AddFloat(&quot;progress&quot;, progress);
+-		message.AddInt32(&quot;current&quot;, fItemsUncompressed);
+-		message.AddInt32(&quot;maximum&quot;, fItemsToUncompress);
+-		message.AddString(&quot;item&quot;, item);
+-		message.AddString(&quot;folder&quot;, targetFolder);
+-		fMessenger.SendMessage(&amp;message);
++	if (fProgressReporter == NULL)
++		return;
++
++	uint64 items = 0;
++	if (fLastItemsUncompressed &lt; fItemsUncompressed) {
++		items = fItemsUncompressed - fLastItemsUncompressed;
++		fLastItemsUncompressed = fItemsUncompressed;
+ 	}
++
++	off_t bytes = 0;
++	if (fLastBytesUncompressed &lt; fBytesUncompressed) {
++		bytes = fBytesUncompressed - fLastBytesUncompressed;
++		fLastBytesUncompressed = fBytesUncompressed;
++	}
++
++	fProgressReporter-&gt;ItemsWritten(items, bytes, item, targetFolder);
+ }
+
+Modified: haiku/trunk/src/apps/installer/UnzipEngine.h
+===================================================================
+--- haiku/trunk/src/apps/installer/UnzipEngine.h	2009-09-06 16:38:00 UTC (rev 32966)
++++ haiku/trunk/src/apps/installer/UnzipEngine.h	2009-09-06 17:23:31 UTC (rev 32967)
+@@ -15,14 +15,12 @@
+ #include &quot;HashMap.h&quot;
+ #include &quot;HashString.h&quot;
+ 
+-class BMessage;
+-class BMessenger;
++class ProgressReporter;
+ 
+ 
+ class UnzipEngine : private BCommandPipe::LineReader {
+ public:
+-								UnzipEngine(const BMessenger&amp; messenger,
+-									BMessage* message,
++								UnzipEngine(ProgressReporter* reporter,
+ 									sem_id cancelSemaphore = -1);
+ 	virtual						~UnzipEngine();
+ 
+@@ -59,11 +57,12 @@
+ 
+ 			off_t				fBytesToUncompress;
+ 			off_t				fBytesUncompressed;
++			off_t				fLastBytesUncompressed;
+ 			uint64				fItemsToUncompress;
+ 			uint64				fItemsUncompressed;
++			uint64				fLastItemsUncompressed;
+ 
+-			BMessenger			fMessenger;
+-			BMessage*			fMessage;
++			ProgressReporter*	fProgressReporter;
+ 			sem_id				fCancelSemaphore;
+ };
+ 
+
+Modified: haiku/trunk/src/apps/installer/WorkerThread.cpp
+===================================================================
+--- haiku/trunk/src/apps/installer/WorkerThread.cpp	2009-09-06 16:38:00 UTC (rev 32966)
++++ haiku/trunk/src/apps/installer/WorkerThread.cpp	2009-09-06 17:23:31 UTC (rev 32967)
+@@ -27,6 +27,7 @@
+ #include &quot;InstallerWindow.h&quot;
+ #include &quot;PackageViews.h&quot;
+ #include &quot;PartitionMenuItem.h&quot;
++#include &quot;ProgressReporter.h&quot;
+ #include &quot;UnzipEngine.h&quot;
+ 
+ 
+@@ -251,7 +252,9 @@
+ 	entry_ref testRef;
+ 
+ 	BMessenger messenger(fWindow);
+-	CopyEngine engine(messenger, new BMessage(MSG_STATUS_MESSAGE));
++	ProgressReporter reporter(messenger, new BMessage(MSG_STATUS_MESSAGE));
++	CopyEngine engine(&amp;reporter);
++	BList unzipEngines;
+ 
+ 	PartitionMenuItem* targetItem = (PartitionMenuItem*)targetMenu-&gt;FindMarked();
+ 	PartitionMenuItem* srcItem = (PartitionMenuItem*)srcMenu-&gt;FindMarked();
+@@ -397,6 +400,7 @@
+ 		goto error;
+ 	}
+ 
++	// Begin actuall installation
+ 
+ 	_LaunchInitScript(targetDirectory);
+ 
+@@ -419,6 +423,14 @@
+ 		}
+ 	}
+ 
++	// collect information about all zip packages
++	err = _ProcessZipPackages(srcDirectory.Path(), targetDirectory.Path(),
++		&amp;reporter, unzipEngines);
++	if (err != B_OK)
++		goto error;
++
++	reporter.StartTimer();
++
+ 	// copy source volume
+ 	err = engine.CopyFolder(srcDirectory.Path(), targetDirectory.Path(),
+ 		fCancelSemaphore);
+@@ -439,37 +451,17 @@
+ 		}
+ 	}
+ 
+-#if 0
+-	// extract zip packages
+-	// TODO: Put those in the optional packages list view
+-	// TODO: Implement mechanism to handle dependencies between these
+-	// packages. (Selecting one will auto-select others.)
+-	{
+-		BPath pkgRootDir(srcDirectory.Path(), PACKAGES_DIRECTORY);
+-		BDirectory directory(pkgRootDir.Path());
+-		BEntry entry;
+-		while (directory.GetNextEntry(&amp;entry) == B_OK) {
+-			char name[B_FILE_NAME_LENGTH];
+-			if (entry.GetName(name) != B_OK)
+-				continue;
+-			int nameLength = strlen(name);
+-			if (nameLength &lt;= 0)
+-				continue;
+-			char* nameExtension = name + nameLength - 4;
+-printf(&quot;inspecting %s (%s)\n&quot;, name, nameExtension);
+-			if (strcasecmp(nameExtension, &quot;.zip&quot;) != 0)
+-				continue;
+-			printf(&quot;found .zip package: %s\n&quot;, name);
+-
+-			UnzipEngine unzipEngine(messenger, new BMessage(MSG_STATUS_MESSAGE),
+-				fCancelSemaphore);
+-			BPath path;
+-			entry.GetPath(&amp;path);
+-			unzipEngine.SetTo(path.Path(), targetDirectory.Path());
+-			unzipEngine.UnzipPackage();
+-		}
++	// Extract all zip packages. If an error occured, delete the rest of
++	// the engines, but stop extracting.
++	for (int32 i = 0; i &lt; unzipEngines.CountItems(); i++) {
++		UnzipEngine* engine = reinterpret_cast&lt;UnzipEngine*&gt;(
++			unzipEngines.ItemAtFast(i));
++		if (err == B_OK)
++			err = engine-&gt;UnzipPackage();
++		delete engine;
+ 	}
+-#endif
++	if (err != B_OK)
++		goto error;
+ 
+ 	_LaunchFinishScript(targetDirectory);
+ 
+@@ -487,6 +479,48 @@
+ }
+ 
+ 
++status_t
++WorkerThread::_ProcessZipPackages(const char* sourcePath,
++	const char* targetPath, ProgressReporter* reporter, BList&amp; unzipEngines)
++{
++	// TODO: Put those in the optional packages list view
++	// TODO: Implement mechanism to handle dependencies between these
++	// packages. (Selecting one will auto-select others.)
++	BPath pkgRootDir(sourcePath, PACKAGES_DIRECTORY);
++	BDirectory directory(pkgRootDir.Path());
++	BEntry entry;
++	while (directory.GetNextEntry(&amp;entry) == B_OK) {
++		char name[B_FILE_NAME_LENGTH];
++		if (entry.GetName(name) != B_OK)
++			continue;
++		int nameLength = strlen(name);
++		if (nameLength &lt;= 0)
++			continue;
++		char* nameExtension = name + nameLength - 4;
++		if (strcasecmp(nameExtension, &quot;.zip&quot;) != 0)
++			continue;
++		printf(&quot;found .zip package: %s\n&quot;, name);
++
++		UnzipEngine* unzipEngine = new(std::nothrow) UnzipEngine(reporter,
++			fCancelSemaphore);
++		if (unzipEngine == NULL || !unzipEngines.AddItem(unzipEngine)) {
++			delete unzipEngine;
++			return B_NO_MEMORY;
++		}
++		BPath path;
++		entry.GetPath(&amp;path);
++		status_t ret = unzipEngine-&gt;SetTo(path.Path(), targetPath);
++		if (ret != B_OK)
++			return ret;
++
++		reporter-&gt;AddItems(unzipEngine-&gt;ItemsToUncompress(),
++			unzipEngine-&gt;BytesToUncompress());
++	}
++
++	return B_OK;
++}
++
++
+ void
+ WorkerThread::_SetStatusMessage(const char *status)
+ {
+
+Modified: haiku/trunk/src/apps/installer/WorkerThread.h
+===================================================================
+--- haiku/trunk/src/apps/installer/WorkerThread.h	2009-09-06 16:38:00 UTC (rev 32966)
++++ haiku/trunk/src/apps/installer/WorkerThread.h	2009-09-06 17:23:31 UTC (rev 32967)
+@@ -16,6 +16,7 @@
+ class BList;
+ class BMenu;
+ class InstallerWindow;
++class ProgressReporter;
+ 
+ class WorkerThread : public BLooper {
+ public:
+@@ -41,7 +42,12 @@
+ 			void				_LaunchInitScript(BPath&amp; path);
+ 			void				_LaunchFinishScript(BPath&amp; path);
+ 
+-			void				_PerformInstall(BMenu* srcMenu, BMenu* dstMenu);
++			void				_PerformInstall(BMenu* srcMenu,
++									BMenu* dstMenu);
++			status_t			_ProcessZipPackages(const char* sourcePath,
++									const char* targetPath,
++									ProgressReporter* reporter,
++									BList&amp; unzipEngines);
+ 
+ 			void				_SetStatusMessage(const char* status);
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020411.html">[Haiku-commits] r32966 - haiku/trunk/src/apps/people
+</A></li>
+	<LI>Next message: <A HREF="020414.html">[Haiku-commits] r32968 - in haiku/trunk/docs/userguide: en	en/applications images images/gui-images
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20412">[ date ]</a>
+              <a href="thread.html#20412">[ thread ]</a>
+              <a href="subject.html#20412">[ subject ]</a>
+              <a href="author.html#20412">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

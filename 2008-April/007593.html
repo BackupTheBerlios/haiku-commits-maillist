@@ -1,0 +1,292 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24870 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24870%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200804091104.m39B4R0b020240%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007592.html">
+   <LINK REL="Next"  HREF="007594.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24870 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24870%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200804091104.m39B4R0b020240%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24870 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Apr  9 13:04:27 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007592.html">[Haiku-commits] r24869 - in haiku/trunk: headers/os/interface	headers/private/interface src/kits/app src/kits/game	src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="007594.html">[Haiku-commits] r24871 - in haiku/trunk: headers/os/drivers	src/system/kernel src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7593">[ date ]</a>
+              <a href="thread.html#7593">[ thread ]</a>
+              <a href="subject.html#7593">[ subject ]</a>
+              <a href="author.html#7593">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-04-09 13:04:26 +0200 (Wed, 09 Apr 2008)
+New Revision: 24870
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24870&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24870&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/block_cache.cpp
+Log:
+* block_cache_sync[_etc]() now also waits for all notifications to be handled.
+  This fixes a potential problem where a volume would be left marked dirty on
+  a clean reboot as reported by Vasilis; no harm would have been done to the
+  data on the volume, though (it would just replay a log entry that it didn't
+  need to).
+* Unified the naming of the notifier/writer thread: renamed the thread to &quot;block
+  notifier/writer&quot;, and the variable holding the thread ID to
+  sNotifierWriterThread.
+* Added a few more doxygen descriptions to the private functions.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-04-09 10:07:35 UTC (rev 24869)
++++ haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-04-09 11:04:26 UTC (rev 24870)
+@@ -31,7 +31,6 @@
+ //	   just read and write single blocks.
+ //	2) the locking could be improved; getting a block should not need to
+ //	   wait for blocks to be written
+-//	3) dirty blocks are only written back if asked for
+ // TODO: the retrieval/copy of the original data could be delayed until the
+ //		new data must be written, ie. in low memory situations.
+ 
+@@ -287,7 +286,7 @@
+ static mutex sCachesLock;
+ static sem_id sEventSemaphore;
+ static mutex sNotificationsLock;
+-static thread_id sWriterNotifyThread;
++static thread_id sNotifierWriterThread;
+ static DoublyLinkedListLink&lt;block_cache&gt; sMarkCache;
+ 	// TODO: this only works if the link is the first entry of block_cache
+ static object_cache *sBlockCache;
+@@ -296,6 +295,7 @@
+ //	#pragma mark - notifications/listener
+ 
+ 
++/*!	Checks wether or not this is an event that closes a transaction. */
+ static inline bool
+ is_closing_event(int32 event)
+ {
+@@ -310,6 +310,10 @@
+ }
+ 
+ 
++/*!	From the specified \a notification, it will remove the lowest pending
++	event, and return that one in \a _event.
++	If there is no pending event anymore, it will return \c false.
++*/
+ static bool
+ get_next_pending_event(cache_notification *notification, int32 *_event)
+ {
+@@ -329,6 +333,7 @@
+ }
+ 
+ 
++/*!	Initializes the \a notification as specified. */
+ static void
+ set_notification(cache_transaction *transaction,
+ 	cache_notification &amp;notification, int32 events,
+@@ -661,7 +666,7 @@
+ }
+ 
+ 
+-//! Should be called with the cache's lock held.
++/*! Should be called with the cache's lock held. */
+ block_cache::~block_cache()
+ {
+ 	deleting = true;
+@@ -871,6 +876,11 @@
+ //	#pragma mark - private block functions
+ 
+ 
++/*!	Removes a reference from the specified \a block. If this was the last
++	reference, the block is moved into the unused list.
++	In low memory situations, it will also free some blocks from that list,
++	but not necessarily the \a block it just released.
++*/
+ static void
+ put_cached_block(block_cache *cache, cached_block *block)
+ {
+@@ -941,8 +951,7 @@
+ }
+ 
+ 
+-/*!
+-	Retrieves the block \a blockNumber from the hash table, if it's already
++/*!	Retrieves the block \a blockNumber from the hash table, if it's already
+ 	there, or reads it from the disk.
+ 
+ 	\param _allocated tells you wether or not a new block has been allocated
+@@ -1002,8 +1011,7 @@
+ }
+ 
+ 
+-/*!
+-	Returns the writable block data for the requested blockNumber.
++/*!	Returns the writable block data for the requested blockNumber.
+ 	If \a cleared is true, the block is not read from disk; an empty block
+ 	is returned.
+ 
+@@ -1115,6 +1123,12 @@
+ }
+ 
+ 
++/*!	Writes the specified \a block back to disk. It will always only write back
++	the oldest change of the block if it is part of more than one transaction.
++	It will automatically send out TRANSACTION_WRITTEN notices, as well as
++	delete transactions when they are no longer used, and \a deleteTransaction
++	is \c true.
++*/
+ static status_t
+ write_cached_block(block_cache *cache, cached_block *block,
+ 	bool deleteTransaction)
+@@ -1178,6 +1192,7 @@
+ 
+ 
+ #ifdef DEBUG_BLOCK_CACHE
++
+ static void
+ dump_block(cached_block *block)
+ {
+@@ -1427,9 +1442,16 @@
+ 
+ 	return 0;
+ }
++
+ #endif	// DEBUG_BLOCK_CACHE
+ 
+ 
++/*!	Traverses through the block_cache list, and returns one cache after the
++	other. The cache returned is automatically locked when you get it, and
++	unlocked with the next call to this function. Ignores caches that are in
++	deletion state.
++	Returns \c NULL when the end of the list is reached.
++*/
+ static block_cache *
+ get_next_locked_block_cache(block_cache *last)
+ {
+@@ -1472,6 +1494,10 @@
+ }
+ 
+ 
++/*!	Background thread that continuously checks for pending notifications of
++	all caches.
++	Every two seconds, it will also write back up to 64 blocks per cache.
++*/
+ static status_t
+ block_notifier_and_writer(void *)
+ {
+@@ -1556,6 +1582,7 @@
+ }
+ 
+ 
++/*!	Notify function for wait_for_notifications(). */
+ static void
+ notify_sync(int32 transactionID, int32 event, void *_cache)
+ {
+@@ -1565,10 +1592,14 @@
+ }
+ 
+ 
++/*!	Waits until all pending notifications are carried out.
++	Safe to be called from the block writer/notifier thread.
++	You must not hold the \a cache lock when calling this function.
++*/
+ static void
+ wait_for_notifications(block_cache *cache)
+ {
+-	if (find_thread(NULL) == sWriterNotifyThread) {
++	if (find_thread(NULL) == sNotifierWriterThread) {
+ 		// We're the notifier thread, don't wait, but flush all pending
+ 		// notifications directly.
+ 		flush_pending_notifications(cache);
+@@ -1608,10 +1639,10 @@
+ 	if (sEventSemaphore &lt; B_OK)
+ 		return sEventSemaphore;
+ 
+-	sWriterNotifyThread = spawn_kernel_thread(&amp;block_notifier_and_writer,
+-		&quot;block writer/notifier&quot;, B_LOW_PRIORITY, NULL);
+-	if (sWriterNotifyThread &gt;= B_OK)
+-		send_signal_etc(sWriterNotifyThread, SIGCONT, B_DO_NOT_RESCHEDULE);
++	sNotifierWriterThread = spawn_kernel_thread(&amp;block_notifier_and_writer,
++		&quot;block notifier/writer&quot;, B_LOW_PRIORITY, NULL);
++	if (sNotifierWriterThread &gt;= B_OK)
++		send_signal_etc(sNotifierWriterThread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 
+ #ifdef DEBUG_BLOCK_CACHE
+ 	add_debugger_command_etc(&quot;block_caches&quot;, &amp;dump_caches,
+@@ -2229,6 +2260,11 @@
+ 	}
+ 
+ 	hash_close(cache-&gt;hash, &amp;iterator, false);
++	locker.Unlock();
++
++	wait_for_notifications(cache);
++		// make sure that all pending TRANSACTION_WRITTEN notifications
++		// are handled after we return
+ 	return B_OK;
+ }
+ 
+@@ -2265,6 +2301,11 @@
+ 		}
+ 	}
+ 
++	locker.Unlock();
++
++	wait_for_notifications(cache);
++		// make sure that all pending TRANSACTION_WRITTEN notifications
++		// are handled after we return
+ 	return B_OK;
+ }
+ 
+@@ -2359,8 +2400,7 @@
+ }
+ 
+ 
+-/*!
+-	Changes the internal status of a writable block to \a dirty. This can be
++/*!	Changes the internal status of a writable block to \a dirty. This can be
+ 	helpful in case you realize you don't need to change that block anymore
+ 	for whatever reason.
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007592.html">[Haiku-commits] r24869 - in haiku/trunk: headers/os/interface	headers/private/interface src/kits/app src/kits/game	src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="007594.html">[Haiku-commits] r24871 - in haiku/trunk: headers/os/drivers	src/system/kernel src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7593">[ date ]</a>
+              <a href="thread.html#7593">[ thread ]</a>
+              <a href="subject.html#7593">[ subject ]</a>
+              <a href="author.html#7593">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

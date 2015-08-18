@@ -1,0 +1,287 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23344 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23344%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200801101609.m0AG9OUw014290%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005305.html">
+   <LINK REL="Next"  HREF="005306.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23344 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata</H1>
+    <B>marcusoverhagen at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23344%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200801101609.m0AG9OUw014290%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23344 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata">marcusoverhagen at mail.berlios.de
+       </A><BR>
+    <I>Thu Jan 10 17:09:24 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005305.html">[Haiku-commits] r23343 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="005306.html">[Haiku-commits] r23345 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5304">[ date ]</a>
+              <a href="thread.html#5304">[ thread ]</a>
+              <a href="subject.html#5304">[ subject ]</a>
+              <a href="author.html#5304">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: marcusoverhagen
+Date: 2008-01-10 17:09:24 +0100 (Thu, 10 Jan 2008)
+New Revision: 23344
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23344&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23344&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.c
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.h
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/Jamfile
+Log:
+New struct ata_request.
+Added ata_request as wrapper around scsi_ccb while they are executed in the ata stack.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/Jamfile
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/Jamfile	2008-01-10 16:04:57 UTC (rev 23343)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/Jamfile	2008-01-10 16:09:24 UTC (rev 23344)
+@@ -6,6 +6,7 @@
+ 
+ KernelAddon ide :
+ 	ata.c
++	ata_request.c
+ 	atapi.c
+ 	channels.c
+ 	devices.c
+
+Added: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.c	2008-01-10 16:04:57 UTC (rev 23343)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.c	2008-01-10 16:09:24 UTC (rev 23344)
+@@ -0,0 +1,153 @@
++
++#include &quot;ata_request.h&quot;
++#include &quot;ide_internal.h&quot;
++#include &quot;scsi_cmds.h&quot;
++#include &lt;string.h&gt;
++
++#define TRACE dprintf
++
++void
++ata_request_init(ata_request *request, struct ide_device_info *device)
++{
++	memset(request, 0, sizeof(request));
++	request-&gt;device = device;
++}
++
++
++/* Start the request, but don't clear sense to allow 
++ * retrieving the previous sense data.
++ */
++void ata_request_start(ata_request **_request, struct ide_device_info *device, struct scsi_ccb *ccb)
++{
++	ata_request *request;
++
++	IDE_LOCK(device-&gt;bus);
++	if (device-&gt;bus-&gt;state != ata_state_idle) {
++		request = NULL;
++	} else {
++		ASSERT(device-&gt;requestFree != NULL);
++		ASSERT(device-&gt;requestActive == NULL);
++		ASSERT(device-&gt;bus-&gt;active_device == NULL);
++
++		device-&gt;bus-&gt;state = ata_state_busy;
++		device-&gt;bus-&gt;active_device = device;
++
++		request = device-&gt;requestFree;
++		device-&gt;requestActive = request;
++		device-&gt;requestFree = NULL;
++	}
++	IDE_UNLOCK(device-&gt;bus);
++
++	*_request = request;
++
++	if (!request)
++		return; // bus was busy
++
++	ASSERT(request-&gt;device == device);
++
++	request-&gt;ccb = ccb;
++	request-&gt;is_write = 0;
++	request-&gt;uses_dma = 0;
++	request-&gt;packet_irq = 0;
++
++	ASSERT(request-&gt;ccb-&gt;subsys_status == SCSI_REQ_INPROG);
++
++	// pretend success
++	request-&gt;ccb-&gt;subsys_status = SCSI_REQ_CMP;
++
++	// device_status always remains set to SCSI_STATUS_GOOD
++	// except when ata_request_set_checkcondition() is called.
++	request-&gt;ccb-&gt;device_status = SCSI_STATUS_GOOD;
++}
++
++
++void
++ata_request_clear_sense(ata_request *request)
++{
++	request-&gt;senseKey = 0;
++	request-&gt;senseAsc = 0;
++	request-&gt;senseAscq = 0;
++}
++
++
++void
++ata_request_set_status(ata_request *request, uint8 status)
++{
++	ASSERT(status != SCSI_REQ_CMP);
++	request-&gt;ccb-&gt;subsys_status = status;
++}
++
++
++void
++ata_request_set_sense(ata_request *request, uint8 key, uint16 asc_acq)
++{
++	request-&gt;senseKey = key;
++	request-&gt;senseAsc = asc_acq &gt;&gt; 8;
++	request-&gt;senseAscq = asc_acq &amp; 0xff;
++}
++
++
++void
++ata_request_finish(ata_request *request, bool resubmit)
++{
++	scsi_ccb *ccb;
++
++	TRACE(&quot;ata_request_finish: request %p, subsys_status 0x%02x, senseKey %02x\n&quot;,
++		request, request-&gt;ccb-&gt;subsys_status, request-&gt;senseKey);
++
++	// when the request completed and has set sense
++    // data, report this to the scsci stack by setting 
++    // CHECK CONDITION status
++	if (request-&gt;ccb-&gt;subsys_status == SCSI_REQ_CMP &amp;&amp; request-&gt;senseKey != 0) {
++	
++		TRACE(&quot;ata_request_finish - setting check condition\n&quot;);
++
++		request-&gt;ccb-&gt;subsys_status = SCSI_REQ_CMP_ERR;
++		request-&gt;ccb-&gt;device_status = SCSI_STATUS_CHECK_CONDITION;
++
++		// copy sense data if caller requested it
++		if ((request-&gt;ccb-&gt;flags &amp; SCSI_DIS_AUTOSENSE) == 0) {
++			scsi_sense sense;
++			int sense_len;
++
++			TRACE(&quot;ata_request_finish - copying autosense data\n&quot;);
++
++			// we cannot copy sense directly as sense buffer may be too small
++			scsi_set_sense(&amp;sense, request);
++
++			ASSERT(sizeof(*request-&gt;ccb-&gt;sense) == SCSI_MAX_SENSE_SIZE);
++
++			sense_len = min(sizeof(*request-&gt;ccb-&gt;sense), sizeof(sense));
++
++			memcpy(request-&gt;ccb-&gt;sense, &amp;sense, sense_len);
++			request-&gt;ccb-&gt;sense_resid = SCSI_MAX_SENSE_SIZE - sense_len;
++			request-&gt;ccb-&gt;subsys_status |= SCSI_AUTOSNS_VALID;
++
++			// device sense gets reset once it's read
++			ata_request_clear_sense(request);
++
++			ASSERT(request-&gt;ccb-&gt;subsys_status == SCSI_REQ_CMP_ERR);
++			ASSERT(request-&gt;ccb-&gt;device_status == SCSI_STATUS_CHECK_CONDITION);
++		}
++	}
++
++	ccb = request-&gt;ccb;
++
++	IDE_LOCK(request-&gt;device-&gt;bus);
++	ASSERT(request-&gt;device-&gt;bus-&gt;state == ata_state_busy);
++	ASSERT(request-&gt;device-&gt;bus-&gt;active_device == request-&gt;device);
++	ASSERT(request-&gt;device-&gt;requestActive == request);
++	ASSERT(request-&gt;device-&gt;requestFree == NULL);
++	request-&gt;device-&gt;bus-&gt;state = ata_state_idle;
++	request-&gt;device-&gt;bus-&gt;active_device = NULL;
++	request-&gt;device-&gt;requestActive = NULL;
++	request-&gt;device-&gt;requestFree = request;
++	IDE_UNLOCK(request-&gt;device-&gt;bus);
++
++	ACQUIRE_BEN(&amp;request-&gt;device-&gt;bus-&gt;status_report_ben);
++	if (resubmit)
++		scsi-&gt;resubmit(ccb);
++	else
++		scsi-&gt;finished(ccb, 1);
++	RELEASE_BEN(&amp;request-&gt;device-&gt;bus-&gt;status_report_ben);
++}
+
+Added: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.h	2008-01-10 16:04:57 UTC (rev 23343)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.h	2008-01-10 16:09:24 UTC (rev 23344)
+@@ -0,0 +1,33 @@
++/*
++ * Copyright 2008 Marcus Overhagen. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _ATA_REQUEST_H
++#define _ATA_REQUEST_H
++
++#include &lt;SupportDefs.h&gt;
++
++typedef struct ata_request {
++
++	struct ide_device_info *	device;
++	struct scsi_ccb *			ccb;				// basic scsi request
++	uint8 						is_write : 1;		// true for write request
++	uint8 						uses_dma : 1;		// true if using dma
++	uint8 						packet_irq : 1;		// true if waiting for command packet irq
++
++	uint8						senseKey;
++	uint8						senseAsc;
++	uint8						senseAscq;
++} ata_request;
++
++struct scsi_ccb;
++struct ide_device_info;
++
++void ata_request_init(ata_request *request, struct ide_device_info *device);
++void ata_request_start(ata_request **_request, struct ide_device_info *device, struct scsi_ccb *ccb);
++void ata_request_clear_sense(ata_request *request);
++void ata_request_set_status(ata_request *request, uint8 status);
++void ata_request_set_sense(ata_request *request, uint8 key, uint16 asc_acq);
++void ata_request_finish(ata_request *request, bool resubmit);
++
++#endif
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005305.html">[Haiku-commits] r23343 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="005306.html">[Haiku-commits] r23345 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5304">[ date ]</a>
+              <a href="thread.html#5304">[ thread ]</a>
+              <a href="subject.html#5304">[ subject ]</a>
+              <a href="author.html#5304">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,270 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31843 -	haiku/trunk/src/add-ons/kernel/file_systems/fat
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31843%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/fat&In-Reply-To=%3C200907281306.n6SD6SdH006003%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018361.html">
+   <LINK REL="Next"  HREF="018363.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31843 -	haiku/trunk/src/add-ons/kernel/file_systems/fat</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31843%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/fat&In-Reply-To=%3C200907281306.n6SD6SdH006003%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31843 -	haiku/trunk/src/add-ons/kernel/file_systems/fat">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Jul 28 15:06:28 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018361.html">[Haiku-commits] r31842 - in haiku/trunk: headers/os/interface	src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="018363.html">[Haiku-commits] r31843 - haiku/trunk/src/add-ons/kernel/file_systems/fat
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18362">[ date ]</a>
+              <a href="thread.html#18362">[ thread ]</a>
+              <a href="subject.html#18362">[ subject ]</a>
+              <a href="author.html#18362">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-07-28 15:06:27 +0200 (Tue, 28 Jul 2009)
+New Revision: 31843
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31843&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31843&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/fat/dosfs.h
+   haiku/trunk/src/add-ons/kernel/file_systems/fat/vcache.c
+   haiku/trunk/src/add-ons/kernel/file_systems/fat/vcache.h
+Log:
+* vcache is now using an rw_lock instead of a semaphore.
+* Got rid of the lock typedef.
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/fat/dosfs.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/fat/dosfs.h	2009-07-28 12:33:47 UTC (rev 31842)
++++ haiku/trunk/src/add-ons/kernel/file_systems/fat/dosfs.h	2009-07-28 13:06:27 UTC (rev 31843)
+@@ -5,20 +5,19 @@
+ #ifndef _DOSFS_H_
+ #define _DOSFS_H_
+ 
++
+ #include &lt;KernelExport.h&gt;
+ #include &lt;fs_interface.h&gt;
+ #include &lt;lock.h&gt;
+ 
++
+ //#define DEBUG 1
+ 
+-typedef recursive_lock lock;
++
+ #define	LOCK(l)		recursive_lock_lock(&amp;l);
+ #define	UNLOCK(l)	recursive_lock_unlock(&amp;l);
+ 
+ 
+-/* for multiple reader/single writer locks */
+-#define READERS 100000
+-
+ /* Unfortunately, ino_t's are defined as signed. This causes problems with
+  * programs (notably cp) that use the modulo of a ino_t as a
+  * hash function to index an array. This means the high bit of every ino_t
+@@ -154,11 +153,11 @@
+ 
+ 	int		fs_flags;				// flags for this mount
+ 
+-	lock	vlock;					// volume lock
++	recursive_lock	vlock;					// volume lock
+ 
+ 	// vcache state
+ 	struct {
+-		sem_id	vc_sem;
++		rw_lock	lock;
+ 		ino_t	cur_vnid;
+ 		uint32	cache_size;
+ 		struct vcache_entry **by_vnid, **by_loc;
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/fat/vcache.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/fat/vcache.c	2009-07-28 12:33:47 UTC (rev 31842)
++++ haiku/trunk/src/add-ons/kernel/file_systems/fat/vcache.c	2009-07-28 13:06:27 UTC (rev 31843)
+@@ -36,31 +36,36 @@
+ purpose.
+ */
+ 
++
++#include &quot;vcache.h&quot;
++
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;stdlib.h&gt;
++
++#include &lt;KernelExport.h&gt;
++
++#include &quot;dosfs.h&quot;
++#include &quot;util.h&quot;
++
++
+ #define DPRINTF(a,b) if (debug_vcache &gt; (a)) dprintf b
+ 
+ #define LOCK_CACHE_R \
+-	acquire_sem(vol-&gt;vcache.vc_sem)
++	rw_lock_read_lock(&amp;vol-&gt;vcache.lock)
+ 
+ #define LOCK_CACHE_W \
+-	acquire_sem_etc(vol-&gt;vcache.vc_sem, READERS, 0, 0)
++	rw_lock_write_lock(&amp;vol-&gt;vcache.lock)
+ 
+ #define UNLOCK_CACHE_R \
+-	release_sem(vol-&gt;vcache.vc_sem)
++	rw_lock_read_unlock(&amp;vol-&gt;vcache.lock)
+ 
+ #define UNLOCK_CACHE_W \
+-	release_sem_etc(vol-&gt;vcache.vc_sem, READERS, 0)
++	rw_lock_write_unlock(&amp;vol-&gt;vcache.lock)
+ 
+-#include &lt;KernelExport.h&gt;
++#define hash(v) ((v) &amp; (vol-&gt;vcache.cache_size-1))
+ 
+-#include &lt;stdio.h&gt;
+-#include &lt;string.h&gt;
+-#include &lt;stdlib.h&gt;
+ 
+-#include &quot;dosfs.h&quot;
+-#include &quot;vcache.h&quot;
+-
+-#include &quot;util.h&quot;
+-
+ struct vcache_entry {
+ 	ino_t	vnid;		/* originally reported vnid */
+ 	ino_t	loc;		/* where the file is now */
+@@ -68,7 +73,9 @@
+ 	struct vcache_entry *next_loc;  /* next entry in location hash table */
+ };
+ 
+-void dump_vcache(nspace *vol)
++
++void
++dump_vcache(nspace *vol)
+ {
+ 	uint32 i;
+ 	struct vcache_entry *c;
+@@ -80,9 +87,9 @@
+ 			dprintf(&quot;%16Lx %16Lx\n&quot;, c-&gt;vnid, c-&gt;loc);
+ }
+ 
+-#define hash(v) ((v) &amp; (vol-&gt;vcache.cache_size-1))
+ 
+-status_t init_vcache(nspace *vol)
++status_t
++init_vcache(nspace *vol)
+ {
+ 	char name[16];
+ 	DPRINTF(0, (&quot;init_vcache called\n&quot;));
+@@ -93,12 +100,16 @@
+ #else
+ 	vol-&gt;vcache.cache_size = 512; /* must be power of 2 */
+ #endif
+-	vol-&gt;vcache.by_vnid = calloc(sizeof(struct vache_entry *), vol-&gt;vcache.cache_size);
++
++	vol-&gt;vcache.by_vnid = calloc(sizeof(struct vache_entry *),
++		vol-&gt;vcache.cache_size);
+ 	if (vol-&gt;vcache.by_vnid == NULL) {
+ 		dprintf(&quot;init_vcache: out of core\n&quot;);
+ 		return ENOMEM;
+ 	}
+-	vol-&gt;vcache.by_loc = calloc(sizeof(struct vache_entry *), vol-&gt;vcache.cache_size);
++
++	vol-&gt;vcache.by_loc = calloc(sizeof(struct vache_entry *),
++		vol-&gt;vcache.cache_size);
+ 	if (vol-&gt;vcache.by_loc == NULL) {
+ 		dprintf(&quot;init_vcache: out of core\n&quot;);
+ 		free(vol-&gt;vcache.by_vnid);
+@@ -107,13 +118,10 @@
+ 	}
+ 
+ 	sprintf(name, &quot;fat cache %lx&quot;, vol-&gt;id);
+-	if ((vol-&gt;vcache.vc_sem = create_sem(READERS, name)) &lt; 0) {
+-		free(vol-&gt;vcache.by_vnid); vol-&gt;vcache.by_vnid = NULL;
+-		free(vol-&gt;vcache.by_loc); vol-&gt;vcache.by_loc = NULL;
+-		return vol-&gt;vcache.vc_sem;
+-	}
++	rw_lock_init(&amp;vol-&gt;vcache.lock, &quot;fat cache&quot;);
+ 
+-	DPRINTF(0, (&quot;init_vcache: initialized vnid cache with %lx entries\n&quot;, vol-&gt;vcache.cache_size));
++	DPRINTF(0, (&quot;init_vcache: initialized vnid cache with %lx entries\n&quot;,
++		vol-&gt;vcache.cache_size));
+ 
+ 	return 0;
+ }
+@@ -129,7 +137,7 @@
+ 	LOCK_CACHE_W;
+ 
+ 	/* free entries */
+-	for (i=0;i&lt;vol-&gt;vcache.cache_size;i++) {
++	for (i = 0; i &lt; vol-&gt;vcache.cache_size; i++) {
+ 		c = vol-&gt;vcache.by_vnid[i];
+ 		while (c) {
+ 			count++;
+@@ -144,9 +152,8 @@
+ 	free(vol-&gt;vcache.by_vnid); vol-&gt;vcache.by_vnid = NULL;
+ 	free(vol-&gt;vcache.by_loc); vol-&gt;vcache.by_loc = NULL;
+ 
+-	delete_sem(vol-&gt;vcache.vc_sem);
+-
+-	return 0;
++	rw_lock_destroy(&amp;vol-&gt;vcache.lock);
++	return B_OK;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/fat/vcache.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/fat/vcache.h	2009-07-28 12:33:47 UTC (rev 31842)
++++ haiku/trunk/src/add-ons/kernel/file_systems/fat/vcache.h	2009-07-28 13:06:27 UTC (rev 31843)
+@@ -5,6 +5,10 @@
+ #ifndef _DOSFS_VCACHE_H_
+ #define _DOSFS_VCACHE_H_
+ 
++
++#include &quot;dosfs.h&quot;
++
++
+ void dump_vcache(nspace *vol);
+ 
+ status_t init_vcache(nspace *vol);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018361.html">[Haiku-commits] r31842 - in haiku/trunk: headers/os/interface	src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="018363.html">[Haiku-commits] r31843 - haiku/trunk/src/add-ons/kernel/file_systems/fat
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18362">[ date ]</a>
+              <a href="thread.html#18362">[ thread ]</a>
+              <a href="subject.html#18362">[ subject ]</a>
+              <a href="author.html#18362">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

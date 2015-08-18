@@ -1,0 +1,1095 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32894 - in haiku/trunk/src/system/libroot/posix: .	malloc_debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32894%20-%20in%20haiku/trunk/src/system/libroot/posix%3A%20.%0A%09malloc_debug&In-Reply-To=%3C200909011815.n81IFWOk027111%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020272.html">
+   <LINK REL="Next"  HREF="020281.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32894 - in haiku/trunk/src/system/libroot/posix: .	malloc_debug</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32894%20-%20in%20haiku/trunk/src/system/libroot/posix%3A%20.%0A%09malloc_debug&In-Reply-To=%3C200909011815.n81IFWOk027111%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32894 - in haiku/trunk/src/system/libroot/posix: .	malloc_debug">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Tue Sep  1 20:15:32 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020272.html">[Haiku-commits] r32893 -	haiku/trunk/headers/private/kernel/disk_device_manager
+</A></li>
+        <LI>Next message: <A HREF="020281.html">[Haiku-commits] r32894 - in	haiku/trunk/src/system/libroot/posix: . malloc_debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20274">[ date ]</a>
+              <a href="thread.html#20274">[ thread ]</a>
+              <a href="subject.html#20274">[ subject ]</a>
+              <a href="author.html#20274">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-09-01 20:15:30 +0200 (Tue, 01 Sep 2009)
+New Revision: 32894
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32894&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32894&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/libroot/posix/malloc_debug/
+   haiku/trunk/src/system/libroot/posix/malloc_debug/Jamfile
+   haiku/trunk/src/system/libroot/posix/malloc_debug/heap.cpp
+Modified:
+   haiku/trunk/src/system/libroot/posix/Jamfile
+Log:
+Ported over the kernel heap to libroot to make use of it's validation
+capabilities to aid in debugging memory corruption issues.
+
+It does:
+* Initialize memory to 0xcc to help turn up use of uninitialized memory
+* Set freed memory to 0xdeadbeef to help find accesses of freed memory
+* Use the paranoid heap validation to turn up many cases of memory corruption
+* Use a simplistic wall check to turn up memory overwrites past allocations
+* Take extra steps to validate freed addresses to turn up misaligned frees
+
+It has an interface to en-/disable paranoid validation and to start/stop regular
+wall checking. Both are currently just enabled. At a later stage a debug version
+of libroot could be used by an application and the checks enabled at will. Note
+that due to the paranoid validation and the suboptimal locking this allocator
+will perform horribly. Still to find memory corruption issues in the system or
+also in your applications it can be helpful to build your installation with it
+turned on. To enable it you currently need to edit the Jamfile to sub-include
+the malloc_debug instead of the malloc directory.
+
+
+Modified: haiku/trunk/src/system/libroot/posix/Jamfile
+===================================================================
+--- haiku/trunk/src/system/libroot/posix/Jamfile	2009-09-01 15:14:57 UTC (rev 32893)
++++ haiku/trunk/src/system/libroot/posix/Jamfile	2009-09-01 18:15:30 UTC (rev 32894)
+@@ -34,6 +34,7 @@
+ SubInclude HAIKU_TOP src system libroot posix crypt ;
+ SubInclude HAIKU_TOP src system libroot posix locale ;
+ SubInclude HAIKU_TOP src system libroot posix malloc ;
++#SubInclude HAIKU_TOP src system libroot posix malloc_debug ;
+ SubInclude HAIKU_TOP src system libroot posix pthread ;
+ SubInclude HAIKU_TOP src system libroot posix signal ;
+ SubInclude HAIKU_TOP src system libroot posix stdio ;
+
+Added: haiku/trunk/src/system/libroot/posix/malloc_debug/Jamfile
+===================================================================
+--- haiku/trunk/src/system/libroot/posix/malloc_debug/Jamfile	2009-09-01 15:14:57 UTC (rev 32893)
++++ haiku/trunk/src/system/libroot/posix/malloc_debug/Jamfile	2009-09-01 18:15:30 UTC (rev 32894)
+@@ -0,0 +1,7 @@
++SubDir HAIKU_TOP src system libroot posix malloc_debug ;
++
++UsePrivateSystemHeaders ;
++
++MergeObject posix_malloc.o :
++	heap.cpp 
++;
+
+Added: haiku/trunk/src/system/libroot/posix/malloc_debug/heap.cpp
+===================================================================
+--- haiku/trunk/src/system/libroot/posix/malloc_debug/heap.cpp	2009-09-01 15:14:57 UTC (rev 32893)
++++ haiku/trunk/src/system/libroot/posix/malloc_debug/heap.cpp	2009-09-01 18:15:30 UTC (rev 32894)
+@@ -0,0 +1,1753 @@
++/*
++ * Copyright 2008-2009, Michael Lotz, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">mmlr at mlotz.ch.</A>
++ * Distributed under the terms of the MIT License.
++ *
++ * Copyright 2002-2006, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Distributed under the terms of the MIT License.
++ *
++ * Copyright 2001, Travis Geiselbrecht. All rights reserved.
++ * Distributed under the terms of the NewOS License.
++ */
++
++#include &lt;malloc.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;stdlib.h&gt;
++
++#include &lt;syscalls.h&gt;
++
++#include &lt;Debug.h&gt;
++#include &lt;OS.h&gt;
++
++
++//#define TRACE_HEAP
++#ifdef TRACE_HEAP
++#	define INFO(x) printf x
++#else
++#	define INFO(x) ;
++#endif
++
++
++void
++panic(const char *format, ...)
++{
++	char buffer[1024];
++
++	va_list args;
++	va_start(args, format);
++	vsnprintf(buffer, sizeof(buffer), format, args);
++	va_end(args);
++
++	debugger(buffer);
++}
++
++
++class MutexLocker {
++public:
++	MutexLocker(sem_id lock)
++		:
++		fLock(lock)
++	{
++		Lock();
++	}
++
++	~MutexLocker()
++	{
++		if (fLocked)
++			Unlock();
++	}
++
++	void Lock()
++	{
++		fLocked = acquire_sem(fLock) == B_OK;
++	}
++
++	void Unlock()
++	{
++		fLocked = false;
++		release_sem(fLock);
++	}
++
++	sem_id	fLock;
++	bool	fLocked;
++};
++
++typedef MutexLocker ReadLocker;
++typedef MutexLocker WriteLocker;
++
++#define ROUNDUP(x, y)		(((x) + (y) - 1) / (y) * (y))
++
++#define HEAP_INITIAL_SIZE			1 * 1024 * 1024
++#define HEAP_GROW_SIZE				2 * 1024 * 1024
++#define HEAP_AREA_USE_THRESHOLD		1 * 1024 * 1024
++
++static bool sParanoidValidation = false;
++static thread_id sWallCheckThread = -1;
++static bool sStopWallChecking = false;
++
++typedef struct heap_leak_check_info_s {
++	size_t		size;
++	thread_id	thread;
++} heap_leak_check_info;
++
++typedef struct heap_page_s heap_page;
++
++typedef struct heap_area_s {
++	area_id			area;
++
++	addr_t			base;
++	size_t			size;
++
++	uint32			page_count;
++	uint32			free_page_count;
++
++	heap_page *		free_pages;
++	heap_page *		page_table;
++
++	heap_area_s *	prev;
++	heap_area_s *	next;
++	heap_area_s *	all_next;
++} heap_area;
++
++typedef struct heap_page_s {
++	heap_area *		area;
++	uint16			index;
++	uint16			bin_index : 5;
++	uint16			free_count : 10;
++	uint16			in_use : 1;
++	heap_page_s *	next;
++	heap_page_s *	prev;
++	union {
++		uint16			empty_index;
++		uint16			allocation_id; // used for bin == bin_count allocations
++	};
++	addr_t *		free_list;
++} heap_page;
++
++typedef struct heap_bin_s {
++	sem_id		lock;
++	uint32		element_size;
++	uint16		max_free_count;
++	heap_page *	page_list; // sorted so that the desired page is always first
++} heap_bin;
++
++typedef struct heap_allocator_s {
++	sem_id		area_lock;
++	sem_id		page_lock;
++
++	const char *name;
++	uint32		bin_count;
++	uint32		page_size;
++
++	uint32		total_pages;
++	uint32		total_free_pages;
++	uint32		empty_areas;
++
++	heap_bin *	bins;
++	heap_area *	areas; // sorted so that the desired area is always first
++	heap_area *	all_areas; // all areas including full ones
++} heap_allocator;
++
++static const uint32 kAreaAllocationMagic = 'AAMG';
++typedef struct area_allocation_info_s {
++	area_id		area;
++	void *		base;
++	uint32		magic;
++	size_t		size;
++	size_t		allocation_size;
++	size_t		allocation_alignment;
++	void *		allocation_base;
++} area_allocation_info;
++
++typedef struct heap_class_s {
++	const char *name;
++	uint32		initial_percentage;
++	size_t		max_allocation_size;
++	size_t		page_size;
++	size_t		min_bin_size;
++	size_t		bin_alignment;
++	uint32		min_count_per_page;
++	size_t		max_waste_per_page;
++} heap_class;
++
++// Heap class configuration
++#define HEAP_CLASS_COUNT 3
++static heap_class sHeapClasses[HEAP_CLASS_COUNT] = {
++	{
++		&quot;small&quot;,					/* name */
++		50,							/* initial percentage */
++		B_PAGE_SIZE / 8,			/* max allocation size */
++		B_PAGE_SIZE,				/* page size */
++		8,							/* min bin size */
++		4,							/* bin alignment */
++		8,							/* min count per page */
++		16							/* max waste per page */
++	},
++	{
++		&quot;medium&quot;,					/* name */
++		30,							/* initial percentage */
++		B_PAGE_SIZE * 2,			/* max allocation size */
++		B_PAGE_SIZE * 8,			/* page size */
++		B_PAGE_SIZE / 8,			/* min bin size */
++		32,							/* bin alignment */
++		4,							/* min count per page */
++		64							/* max waste per page */
++	},
++	{
++		&quot;large&quot;,					/* name */
++		20,							/* initial percentage */
++		HEAP_AREA_USE_THRESHOLD,	/* max allocation size */
++		B_PAGE_SIZE * 16,			/* page size */
++		B_PAGE_SIZE * 2,			/* min bin size */
++		128,						/* bin alignment */
++		1,							/* min count per page */
++		256							/* max waste per page */
++	}
++};
++
++static heap_allocator *sHeaps[HEAP_CLASS_COUNT];
++
++
++// #pragma mark - Debug functions
++
++
++static void
++dump_page(heap_page *page)
++{
++	uint32 count = 0;
++	for (addr_t *temp = page-&gt;free_list; temp != NULL; temp = (addr_t *)*temp)
++		count++;
++
++	printf(&quot;\t\tpage %p: bin_index: %u; free_count: %u; empty_index: %u; &quot;
++		&quot;free_list %p (%lu entr%s)\n&quot;, page, page-&gt;bin_index, page-&gt;free_count,
++		page-&gt;empty_index, page-&gt;free_list, count, count == 1 ? &quot;y&quot; : &quot;ies&quot;);
++}
++
++
++static void
++dump_bin(heap_bin *bin)
++{
++	printf(&quot;\telement_size: %lu; max_free_count: %u; page_list %p;\n&quot;,
++		bin-&gt;element_size, bin-&gt;max_free_count, bin-&gt;page_list);
++
++	for (heap_page *temp = bin-&gt;page_list; temp != NULL; temp = temp-&gt;next)
++		dump_page(temp);
++}
++
++
++static void
++dump_bin_list(heap_allocator *heap)
++{
++	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++)
++		dump_bin(&amp;heap-&gt;bins[i]);
++	printf(&quot;\n&quot;);
++}
++
++
++static void
++dump_allocator_areas(heap_allocator *heap)
++{
++	heap_area *area = heap-&gt;all_areas;
++	while (area) {
++		printf(&quot;\tarea %p: area: %ld; base: 0x%08lx; size: %lu; page_count: &quot;
++			&quot;%lu; free_pages: %p (%lu entr%s)\n&quot;, area, area-&gt;area, area-&gt;base,
++			area-&gt;size, area-&gt;page_count, area-&gt;free_pages,
++			area-&gt;free_page_count, area-&gt;free_page_count == 1 ? &quot;y&quot; : &quot;ies&quot;);
++		area = area-&gt;all_next;
++	}
++
++	printf(&quot;\n&quot;);
++}
++
++
++static void
++dump_allocator(heap_allocator *heap, bool areas, bool bins)
++{
++	printf(&quot;allocator %p: name: %s; page_size: %lu; bin_count: %lu; pages: &quot;
++		&quot;%lu; free_pages: %lu; empty_areas: %lu\n&quot;, heap, heap-&gt;name,
++		heap-&gt;page_size, heap-&gt;bin_count, heap-&gt;total_pages,
++		heap-&gt;total_free_pages, heap-&gt;empty_areas);
++
++	if (areas)
++		dump_allocator_areas(heap);
++	if (bins)
++		dump_bin_list(heap);
++}
++
++
++void
++dump_heap_list(int argc, char **argv)
++{
++	for (uint32 i = 0; i &lt; HEAP_CLASS_COUNT; i++)
++		dump_allocator(sHeaps[i], true, true);
++}
++
++
++void
++dump_allocations(bool statsOnly, thread_id thread)
++{
++	size_t totalSize = 0;
++	uint32 totalCount = 0;
++	for (uint32 classIndex = 0; classIndex &lt; HEAP_CLASS_COUNT; classIndex++) {
++		heap_allocator *heap = sHeaps[classIndex];
++
++		// go through all the pages in all the areas
++		heap_area *area = heap-&gt;all_areas;
++		while (area) {
++			heap_leak_check_info *info = NULL;
++			for (uint32 i = 0; i &lt; area-&gt;page_count; i++) {
++				heap_page *page = &amp;area-&gt;page_table[i];
++				if (!page-&gt;in_use)
++					continue;
++
++				addr_t base = area-&gt;base + i * heap-&gt;page_size;
++				if (page-&gt;bin_index &lt; heap-&gt;bin_count) {
++					// page is used by a small allocation bin
++					uint32 elementCount = page-&gt;empty_index;
++					size_t elementSize
++						= heap-&gt;bins[page-&gt;bin_index].element_size;
++					for (uint32 j = 0; j &lt; elementCount;
++							j++, base += elementSize) {
++						// walk the free list to see if this element is in use
++						bool elementInUse = true;
++						for (addr_t *temp = page-&gt;free_list; temp != NULL;
++								temp = (addr_t *)*temp) {
++							if ((addr_t)temp == base) {
++								elementInUse = false;
++								break;
++							}
++						}
++
++						if (!elementInUse)
++							continue;
++
++						info = (heap_leak_check_info *)(base + elementSize
++							- sizeof(heap_leak_check_info));
++
++						if (thread == -1 || info-&gt;thread == thread) {
++							// interesting...
++							if (!statsOnly) {
++								printf(&quot;thread: % 6ld; address: 0x%08lx;&quot;
++									&quot; size: %lu bytes\n&quot;, info-&gt;thread,
++									base, info-&gt;size);
++							}
++
++							totalSize += info-&gt;size;
++							totalCount++;
++						}
++					}
++				} else {
++					// page is used by a big allocation, find the page count
++					uint32 pageCount = 1;
++					while (i + pageCount &lt; area-&gt;page_count
++						&amp;&amp; area-&gt;page_table[i + pageCount].in_use
++						&amp;&amp; area-&gt;page_table[i + pageCount].bin_index
++							== heap-&gt;bin_count
++						&amp;&amp; area-&gt;page_table[i + pageCount].allocation_id
++							== page-&gt;allocation_id)
++						pageCount++;
++
++					info = (heap_leak_check_info *)(base + pageCount
++						* heap-&gt;page_size - sizeof(heap_leak_check_info));
++
++					if (thread == -1 || info-&gt;thread == thread) {
++						// interesting...
++						if (!statsOnly) {
++							printf(&quot;thread: % 6ld; address: 0x%08lx;&quot;
++								&quot; size: %lu bytes\n&quot;, info-&gt;thread,
++								base, info-&gt;size);
++						}
++
++						totalSize += info-&gt;size;
++						totalCount++;
++					}
++
++					// skip the allocated pages
++					i += pageCount - 1;
++				}
++			}
++
++			area = area-&gt;all_next;
++		}
++	}
++
++	printf(&quot;total allocations: %lu; total bytes: %lu\n&quot;, totalCount, totalSize);
++}
++
++
++void
++heap_validate_walls()
++{
++	for (uint32 classIndex = 0; classIndex &lt; HEAP_CLASS_COUNT; classIndex++) {
++		heap_allocator *heap = sHeaps[classIndex];
++		ReadLocker areaReadLocker(heap-&gt;area_lock);
++		for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++)
++			acquire_sem(heap-&gt;bins[i].lock);
++		MutexLocker pageLocker(heap-&gt;page_lock);
++
++		// go through all the pages in all the areas
++		heap_area *area = heap-&gt;all_areas;
++		while (area) {
++			heap_leak_check_info *info = NULL;
++			for (uint32 i = 0; i &lt; area-&gt;page_count; i++) {
++				heap_page *page = &amp;area-&gt;page_table[i];
++				if (!page-&gt;in_use)
++					continue;
++
++				addr_t base = area-&gt;base + i * heap-&gt;page_size;
++				if (page-&gt;bin_index &lt; heap-&gt;bin_count) {
++					// page is used by a small allocation bin
++					uint32 elementCount = page-&gt;empty_index;
++					size_t elementSize
++						= heap-&gt;bins[page-&gt;bin_index].element_size;
++					for (uint32 j = 0; j &lt; elementCount;
++							j++, base += elementSize) {
++						// walk the free list to see if this element is in use
++						bool elementInUse = true;
++						for (addr_t *temp = page-&gt;free_list; temp != NULL;
++								temp = (addr_t *)*temp) {
++							if ((addr_t)temp == base) {
++								elementInUse = false;
++								break;
++							}
++						}
++
++						if (!elementInUse)
++							continue;
++
++						info = (heap_leak_check_info *)(base + elementSize
++							- sizeof(heap_leak_check_info));
++						if (info-&gt;size &gt; elementSize - sizeof(addr_t)
++								- sizeof(heap_leak_check_info)) {
++							panic(&quot;leak check info has invalid size %lu for&quot;
++								&quot; element size %lu\n&quot;, info-&gt;size, elementSize);
++							continue;
++						}
++
++						addr_t wallValue;
++						addr_t wallAddress = base + info-&gt;size;
++						memcpy(&amp;wallValue, (void *)wallAddress, sizeof(addr_t));
++						if (wallValue != wallAddress) {
++							panic(&quot;someone wrote beyond small allocation at&quot;
++								&quot; 0x%08lx; size: %lu bytes; allocated by %ld;&quot;
++								&quot; value: 0x%08lx\n&quot;, base, info-&gt;size,
++								info-&gt;thread, wallValue);
++						}
++					}
++				} else {
++					// page is used by a big allocation, find the page count
++					uint32 pageCount = 1;
++					while (i + pageCount &lt; area-&gt;page_count
++						&amp;&amp; area-&gt;page_table[i + pageCount].in_use
++						&amp;&amp; area-&gt;page_table[i + pageCount].bin_index
++							== heap-&gt;bin_count
++						&amp;&amp; area-&gt;page_table[i + pageCount].allocation_id
++							== page-&gt;allocation_id)
++						pageCount++;
++
++					info = (heap_leak_check_info *)(base + pageCount
++						* heap-&gt;page_size - sizeof(heap_leak_check_info));
++
++					if (info-&gt;size &gt; pageCount * heap-&gt;page_size
++							- sizeof(addr_t) - sizeof(heap_leak_check_info)) {
++						panic(&quot;leak check info has invalid size %lu for&quot;
++							&quot; page count %lu (%lu bytes)\n&quot;, info-&gt;size,
++							pageCount, pageCount * heap-&gt;page_size);
++						continue;
++					}
++
++					addr_t wallValue;
++					addr_t wallAddress = base + info-&gt;size;
++					memcpy(&amp;wallValue, (void *)wallAddress, sizeof(addr_t));
++					if (wallValue != wallAddress) {
++						panic(&quot;someone wrote beyond big allocation at 0x%08lx;&quot;
++							&quot; size: %lu bytes; allocated by %ld;&quot;
++							&quot; value: 0x%08lx\n&quot;, base, info-&gt;size,
++							info-&gt;thread, wallValue);
++					}
++
++					// skip the allocated pages
++					i += pageCount - 1;
++				}
++			}
++
++			area = area-&gt;all_next;
++		}
++
++		pageLocker.Unlock();
++		for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++)
++			release_sem(heap-&gt;bins[i].lock);
++	}
++}
++
++
++static void
++heap_validate_heap(heap_allocator *heap)
++{
++	ReadLocker areaReadLocker(heap-&gt;area_lock);
++	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++)
++		acquire_sem(heap-&gt;bins[i].lock);
++	MutexLocker pageLocker(heap-&gt;page_lock);
++
++	uint32 totalPageCount = 0;
++	uint32 totalFreePageCount = 0;
++	heap_area *area = heap-&gt;all_areas;
++	while (area != NULL) {
++		// validate the free pages list
++		uint32 freePageCount = 0;
++		heap_page *lastPage = NULL;
++		heap_page *page = area-&gt;free_pages;
++		while (page) {
++			if ((addr_t)page &lt; (addr_t)&amp;area-&gt;page_table[0]
++				|| (addr_t)page &gt;= (addr_t)&amp;area-&gt;page_table[area-&gt;page_count])
++				panic(&quot;free page is not part of the page table\n&quot;);
++
++			if (page-&gt;index &gt;= area-&gt;page_count)
++				panic(&quot;free page has invalid index\n&quot;);
++
++			if ((addr_t)&amp;area-&gt;page_table[page-&gt;index] != (addr_t)page)
++				panic(&quot;free page index does not lead to target page\n&quot;);
++
++			if (page-&gt;prev != lastPage)
++				panic(&quot;free page entry has invalid prev link\n&quot;);
++
++			if (page-&gt;in_use)
++				panic(&quot;free page marked as in use\n&quot;);
++
++			lastPage = page;
++			page = page-&gt;next;
++			freePageCount++;
++		}
++
++		totalPageCount += freePageCount;
++		totalFreePageCount += freePageCount;
++		if (area-&gt;free_page_count != freePageCount) {
++			panic(&quot;free page count %ld doesn't match free page list %ld\n&quot;,
++				area-&gt;free_page_count, freePageCount);
++		}
++
++		// validate the page table
++		uint32 usedPageCount = 0;
++		for (uint32 i = 0; i &lt; area-&gt;page_count; i++) {
++			if (area-&gt;page_table[i].in_use)
++				usedPageCount++;
++		}
++
++		totalPageCount += usedPageCount;
++		if (freePageCount + usedPageCount != area-&gt;page_count) {
++			panic(&quot;free pages and used pages do not add up (%lu + %lu != %lu)\n&quot;,
++				freePageCount, usedPageCount, area-&gt;page_count);
++		}
++
++		area = area-&gt;all_next;
++	}
++
++	// validate the areas
++	area = heap-&gt;areas;
++	heap_area *lastArea = NULL;
++	uint32 lastFreeCount = 0;
++	while (area != NULL) {
++		if (area-&gt;free_page_count &lt; lastFreeCount)
++			panic(&quot;size ordering of area list broken\n&quot;);
++
++		if (area-&gt;prev != lastArea)
++			panic(&quot;area list entry has invalid prev link\n&quot;);
++
++		lastArea = area;
++		lastFreeCount = area-&gt;free_page_count;
++		area = area-&gt;next;
++	}
++
++	lastArea = NULL;
++	area = heap-&gt;all_areas;
++	while (area != NULL) {
++		if (lastArea != NULL &amp;&amp; lastArea-&gt;base &lt; area-&gt;base)
++			panic(&quot;base ordering of all_areas list broken\n&quot;);
++
++		lastArea = area;
++		area = area-&gt;all_next;
++	}
++
++	// validate the bins
++	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++) {
++		heap_bin *bin = &amp;heap-&gt;bins[i];
++		heap_page *lastPage = NULL;
++		heap_page *page = bin-&gt;page_list;
++		lastFreeCount = 0;
++		while (page) {
++			area = heap-&gt;all_areas;
++			while (area) {
++				if (area == page-&gt;area)
++					break;
++				area = area-&gt;all_next;
++			}
++
++			if (area == NULL) {
++				panic(&quot;page area not present in area list\n&quot;);
++				page = page-&gt;next;
++				continue;
++			}
++
++			if ((addr_t)page &lt; (addr_t)&amp;area-&gt;page_table[0]
++				|| (addr_t)page &gt;= (addr_t)&amp;area-&gt;page_table[area-&gt;page_count])
++				panic(&quot;used page is not part of the page table\n&quot;);
++
++			if (page-&gt;index &gt;= area-&gt;page_count)
++				panic(&quot;used page has invalid index %lu\n&quot;, page-&gt;index);
++
++			if ((addr_t)&amp;area-&gt;page_table[page-&gt;index] != (addr_t)page) {
++				panic(&quot;used page index does not lead to target page&quot;
++					&quot; (%lu vs. %lu)\n&quot;, (addr_t)&amp;area-&gt;page_table[page-&gt;index],
++					page);
++			}
++
++			if (page-&gt;prev != lastPage) {
++				panic(&quot;used page entry has invalid prev link (%p vs %p bin &quot;
++					&quot;%lu)\n&quot;, page-&gt;prev, lastPage, i);
++			}
++
++			if (!page-&gt;in_use)
++				panic(&quot;used page %p marked as not in use\n&quot;, page);
++
++			if (page-&gt;bin_index != i) {
++				panic(&quot;used page with bin index %u in page list of bin %lu\n&quot;,
++					page-&gt;bin_index, i);
++			}
++
++			if (page-&gt;free_count &lt; lastFreeCount)
++				panic(&quot;ordering of bin page list broken\n&quot;);
++
++			// validate the free list
++			uint32 freeSlotsCount = 0;
++			addr_t *element = page-&gt;free_list;
++			addr_t pageBase = area-&gt;base + page-&gt;index * heap-&gt;page_size;
++			while (element) {
++				if ((addr_t)element &lt; pageBase
++					|| (addr_t)element &gt;= pageBase + heap-&gt;page_size)
++					panic(&quot;free list entry out of page range %p\n&quot;, element);
++
++				if (((addr_t)element - pageBase) % bin-&gt;element_size != 0)
++					panic(&quot;free list entry not on a element boundary\n&quot;);
++
++				element = (addr_t *)*element;
++				freeSlotsCount++;
++			}
++
++			uint32 slotCount = bin-&gt;max_free_count;
++			if (page-&gt;empty_index &gt; slotCount) {
++				panic(&quot;empty index beyond slot count (%u with %lu slots)\n&quot;,
++					page-&gt;empty_index, slotCount);
++			}
++
++			freeSlotsCount += (slotCount - page-&gt;empty_index);
++			if (freeSlotsCount &gt; slotCount)
++				panic(&quot;more free slots than fit into the page\n&quot;);
++
++			lastPage = page;
++			lastFreeCount = page-&gt;free_count;
++			page = page-&gt;next;
++		}
++	}
++
++	pageLocker.Unlock();
++	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++)
++		release_sem(heap-&gt;bins[i].lock);
++}
++
++
++// #pragma mark - Heap functions
++
++
++static void
++heap_add_area(heap_allocator *heap, area_id areaID, addr_t base, size_t size)
++{
++	heap_area *area = (heap_area *)base;
++	area-&gt;area = areaID;
++
++	base += sizeof(heap_area);
++	size -= sizeof(heap_area);
++
++	uint32 pageCount = size / heap-&gt;page_size;
++	size_t pageTableSize = pageCount * sizeof(heap_page);
++	area-&gt;page_table = (heap_page *)base;
++	base += pageTableSize;
++	size -= pageTableSize;
++
++	// the rest is now actually usable memory (rounded to the next page)
++	area-&gt;base = ROUNDUP(base, B_PAGE_SIZE);
++	area-&gt;size = size &amp; ~(B_PAGE_SIZE - 1);
++
++	// now we know the real page count
++	pageCount = area-&gt;size / heap-&gt;page_size;
++	area-&gt;page_count = pageCount;
++
++	// zero out the page table and fill in page indexes
++	memset((void *)area-&gt;page_table, 0, pageTableSize);
++	for (uint32 i = 0; i &lt; pageCount; i++) {
++		area-&gt;page_table[i].area = area;
++		area-&gt;page_table[i].index = i;
++	}
++
++	// add all pages up into the free pages list
++	for (uint32 i = 1; i &lt; pageCount; i++) {
++		area-&gt;page_table[i - 1].next = &amp;area-&gt;page_table[i];
++		area-&gt;page_table[i].prev = &amp;area-&gt;page_table[i - 1];
++	}
++	area-&gt;free_pages = &amp;area-&gt;page_table[0];
++	area-&gt;free_page_count = pageCount;
++	area-&gt;page_table[0].prev = NULL;
++	area-&gt;next = NULL;
++
++	WriteLocker areaWriteLocker(heap-&gt;area_lock);
++	MutexLocker pageLocker(heap-&gt;page_lock);
++	if (heap-&gt;areas == NULL) {
++		// it's the only (empty) area in that heap
++		area-&gt;prev = NULL;
++		heap-&gt;areas = area;
++	} else {
++		// link in this area as the last one as it is completely empty
++		heap_area *lastArea = heap-&gt;areas;
++		while (lastArea-&gt;next != NULL)
++			lastArea = lastArea-&gt;next;
++
++		lastArea-&gt;next = area;
++		area-&gt;prev = lastArea;
++	}
++
++	// insert this area in the all_areas list so it stays ordered by base
++	if (heap-&gt;all_areas == NULL || heap-&gt;all_areas-&gt;base &lt; area-&gt;base) {
++		area-&gt;all_next = heap-&gt;all_areas;
++		heap-&gt;all_areas = area;
++	} else {
++		heap_area *insert = heap-&gt;all_areas;
++		while (insert-&gt;all_next &amp;&amp; insert-&gt;all_next-&gt;base &gt; area-&gt;base)
++			insert = insert-&gt;all_next;
++
++		area-&gt;all_next = insert-&gt;all_next;
++		insert-&gt;all_next = area;
++	}
++
++	heap-&gt;total_pages += area-&gt;page_count;
++	heap-&gt;total_free_pages += area-&gt;free_page_count;
++
++	if (areaID &gt;= 0) {
++		// this later on deletable area is yet empty - the empty count will be
++		// decremented as soon as this area is used for the first time
++		heap-&gt;empty_areas++;
++	}
++
++	pageLocker.Unlock();
++	areaWriteLocker.Unlock();
++}
++
++
++static status_t
++heap_remove_area(heap_allocator *heap, heap_area *area)
++{
++	if (area-&gt;free_page_count != area-&gt;page_count) {
++		panic(&quot;tried removing heap area that has still pages in use&quot;);
++		return B_ERROR;
++	}
++
++	if (area-&gt;prev == NULL &amp;&amp; area-&gt;next == NULL) {
++		panic(&quot;tried removing the last non-full heap area&quot;);
++		return B_ERROR;
++	}
++
++	if (heap-&gt;areas == area)
++		heap-&gt;areas = area-&gt;next;
++	if (area-&gt;prev != NULL)
++		area-&gt;prev-&gt;next = area-&gt;next;
++	if (area-&gt;next != NULL)
++		area-&gt;next-&gt;prev = area-&gt;prev;
++
++	if (heap-&gt;all_areas == area)
++		heap-&gt;all_areas = area-&gt;all_next;
++	else {
++		heap_area *previous = heap-&gt;all_areas;
++		while (previous) {
++			if (previous-&gt;all_next == area) {
++				previous-&gt;all_next = area-&gt;all_next;
++				break;
++			}
++
++			previous = previous-&gt;all_next;
++		}
++
++		if (previous == NULL)
++			panic(&quot;removing heap area that is not in all list&quot;);
++	}
++
++	heap-&gt;total_pages -= area-&gt;page_count;
++	heap-&gt;total_free_pages -= area-&gt;free_page_count;
++	return B_OK;
++}
++
++
++heap_allocator *
++heap_create_allocator(const char *name, addr_t base, size_t size,
++	const heap_class *heapClass)
++{
++	heap_allocator *heap = (heap_allocator *)base;
++	base += sizeof(heap_allocator);
++	size -= sizeof(heap_allocator);
++
++	heap-&gt;name = name;
++	heap-&gt;page_size = heapClass-&gt;page_size;
++	heap-&gt;total_pages = heap-&gt;total_free_pages = heap-&gt;empty_areas = 0;
++	heap-&gt;areas = heap-&gt;all_areas = NULL;
++	heap-&gt;bins = (heap_bin *)base;
++
++	heap-&gt;bin_count = 0;
++	size_t binSize = 0, lastSize = 0;
++	uint32 count = heap-&gt;page_size / heapClass-&gt;min_bin_size;
++	for (; count &gt;= heapClass-&gt;min_count_per_page; count--, lastSize = binSize) {
++		binSize = (heap-&gt;page_size / count) &amp; ~(heapClass-&gt;bin_alignment - 1);
++		if (binSize == lastSize)
++			continue;
++		if (heap-&gt;page_size - count * binSize &gt; heapClass-&gt;max_waste_per_page)
++			continue;
++
++		heap_bin *bin = &amp;heap-&gt;bins[heap-&gt;bin_count];
++		bin-&gt;lock = create_sem(1, &quot;heap bin lock&quot;);
++		bin-&gt;element_size = binSize;
++		bin-&gt;max_free_count = heap-&gt;page_size / binSize;
++		bin-&gt;page_list = NULL;
++		heap-&gt;bin_count++;
++
++		if (heap-&gt;bin_count &gt;= 32)
++			panic(&quot;heap configuration invalid - max bin count reached\n&quot;);
++	};
++
++	base += heap-&gt;bin_count * sizeof(heap_bin);
++	size -= heap-&gt;bin_count * sizeof(heap_bin);
++
++	heap-&gt;page_lock = create_sem(1, &quot;heap page lock&quot;);
++	heap-&gt;area_lock = create_sem(1, &quot;heap area lock&quot;);
++
++	heap_add_area(heap, -1, base, size);
++	return heap;
++}
++
++
++static inline void
++heap_free_pages_added(heap_allocator *heap, heap_area *area, uint32 pageCount)
++{
++	area-&gt;free_page_count += pageCount;
++	heap-&gt;total_free_pages += pageCount;
++
++	if (area-&gt;free_page_count == pageCount) {
++		// we need to add ourselfs to the area list of the heap
++		area-&gt;prev = NULL;
++		area-&gt;next = heap-&gt;areas;
++		if (area-&gt;next)
++			area-&gt;next-&gt;prev = area;
++		heap-&gt;areas = area;
++	} else {
++		// we might need to move back in the area list
++		if (area-&gt;next &amp;&amp; area-&gt;next-&gt;free_page_count &lt; area-&gt;free_page_count) {
++			// move ourselfs so the list stays ordered
++			heap_area *insert = area-&gt;next;
++			while (insert-&gt;next
++				&amp;&amp; insert-&gt;next-&gt;free_page_count &lt; area-&gt;free_page_count)
++				insert = insert-&gt;next;
++
++			if (area-&gt;prev)
++				area-&gt;prev-&gt;next = area-&gt;next;
++			if (area-&gt;next)
++				area-&gt;next-&gt;prev = area-&gt;prev;
++			if (heap-&gt;areas == area)
++				heap-&gt;areas = area-&gt;next;
++
++			area-&gt;prev = insert;
++			area-&gt;next = insert-&gt;next;
++			if (area-&gt;next)
++				area-&gt;next-&gt;prev = area;
++			insert-&gt;next = area;
++		}
++	}
++
++	if (area-&gt;free_page_count == area-&gt;page_count &amp;&amp; area-&gt;area &gt;= 0)
++		heap-&gt;empty_areas++;
++}
++
++
++static inline void
++heap_free_pages_removed(heap_allocator *heap, heap_area *area, uint32 pageCount)
++{
++	if (area-&gt;free_page_count == area-&gt;page_count &amp;&amp; area-&gt;area &gt;= 0) {
++		// this area was completely empty
++		heap-&gt;empty_areas--;
++	}
++
++	area-&gt;free_page_count -= pageCount;
++	heap-&gt;total_free_pages -= pageCount;
++
++	if (area-&gt;free_page_count == 0) {
++		// the area is now full so we remove it from the area list
++		if (area-&gt;prev)
++			area-&gt;prev-&gt;next = area-&gt;next;
++		if (area-&gt;next)
++			area-&gt;next-&gt;prev = area-&gt;prev;
++		if (heap-&gt;areas == area)
++			heap-&gt;areas = area-&gt;next;
++		area-&gt;next = area-&gt;prev = NULL;
++	} else {
++		// we might need to move forward in the area list
++		if (area-&gt;prev &amp;&amp; area-&gt;prev-&gt;free_page_count &gt; area-&gt;free_page_count) {
++			// move ourselfs so the list stays ordered
++			heap_area *insert = area-&gt;prev;
++			while (insert-&gt;prev
++				&amp;&amp; insert-&gt;prev-&gt;free_page_count &gt; area-&gt;free_page_count)
++				insert = insert-&gt;prev;
++
++			if (area-&gt;prev)
++				area-&gt;prev-&gt;next = area-&gt;next;
++			if (area-&gt;next)
++				area-&gt;next-&gt;prev = area-&gt;prev;
++
++			area-&gt;prev = insert-&gt;prev;
++			area-&gt;next = insert;
++			if (area-&gt;prev)
++				area-&gt;prev-&gt;next = area;
++			if (heap-&gt;areas == insert)
++				heap-&gt;areas = area;
++			insert-&gt;prev = area;
++		}
++	}
++}
++
++
++static inline void
++heap_link_page(heap_page *page, heap_page **list)
++{
++	page-&gt;prev = NULL;
++	page-&gt;next = *list;
++	if (page-&gt;next)
++		page-&gt;next-&gt;prev = page;
++	*list = page;
++}
++
++
++static inline void
++heap_unlink_page(heap_page *page, heap_page **list)
++{
++	if (page-&gt;prev)
++		page-&gt;prev-&gt;next = page-&gt;next;
++	if (page-&gt;next)
++		page-&gt;next-&gt;prev = page-&gt;prev;
++	if (list &amp;&amp; *list == page) {
++		*list = page-&gt;next;
++		if (page-&gt;next)
++			page-&gt;next-&gt;prev = NULL;
++	}
++}
++
++
++static heap_page *
++heap_allocate_contiguous_pages(heap_allocator *heap, uint32 pageCount)
++{
++	heap_area *area = heap-&gt;areas;
++	while (area) {
++		bool found = false;
++		int32 first = -1;
++		for (uint32 i = 0; i &lt; area-&gt;page_count; i++) {
++			if (area-&gt;page_table[i].in_use) {
++				first = -1;
++				continue;
++			}
++
++			if (first &gt; 0) {
++				if ((i + 1 - first) == pageCount) {
++					found = true;
++					break;
++				}
++			} else
++				first = i;
++		}
++
++		if (!found) {
+
+[... truncated: 785 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020272.html">[Haiku-commits] r32893 -	haiku/trunk/headers/private/kernel/disk_device_manager
+</A></li>
+	<LI>Next message: <A HREF="020281.html">[Haiku-commits] r32894 - in	haiku/trunk/src/system/libroot/posix: . malloc_debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20274">[ date ]</a>
+              <a href="thread.html#20274">[ thread ]</a>
+              <a href="subject.html#20274">[ subject ]</a>
+              <a href="author.html#20274">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

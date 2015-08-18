@@ -1,0 +1,238 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31841 - haiku/trunk/src/servers/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31841%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200907281059.n6SAxPw6028822%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018356.html">
+   <LINK REL="Next"  HREF="018378.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31841 - haiku/trunk/src/servers/app</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31841%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200907281059.n6SAxPw6028822%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31841 - haiku/trunk/src/servers/app">stippi at mail.berlios.de
+       </A><BR>
+    <I>Tue Jul 28 12:59:25 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018356.html">[Haiku-commits] r31840 -	haiku/trunk/src/add-ons/kernel/drivers/ports/pc_serial
+</A></li>
+        <LI>Next message: <A HREF="018378.html">[Haiku-commits] r31841 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18359">[ date ]</a>
+              <a href="thread.html#18359">[ thread ]</a>
+              <a href="subject.html#18359">[ subject ]</a>
+              <a href="author.html#18359">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-07-28 12:59:21 +0200 (Tue, 28 Jul 2009)
+New Revision: 31841
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31841&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31841&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/Window.cpp
+   haiku/trunk/src/servers/app/Window.h
+Log:
+* Fixed bug introduced with recent commits that didn't keep the relative
+  offset of the mouse when resizing/moving windows when other constraints
+  restricted the resizing or moving.
+* Applied patch by Stephen Deken with changes by myself:
+  - Windows now snap to the screen edges.
+  - There is a snapping time window of 1.5 secs during which the window still
+    snaps to the screen edge after it first snapped. Then there is a pause
+    during which there is no snapping.
+Thanks a lot, Stephen, and sorry it took so long, nice patch!
+
+
+Modified: haiku/trunk/src/servers/app/Window.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/Window.cpp	2009-07-28 08:21:23 UTC (rev 31840)
++++ haiku/trunk/src/servers/app/Window.cpp	2009-07-28 10:59:21 UTC (rev 31841)
+@@ -111,6 +111,7 @@
+ 	fLastMousePosition(0.0f, 0.0f),
+ 	fMouseMoveDistance(0.0f),
+ 	fLastMoveTime(0),
++	fLastSnapTime(0),
+ 
+ 	fCurrentUpdateSession(&amp;fUpdateSessions[0]),
+ 	fPendingUpdateSession(&amp;fUpdateSessions[1]),
+@@ -1003,8 +1004,9 @@
+ 
+ 	// limit the rate at which &quot;mouse moved&quot; events
+ 	// are handled that move or resize the window
++	bigtime_t now = 0;
+ 	if (fIsDragging || fIsResizing) {
+-		bigtime_t now = system_time();
++		now = system_time();
+ 		if (now - fLastMoveTime &lt; 13333) {
+ 			// TODO: add a &quot;timed event&quot; to query for
+ 			// the then current mouse position
+@@ -1059,18 +1061,15 @@
+ 			delta = B_ORIGIN;
+ 	}
+ 
+-	// NOTE: fLastMousePosition is currently only
+-	// used for window moving/resizing/sliding the tab
+-	fLastMousePosition += delta;
+-
+ 	// moving
+ 	if (fIsDragging) {
+ 		if (!(Flags() &amp; B_NOT_MOVABLE)) {
+ 			BPoint oldLeftTop = fFrame.LeftTop();
+ 
++			_AlterDeltaForSnap(delta, now);
+ 			fDesktop-&gt;MoveWindowBy(this, delta.x, delta.y);
+ 
+-			// constrain delta to true change in size
++			// constrain delta to true change in position
+ 			delta = fFrame.LeftTop() - oldLeftTop;
+ 		} else
+ 			delta = BPoint(0, 0);
+@@ -1103,6 +1102,10 @@
+ 			delta = BPoint(0, 0);
+ 	}
+ 
++	// NOTE: fLastMousePosition is currently only
++	// used for window moving/resizing/sliding the tab
++	fLastMousePosition += delta;
++
+ 	// change focus in FFM mode
+ 	DesktopSettings desktopSettings(fDesktop);
+ 	if (desktopSettings.FocusFollowsMouse()
+@@ -1122,6 +1125,77 @@
+ }
+ 
+ 
++void
++Window::_AlterDeltaForSnap(BPoint&amp; delta, bigtime_t now)
++{
++	// Alter the delta (which is a proposed offset used while dragging a
++	// window) so that the frame of the window 'snaps' to the edges of the
++	// screen.
++
++	const bigtime_t kSnappingDuration = 1500000LL;
++	const bigtime_t kSnappingPause = 3000000LL;
++	const float kSnapDistance = 8.0f;
++
++	if (now - fLastSnapTime &gt; kSnappingDuration
++		&amp;&amp; now - fLastSnapTime &lt; kSnappingPause) {
++		// Maintain a pause between snapping.
++		return;
++	}
++
++	BRect frame = fFrame;
++	BPoint offsetWithinFrame;
++	// TODO: Perhaps obtain the usable area (not covered by the Deskbar)?
++	BRect screenFrame = fDesktop-&gt;ActiveScreen()-&gt;Frame();
++
++	if (fDecorator) {
++		BRegion reg;
++		fDecorator-&gt;GetFootprint(&amp;reg);
++		frame = reg.Frame();
++		offsetWithinFrame.x = fFrame.left - frame.left;
++		offsetWithinFrame.y = fFrame.top - frame.top;
++	}
++
++	frame.OffsetBy(delta);
++
++	float leftDist = fabs(frame.left - screenFrame.left);
++	float topDist = fabs(frame.top - screenFrame.top);
++	float rightDist = fabs(frame.right - screenFrame.right);
++	float bottomDist = fabs(frame.bottom - screenFrame.bottom);
++
++	bool snapped = false;
++	if (leftDist &lt; kSnapDistance || rightDist &lt; kSnapDistance) {
++		snapped = true;
++		if (leftDist &lt; rightDist) {
++			frame.right -= frame.left;
++			frame.left = 0.0f;
++		} else {
++			frame.left -= frame.right - screenFrame.right;
++			frame.right = screenFrame.right;
++		}
++	}
++
++	if (topDist &lt; kSnapDistance || bottomDist &lt; kSnapDistance) {
++		snapped = true;
++		if (topDist &lt; bottomDist) {
++			frame.bottom -= frame.top;
++			frame.top = 0.0f;
++		} else {
++			frame.top -= frame.bottom - screenFrame.bottom;
++			frame.bottom = screenFrame.bottom;
++		}
++	}
++	if (snapped &amp;&amp; now - fLastSnapTime &gt; kSnappingPause)
++		fLastSnapTime = now;
++
++
++	frame.top += offsetWithinFrame.y;
++	frame.left += offsetWithinFrame.x;
++
++	delta.y = frame.top - fFrame.top;
++	delta.x = frame.left - fFrame.left;
++}
++
++
+ // #pragma mark -
+ 
+ 
+
+Modified: haiku/trunk/src/servers/app/Window.h
+===================================================================
+--- haiku/trunk/src/servers/app/Window.h	2009-07-28 08:21:23 UTC (rev 31840)
++++ haiku/trunk/src/servers/app/Window.h	2009-07-28 10:59:21 UTC (rev 31841)
+@@ -267,6 +267,9 @@
+ 			void				_ObeySizeLimits();
+ 			void				_PropagatePosition();
+ 
++			void				_AlterDeltaForSnap(BPoint&amp; delta,
++									bigtime_t now);
++
+ 			BString				fTitle;
+ 			// TODO: no fp rects anywhere
+ 			BRect				fFrame;
+@@ -319,6 +322,7 @@
+ 			BPoint				fLastMousePosition;
+ 			float				fMouseMoveDistance;
+ 			bigtime_t			fLastMoveTime;
++			bigtime_t			fLastSnapTime;
+ 
+ 			// The synchronization, which client drawing commands
+ 			// belong to the redraw of which dirty region is handled
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018356.html">[Haiku-commits] r31840 -	haiku/trunk/src/add-ons/kernel/drivers/ports/pc_serial
+</A></li>
+	<LI>Next message: <A HREF="018378.html">[Haiku-commits] r31841 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18359">[ date ]</a>
+              <a href="thread.html#18359">[ thread ]</a>
+              <a href="subject.html#18359">[ subject ]</a>
+              <a href="author.html#18359">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

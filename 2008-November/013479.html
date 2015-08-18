@@ -1,0 +1,1080 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28617 - in haiku/trunk/src: system/kernel/cache	tools/fs_shell
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28617%20-%20in%20haiku/trunk/src%3A%20system/kernel/cache%0A%09tools/fs_shell&In-Reply-To=%3C200811112219.mABMJko3009078%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013478.html">
+   <LINK REL="Next"  HREF="013480.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28617 - in haiku/trunk/src: system/kernel/cache	tools/fs_shell</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28617%20-%20in%20haiku/trunk/src%3A%20system/kernel/cache%0A%09tools/fs_shell&In-Reply-To=%3C200811112219.mABMJko3009078%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28617 - in haiku/trunk/src: system/kernel/cache	tools/fs_shell">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Nov 11 23:19:46 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013478.html">[Haiku-commits] r28616 - haiku/trunk/build/jam
+</A></li>
+        <LI>Next message: <A HREF="013480.html">[Haiku-commits] r28618 - in haiku/trunk/src/tools: . hack_coff
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13479">[ date ]</a>
+              <a href="thread.html#13479">[ thread ]</a>
+              <a href="subject.html#13479">[ subject ]</a>
+              <a href="author.html#13479">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-11-11 23:19:46 +0100 (Tue, 11 Nov 2008)
+New Revision: 28617
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28617&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28617&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/block_cache.cpp
+   haiku/trunk/src/tools/fs_shell/block_cache.cpp
+Log:
+* Brought the fs_shell block_cache implementation up to date, and incorporate
+  the fixes applied to the kernel version of it (most notably a correctly
+  working block_cache_discard(), and cache_detach_sub_transaction()).
+  Also switched to the new notification functions, even though it still works
+  synchronously in the fs_shell.
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-11-11 21:47:12 UTC (rev 28616)
++++ haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-11-11 22:19:46 UTC (rev 28617)
+@@ -471,6 +471,61 @@
+ }
+ 
+ 
++static void
++flush_pending_notifications(block_cache* cache)
++{
++	ASSERT_LOCKED_MUTEX(&amp;sCachesLock);
++
++	while (true) {
++		MutexLocker locker(sNotificationsLock);
++
++		cache_notification* notification = cache-&gt;pending_notifications.Head();
++		if (notification == NULL)
++			return;
++
++		bool deleteAfterEvent = false;
++		int32 event = -1;
++		if (!get_next_pending_event(notification, &amp;event)) {
++			// remove the notification if this was the last pending event
++			cache-&gt;pending_notifications.Remove(notification);
++			deleteAfterEvent = notification-&gt;delete_after_event;
++		}
++
++		if (event &gt;= 0) {
++			// Notify listener, we need to copy the notification, as it might
++			// be removed when we unlock the list.
++			cache_notification copy = *notification;
++			locker.Unlock();
++
++			copy.hook(copy.transaction_id, event, copy.data);
++
++			locker.Lock();
++		}
++
++		if (deleteAfterEvent)
++			delete notification;
++	}
++}
++
++
++/*!	Flushes all pending notifications by calling the appropriate hook
++	functions.
++	Must not be called with a cache lock held.
++*/
++static void
++flush_pending_notifications()
++{
++	MutexLocker _(sCachesLock);
++
++	DoublyLinkedList&lt;block_cache&gt;::Iterator iterator = sCaches.GetIterator();
++	while (iterator.HasNext()) {
++		block_cache* cache = iterator.Next();
++
++		flush_pending_notifications(cache);
++	}
++}
++
++
+ /*!	Initializes the \a notification as specified. */
+ static void
+ set_notification(cache_transaction* transaction,
+@@ -563,61 +618,6 @@
+ }
+ 
+ 
+-static void
+-flush_pending_notifications(block_cache* cache)
+-{
+-	ASSERT_LOCKED_MUTEX(&amp;sCachesLock);
+-
+-	while (true) {
+-		MutexLocker locker(sNotificationsLock);
+-
+-		cache_notification* notification = cache-&gt;pending_notifications.Head();
+-		if (notification == NULL)
+-			return;
+-
+-		bool deleteAfterEvent = false;
+-		int32 event = -1;
+-		if (!get_next_pending_event(notification, &amp;event)) {
+-			// remove the notification if this was the last pending event
+-			cache-&gt;pending_notifications.Remove(notification);
+-			deleteAfterEvent = notification-&gt;delete_after_event;
+-		}
+-
+-		if (event &gt;= 0) {
+-			// Notify listener, we need to copy the notification, as it might
+-			// be removed when we unlock the list.
+-			cache_notification copy = *notification;
+-			locker.Unlock();
+-
+-			copy.hook(copy.transaction_id, event, copy.data);
+-
+-			locker.Lock();
+-		}
+-
+-		if (deleteAfterEvent)
+-			delete notification;
+-	}
+-}
+-
+-
+-/*!	Flushes all pending notifications by calling the appropriate hook
+-	functions.
+-	Must not be called with a cache lock held.
+-*/
+-static void
+-flush_pending_notifications()
+-{
+-	MutexLocker _(sCachesLock);
+-
+-	DoublyLinkedList&lt;block_cache&gt;::Iterator iterator = sCaches.GetIterator();
+-	while (iterator.HasNext()) {
+-		block_cache* cache = iterator.Next();
+-
+-		flush_pending_notifications(cache);
+-	}
+-}
+-
+-
+ /*!	Removes and deletes all listeners that are still monitoring this
+ 	transaction.
+ */
+@@ -1218,7 +1218,7 @@
+ 	cache_transaction* transaction = block-&gt;transaction;
+ 
+ 	if (transaction != NULL &amp;&amp; transaction-&gt;id != transactionID) {
+-		// ToDo: we have to wait here until the other transaction is done.
++		// TODO: we have to wait here until the other transaction is done.
+ 		//	Maybe we should even panic, since we can't prevent any deadlocks.
+ 		panic(&quot;get_writable_cached_block(): asked to get busy writable block (transaction %ld)\n&quot;, block-&gt;transaction-&gt;id);
+ 		put_cached_block(cache, block);
+@@ -2594,7 +2594,7 @@
+ 	if (cache-&gt;read_only)
+ 		panic(&quot;tried to make block writable on a read-only cache!&quot;);
+ 
+-	// ToDo: this can be done better!
++	// TODO: this can be done better!
+ 	void* block = get_writable_cached_block(cache, blockNumber,
+ 		blockNumber, 1, transaction, false);
+ 	if (block != NULL) {
+
+Modified: haiku/trunk/src/tools/fs_shell/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/tools/fs_shell/block_cache.cpp	2008-11-11 21:47:12 UTC (rev 28616)
++++ haiku/trunk/src/tools/fs_shell/block_cache.cpp	2008-11-11 22:19:46 UTC (rev 28617)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
++ * Copyright 2004-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  */
+ 
+@@ -23,7 +23,6 @@
+ //	   just read and write single blocks.
+ //	2) the locking could be improved; getting a block should not need to
+ //	   wait for blocks to be written
+-//	3) dirty blocks are only written back if asked for
+ // TODO: the retrieval/copy of the original data could be delayed until the
+ //		new data must be written, ie. in low memory situations.
+ 
+@@ -40,6 +39,10 @@
+ // system, like out of memory situations - should only panic for debugging.
+ #define FATAL(x) fssh_panic x
+ 
++#undef offsetof
++#define offsetof(struct, member) 0
++	// TODO: I don't know why the offsetof() macro doesn't work in this context,
++	// but (0) is okay here...
+ 
+ namespace FSShell {
+ 
+@@ -56,15 +59,14 @@
+ struct block_cache;
+ typedef DoublyLinkedListLink&lt;cached_block&gt; block_link;
+ 
+-
+ struct cached_block {
+-	cached_block	*next;			// next in hash
+-	cached_block	*transaction_next;
++	cached_block*	next;			// next in hash
++	cached_block*	transaction_next;
+ 	block_link		link;
+ 	fssh_off_t		block_number;
+-	void			*current_data;
+-	void			*original_data;
+-	void			*parent_data;
++	void*			current_data;
++	void*			original_data;
++	void*			parent_data;
+ #ifdef DEBUG_CHANGED
+ 	void			*compare;
+ #endif
+@@ -75,77 +77,306 @@
+ 	bool			is_dirty : 1;
+ 	bool			unused : 1;
+ 	bool			discard : 1;
+-	cache_transaction *transaction;
+-	cache_transaction *previous_transaction;
++	cache_transaction* transaction;
++	cache_transaction* previous_transaction;
+ 
+-	static int Compare(void *_cacheEntry, const void *_block);
+-	static uint32_t Hash(void *_cacheEntry, const void *_block, uint32_t range);
++	static int Compare(void* _cacheEntry, const void* _block);
++	static uint32_t Hash(void* _cacheEntry, const void* _block, uint32_t range);
+ };
+ 
+ typedef DoublyLinkedList&lt;cached_block,
+ 	DoublyLinkedListMemberGetLink&lt;cached_block,
+ 		&amp;cached_block::link&gt; &gt; block_list;
+ 
++struct cache_notification : DoublyLinkedListLinkImpl&lt;cache_notification&gt; {
++	int32_t			transaction_id;
++	int32_t			events_pending;
++	int32_t			events;
++	fssh_transaction_notification_hook hook;
++	void*			data;
++	bool			delete_after_event;
++};
++
++typedef DoublyLinkedList&lt;cache_notification&gt; NotificationList;
++
+ struct block_cache {
+-	hash_table	*hash;
+-	fssh_mutex	lock;
+-	int			fd;
+-	fssh_off_t	max_blocks;
+-	fssh_size_t	block_size;
+-	int32_t		allocated_block_count;
+-	int32_t		next_transaction_id;
+-	cache_transaction *last_transaction;
+-	hash_table	*transaction_hash;
++	hash_table*		hash;
++	fssh_mutex		lock;
++	int				fd;
++	fssh_off_t		max_blocks;
++	fssh_size_t		block_size;
++	int32_t			allocated_block_count;
++	int32_t			next_transaction_id;
++	cache_transaction* last_transaction;
++	hash_table*		transaction_hash;
+ 
+-	block_list	unused_blocks;
++	block_list		unused_blocks;
+ 
+-	bool		read_only;
++	bool			read_only;
+ 
+-	block_cache(int fd, fssh_off_t numBlocks, fssh_size_t blockSize, bool readOnly);
+-	~block_cache();
++	NotificationList pending_notifications;
+ 
+-	fssh_status_t InitCheck();
++					block_cache(int fd, fssh_off_t numBlocks,
++						fssh_size_t blockSize, bool readOnly);
++					~block_cache();
+ 
+-	void RemoveUnusedBlocks(int32_t maxAccessed = LONG_MAX, int32_t count = LONG_MAX);
+-	void RemoveBlock(cached_block* block);
+-	void FreeBlock(cached_block *block);
+-	cached_block *NewBlock(fssh_off_t blockNumber);
+-	void Free(void *address);
+-	void *Allocate();
++	fssh_status_t	Init();
+ 
+-	static void LowMemoryHandler(void *data, int32_t level);
++	void			Free(void* buffer);
++	void*			Allocate();
++	void			RemoveUnusedBlocks(int32_t maxAccessed = LONG_MAX,
++						int32_t count = LONG_MAX);
++	void			RemoveBlock(cached_block* block);
++	void			DiscardBlock(cached_block* block);
++	void			FreeBlock(cached_block* block);
++	cached_block*	NewBlock(fssh_off_t blockNumber);
+ };
+ 
+ static const int32_t kMaxBlockCount = 1024;
+ 
+-struct cache_hook : DoublyLinkedListLinkImpl&lt;cache_hook&gt; {
+-	fssh_transaction_notification_hook	hook;
+-	void								*data;
++struct cache_listener;
++typedef DoublyLinkedListLink&lt;cache_listener&gt; listener_link;
++
++struct cache_listener : cache_notification {
++	listener_link	link;
+ };
+ 
+-typedef DoublyLinkedList&lt;cache_hook&gt; HookList;
++typedef DoublyLinkedList&lt;cache_listener,
++	DoublyLinkedListMemberGetLink&lt;cache_listener,
++		&amp;cache_listener::link&gt; &gt; ListenerList;
+ 
+ struct cache_transaction {
+ 	cache_transaction();
+ 
+-	cache_transaction *next;
++	cache_transaction* next;
+ 	int32_t			id;
+ 	int32_t			num_blocks;
+ 	int32_t			main_num_blocks;
+ 	int32_t			sub_num_blocks;
+-	cached_block	*first_block;
++	cached_block*	first_block;
+ 	block_list		blocks;
+ 	fssh_transaction_notification_hook notification_hook;
+-	void			*notification_data;
+-	HookList		listeners;
++	void*			notification_data;
++	ListenerList	listeners;
+ 	bool			open;
+ 	bool			has_sub_transaction;
+ };
+ 
+-static fssh_status_t write_cached_block(block_cache *cache, cached_block *block,
++
++static fssh_status_t write_cached_block(block_cache* cache, cached_block* block,
+ 	bool deleteTransaction = true);
+ 
+ 
++static fssh_mutex sNotificationsLock;
++
++
++//	#pragma mark - notifications/listener
++
++
++/*!	Checks wether or not this is an event that closes a transaction. */
++static inline bool
++is_closing_event(int32_t event)
++{
++	return (event &amp; (FSSH_TRANSACTION_ABORTED | FSSH_TRANSACTION_ENDED)) != 0;
++}
++
++
++static inline bool
++is_written_event(int32_t event)
++{
++	return (event &amp; FSSH_TRANSACTION_WRITTEN) != 0;
++}
++
++
++/*!	From the specified \a notification, it will remove the lowest pending
++	event, and return that one in \a _event.
++	If there is no pending event anymore, it will return \c false.
++*/
++static bool
++get_next_pending_event(cache_notification* notification, int32_t* _event)
++{
++	for (int32_t eventMask = 1; eventMask &lt;= FSSH_TRANSACTION_IDLE; eventMask &lt;&lt;= 1) {
++		int32_t pending = fssh_atomic_and(&amp;notification-&gt;events_pending,
++			~eventMask);
++
++		bool more = (pending &amp; ~eventMask) != 0;
++
++		if ((pending &amp; eventMask) != 0) {
++			*_event = eventMask;
++			return more;
++		}
++	}
++
++	return false;
++}
++
++
++static void
++flush_pending_notifications(block_cache* cache)
++{
++	while (true) {
++		MutexLocker locker(sNotificationsLock);
++
++		cache_notification* notification = cache-&gt;pending_notifications.Head();
++		if (notification == NULL)
++			return;
++
++		bool deleteAfterEvent = false;
++		int32_t event = -1;
++		if (!get_next_pending_event(notification, &amp;event)) {
++			// remove the notification if this was the last pending event
++			cache-&gt;pending_notifications.Remove(notification);
++			deleteAfterEvent = notification-&gt;delete_after_event;
++		}
++
++		if (event &gt;= 0) {
++			// Notify listener, we need to copy the notification, as it might
++			// be removed when we unlock the list.
++			cache_notification copy = *notification;
++			locker.Unlock();
++
++			copy.hook(copy.transaction_id, event, copy.data);
++
++			locker.Lock();
++		}
++
++		if (deleteAfterEvent)
++			delete notification;
++	}
++}
++
++
++/*!	Initializes the \a notification as specified. */
++static void
++set_notification(cache_transaction* transaction,
++	cache_notification &amp;notification, int32_t events,
++	fssh_transaction_notification_hook hook, void* data)
++{
++	notification.transaction_id = transaction != NULL ? transaction-&gt;id : -1;
++	notification.events_pending = 0;
++	notification.events = events;
++	notification.hook = hook;
++	notification.data = data;
++	notification.delete_after_event = false;
++}
++
++
++/*!	Makes sure the notification is deleted. It either deletes it directly,
++	when possible, or marks it for deletion if the notification is pending.
++*/
++static void
++delete_notification(cache_notification* notification)
++{
++	MutexLocker locker(sNotificationsLock);
++
++	if (notification-&gt;events_pending != 0)
++		notification-&gt;delete_after_event = true;
++	else
++		delete notification;
++}
++
++
++/*!	Adds the notification to the pending notifications list, or, if it's
++	already part of it, updates its events_pending field.
++	Also marks the notification to be deleted if \a deleteNotification
++	is \c true.
++	Triggers the notifier thread to run.
++*/
++static void
++add_notification(block_cache* cache, cache_notification* notification,
++	int32_t event, bool deleteNotification)
++{
++	if (notification-&gt;hook == NULL)
++		return;
++
++	int32_t pending = fssh_atomic_or(&amp;notification-&gt;events_pending, event);
++	if (pending == 0) {
++		// not yet part of the notification list
++		MutexLocker locker(sNotificationsLock);
++		if (deleteNotification)
++			notification-&gt;delete_after_event = true;
++		cache-&gt;pending_notifications.Add(notification);
++	} else if (deleteNotification) {
++		// we might need to delete it ourselves if we're late
++		delete_notification(notification);
++	}
++}
++
++
++/*!	Notifies all interested listeners of this transaction about the \a event.
++	If \a event is a closing event (ie. TRANSACTION_ENDED, and
++	TRANSACTION_ABORTED), all listeners except those listening to
++	TRANSACTION_WRITTEN will be removed.
++*/
++static void
++notify_transaction_listeners(block_cache* cache, cache_transaction* transaction,
++	int32_t event)
++{
++	bool isClosing = is_closing_event(event);
++	bool isWritten = is_written_event(event);
++
++	ListenerList::Iterator iterator = transaction-&gt;listeners.GetIterator();
++	while (iterator.HasNext()) {
++		cache_listener* listener = iterator.Next();
++
++		bool remove = isClosing &amp;&amp; !is_written_event(listener-&gt;events)
++			|| isWritten &amp;&amp; is_written_event(listener-&gt;events);
++		if (remove)
++			iterator.Remove();
++
++		if ((listener-&gt;events &amp; event) != 0)
++			add_notification(cache, listener, event, remove);
++		else if (remove)
++			delete_notification(listener);
++	}
++
++	// This must work asynchronously in the kernel, but since we're not using
++	// most transaction events, we can do it here.
++	flush_pending_notifications(cache);
++}
++
++
++/*!	Removes and deletes all listeners that are still monitoring this
++	transaction.
++*/
++static void
++remove_transaction_listeners(block_cache* cache, cache_transaction* transaction)
++{
++	ListenerList::Iterator iterator = transaction-&gt;listeners.GetIterator();
++	while (iterator.HasNext()) {
++		cache_listener* listener = iterator.Next();
++		iterator.Remove();
++
++		delete_notification(listener);
++	}
++}
++
++
++static fssh_status_t
++add_transaction_listener(block_cache* cache, cache_transaction* transaction,
++	int32_t events, fssh_transaction_notification_hook hookFunction, void* data)
++{
++	ListenerList::Iterator iterator = transaction-&gt;listeners.GetIterator();
++	while (iterator.HasNext()) {
++		cache_listener* listener = iterator.Next();
++
++		if (listener-&gt;data == data &amp;&amp; listener-&gt;hook == hookFunction) {
++			// this listener already exists, just update it
++			listener-&gt;events |= events;
++			return FSSH_B_OK;
++		}
++	}
++
++	cache_listener* listener = new(std::nothrow) cache_listener;
++	if (listener == NULL)
++		return FSSH_B_NO_MEMORY;
++
++	set_notification(transaction, *listener, events, hookFunction, data);
++	transaction-&gt;listeners.Add(listener);
++	return FSSH_B_OK;
++}
++
++
+ //	#pragma mark - private transaction
+ 
+ 
+@@ -162,20 +393,20 @@
+ 
+ 
+ static int
+-transaction_compare(void *_transaction, const void *_id)
++transaction_compare(void* _transaction, const void* _id)
+ {
+-	cache_transaction *transaction = (cache_transaction *)_transaction;
+-	const int32_t *id = (const int32_t *)_id;
++	cache_transaction* transaction = (cache_transaction*)_transaction;
++	const int32_t* id = (const int32_t*)_id;
+ 
+ 	return transaction-&gt;id - *id;
+ }
+ 
+ 
+ static uint32_t
+-transaction_hash(void *_transaction, const void *_id, uint32_t range)
++transaction_hash(void* _transaction, const void* _id, uint32_t range)
+ {
+-	cache_transaction *transaction = (cache_transaction *)_transaction;
+-	const int32_t *id = (const int32_t *)_id;
++	cache_transaction* transaction = (cache_transaction*)_transaction;
++	const int32_t* id = (const int32_t*)_id;
+ 
+ 	if (transaction != NULL)
+ 		return transaction-&gt;id % range;
+@@ -184,62 +415,47 @@
+ }
+ 
+ 
+-/*!	Notifies all listeners of this transaction, and removes them
+-	afterwards.
+-*/
+ static void
+-notify_transaction_listeners(cache_transaction *transaction, int32_t event)
++delete_transaction(block_cache* cache, cache_transaction* transaction)
+ {
+-	HookList::Iterator iterator = transaction-&gt;listeners.GetIterator();
+-	while (iterator.HasNext()) {
+-		cache_hook *hook = iterator.Next();
+-
+-		hook-&gt;hook(transaction-&gt;id, event, hook-&gt;data);
+-
+-		iterator.Remove();
+-		delete hook;
+-	}
+-}
+-
+-
+-static void
+-delete_transaction(block_cache *cache, cache_transaction *transaction)
+-{
+ 	if (cache-&gt;last_transaction == transaction)
+ 		cache-&gt;last_transaction = NULL;
+ 
++	remove_transaction_listeners(cache, transaction);
+ 	delete transaction;
+ }
+ 
+ 
+-static cache_transaction *
+-lookup_transaction(block_cache *cache, int32_t id)
++static cache_transaction*
++lookup_transaction(block_cache* cache, int32_t id)
+ {
+-	return (cache_transaction *)hash_lookup(cache-&gt;transaction_hash, &amp;id);
++	return (cache_transaction*)hash_lookup(cache-&gt;transaction_hash, &amp;id);
+ }
+ 
+ 
+ //	#pragma mark - cached_block
+ 
+ 
+-/* static */
+-int
+-cached_block::Compare(void *_cacheEntry, const void *_block)
++/*static*/ int
++cached_block::Compare(void* _cacheEntry, const void* _block)
+ {
+-	cached_block *cacheEntry = (cached_block *)_cacheEntry;
+-	const fssh_off_t *block = (const fssh_off_t *)_block;
++	cached_block* cacheEntry = (cached_block*)_cacheEntry;
++	const fssh_off_t* block = (const fssh_off_t*)_block;
+ 
+-	return cacheEntry-&gt;block_number - *block;
++	fssh_off_t diff = cacheEntry-&gt;block_number - *block;
++	if (diff &gt; 0)
++		return 1;
++
++	return diff &lt; 0 ? -1 : 0;
+ }
+ 
+ 
+ 
+-/* static */
+-uint32_t
+-cached_block::Hash(void *_cacheEntry, const void *_block, uint32_t range)
++/*static*/ uint32_t
++cached_block::Hash(void* _cacheEntry, const void* _block, uint32_t range)
+ {
+-	cached_block *cacheEntry = (cached_block *)_cacheEntry;
+-	const fssh_off_t *block = (const fssh_off_t *)_block;
++	cached_block* cacheEntry = (cached_block*)_cacheEntry;
++	const fssh_off_t* block = (const fssh_off_t*)_block;
+ 
+ 	if (cacheEntry != NULL)
+ 		return cacheEntry-&gt;block_number % range;
+@@ -264,52 +480,50 @@
+ 	transaction_hash(NULL),
+ 	read_only(readOnly)
+ {
+-	hash = hash_init(32, 0, &amp;cached_block::Compare, &amp;cached_block::Hash);
+-	if (hash == NULL)
+-		return;
+-
+-	transaction_hash = hash_init(16, 0, &amp;transaction_compare,
+-		&amp;FSShell::transaction_hash);
+-	if (transaction_hash == NULL)
+-		return;
+-
+-	fssh_mutex_init(&amp;lock, &quot;block cache&quot;);
+ }
+ 
+ 
+ block_cache::~block_cache()
+ {
+-	fssh_mutex_destroy(&amp;lock);
+-
+ 	hash_uninit(transaction_hash);
+ 	hash_uninit(hash);
++
++	fssh_mutex_destroy(&amp;lock);
+ }
+ 
+ 
+ fssh_status_t
+-block_cache::InitCheck()
++block_cache::Init()
+ {
++	fssh_mutex_init(&amp;lock, &quot;block cache&quot;);
+ 	if (lock.sem &lt; FSSH_B_OK)
+ 		return lock.sem;
+ 
+-	if (hash == NULL || transaction_hash == NULL)
++	hash = hash_init(128, offsetof(cached_block, next), &amp;cached_block::Compare,
++		&amp;cached_block::Hash);
++	if (hash == NULL)
+ 		return FSSH_B_NO_MEMORY;
+ 
++	transaction_hash = hash_init(16, offsetof(cache_transaction, next),
++		&amp;transaction_compare, &amp;FSShell::transaction_hash);
++	if (transaction_hash == NULL)
++		return FSSH_B_NO_MEMORY;
++
+ 	return FSSH_B_OK;
+ }
+ 
+ 
+ void
+-block_cache::Free(void *address)
++block_cache::Free(void* buffer)
+ {
+-	if (address == NULL)
++	if (buffer == NULL)
+ 		return;
+ 
+-	free(address);
++	free(buffer);
+ }
+ 
+ 
+-void *
++void*
+ block_cache::Allocate()
+ {
+ 	return malloc(block_size);
+@@ -317,7 +531,7 @@
+ 
+ 
+ void
+-block_cache::FreeBlock(cached_block *block)
++block_cache::FreeBlock(cached_block* block)
+ {
+ 	Free(block-&gt;current_data);
+ 
+@@ -335,10 +549,10 @@
+ 
+ 
+ /*! Allocates a new block for \a blockNumber, ready for use */
+-cached_block *
++cached_block*
+ block_cache::NewBlock(fssh_off_t blockNumber)
+ {
+-	cached_block *block = new(nothrow) cached_block;
++	cached_block* block = new(nothrow) cached_block;
+ 	if (block == NULL) {
+ 		FATAL((&quot;could not allocate block!\n&quot;));
+ 		return NULL;
+@@ -351,7 +565,7 @@
+ 	}
+ 
+ 	block-&gt;current_data = Allocate();
+-	if (!block-&gt;current_data) {
++	if (block-&gt;current_data == NULL) {
+ 		FATAL((&quot;could not allocate block data!\n&quot;));
+ 		delete block;
+ 		return NULL;
+@@ -378,14 +592,6 @@
+ 
+ 
+ void
+-block_cache::RemoveBlock(cached_block* block)
+-{
+-	hash_remove(hash, block);
+-	FreeBlock(block);
+-}
+-
+-
+-void
+ block_cache::RemoveUnusedBlocks(int32_t maxAccessed, int32_t count)
+ {
+ 	TRACE((&quot;block_cache: remove up to %ld unused blocks\n&quot;, count));
+@@ -399,7 +605,7 @@
+ 			block-&gt;block_number, block-&gt;accessed));
+ 
+ 		// this can only happen if no transactions are used
+-		if (block-&gt;is_dirty)
++		if (block-&gt;is_dirty &amp;&amp; !block-&gt;discard)
+ 			write_cached_block(this, block, false);
+ 
+ 		// remove block from lists
+@@ -412,19 +618,52 @@
+ }
+ 
+ 
++void
++block_cache::RemoveBlock(cached_block* block)
++{
++	hash_remove(hash, block);
++	FreeBlock(block);
++}
++
++
++/*!	Discards the block from a transaction (this method must not be called
++	for blocks not part of a transaction).
++*/
++void
++block_cache::DiscardBlock(cached_block* block)
++{
++	if (block-&gt;parent_data != NULL &amp;&amp; block-&gt;parent_data != block-&gt;current_data)
++		Free(block-&gt;parent_data);
++
++	block-&gt;parent_data = NULL;
++
++	if (block-&gt;original_data != NULL) {
++		Free(block-&gt;original_data);
++		block-&gt;original_data = NULL;
++	}
++
++	RemoveBlock(block);
++}
++
++
+ //	#pragma mark - private block functions
+ 
+ 
++/*!	Removes a reference from the specified \a block. If this was the last
++	reference, the block is moved into the unused list.
++	In low memory situations, it will also free some blocks from that list,
++	but not necessarily the \a block it just released.
++*/
+ static void
+-put_cached_block(block_cache *cache, cached_block *block)
++put_cached_block(block_cache* cache, cached_block* block)
+ {
+ #ifdef DEBUG_CHANGED
+ 	if (!block-&gt;is_dirty &amp;&amp; block-&gt;compare != NULL
+ 		&amp;&amp; memcmp(block-&gt;current_data, block-&gt;compare, cache-&gt;block_size)) {
+ 		fssh_dprintf(&quot;new block:\n&quot;);
+-		fssh_dump_block((const char *)block-&gt;current_data, 256, &quot;  &quot;);
++		fssh_dump_block((const char*)block-&gt;current_data, 256, &quot;  &quot;);
+ 		fssh_dprintf(&quot;unchanged block:\n&quot;);
+-		fssh_dump_block((const char *)block-&gt;compare, 256, &quot;  &quot;);
++		fssh_dump_block((const char*)block-&gt;compare, 256, &quot;  &quot;);
+ 		write_cached_block(cache, block);
+ 		fssh_panic(&quot;block_cache: supposed to be clean block was changed!\n&quot;);
+ 
+@@ -453,21 +692,20 @@
+ 
+ 
+ static void
+-put_cached_block(block_cache *cache, fssh_off_t blockNumber)
++put_cached_block(block_cache* cache, fssh_off_t blockNumber)
+ {
+ 	if (blockNumber &lt; 0 || blockNumber &gt;= cache-&gt;max_blocks) {
+ 		fssh_panic(&quot;put_cached_block: invalid block number %lld (max %lld)&quot;,
+ 			blockNumber, cache-&gt;max_blocks - 1);
+ 	}
+ 
+-	cached_block *block = (cached_block *)hash_lookup(cache-&gt;hash, &amp;blockNumber);
++	cached_block* block = (cached_block*)hash_lookup(cache-&gt;hash, &amp;blockNumber);
+ 	if (block != NULL)
+ 		put_cached_block(cache, block);
+ }
+ 
+ 
+-/*!
+-	Retrieves the block \a blockNumber from the hash table, if it's already
++/*!	Retrieves the block \a blockNumber from the hash table, if it's already
+ 	there, or reads it from the disk.
+ 
+ 	\param _allocated tells you wether or not a new block has been allocated
+@@ -476,8 +714,8 @@
+ 		not already in the cache. The block you retrieve may contain random
+ 		data.
+ */
+-static cached_block *
+-get_cached_block(block_cache *cache, fssh_off_t blockNumber, bool *_allocated,
++static cached_block*
++get_cached_block(block_cache* cache, fssh_off_t blockNumber, bool* _allocated,
+ 	bool readBlock = true)
+ {
+ 	if (blockNumber &lt; 0 || blockNumber &gt;= cache-&gt;max_blocks) {
+@@ -486,7 +724,7 @@
+ 		return NULL;
+ 	}
+ 
+-	cached_block *block = (cached_block *)hash_lookup(cache-&gt;hash,
++	cached_block* block = (cached_block*)hash_lookup(cache-&gt;hash,
+ 		&amp;blockNumber);
+ 	*_allocated = false;
+ 
+@@ -505,8 +743,7 @@
+ 
+ 		if (fssh_read_pos(cache-&gt;fd, blockNumber * blockSize, block-&gt;current_data,
+ 				blockSize) &lt; blockSize) {
+-			hash_remove(cache-&gt;hash, block);
+-			cache-&gt;FreeBlock(block);
++			cache-&gt;RemoveBlock(block);
+ 			FATAL((&quot;could not read block %Ld\n&quot;, blockNumber));
+ 			return NULL;
+ 		}
+@@ -525,16 +762,15 @@
+ }
+ 
+ 
+-/*!
+-	Returns the writable block data for the requested blockNumber.
++/*!	Returns the writable block data for the requested blockNumber.
+ 	If \a cleared is true, the block is not read from disk; an empty block
+ 	is returned.
+ 
+ 	This is the only method to insert a block into a transaction. It makes
+ 	sure that the previous block contents are preserved in that case.
+ */
+-static void *
+-get_writable_cached_block(block_cache *cache, fssh_off_t blockNumber, fssh_off_t base,
++static void*
++get_writable_cached_block(block_cache* cache, fssh_off_t blockNumber, fssh_off_t base,
+ 	fssh_off_t length, int32_t transactionID, bool cleared)
+ {
+ 	TRACE((&quot;get_writable_cached_block(blockNumber = %Ld, transaction = %d)\n&quot;,
+@@ -546,7 +782,7 @@
+ 	}
+ 
+ 	bool allocated;
+-	cached_block *block = get_cached_block(cache, blockNumber, &amp;allocated,
++	cached_block* block = get_cached_block(cache, blockNumber, &amp;allocated,
+ 		!cleared);
+ 	if (block == NULL)
+ 		return NULL;
+@@ -564,10 +800,10 @@
+ 		return block-&gt;current_data;
+ 	}
+ 
+-	cache_transaction *transaction = block-&gt;transaction;
++	cache_transaction* transaction = block-&gt;transaction;
+ 
+ 	if (transaction != NULL &amp;&amp; transaction-&gt;id != transactionID) {
+-		// ToDo: we have to wait here until the other transaction is done.
++		// TODO: we have to wait here until the other transaction is done.
+ 		//	Maybe we should even panic, since we can't prevent any deadlocks.
+ 		fssh_panic(&quot;get_writable_cached_block(): asked to get busy writable block (transaction %d)\n&quot;, (int)transaction-&gt;id);
+ 		put_cached_block(cache, block);
+@@ -635,14 +871,20 @@
+ }
+ 
+ 
++/*!	Writes the specified \a block back to disk. It will always only write back
++	the oldest change of the block if it is part of more than one transaction.
++	It will automatically send out TRANSACTION_WRITTEN notices, as well as
++	delete transactions when they are no longer used, and \a deleteTransaction
++	is \c true.
++*/
+ static fssh_status_t
+-write_cached_block(block_cache *cache, cached_block *block,
++write_cached_block(block_cache* cache, cached_block* block,
+ 	bool deleteTransaction)
+ {
+-	cache_transaction *previous = block-&gt;previous_transaction;
++	cache_transaction* previous = block-&gt;previous_transaction;
+ 	int32_t blockSize = cache-&gt;block_size;
+ 
+-	void *data = previous &amp;&amp; block-&gt;original_data
++	void* data = previous &amp;&amp; block-&gt;original_data
+ 		? block-&gt;original_data : block-&gt;current_data;
+ 		// we first need to write back changes from previous transactions
+ 
+@@ -675,10 +917,7 @@
+ 		if (--previous-&gt;num_blocks == 0) {
+ 			TRACE((&quot;cache transaction %ld finished!\n&quot;, previous-&gt;id));
+ 
+-			if (previous-&gt;notification_hook != NULL) {
+-				previous-&gt;notification_hook(previous-&gt;id,
+-					FSSH_TRANSACTION_WRITTEN, previous-&gt;notification_data);
+-			}
++			notify_transaction_listeners(cache, previous, FSSH_TRANSACTION_WRITTEN);
+ 
+ 			if (deleteTransaction) {
+ 				hash_remove(cache-&gt;transaction_hash, previous);
+@@ -686,14 +925,31 @@
+ 			}
+ 		}
+ 	}
++	if (block-&gt;transaction == NULL &amp;&amp; block-&gt;ref_count == 0) {
++		// the block is no longer used
++		block-&gt;unused = true;
++		cache-&gt;unused_blocks.Add(block);
++	}
+ 
+ 	return FSSH_B_OK;
+ }
+ 
+ 
++/*!	Waits until all pending notifications are carried out.
++	Safe to be called from the block writer/notifier thread.
++	You must not hold the \a cache lock when calling this function.
++*/
++static void
++wait_for_notifications(block_cache* cache)
++{
++// TODO: nothing to wait for here.
++}
++
++
+ fssh_status_t
+ block_cache_init()
+ {
++	fssh_mutex_init(&amp;sNotificationsLock, &quot;block cache notifications&quot;);
+ 	return FSSH_B_OK;
+ }
+ 
+@@ -708,9 +964,9 @@
+ 
+ 
+ int32_t
+-fssh_cache_start_transaction(void *_cache)
++fssh_cache_start_transaction(void* _cache)
+ {
+-	block_cache *cache = (block_cache *)_cache;
+
+[... truncated: 725 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013478.html">[Haiku-commits] r28616 - haiku/trunk/build/jam
+</A></li>
+	<LI>Next message: <A HREF="013480.html">[Haiku-commits] r28618 - in haiku/trunk/src/tools: . hack_coff
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13479">[ date ]</a>
+              <a href="thread.html#13479">[ thread ]</a>
+              <a href="subject.html#13479">[ subject ]</a>
+              <a href="author.html#13479">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

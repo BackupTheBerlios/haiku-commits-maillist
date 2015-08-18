@@ -1,0 +1,533 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25952 - haiku/trunk/src/servers/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25952%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200806131348.m5DDmYZN028039%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009600.html">
+   <LINK REL="Next"  HREF="009602.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25952 - haiku/trunk/src/servers/app</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25952%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200806131348.m5DDmYZN028039%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25952 - haiku/trunk/src/servers/app">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Fri Jun 13 15:48:34 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009600.html">[Haiku-commits] r25951 - haiku/trunk/src/servers/app
+</A></li>
+        <LI>Next message: <A HREF="009602.html">[Haiku-commits] r25952 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9601">[ date ]</a>
+              <a href="thread.html#9601">[ thread ]</a>
+              <a href="subject.html#9601">[ subject ]</a>
+              <a href="author.html#9601">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-06-13 15:48:33 +0200 (Fri, 13 Jun 2008)
+New Revision: 25952
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25952&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25952&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/DefaultDecorator.cpp
+   haiku/trunk/src/servers/app/DefaultDecorator.h
+Log:
+* Cache the close and zoom buttons in a blit-ready bitmap so the buttons don't
+  need to be drawn each time an update occurs (switching focus/non-focus or
+  pressed state, involving many graphics card blits and state updates in the
+  drawing subsystem).
+* Provide a shared list of already present bitmaps. All the default decorators
+  now use the new _GetBitmapForButton static method to get a rendered bitmap
+  of the button for the given size and state (focus, pressed). If a matching
+  bitmap exists it is returned, otherwise a new one is created on demand using
+  a shared BitmapDrawingEngine.
+* Cache the colors of the tab and frame for both focus and non-focus states to
+  avoid always looking them up.
+* Added a todo that these bitmaps and the BitmapDrawingEngine are never freed.
+  They should be freed on app_server quit, but as there are only like 12 of
+  them anyway I didn't really bother.
+* Some cleanup.
+
+This should reduce the waste of cycles for just drawing the default decorator
+buttons quite a bit. Probably the whole tab should be pre-rendered though to
+also safe the text rendering of the title.
+
+Modified: haiku/trunk/src/servers/app/DefaultDecorator.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/DefaultDecorator.cpp	2008-06-13 13:28:13 UTC (rev 25951)
++++ haiku/trunk/src/servers/app/DefaultDecorator.cpp	2008-06-13 13:48:33 UTC (rev 25952)
+@@ -12,22 +12,25 @@
+ 
+ #include &quot;DefaultDecorator.h&quot;
+ 
++#include &quot;BitmapDrawingEngine.h&quot;
+ #include &quot;DesktopSettings.h&quot;
+ #include &quot;DrawingEngine.h&quot;
+ #include &quot;DrawState.h&quot;
+ #include &quot;FontManager.h&quot;
+ #include &quot;PatternHandler.h&quot;
++#include &quot;ServerBitmap.h&quot;
+ 
+ #include &lt;WindowPrivate.h&gt;
+ 
++#include &lt;Autolock.h&gt;
+ #include &lt;Rect.h&gt;
+ #include &lt;View.h&gt;
+ 
++#include &lt;new&gt;
+ #include &lt;stdio.h&gt;
+ 
+ //#define DEBUG_DECORATOR
+ #ifdef DEBUG_DECORATOR
+-#	include &lt;stdio.h&gt;
+ #	define STRACE(x) printf x
+ #else
+ #	define STRACE(x) ;
+@@ -89,13 +92,27 @@
+ {
+ 	DefaultDecorator::SetLook(settings, look);
+ 
++	// common colors to both focus and non focus state
+ 	fFrameColors[0] = (rgb_color){ 152, 152, 152, 255 };
+ 	fFrameColors[1] = (rgb_color){ 255, 255, 255, 255 };
+-	fFrameColors[2] = (rgb_color){ 216, 216, 216, 255 };
+-	fFrameColors[3] = (rgb_color){ 136, 136, 136, 255 };
+ 	fFrameColors[4] = (rgb_color){ 152, 152, 152, 255 };
+ 	fFrameColors[5] = (rgb_color){ 96, 96, 96, 255 };
+ 
++	// state based colors
++	fFocusFrameColors[0] = (rgb_color){ 216, 216, 216, 255 };
++	fFocusFrameColors[1] = (rgb_color){ 136, 136, 136, 255 };
++	fNonFocusFrameColors[0] = (rgb_color){ 232, 232, 232, 255 };
++	fNonFocusFrameColors[1] = (rgb_color){ 148, 148, 148, 255 };
++
++	fFocusTabColor = UIColor(B_WINDOW_TAB_COLOR);
++	fFocusTextColor = UIColor(B_WINDOW_TEXT_COLOR);
++	fNonFocusTabColor = UIColor(B_WINDOW_INACTIVE_TAB_COLOR);
++	fNonFocusTextColor = UIColor(B_WINDOW_INACTIVE_TEXT_COLOR);
++
++	fCloseBitmaps[0] = fCloseBitmaps[1] = fCloseBitmaps[2] = fCloseBitmaps[3]
++		= fZoomBitmaps[0] = fZoomBitmaps[1] = fZoomBitmaps[2] = fZoomBitmaps[3]
++		= NULL;
++
+ 	// Set appropriate colors based on the current focus value. In this case, each decorator
+ 	// defaults to not having the focus.
+ 	_SetFocus();
+@@ -435,7 +452,7 @@
+ 	_DrawTab(update);
+ }
+ 
+-// Draw
++
+ void
+ DefaultDecorator::Draw()
+ {
+@@ -447,7 +464,7 @@
+ 	_DrawTab(fTabRect);
+ }
+ 
+-// GetSizeLimits
++
+ void
+ DefaultDecorator::GetSizeLimits(int32* minWidth, int32* minHeight,
+ 								int32* maxWidth, int32* maxHeight) const
+@@ -458,7 +475,7 @@
+ 		*minHeight = (int32)roundf(max_c(*minHeight, fResizeRect.Height() - fBorderWidth));
+ }
+ 
+-// GetFootprint
++
+ void
+ DefaultDecorator::GetFootprint(BRegion *region)
+ {
+@@ -712,7 +729,7 @@
+ 	}
+ }
+ 
+-// _DrawFrame
++
+ void
+ DefaultDecorator::_DrawFrame(BRect invalid)
+ {
+@@ -903,7 +920,7 @@
+ 	}
+ }
+ 
+-// _DrawTab
++
+ void
+ DefaultDecorator::_DrawTab(BRect invalid)
+ {
+@@ -964,16 +981,28 @@
+ 		_DrawZoom(fZoomRect);
+ }
+ 
+-// _DrawClose
++
+ void
+-DefaultDecorator::_DrawClose(BRect r)
++DefaultDecorator::_DrawClose(BRect rect)
+ {
+-	STRACE((&quot;_DrawClose(%f,%f,%f,%f)\n&quot;, r.left, r.top, r.right, r.bottom));
+-	// Just like DrawZoom, but for a close button
+-	_DrawBlendedRect(r, GetClose());
++	STRACE((&quot;_DrawClose(%f,%f,%f,%f)\n&quot;, rect.left, rect.top, rect.right,
++		rect.bottom));
++
++	int32 index = (fButtonFocus ? 0 : 1) + (GetClose() ? 0 : 2);
++	ServerBitmap *bitmap = fCloseBitmaps[index];
++	if (bitmap == NULL) {
++		bitmap = _GetBitmapForButton(DEC_CLOSE, GetClose(), fButtonFocus,
++			rect.IntegerWidth(), rect.IntegerHeight(), this);
++		fCloseBitmaps[index] = bitmap;
++	}
++
++	if (bitmap == NULL)
++		return;
++
++	fDrawingEngine-&gt;DrawBitmap(bitmap, rect.OffsetToCopy(0, 0), rect);
+ }
+ 
+-// _DrawTitle
++
+ void
+ DefaultDecorator::_DrawTitle(BRect r)
+ {
+@@ -1008,23 +1037,23 @@
+ 
+ // _DrawZoom
+ void
+-DefaultDecorator::_DrawZoom(BRect r)
++DefaultDecorator::_DrawZoom(BRect rect)
+ {
+-	STRACE((&quot;_DrawZoom(%f,%f,%f,%f)\n&quot;, r.left, r.top, r.right, r.bottom));
++	STRACE((&quot;_DrawZoom(%f,%f,%f,%f)\n&quot;, rect.left, rect.top, rect.right,
++		rect.bottom));
+ 
+-	float inset = floorf(r.Width() / 4.0);
++	int32 index = (fButtonFocus ? 0 : 1) + (GetZoom() ? 0 : 2);
++	ServerBitmap *bitmap = fZoomBitmaps[index];
++	if (bitmap == NULL) {
++		bitmap = _GetBitmapForButton(DEC_ZOOM, GetZoom(), fButtonFocus,
++			rect.IntegerWidth(), rect.IntegerHeight(), this);
++		fZoomBitmaps[index] = bitmap;
++	}
+ 
+-	BRect zr(r);
+-	zr.left += inset;
+-	zr.top += inset;
+-	_DrawBlendedRect(zr, GetZoom());
++	if (bitmap == NULL)
++		return;
+ 
+-	inset = floorf(r.Width() / 2.1);
+-
+-	zr = r;
+-	zr.right -= inset;
+-	zr.bottom -= inset;
+-	_DrawBlendedRect(zr, GetZoom());
++	fDrawingEngine-&gt;DrawBitmap(bitmap, rect.OffsetToCopy(0, 0), rect);
+ }
+ 
+ // _SetFocus
+@@ -1037,21 +1066,17 @@
+ 	if (IsFocus()
+ 		|| ((fLook == B_FLOATING_WINDOW_LOOK || fLook == kLeftTitledWindowLook)
+ 		&amp;&amp; (fFlags &amp; B_AVOID_FOCUS) != 0)) {
+-		fTabColor = UIColor(B_WINDOW_TAB_COLOR);
+-		fTextColor = UIColor(B_WINDOW_TEXT_COLOR);
+-		fButtonHighColor = tint_color(fTabColor, B_LIGHTEN_2_TINT);
+-		fButtonLowColor = tint_color(fTabColor, B_DARKEN_1_TINT);
+-
+-		fFrameColors[2] = (rgb_color){ 216, 216, 216, 255 };
+-		fFrameColors[3] = (rgb_color){ 136, 136, 136, 255 };
++		fTabColor = fFocusTabColor;
++		fTextColor = fFocusTextColor;
++		fFrameColors[2] = fFocusFrameColors[0];
++		fFrameColors[3] = fFocusFrameColors[1];
++		fButtonFocus = true;
+ 	} else {
+-		fTabColor = UIColor(B_WINDOW_INACTIVE_TAB_COLOR);
+-		fTextColor = UIColor(B_WINDOW_INACTIVE_TEXT_COLOR);
+-		fButtonHighColor = tint_color(fTabColor, B_LIGHTEN_2_TINT);
+-		fButtonLowColor = tint_color(fTabColor, B_DARKEN_1_TINT);
+-
+-		fFrameColors[2] = (rgb_color){ 232, 232, 232, 255 };
+-		fFrameColors[3] = (rgb_color){ 148, 148, 148, 255 };
++		fTabColor = fNonFocusTabColor;
++		fTextColor = fNonFocusTextColor;
++		fFrameColors[2] = fNonFocusFrameColors[0];
++		fFrameColors[3] = fNonFocusFrameColors[1];
++		fButtonFocus = false;
+ 	}
+ 
+ 	fTabColorLight = tint_color(fTabColor,
+@@ -1060,7 +1085,7 @@
+ 		B_DARKEN_2_TINT);
+ }
+ 
+-// _SetColors
++
+ void
+ DefaultDecorator::_SetColors()
+ {
+@@ -1073,48 +1098,49 @@
+ 	\param down The rectangle should be drawn recessed or not
+ */
+ void
+-DefaultDecorator::_DrawBlendedRect(BRect r, bool down)
++DefaultDecorator::_DrawBlendedRect(DrawingEngine *engine, BRect rect,
++	bool down, bool focus)
+ {
+ 	// Actually just draws a blended square
+-	int32 w = r.IntegerWidth();
+-	int32 h = r.IntegerHeight();
++	int32 width = rect.IntegerWidth();
++	int32 height = rect.IntegerHeight();
++	int32 steps = width &lt; height ? width : height;
+ 
+-	rgb_color tempColor;
+-	rgb_color halfColor, startColor, endColor;
+-	float rstep, gstep, bstep;
+-
+-	int steps = w &lt; h ? w : h;
+-
++	rgb_color startColor, endColor;
++	rgb_color tabColor = focus ? fFocusTabColor : fNonFocusTabColor;
+ 	if (down) {
+-		startColor = fButtonLowColor;
+-		endColor = fButtonHighColor;
++		startColor = tint_color(tabColor, B_DARKEN_1_TINT);
++		endColor = tint_color(tabColor, B_LIGHTEN_2_TINT);;
+ 	} else {
+-		startColor = fButtonHighColor;
+-		endColor = fButtonLowColor;
++		startColor = tint_color(tabColor, B_LIGHTEN_2_TINT);
++		endColor = tint_color(tabColor, B_DARKEN_1_TINT);
+ 	}
+ 
+-	halfColor = make_blend_color(startColor, endColor, 0.5);
++	rgb_color halfColor = make_blend_color(startColor, endColor, 0.5);
+ 
+-	rstep = float(startColor.red - halfColor.red) / steps;
+-	gstep = float(startColor.green - halfColor.green) / steps;
+-	bstep = float(startColor.blue - halfColor.blue) / steps;
++	float rstep = float(startColor.red - halfColor.red) / steps;
++	float gstep = float(startColor.green - halfColor.green) / steps;
++	float bstep = float(startColor.blue - halfColor.blue) / steps;
+ 
++	rgb_color tempColor;
+ 	for (int32 i = 0; i &lt;= steps; i++) {
+ 		tempColor.red = uint8(startColor.red - (i * rstep));
+ 		tempColor.green = uint8(startColor.green - (i * gstep));
+ 		tempColor.blue = uint8(startColor.blue - (i * bstep));
+ 
+-		fDrawingEngine-&gt;StrokeLine(BPoint(r.left, r.top + i),
+-			BPoint(r.left + i, r.top), tempColor);
++		engine-&gt;StrokeLine(BPoint(rect.left, rect.top + i),
++			BPoint(rect.left + i, rect.top), tempColor);
+ 
+ 		tempColor.red = uint8(halfColor.red - (i * rstep));
+ 		tempColor.green = uint8(halfColor.green - (i * gstep));
+ 		tempColor.blue = uint8(halfColor.blue - (i * bstep));
+ 
+-		fDrawingEngine-&gt;StrokeLine(BPoint(r.left + steps, r.top + i),
+-			BPoint(r.left + i, r.top + steps), tempColor);
++		engine-&gt;StrokeLine(BPoint(rect.left + steps, rect.top + i),
++			BPoint(rect.left + i, rect.top + steps), tempColor);
+ 	}
+-	fDrawingEngine-&gt;StrokeRect(r, fFrameColors[3]);
++
++	engine-&gt;StrokeRect(rect,
++		focus ? fFocusFrameColors[1] : fNonFocusFrameColors[1]);
+ }
+ 
+ // _GetButtonSizeAndOffset
+@@ -1187,3 +1213,96 @@
+ 	fDrawState.Font().TruncateString(&amp;fTruncatedTitle, B_TRUNCATE_END, size);
+ 	fTruncatedTitleLength = fTruncatedTitle.Length();
+ }
++
++
++ServerBitmap *
++DefaultDecorator::_GetBitmapForButton(int32 item, bool down, bool focus,
++	int32 width, int32 height, DefaultDecorator *object)
++{
++	// TODO: the list of shared bitmaps is never freed
++	struct decorator_bitmap {
++		int32				item;
++		bool				down;
++		bool				focus;
++		int32				width;
++		int32				height;
++		UtilityBitmap *		bitmap;
++		decorator_bitmap *	next;
++	};
++
++	static BLocker sBitmapListLock(&quot;decorator lock&quot;, true);
++	static decorator_bitmap *sBitmapList = NULL;
++	BAutolock locker(sBitmapListLock);
++
++	// search our list for a matching bitmap
++	decorator_bitmap *current = sBitmapList;
++	while (current) {
++		if (current-&gt;item == item &amp;&amp; current-&gt;down == down
++			&amp;&amp; current-&gt;focus == focus &amp;&amp; current-&gt;width == width
++			&amp;&amp; current-&gt;height == height) {
++			return current-&gt;bitmap;
++		}
++
++		current = current-&gt;next;
++	}
++
++	static BitmapDrawingEngine *sBitmapDrawingEngine = NULL;
++
++	// didn't find any bitmap, create a new one
++	if (sBitmapDrawingEngine == NULL)
++		sBitmapDrawingEngine = new(std::nothrow) BitmapDrawingEngine();
++	if (sBitmapDrawingEngine == NULL
++		|| sBitmapDrawingEngine-&gt;SetSize(width, height) != B_OK)
++		return NULL;
++
++	BRect rect(0, 0, width - 1, height - 1);
++	sBitmapDrawingEngine-&gt;FillRect(rect,
++		focus ? object-&gt;fFocusTabColor : object-&gt;fNonFocusTabColor);
++
++	STRACE((&quot;DefaultDecorator creating bitmap for %s %sfocus %s at size %ldx%ld\n&quot;,
++		item == DEC_CLOSE ? &quot;close&quot; : &quot;zoom&quot;, focus ? &quot;&quot; : &quot;non-&quot;,
++		down ? &quot;down&quot; : &quot;up&quot;, width, height));
++	switch (item) {
++		case DEC_CLOSE:
++			object-&gt;_DrawBlendedRect(sBitmapDrawingEngine, rect, down, focus);
++			break;
++
++		case DEC_ZOOM:
++		{
++			float inset = floorf(width / 4.0);
++			BRect zoomRect(rect);
++			zoomRect.left += inset;
++			zoomRect.top += inset;
++			object-&gt;_DrawBlendedRect(sBitmapDrawingEngine, zoomRect, down, focus);
++
++			inset = floorf(width / 2.1);
++			zoomRect = rect;
++			zoomRect.right -= inset;
++			zoomRect.bottom -= inset;
++			object-&gt;_DrawBlendedRect(sBitmapDrawingEngine, zoomRect, down, focus);
++			break;
++		}
++	}
++
++	UtilityBitmap *bitmap = sBitmapDrawingEngine-&gt;ExportToBitmap(width, height,
++		B_RGB32);
++	if (bitmap == NULL)
++		return NULL;
++
++	// bitmap ready, put it into the list
++	decorator_bitmap *entry = new(std::nothrow) decorator_bitmap;
++	if (entry == NULL) {
++		delete bitmap;
++		return NULL;
++	}
++
++	entry-&gt;item = item;
++	entry-&gt;down = down;
++	entry-&gt;focus = focus;
++	entry-&gt;width = width;
++	entry-&gt;height = height;
++	entry-&gt;bitmap = bitmap;
++	entry-&gt;next = sBitmapList;
++	sBitmapList = entry;
++	return bitmap;
++}
+
+Modified: haiku/trunk/src/servers/app/DefaultDecorator.h
+===================================================================
+--- haiku/trunk/src/servers/app/DefaultDecorator.h	2008-06-13 13:28:13 UTC (rev 25951)
++++ haiku/trunk/src/servers/app/DefaultDecorator.h	2008-06-13 13:48:33 UTC (rev 25952)
+@@ -14,8 +14,8 @@
+ #include &lt;Region.h&gt;
+ 
+ class Desktop;
++class ServerBitmap;
+ 
+-
+ class DefaultDecorator: public Decorator {
+  public:
+ 								DefaultDecorator(DesktopSettings&amp; settings,
+@@ -68,21 +68,36 @@
+ 	virtual void				_SetColors();
+ 
+  private:
+-			void				_DrawBlendedRect(BRect r, bool down);
++			void				_DrawBlendedRect(DrawingEngine *engine,
++									BRect rect, bool down, bool focus);
+ 			void				_GetButtonSizeAndOffset(const BRect&amp; tabRect,
+ 									float* offset, float* size,
+ 									float* inset) const;
+ 			void				_LayoutTabItems(const BRect&amp; tabRect);
+ 
++static		ServerBitmap *		_GetBitmapForButton(int32 item, bool down,
++									bool focus, int32 width, int32 height,
++									DefaultDecorator *object);
++
+ 			rgb_color			fButtonHighColor;
+ 			rgb_color			fButtonLowColor;
++			rgb_color			fTabColor;
++			rgb_color			fFocusTabColor;
++			rgb_color			fNonFocusTabColor;
+ 			rgb_color			fTextColor;
+-			rgb_color			fTabColor;
++			rgb_color			fFocusTextColor;
++			rgb_color			fNonFocusTextColor;
+ 			rgb_color			fTabColorLight;
+ 			rgb_color			fTabColorShadow;
+ 
+ 			rgb_color			fFrameColors[6];
++			rgb_color			fFocusFrameColors[2];
++			rgb_color			fNonFocusFrameColors[2];
+ 
++			bool				fButtonFocus;
++			ServerBitmap *		fCloseBitmaps[4];
++			ServerBitmap *		fZoomBitmaps[4];
++
+ 			// Individual rects for handling window frame
+ 			// rendering the proper way
+ 			BRect				fRightBorder;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009600.html">[Haiku-commits] r25951 - haiku/trunk/src/servers/app
+</A></li>
+	<LI>Next message: <A HREF="009602.html">[Haiku-commits] r25952 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9601">[ date ]</a>
+              <a href="thread.html#9601">[ thread ]</a>
+              <a href="subject.html#9601">[ subject ]</a>
+              <a href="author.html#9601">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

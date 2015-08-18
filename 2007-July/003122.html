@@ -1,0 +1,134 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21670 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/remote_disk
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21670%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/remote_disk&In-Reply-To=%3C200707192146.l6JLkJqv032595%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003121.html">
+   <LINK REL="Next"  HREF="003123.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21670 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/remote_disk</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21670%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/remote_disk&In-Reply-To=%3C200707192146.l6JLkJqv032595%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21670 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/remote_disk">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Jul 19 23:46:19 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003121.html">[Haiku-commits] r21669 - haiku/trunk/src/system/kernel/cache
+</A></li>
+        <LI>Next message: <A HREF="003123.html">[Haiku-commits] r21671 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3122">[ date ]</a>
+              <a href="thread.html#3122">[ thread ]</a>
+              <a href="subject.html#3122">[ subject ]</a>
+              <a href="author.html#3122">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-07-19 23:46:19 +0200 (Thu, 19 Jul 2007)
+New Revision: 21670
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21670&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21670&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/remote_disk/RemoteDisk.cpp
+Log:
+* Fine-tuned timeouts.
+* Also eat B_INTERRUPTED on sendto()/recvfrom(). The net stack is
+  interruptable in principle, but our disk device operations shouldn't.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/remote_disk/RemoteDisk.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/remote_disk/RemoteDisk.cpp	2007-07-19 21:43:22 UTC (rev 21669)
++++ haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/remote_disk/RemoteDisk.cpp	2007-07-19 21:46:19 UTC (rev 21670)
+@@ -30,8 +30,9 @@
+ #endif
+ 
+ 
+-static const bigtime_t kReceiveTimeout = 2000000LL;
+-static const bigtime_t kRequestTimeout = 6000000LL;
++static const int kMaxRequestResendCount = 5;
++static const bigtime_t kReceiveTimeout = 800000LL;
++static const bigtime_t kRequestTimeout = 5000000LL;
+ 
+ #if __BYTE_ORDER == __LITTLE_ENDIAN
+ 
+@@ -405,18 +406,23 @@
+ 	request-&gt;request_id = fRequestID++;
+ 	request-&gt;port = fSocketAddress.sin_port;
+ 
+-	// try sending the request 3 times at most
+-	for (int i = 0; i &lt; 3; i++) {
++	// try sending the request kMaxRequestResendCount times at most
++	for (int i = 0; i &lt; kMaxRequestResendCount; i++) {
+ 		// send request
+-		ssize_t bytesSent = fSocketModule-&gt;sendto(fSocket, request, size,
+-        	0, (sockaddr*)&amp;fServerAddress, sizeof(fServerAddress));
++		ssize_t bytesSent;
++		do {
++			bytesSent = fSocketModule-&gt;sendto(fSocket, request, size,
++        		0, (sockaddr*)&amp;fServerAddress, sizeof(fServerAddress));
++		} while (bytesSent &lt; 0 &amp;&amp; errno == B_INTERRUPTED);
++
+ 		if (bytesSent &lt; 0) {
+ 			dprintf(&quot;RemoteDisk::_SendRequest(): failed to send packet: %s\n&quot;,
+ 				strerror(errno));
+ 			return errno;
+ 		}
+ 		if (bytesSent != (ssize_t)size) {
+-			dprintf(&quot;RemoteDisk::_SendRequest(): sent less bytes than desired\n&quot;);
++			dprintf(&quot;RemoteDisk::_SendRequest(): sent less bytes than &quot;
++				&quot;desired\n&quot;);
+ 			return B_ERROR;
+ 		}
+ 
+@@ -430,8 +436,12 @@
+ 				(peerAddress ? &amp;addrSize : 0));
+ 			if (bytesReceived &lt; 0) {
+ 				status_t error = errno;
+-				if (error != B_TIMED_OUT &amp;&amp; error != B_WOULD_BLOCK)
++				if (error != B_TIMED_OUT &amp;&amp; error != B_WOULD_BLOCK
++						&amp;&amp; error != B_INTERRUPTED) {
++					dprintf(&quot;RemoteDisk::_SendRequest(): recvfrom() failed: &quot;
++						&quot;%s\n&quot;, strerror(error));
+ 					return error;
++				}
+ 				continue;
+ 			}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003121.html">[Haiku-commits] r21669 - haiku/trunk/src/system/kernel/cache
+</A></li>
+	<LI>Next message: <A HREF="003123.html">[Haiku-commits] r21671 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3122">[ date ]</a>
+              <a href="thread.html#3122">[ thread ]</a>
+              <a href="subject.html#3122">[ subject ]</a>
+              <a href="author.html#3122">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

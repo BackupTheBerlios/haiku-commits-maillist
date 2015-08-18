@@ -1,0 +1,327 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25280 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25280%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200805011806.m41I69QJ019287%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008392.html">
+   <LINK REL="Next"  HREF="008407.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25280 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25280%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200805011806.m41I69QJ019287%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25280 - in haiku/trunk: headers/private/kernel	src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu May  1 20:06:09 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008392.html">[Haiku-commits] r25279 - haiku/trunk/src/tools/fs_shell
+</A></li>
+        <LI>Next message: <A HREF="008407.html">[Haiku-commits] r25281 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8400">[ date ]</a>
+              <a href="thread.html#8400">[ thread ]</a>
+              <a href="subject.html#8400">[ subject ]</a>
+              <a href="author.html#8400">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-05-01 20:06:09 +0200 (Thu, 01 May 2008)
+New Revision: 25280
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25280&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25280&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/lock.h
+   haiku/trunk/src/system/kernel/lock.cpp
+Log:
+* Replaced cutex::release_count by flags field. It is only one thread
+  that can unlock the mutex, so one bit is sufficient.
+* Added cutex_init_etc() which has an additional &quot;flags&quot; parameter.
+  The only specifyable flag is CUTEX_FLAG_CLONE_NAME, which causes the
+  function to strdup() the given name and free() its copy in
+  cutex_destroy().
+* cutex_destroy() does now unblock waiting threads.
+
+
+Modified: haiku/trunk/headers/private/kernel/lock.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/lock.h	2008-05-01 12:43:29 UTC (rev 25279)
++++ haiku/trunk/headers/private/kernel/lock.h	2008-05-01 18:06:09 UTC (rev 25280)
+@@ -49,10 +49,12 @@
+ #else
+ 	int32					count;
+ #endif
+-	int32					release_count;
++	uint8					flags;
+ } cutex;
+ 
++#define CUTEX_FLAG_CLONE_NAME	0x1
+ 
++
+ #if 0 &amp;&amp; KDEBUG // XXX disable this for now, it causes problems when including thread.h here
+ #	include &lt;thread.h&gt;
+ #define ASSERT_LOCKED_RECURSIVE(r) { ASSERT(thread_get_current_thread_id() == (r)-&gt;holder); }
+@@ -121,22 +123,24 @@
+ 
+ extern void cutex_init(cutex* lock, const char *name);
+ 	// name is *not* cloned nor freed in cutex_destroy()
++extern void cutex_init_etc(cutex* lock, const char *name, uint32 flags);
+ extern void cutex_destroy(cutex* lock);
+ 
+ // implementation private:
+-extern void _cutex_lock(cutex* lock);
++extern status_t _cutex_lock(cutex* lock);
+ extern void _cutex_unlock(cutex* lock);
+ extern status_t _cutex_trylock(cutex* lock);
+ 
+ 
+-static inline void
++static inline status_t
+ cutex_lock(cutex* lock)
+ {
+ #ifdef KDEBUG
+-	_cutex_lock(lock);
++	return _cutex_lock(lock);
+ #else
+ 	if (atomic_add(&amp;lock-&gt;count, -1) &lt; 0)
+-		_cutex_lock(lock);
++		return _cutex_lock(lock);
++	return B_OK;
+ #endif
+ }
+ 
+@@ -149,6 +153,7 @@
+ #else
+ 	if (atomic_test_and_set(&amp;lock-&gt;count, -1, 0) != 0)
+ 		return B_WOULD_BLOCK;
++	return B_OK;
+ #endif
+ }
+ 
+
+Modified: haiku/trunk/src/system/kernel/lock.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/lock.cpp	2008-05-01 12:43:29 UTC (rev 25279)
++++ haiku/trunk/src/system/kernel/lock.cpp	2008-05-01 18:06:09 UTC (rev 25280)
+@@ -11,6 +11,9 @@
+ 
+ #include &lt;lock.h&gt;
+ 
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++
+ #include &lt;OS.h&gt;
+ 
+ #include &lt;debug.h&gt;
+@@ -26,7 +29,10 @@
+ 	cutex_waiter*	last;		// last in queue (valid for the first in queue)
+ };
+ 
++#define CUTEX_FLAG_OWNS_NAME	CUTEX_FLAG_CLONE_NAME
++#define CUTEX_FLAG_RELEASED		0x2
+ 
++
+ int32
+ recursive_lock_get_recursion(recursive_lock *lock)
+ {
+@@ -302,23 +308,67 @@
+ #else
+ 	lock-&gt;count = 0;
+ #endif
+-	lock-&gt;release_count = 0;
++	lock-&gt;flags = 0;
+ }
+ 
+ 
+ void
++cutex_init_etc(cutex* lock, const char *name, uint32 flags)
++{
++	lock-&gt;name = (flags &amp; CUTEX_FLAG_CLONE_NAME) != 0 ? strdup(name) : name;
++	lock-&gt;waiters = NULL;
++#ifdef KDEBUG
++	lock-&gt;holder = -1;
++#else
++	lock-&gt;count = 0;
++#endif
++	lock-&gt;flags = flags &amp; CUTEX_FLAG_CLONE_NAME;
++}
++
++
++void
+ cutex_destroy(cutex* lock)
+ {
+-	// no-op
++	char* name = (lock-&gt;flags &amp; CUTEX_FLAG_CLONE_NAME) != 0
++		? (char*)lock-&gt;name : NULL;
++
++	// unblock all waiters
++	InterruptsSpinLocker locker(thread_spinlock);
++
++#ifdef KDEBUG
++	if (lock-&gt;waiters != NULL &amp;&amp; thread_get_current_thread_id()
++		!= lock-&gt;holder) {
++		panic(&quot;cutex_destroy(): there are blocking threads, but caller doesn't &quot;
++			&quot;hold the lock (%p)&quot;, lock);
++		locker.Unlock();
++		if (_cutex_lock(lock) != B_OK)
++			return;
++		locker.Lock();
++	}
++#endif
++
++	while (cutex_waiter* waiter = lock-&gt;waiters) {
++		// dequeue
++		lock-&gt;waiters = waiter-&gt;next;
++
++		// unblock thread
++		thread_unblock_locked(waiter-&gt;thread, B_ERROR);
++	}
++
++	lock-&gt;name = NULL;
++
++	locker.Unlock();
++
++	free(name);
+ }
+ 
+ 
+-void
++status_t
+ _cutex_lock(cutex* lock)
+ {
+ #ifdef KDEBUG
+ 	if (!kernel_startup &amp;&amp; !are_interrupts_enabled()) {
+-		panic(&quot;_cutex_unlock: called with interrupts disabled for lock %p&quot;,
++		panic(&quot;_cutex_unlock(): called with interrupts disabled for lock %p&quot;,
+ 			lock);
+ 	}
+ #endif
+@@ -328,14 +378,16 @@
+ 	// Might have been released after we decremented the count, but before
+ 	// we acquired the spinlock.
+ #ifdef KDEBUG
+-	if (lock-&gt;release_count &gt;= 0) {
++	if (lock-&gt;holder &lt;= 0) {
+ 		lock-&gt;holder = thread_get_current_thread_id();
++		return B_OK;
++	}
+ #else
+-	if (lock-&gt;release_count &gt; 0) {
++	if ((lock-&gt;flags &amp; CUTEX_FLAG_RELEASED) != 0) {
++		lock-&gt;flags &amp;= ~CUTEX_FLAG_RELEASED;
++		return B_OK;
++	}
+ #endif
+-		lock-&gt;release_count--;
+-		return;
+-	}
+ 
+ 	// enqueue in waiter list
+ 	cutex_waiter waiter;
+@@ -351,11 +403,14 @@
+ 
+ 	// block
+ 	thread_prepare_to_block(waiter.thread, 0, THREAD_BLOCK_TYPE_CUTEX, lock);
+-	thread_block_locked(waiter.thread);
++	status_t error = thread_block_locked(waiter.thread);
+ 
+ #ifdef KDEBUG
+-	lock-&gt;holder = waiter.thread-&gt;id;
++	if (error == B_OK)
++		lock-&gt;holder = waiter.thread-&gt;id;
+ #endif
++
++	return error;
+ }
+ 
+ 
+@@ -371,8 +426,6 @@
+ 			lock, lock-&gt;holder);
+ 		return;
+ 	}
+-
+-	lock-&gt;holder = -1;
+ #endif
+ 
+ 	cutex_waiter* waiter = lock-&gt;waiters;
+@@ -384,10 +437,22 @@
+ 
+ 		// unblock thread
+ 		thread_unblock_locked(waiter-&gt;thread, B_OK);
++
++#ifdef KDEBUG
++		// Already set the holder to the unblocked thread. Besides that this
++		// actually reflects the current situation, setting it to -1 would
++		// cause a race condition, since another locker could think the lock
++		// is not held by anyone.
++		lock-&gt;holder = waiter-&gt;thread-&gt;id;
++#endif
+ 	} else {
+-		// We acquired the spinlock before the locker that is going to wait.
+-		// Just increment the release count.
+-		lock-&gt;release_count++;
++		// We've acquired the spinlock before the locker that is going to wait.
++		// Just mark the lock as released.
++#ifdef KDEBUG
++		lock-&gt;holder = -1;
++#else
++		lock-&gt;flags |= CUTEX_FLAG_RELEASED;
++#endif
+ 	}
+ }
+ 
+@@ -398,9 +463,8 @@
+ #ifdef KDEBUG
+ 	InterruptsSpinLocker _(thread_spinlock);
+ 
+-	if (lock-&gt;release_count &gt;= 0) {
++	if (lock-&gt;holder &lt;= 0) {
+ 		lock-&gt;holder = thread_get_current_thread_id();
+-		lock-&gt;release_count--;
+ 		return B_OK;
+ 	}
+ #endif
+@@ -425,7 +489,7 @@
+ 
+ 	kprintf(&quot;cutex %p:\n&quot;, lock);
+ 	kprintf(&quot;  name:            %s\n&quot;, lock-&gt;name);
+-	kprintf(&quot;  release count:   %ld\n&quot;, lock-&gt;release_count);
++	kprintf(&quot;  flags:           0x%x\n&quot;, lock-&gt;flags);
+ #ifdef KDEBUG
+ 	kprintf(&quot;  holder:          %ld\n&quot;, lock-&gt;holder);
+ #else
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008392.html">[Haiku-commits] r25279 - haiku/trunk/src/tools/fs_shell
+</A></li>
+	<LI>Next message: <A HREF="008407.html">[Haiku-commits] r25281 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8400">[ date ]</a>
+              <a href="thread.html#8400">[ thread ]</a>
+              <a href="subject.html#8400">[ subject ]</a>
+              <a href="author.html#8400">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

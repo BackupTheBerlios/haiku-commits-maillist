@@ -1,0 +1,345 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26843 - in haiku/trunk: headers/private/storage	src/kits/storage
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26843%20-%20in%20haiku/trunk%3A%20headers/private/storage%0A%09src/kits/storage&In-Reply-To=%3C200808061656.m76GuY9g026329%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010872.html">
+   <LINK REL="Next"  HREF="010871.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26843 - in haiku/trunk: headers/private/storage	src/kits/storage</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26843%20-%20in%20haiku/trunk%3A%20headers/private/storage%0A%09src/kits/storage&In-Reply-To=%3C200808061656.m76GuY9g026329%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26843 - in haiku/trunk: headers/private/storage	src/kits/storage">stippi at mail.berlios.de
+       </A><BR>
+    <I>Wed Aug  6 18:56:34 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010872.html">[Haiku-commits] r26842 - haiku/trunk/src/add-ons/kernel/bus_managers/pci
+</A></li>
+        <LI>Next message: <A HREF="010871.html">[Haiku-commits] r26843 - in haiku/trunk:	headers/private/storage src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10869">[ date ]</a>
+              <a href="thread.html#10869">[ thread ]</a>
+              <a href="subject.html#10869">[ subject ]</a>
+              <a href="author.html#10869">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2008-08-06 18:56:24 +0200 (Wed, 06 Aug 2008)
+New Revision: 26843
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26843&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26843&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/storage/PathMonitor.h
+   haiku/trunk/src/kits/storage/PathMonitor.cpp
+Log:
+* StartWatching() now takes an optional BLooper pointer. This looper will
+  then be used for receiving node monitoring messages.
+* Reenabled using be_app as default BLooper if the API user does not provide
+  one. I think the problem that Stefano needed to work aroung in r23995 was
+  actually caused by the incorrect locking (an never unlocking) of the looper
+  before calling PathHandler::Quit().
+-&gt;If I understand correctly, this code as supposed to work around the possible
+  situation that the looper holding those PathHandlers may have already quit,
+  leaving stale PathHandler pointers behind. But that case was not prevented
+  by the old code anyways, since one would have had to access freed memory to
+  even get the stale BLooper pointer. The real fix would be to store the
+  BLooper pointer with each PathHandler so that the possible gone-ness of
+  those loopers could be checked independent of accessing the PathHandler
+  pointer. (The whole problem is that PathHandler adds itself to the BLooper
+  and if the looper quits, it will free all its attached handlers.)
+* Introduced a global fallback BLooper for the case that no BApplication is
+  running, which resolves a TODO.
+
+All this is yet untested, but should have a good chance of working.
+(Famous last words...)
+
+
+Modified: haiku/trunk/headers/private/storage/PathMonitor.h
+===================================================================
+--- haiku/trunk/headers/private/storage/PathMonitor.h	2008-08-06 16:39:56 UTC (rev 26842)
++++ haiku/trunk/headers/private/storage/PathMonitor.h	2008-08-06 16:56:24 UTC (rev 26843)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2007, Haiku Inc. All Rights Reserved.
++ * Copyright 2007-2008, Haiku Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT License.
+  */
+ #ifndef _PATH_MONITOR_H
+@@ -20,7 +20,8 @@
+ class BPathMonitor {
+ public:
+ 	static	status_t			StartWatching(const char* path, uint32 flags,
+-									BMessenger target);
++									BMessenger target,
++									BLooper* useLooper = NULL);
+ 
+ 	static	status_t			StopWatching(const char* path,
+ 									BMessenger target);
+@@ -30,7 +31,8 @@
+ 								BPathMonitor();
+ 								~BPathMonitor();
+ 
+-	static	status_t			_InitIfNeeded();
++	static	status_t			_InitLockerIfNeeded();
++	static	status_t			_InitLooperIfNeeded();
+ };
+ 
+ }	// namespace BPrivate
+
+Modified: haiku/trunk/src/kits/storage/PathMonitor.cpp
+===================================================================
+--- haiku/trunk/src/kits/storage/PathMonitor.cpp	2008-08-06 16:39:56 UTC (rev 26842)
++++ haiku/trunk/src/kits/storage/PathMonitor.cpp	2008-08-06 16:56:24 UTC (rev 26843)
+@@ -1,9 +1,10 @@
+ /*
+- * Copyright 2007, Haiku Inc. All Rights Reserved.
++ * Copyright 2007-2008, Haiku Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+  *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
++ *		Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;
+  */
+ 
+ 
+@@ -22,6 +23,7 @@
+ #include &lt;String.h&gt;
+ 
+ #include &lt;map&gt;
++#include &lt;new&gt;
+ #include &lt;set&gt;
+ 
+ #undef TRACE
+@@ -34,6 +36,7 @@
+ 
+ using namespace BPrivate;
+ using namespace std;
++using std::nothrow; // TODO: Remove this line if the above line is enough.
+ 
+ 
+ #define WATCH_NODE_FLAG_MASK	0x00ff
+@@ -72,7 +75,8 @@
+ 
+ class PathHandler : public BHandler {
+ 	public:
+-		PathHandler(const char* path, uint32 flags, BMessenger target);
++		PathHandler(const char* path, uint32 flags, BMessenger target,
++			BLooper* looper);
+ 		virtual ~PathHandler();
+ 
+ 		status_t InitCheck() const;
+@@ -112,7 +116,6 @@
+ 		BMessenger		fTarget;
+ 		uint32			fFlags;
+ 		status_t		fStatus;
+-		bool			fOwnsLooper;
+ 		DirectorySet	fDirectories;
+ 		FileSet			fFiles;
+ };
+@@ -120,6 +123,7 @@
+ 
+ static WatcherMap sWatchers;
+ static BLocker* sLocker = NULL;
++static BLooper* sLooper = NULL;
+ 
+ 
+ static status_t
+@@ -159,11 +163,11 @@
+ //	#pragma mark -
+ 
+ 
+-PathHandler::PathHandler(const char* path, uint32 flags, BMessenger target)
++PathHandler::PathHandler(const char* path, uint32 flags, BMessenger target,
++		BLooper* looper)
+ 	: BHandler(path),
+ 	fTarget(target),
+-	fFlags(flags),
+-	fOwnsLooper(false)
++	fFlags(flags)
+ {
+ 	if (path == NULL || !path[0]) {
+ 		fStatus = B_BAD_VALUE;
+@@ -176,13 +180,6 @@
+ 	if (fStatus &lt; B_OK)
+ 		return;
+ 
+-	BLooper* looper;
+-	// TODO: only have a single global looper!
+-	// TODO: Use BLooper::LooperForThread(find_looper(NULL)) ?
+-	looper = new BLooper(&quot;PathMonitor looper&quot;);
+-	looper-&gt;Run();
+-	fOwnsLooper = true;
+-
+ 	looper-&gt;Lock();
+ 	looper-&gt;AddHandler(this);
+ 	looper-&gt;Unlock();
+@@ -212,13 +209,8 @@
+ void
+ PathHandler::Quit()
+ {
+-	if (!LockLooper())
+-		return;
+-
+ 	BMessenger me(this);
+ 	me.SendMessage(B_QUIT_REQUESTED);
+-
+-	UnlockLooper();
+ }
+ 
+ 
+@@ -488,18 +480,15 @@
+ 
+ 		case B_QUIT_REQUESTED:
+ 		{
++			// Obviously the looper is still valid and running
++			// when we receive the message here, it is also currently
++			// locked, because it is processing the message.
+ 			BLooper* looper = Looper();
+-			bool ownsLooper = fOwnsLooper;
+ 
+ 			stop_watching(this);
+ 			looper-&gt;RemoveHandler(this);
+ 			delete this;
+ 
+-			if (ownsLooper) {
+-				looper-&gt;Lock();
+-				looper-&gt;Quit();
+-			}
+-
+ 			return;
+ 		}
+ 
+@@ -773,7 +762,7 @@
+ 
+ 
+ /*static*/ status_t
+-BPathMonitor::_InitIfNeeded()
++BPathMonitor::_InitLockerIfNeeded()
+ {
+ 	static vint32 lock = 0;
+ 	
+@@ -782,7 +771,9 @@
+ 
+ 	while (sLocker == NULL) {
+ 		if (atomic_add(&amp;lock, 1) == 0) {
+-			sLocker = new BLocker(&quot;path monitor&quot;);
++			sLocker = new (nothrow) BLocker(&quot;path monitor&quot;);
++			if (sLocker == NULL)
++				return B_NO_MEMORY;
+ 		}
+ 		snooze(5000);
+ 	}
+@@ -792,12 +783,53 @@
+ 
+ 
+ /*static*/ status_t
+-BPathMonitor::StartWatching(const char* path, uint32 flags, BMessenger target)
++BPathMonitor::_InitLooperIfNeeded()
+ {
+-	status_t status = _InitIfNeeded();
++	static vint32 lock = 0;
++	
++	if (sLooper != NULL)
++		return B_OK;
++
++	while (sLooper == NULL) {
++		if (atomic_add(&amp;lock, 1) == 0) {
++			// first thread initializes the global looper
++			sLooper = new (nothrow) BLooper(&quot;PathMonitor looper&quot;);
++			if (sLooper == NULL)
++				return B_NO_MEMORY;
++			thread_id thread = sLooper-&gt;Run();
++			if (thread &lt; B_OK)
++				return (status_t)thread;
++		}
++		snooze(5000);
++	}
++
++	return sLooper-&gt;Thread() &gt;= 0 ? B_OK : B_ERROR;
++}
++
++
++/*static*/ status_t
++BPathMonitor::StartWatching(const char* path, uint32 flags, BMessenger target,
++	BLooper* looper)
++{
++	status_t status = _InitLockerIfNeeded();
+ 	if (status != B_OK)
+ 		return status;
+ 
++	// Check which BLooper should be used to receive node monitoring messages.
++	// If no looper is given, prefer the BApplication if it is running,
++	// otherwise use a global BLooper just for node monitoring.
++	if (looper == NULL) {
++		if (be_app)
++			looper = be_app;
++		else {
++			// only use the global looper if no BApplication is running
++			status = _InitLooperIfNeeded();
++			if (status &lt; B_OK)
++				return status;
++			looper = sLooper;
++		}
++	}
++
+ 	BAutolock _(sLocker);
+ 
+ 	WatcherMap::iterator iterator = sWatchers.find(target);
+@@ -805,13 +837,18 @@
+ 	if (iterator != sWatchers.end())
+ 		watcher = iterator-&gt;second;
+ 
+-	PathHandler* handler = new PathHandler(path, flags, target);
++	PathHandler* handler = new (nothrow) PathHandler(path, flags, target,
++		looper);
++	if (handler == NULL)
++		return B_NO_MEMORY;
+ 	status = handler-&gt;InitCheck();
+ 	if (status &lt; B_OK)
+ 		return status;
+ 
+ 	if (watcher == NULL) {
+-		watcher = new BPrivate::watcher;
++		watcher = new (nothrow) BPrivate::watcher;
++		if (watcher == NULL)
++			return B_NO_MEMORY;
+ 		sWatchers[target] = watcher;
+ 	}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010872.html">[Haiku-commits] r26842 - haiku/trunk/src/add-ons/kernel/bus_managers/pci
+</A></li>
+	<LI>Next message: <A HREF="010871.html">[Haiku-commits] r26843 - in haiku/trunk:	headers/private/storage src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10869">[ date ]</a>
+              <a href="thread.html#10869">[ thread ]</a>
+              <a href="subject.html#10869">[ subject ]</a>
+              <a href="author.html#10869">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

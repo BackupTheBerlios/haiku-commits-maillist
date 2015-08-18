@@ -1,0 +1,540 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29375 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29375%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel%20src/system/kernel/fs&In-Reply-To=%3C200903020026.n220QO8Q009632%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014646.html">
+   <LINK REL="Next"  HREF="014650.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29375 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/fs</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29375%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel%20src/system/kernel/fs&In-Reply-To=%3C200903020026.n220QO8Q009632%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29375 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/fs">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Mar  2 01:26:24 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014646.html">[Haiku-commits] r29374 - in haiku/trunk: headers/os/media	src/kits/media
+</A></li>
+        <LI>Next message: <A HREF="014650.html">[Haiku-commits] r29375 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14647">[ date ]</a>
+              <a href="thread.html#14647">[ thread ]</a>
+              <a href="subject.html#14647">[ subject ]</a>
+              <a href="author.html#14647">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-03-02 01:26:22 +0100 (Mon, 02 Mar 2009)
+New Revision: 29375
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29375&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29375&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/team.h
+   haiku/trunk/headers/private/kernel/thread_types.h
+   haiku/trunk/headers/private/kernel/usergroup.h
+   haiku/trunk/headers/private/kernel/vfs.h
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+   haiku/trunk/src/system/kernel/team.cpp
+   haiku/trunk/src/system/kernel/usergroup.cpp
+Log:
+* Introduced ref-counting for the I/O contexts.
+* The I/O context related vfs_*() functions have io_context* instead of void*
+  parameters/return values, now.
+* vfs_new_io_context(): Lock the parent I/O context before getting its table
+  size. Otherwise the table size could change until we do.
+* vfs_resize_fd_table(): Fixed use of MutexLocker. We created only a temporary
+  object, not one with function scope.
+* Renamed load_image_etc() to load_image_internal() and added a parameter for
+  specifying the parent team of the one to create.
+* Introduced a kernel private load_image_etc() with a few more arguments than
+  load_image().
+
+
+Modified: haiku/trunk/headers/private/kernel/team.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/team.h	2009-03-01 23:22:30 UTC (rev 29374)
++++ haiku/trunk/headers/private/kernel/team.h	2009-03-02 00:26:22 UTC (rev 29375)
+@@ -14,8 +14,6 @@
+ #endif
+ 
+ status_t team_init(struct kernel_args *args);
+-team_id team_create_team(const char *path, const char *name, char **args,
+-			int argc, char **envp, int envc, int priority);
+ status_t wait_for_team(team_id id, status_t *returnCode);
+ void team_remove_team(struct team *team);
+ void team_delete_team(struct team *team);
+@@ -36,6 +34,9 @@
+ int32 team_max_teams(void);
+ int32 team_used_teams(void);
+ 
++thread_id load_image_etc(int32 argCount, const char* const* args,
++	const char* const* env, int32 priority, team_id parentID, uint32 flags);
++
+ void team_set_job_control_state(struct team* team, job_control_state newState,
+ 			int signal, bool threadsLocked);
+ void team_set_controlling_tty(int32 index);
+
+Modified: haiku/trunk/headers/private/kernel/thread_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/thread_types.h	2009-03-01 23:22:30 UTC (rev 29374)
++++ haiku/trunk/headers/private/kernel/thread_types.h	2009-03-02 00:26:22 UTC (rev 29375)
+@@ -54,6 +54,7 @@
+ 
+ 
+ struct image;					// defined in image.c
++struct io_context;
+ struct realtime_sem_context;	// defined in realtime_sem.cpp
+ struct select_info;
+ struct user_thread;				// defined in libroot/user_thread.h
+@@ -172,7 +173,7 @@
+ 	int				num_threads;	// number of threads in this team
+ 	int				state;			// current team state, see above
+ 	int32			flags;
+-	void			*io_context;
++	struct io_context *io_context;
+ 	struct realtime_sem_context	*realtime_sem_context;
+ 	struct xsi_sem_context *xsi_sem_context;
+ 	sem_id			death_sem;		// semaphore to wait on for dying threads
+
+Modified: haiku/trunk/headers/private/kernel/usergroup.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/usergroup.h	2009-03-01 23:22:30 UTC (rev 29374)
++++ haiku/trunk/headers/private/kernel/usergroup.h	2009-03-02 00:26:22 UTC (rev 29375)
+@@ -21,6 +21,8 @@
+ 
+ void		inherit_parent_user_and_group(struct team* team,
+ 				struct team* parent);
++void		inherit_parent_user_and_group_locked(struct team* team,
++				struct team* parent);
+ status_t	update_set_id_user_and_group(struct team* team, const char* file);
+ 
+ // syscalls
+
+Modified: haiku/trunk/headers/private/kernel/vfs.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vfs.h	2009-03-01 23:22:30 UTC (rev 29374)
++++ haiku/trunk/headers/private/kernel/vfs.h	2009-03-02 00:26:22 UTC (rev 29375)
+@@ -46,6 +46,7 @@
+ 	struct vnode *root;
+ 	struct vnode *cwd;
+ 	mutex		io_mutex;
++	int32		ref_count;
+ 	uint32		table_size;
+ 	uint32		num_used_fds;
+ 	struct file_descriptor **fds;
+@@ -69,9 +70,10 @@
+ status_t vfs_init(struct kernel_args *args);
+ status_t vfs_bootstrap_file_systems(void);
+ void vfs_mount_boot_file_system(struct kernel_args *args);
+-void vfs_exec_io_context(void *context);
+-void *vfs_new_io_context(void *parentContext);
+-status_t vfs_free_io_context(void *context);
++void vfs_exec_io_context(io_context *context);
++io_context *vfs_new_io_context(io_context *parentContext);
++void vfs_get_io_context(io_context *context);
++void vfs_put_io_context(io_context *context);
+ 
+ struct rlimit;
+ int vfs_getrlimit(int resource, struct rlimit * rlp);
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2009-03-01 23:22:30 UTC (rev 29374)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2009-03-02 00:26:22 UTC (rev 29375)
+@@ -4595,9 +4595,8 @@
+ 	have the O_CLOEXEC flag set.
+ */
+ void
+-vfs_exec_io_context(void* _context)
++vfs_exec_io_context(io_context* context)
+ {
+-	struct io_context* context = (struct io_context*)_context;
+ 	uint32 i;
+ 
+ 	for (i = 0; i &lt; context-&gt;table_size; i++) {
+@@ -4626,23 +4625,24 @@
+ /*! Sets up a new io_control structure, and inherits the properties
+ 	of the parent io_control if it is given.
+ */
+-void*
+-vfs_new_io_context(void* _parentContext)
++io_context*
++vfs_new_io_context(io_context* parentContext)
+ {
+ 	size_t tableSize;
+ 	struct io_context* context;
+-	struct io_context* parentContext;
+ 
+ 	context = (io_context*)malloc(sizeof(struct io_context));
+ 	if (context == NULL)
+ 		return NULL;
+ 
+ 	memset(context, 0, sizeof(struct io_context));
++	context-&gt;ref_count = 1;
+ 
+-	parentContext = (struct io_context*)_parentContext;
+-	if (parentContext)
++	MutexLocker parentLocker;
++	if (parentContext) {
++		parentLocker.SetTo(parentContext-&gt;io_mutex, false);
+ 		tableSize = parentContext-&gt;table_size;
+-	else
++	} else
+ 		tableSize = DEFAULT_FD_TABLE_SIZE;
+ 
+ 	// allocate space for FDs and their close-on-exec flag
+@@ -4669,8 +4669,6 @@
+ 	if (parentContext) {
+ 		size_t i;
+ 
+-		mutex_lock(&amp;parentContext-&gt;io_mutex);
+-
+ 		mutex_lock(&amp;sIOContextRootLock);
+ 		context-&gt;root = parentContext-&gt;root;
+ 		if (context-&gt;root)
+@@ -4695,7 +4693,7 @@
+ 			}
+ 		}
+ 
+-		mutex_unlock(&amp;parentContext-&gt;io_mutex);
++		parentLocker.Unlock();
+ 	} else {
+ 		context-&gt;root = sRoot;
+ 		context-&gt;cwd = sRoot;
+@@ -4716,10 +4714,9 @@
+ }
+ 
+ 
+-status_t
+-vfs_free_io_context(void* _ioContext)
++static status_t
++vfs_free_io_context(io_context* context)
+ {
+-	struct io_context* context = (struct io_context*)_ioContext;
+ 	uint32 i;
+ 
+ 	if (context-&gt;root)
+@@ -4747,13 +4744,26 @@
+ }
+ 
+ 
++void vfs_get_io_context(io_context *context)
++{
++	atomic_add(&amp;context-&gt;ref_count, 1);
++}
++
++
++void vfs_put_io_context(io_context *context)
++{
++	if (atomic_add(&amp;context-&gt;ref_count, -1) == 1)
++		vfs_free_io_context(context);
++}
++
++
+ static status_t
+ vfs_resize_fd_table(struct io_context* context, const int newSize)
+ {
+ 	if (newSize &lt;= 0 || newSize &gt; MAX_FD_TABLE_SIZE)
+ 		return EINVAL;
+ 
+-	MutexLocker(context-&gt;io_mutex);
++	MutexLocker _(context-&gt;io_mutex);
+ 
+ 	int oldSize = context-&gt;table_size;
+ 	int oldCloseOnExitBitmapSize = (oldSize + 7) / 8;
+
+Modified: haiku/trunk/src/system/kernel/team.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/team.cpp	2009-03-01 23:22:30 UTC (rev 29374)
++++ haiku/trunk/src/system/kernel/team.cpp	2009-03-02 00:26:22 UTC (rev 29375)
+@@ -1085,37 +1085,33 @@
+ }
+ 
+ 
+-/*!	The BeOS kernel exports a function with this name, but most probably with
+-	different parameters; we should not make it public.
+-*/
+ static thread_id
+-load_image_etc(char**&amp; _flatArgs, size_t flatArgsSize, int32 argCount,
+-	int32 envCount, int32 priority, uint32 flags, port_id errorPort,
+-	uint32 errorToken)
++load_image_internal(char**&amp; _flatArgs, size_t flatArgsSize, int32 argCount,
++	int32 envCount, int32 priority, team_id parentID, uint32 flags,
++	port_id errorPort, uint32 errorToken)
+ {
+ 	char** flatArgs = _flatArgs;
+-	struct team *team, *parent;
++	struct team *team;
+ 	const char *threadName;
+ 	thread_id thread;
+ 	status_t status;
+ 	cpu_status state;
+ 	struct team_arg *teamArgs;
+ 	struct team_loading_info loadingInfo;
++	io_context* parentIOContext = NULL;
+ 
+ 	if (flatArgs == NULL || argCount == 0)
+ 		return B_BAD_VALUE;
+ 
+ 	const char* path = flatArgs[0];
+ 
+-	TRACE((&quot;load_image_etc: name '%s', args = %p, argCount = %ld\n&quot;,
++	TRACE((&quot;load_image_internal: name '%s', args = %p, argCount = %ld\n&quot;,
+ 		path, flatArgs, argCount));
+ 
+ 	team = create_team_struct(path, false);
+ 	if (team == NULL)
+ 		return B_NO_MEMORY;
+ 
+-	parent = thread_get_current_thread()-&gt;team;
+-
+ 	if (flags &amp; B_WAIT_TILL_LOADED) {
+ 		loadingInfo.thread = thread_get_current_thread();
+ 		loadingInfo.result = B_ERROR;
+@@ -1123,22 +1119,39 @@
+ 		team-&gt;loading_info = &loadingInfo;
+ 	}
+ 
+-	// Inherit the parent's user/group, but also check the executable's
+-	// set-user/group-id permission
+-	inherit_parent_user_and_group(team, parent);
+-	update_set_id_user_and_group(team, path);
++ 	InterruptsSpinLocker teamLocker(gTeamSpinlock);
+ 
+-	state = disable_interrupts();
+-	GRAB_TEAM_LOCK();
++	// get the parent team
++	struct team* parent;
+ 
++	if (parentID == B_CURRENT_TEAM)
++		parent = thread_get_current_thread()-&gt;team;
++	else
++		parent = team_get_team_struct_locked(parentID);
++
++	if (parent == NULL) {
++		teamLocker.Unlock();
++		status = B_BAD_TEAM_ID;
++		goto err0;
++	}
++
++	// inherit the parent's user/group
++	inherit_parent_user_and_group_locked(team, parent);
++
+ 	hash_insert(sTeamHash, team);
+ 	insert_team_into_parent(parent, team);
+ 	insert_team_into_group(parent-&gt;group, team);
+ 	sUsedTeams++;
+ 
+-	RELEASE_TEAM_LOCK();
+-	restore_interrupts(state);
++	// get a reference to the parent's I/O context -- we need it to create ours
++	parentIOContext = parent-&gt;io_context;
++	vfs_get_io_context(parentIOContext);
+ 
++	teamLocker.Unlock();
++
++	// check the executable's set-user/group-id permission
++	update_set_id_user_and_group(team, path);
++
+ 	status = create_team_arg(&amp;teamArgs, path, flatArgs, flatArgsSize, argCount,
+ 		envCount, errorPort, errorToken);
+ 
+@@ -1149,12 +1162,16 @@
+ 		// args are owned by the team_arg structure now
+ 
+ 	// create a new io_context for this team
+-	team-&gt;io_context = vfs_new_io_context(parent-&gt;io_context);
++	team-&gt;io_context = vfs_new_io_context(parentIOContext);
+ 	if (!team-&gt;io_context) {
+ 		status = B_NO_MEMORY;
+ 		goto err2;
+ 	}
+ 
++	// We don't need the parent's I/O context any longer.
++	vfs_put_io_context(parentIOContext);
++	parentIOContext = NULL;
++
+ 	// remove any fds that have the CLOEXEC flag set (emulating BeOS behaviour)
+ 	vfs_exec_io_context(team-&gt;io_context);
+ 
+@@ -1229,21 +1246,25 @@
+ err4:
+ 	vm_put_address_space(team-&gt;address_space);
+ err3:
+-	vfs_free_io_context(team-&gt;io_context);
++	vfs_put_io_context(team-&gt;io_context);
+ err2:
+ 	free_team_arg(teamArgs);
+ err1:
++	if (parentIOContext != NULL)
++		vfs_put_io_context(parentIOContext);
++
+ 	// remove the team structure from the team hash table and delete the team structure
+ 	state = disable_interrupts();
+ 	GRAB_TEAM_LOCK();
+ 
+ 	remove_team_from_group(team);
+-	remove_team_from_parent(parent, team);
++	remove_team_from_parent(team-&gt;parent, team);
+ 	hash_remove(sTeamHash, team);
+ 
+ 	RELEASE_TEAM_LOCK();
+ 	restore_interrupts(state);
+ 
++err0:
+ 	delete_team_struct(team);
+ 
+ 	return status;
+@@ -1431,7 +1452,8 @@
+ 		return B_NOT_ALLOWED;
+ 
+ 	// create a new team
+-	// ToDo: this is very similar to team_create_team() - maybe we can do something about it :)
++	// TODO: this is very similar to load_image_internal() - maybe we can do
++	// something about it :)
+ 
+ 	team = create_team_struct(parentTeam-&gt;name, false);
+ 	if (team == NULL)
+@@ -1562,7 +1584,7 @@
+ err3:
+ 	delete_realtime_sem_context(team-&gt;realtime_sem_context);
+ err25:
+-	vfs_free_io_context(team-&gt;io_context);
++	vfs_put_io_context(team-&gt;io_context);
+ err2:
+ 	free(forkArgs);
+ err1:
+@@ -2354,7 +2376,7 @@
+ 
+ 	// free team resources
+ 
+-	vfs_free_io_context(team-&gt;io_context);
++	vfs_put_io_context(team-&gt;io_context);
+ 	delete_realtime_sem_context(team-&gt;realtime_sem_context);
+ 	xsi_sem_undo(team);
+ 	delete_owned_ports(teamID);
+@@ -2639,6 +2661,15 @@
+ thread_id
+ load_image(int32 argCount, const char **args, const char **env)
+ {
++	return load_image_etc(argCount, args, env, B_NORMAL_PRIORITY,
++		B_CURRENT_TEAM, B_WAIT_TILL_LOADED);
++}
++
++
++thread_id
++load_image_etc(int32 argCount, const char* const* args,
++	const char* const* env, int32 priority, team_id parentID, uint32 flags)
++{
+ 	// we need to flatten the args and environment
+ 
+ 	if (args == NULL)
+@@ -2685,11 +2716,11 @@
+ 
+ 	*slot++ = NULL;
+ 
+-	thread_id thread = load_image_etc(flatArgs, size, argCount, envCount,
+-		B_NORMAL_PRIORITY, B_WAIT_TILL_LOADED, -1, 0);
++	thread_id thread = load_image_internal(flatArgs, size, argCount, envCount,
++		B_NORMAL_PRIORITY, parentID, B_WAIT_TILL_LOADED, -1, 0);
+ 
+ 	free(flatArgs);
+-		// load_image_etc() unset our variable if it took over ownership
++		// load_image_internal() unset our variable if it took over ownership
+ 
+ 	return thread;
+ }
+@@ -3277,7 +3308,7 @@
+ 	int32 argCount, int32 envCount, int32 priority, uint32 flags,
+ 	port_id errorPort, uint32 errorToken)
+ {
+-	TRACE((&quot;_user_load_image_etc: argc = %ld\n&quot;, argCount));
++	TRACE((&quot;_user_load_image: argc = %ld\n&quot;, argCount));
+ 
+ 	if (argCount &lt; 1)
+ 		return B_BAD_VALUE;
+@@ -3289,11 +3320,12 @@
+ 	if (error != B_OK)
+ 		return error;
+ 
+-	thread_id thread = load_image_etc(flatArgs, _ALIGN(flatArgsSize), argCount,
+-		envCount, priority, flags, errorPort, errorToken);
++	thread_id thread = load_image_internal(flatArgs, _ALIGN(flatArgsSize),
++		argCount, envCount, priority, B_CURRENT_TEAM, flags, errorPort,
++		errorToken);
+ 
+ 	free(flatArgs);
+-		// load_image_etc() unset our variable if it took over ownership
++		// load_image_internal() unset our variable if it took over ownership
+ 
+ 	return thread;
+ }
+
+Modified: haiku/trunk/src/system/kernel/usergroup.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/usergroup.cpp	2009-03-01 23:22:30 UTC (rev 29374)
++++ haiku/trunk/src/system/kernel/usergroup.cpp	2009-03-02 00:26:22 UTC (rev 29375)
+@@ -243,10 +243,8 @@
+ 
+ 
+ void
+-inherit_parent_user_and_group(struct team* team, struct team* parent)
++inherit_parent_user_and_group_locked(struct team* team, struct team* parent)
+ {
+-	InterruptsSpinLocker _(gTeamSpinlock);
+-
+ 	team-&gt;saved_set_uid = parent-&gt;saved_set_uid;
+ 	team-&gt;real_uid = parent-&gt;real_uid;
+ 	team-&gt;effective_uid = parent-&gt;effective_uid;
+@@ -260,6 +258,14 @@
+ }
+ 
+ 
++void
++inherit_parent_user_and_group(struct team* team, struct team* parent)
++{
++	InterruptsSpinLocker _(gTeamSpinlock);
++	inherit_parent_user_and_group_locked(team, parent);
++}
++
++
+ status_t
+ update_set_id_user_and_group(struct team* team, const char* file)
+ {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014646.html">[Haiku-commits] r29374 - in haiku/trunk: headers/os/media	src/kits/media
+</A></li>
+	<LI>Next message: <A HREF="014650.html">[Haiku-commits] r29375 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14647">[ date ]</a>
+              <a href="thread.html#14647">[ thread ]</a>
+              <a href="subject.html#14647">[ subject ]</a>
+              <a href="author.html#14647">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

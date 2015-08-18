@@ -1,0 +1,255 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28603 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat/sys
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28603%20-%20in%0A%09haiku/trunk/src/libs/compat/freebsd_network%3A%20.%20compat/sys&In-Reply-To=%3C200811111226.mABCQ8gE012335%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013460.html">
+   <LINK REL="Next"  HREF="013462.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28603 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat/sys</H1>
+    <B>korli at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28603%20-%20in%0A%09haiku/trunk/src/libs/compat/freebsd_network%3A%20.%20compat/sys&In-Reply-To=%3C200811111226.mABCQ8gE012335%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28603 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat/sys">korli at mail.berlios.de
+       </A><BR>
+    <I>Tue Nov 11 13:26:08 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013460.html">[Haiku-commits] r28602 - in	haiku/trunk/src/add-ons/kernel/drivers/network/broadcom570x/dev:	bge mii
+</A></li>
+        <LI>Next message: <A HREF="013462.html">[Haiku-commits] r28604 -	haiku/trunk/src/add-ons/kernel/drivers/network/broadcom570x/dev/bge
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13461">[ date ]</a>
+              <a href="thread.html#13461">[ thread ]</a>
+              <a href="subject.html#13461">[ subject ]</a>
+              <a href="author.html#13461">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: korli
+Date: 2008-11-11 13:26:07 +0100 (Tue, 11 Nov 2008)
+New Revision: 28603
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28603&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28603&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/libs/compat/freebsd_network/compat/sys/mbuf.h
+   haiku/trunk/src/libs/compat/freebsd_network/mbuf.c
+Log:
+added m_cljget() with support for jumbo9 size: it should help with broadcom570x
+
+
+Modified: haiku/trunk/src/libs/compat/freebsd_network/compat/sys/mbuf.h
+===================================================================
+--- haiku/trunk/src/libs/compat/freebsd_network/compat/sys/mbuf.h	2008-11-11 12:20:21 UTC (rev 28602)
++++ haiku/trunk/src/libs/compat/freebsd_network/compat/sys/mbuf.h	2008-11-11 12:26:07 UTC (rev 28603)
+@@ -78,10 +78,14 @@
+ 
+ #define EXT_CLUSTER		1
+ #define EXT_PACKET		3
++#define EXT_JUMBO9		4
+ #define	EXT_NET_DRV		100
+ 
+ #define M_BCAST			0x00000200
+ #define M_MCAST			0x00000400
++#define M_FRAG			0x00000800
++#define M_FIRSTFRAG		0x00001000
++#define M_LASTFRAG		0x00002000
+ #define	M_VLANTAG		0x00010000
+ 
+ #define CSUM_IP			0x0001
+@@ -125,6 +129,7 @@
+ struct mbuf *m_get(int how, short type);
+ struct mbuf *m_gethdr(int how, short type);
+ void m_clget(struct mbuf *m, int how);
++void *m_cljget(struct mbuf *m, int how, int size);
+ 
+ void m_extadd(struct mbuf *m, caddr_t buffer, u_int size,
+     void (*freeHook)(void *, void *), void *args, int flags, int type);
+
+Modified: haiku/trunk/src/libs/compat/freebsd_network/mbuf.c
+===================================================================
+--- haiku/trunk/src/libs/compat/freebsd_network/mbuf.c	2008-11-11 12:20:21 UTC (rev 28602)
++++ haiku/trunk/src/libs/compat/freebsd_network/mbuf.c	2008-11-11 12:26:07 UTC (rev 28603)
+@@ -21,6 +21,7 @@
+ 
+ static object_cache *sMBufCache;
+ static object_cache *sChunkCache;
++static object_cache *sJumbo9ChunkCache;
+ 
+ int max_linkhdr = 16;
+ int max_protohdr = 40 + 20; /* ip6 + tcp */
+@@ -60,31 +61,50 @@
+ 
+ 
+ static int
+-construct_ext_mbuf(struct mbuf *mb, int how)
++construct_ext_sized_mbuf(struct mbuf *mb, int how, int size)
+ {
+-	mb-&gt;m_ext.ext_buf = object_cache_alloc(sChunkCache, m_to_oc_flags(how));
++	object_cache *cache;
++	int ext_type;
++	if (size != MCLBYTES &amp;&amp; size != MJUM9BYTES)
++		panic(&quot;unsupported size&quot;);
++
++	if (size == MCLBYTES) {
++		cache = sChunkCache;
++		ext_type = EXT_CLUSTER;
++	} else {
++		cache = sJumbo9ChunkCache;
++		ext_type = EXT_JUMBO9;
++	}
++	mb-&gt;m_ext.ext_buf = object_cache_alloc(cache, m_to_oc_flags(how));
+ 	if (mb-&gt;m_ext.ext_buf == NULL)
+ 		return B_NO_MEMORY;
+-
++	
+ 	mb-&gt;m_data = mb-&gt;m_ext.ext_buf;
+ 	mb-&gt;m_flags |= M_EXT;
+ 	/* mb-&gt;m_ext.ext_free = NULL; */
+ 	/* mb-&gt;m_ext.ext_args = NULL; */
+-	mb-&gt;m_ext.ext_size = MCLBYTES;
+-	mb-&gt;m_ext.ext_type = EXT_CLUSTER;
++	mb-&gt;m_ext.ext_size = size;
++	mb-&gt;m_ext.ext_type = ext_type;
+ 	/* mb-&gt;m_ext.ref_cnt = NULL; */
+ 
+-	return 0;
++        return 0;
+ }
+ 
+ 
++static inline int
++construct_ext_mbuf(struct mbuf *mb, int how)
++{
++	return construct_ext_sized_mbuf(mb, how, MCLBYTES);
++}
++
++
+ static int
+ construct_pkt_mbuf(int how, struct mbuf *mb, short type, int flags)
+ {
+ 	construct_mbuf(mb, type, flags);
+ 	if (construct_ext_mbuf(mb, how) &lt; 0)
+ 		return -1;
+-	mb-&gt;m_ext.ext_type = EXT_PACKET;
++	mb-&gt;m_ext.ext_type |= EXT_PACKET;
+ 	return 0;
+ }
+ 
+@@ -92,7 +112,14 @@
+ static void
+ destruct_pkt_mbuf(struct mbuf *mb)
+ {
+-	object_cache_free(sChunkCache, mb-&gt;m_ext.ext_buf);
++	object_cache *cache;
++	if (mb-&gt;m_ext.ext_type &amp; EXT_CLUSTER)
++		cache = sChunkCache;
++	else if (mb-&gt;m_ext.ext_type &amp; EXT_JUMBO9)
++		cache = sJumbo9ChunkCache;
++	else
++		panic(&quot;unknown cache&quot;);
++	object_cache_free(cache, mb-&gt;m_ext.ext_buf);
+ 	mb-&gt;m_ext.ext_buf = NULL;
+ }
+ 
+@@ -151,6 +178,18 @@
+ }
+ 
+ 
++void *
++m_cljget(struct mbuf *m, int how, int size)
++{
++	if (m == NULL)
++		panic(&quot;m_cljget doesn't support allocate mbuf&quot;);
++	m-&gt;m_ext.ext_buf = NULL;
++	construct_ext_sized_mbuf(m, how, size);
++	/* shouldn't be used */
++	return NULL;
++}
++
++
+ void
+ m_freem(struct mbuf *mb)
+ {
+@@ -172,6 +211,9 @@
+ 	else if (m-&gt;m_ext.ext_type == EXT_CLUSTER) {
+ 		object_cache_free(sChunkCache, m-&gt;m_ext.ext_buf);
+ 		m-&gt;m_ext.ext_buf = NULL;
++	} else if (m-&gt;m_ext.ext_type == EXT_JUMBO9) {
++		object_cache_free(sJumbo9ChunkCache, m-&gt;m_ext.ext_buf);
++		m-&gt;m_ext.ext_buf = NULL;
+ 	} else
+ 		panic(&quot;unknown type&quot;);
+ 
+@@ -207,16 +249,23 @@
+ {
+ 	sMBufCache = create_object_cache(&quot;mbufs&quot;, MSIZE, 8, NULL, NULL, NULL);
+ 	if (sMBufCache == NULL)
+-		return B_NO_MEMORY;
+-
++		goto clean;
+ 	sChunkCache = create_object_cache(&quot;mbuf chunks&quot;, MCLBYTES, 0, NULL, NULL,
+ 		NULL);
+-	if (sChunkCache == NULL) {
++	if (sChunkCache == NULL)
++		goto clean;
++	sJumbo9ChunkCache = create_object_cache(&quot;mbuf jumbo9 chunks&quot;, MJUM9BYTES, 0, NULL, NULL,
++		NULL);
++	if (sJumbo9ChunkCache == NULL)
++		goto clean;
++	return B_OK;
++
++clean:
++	if (sChunkCache != NULL)
++		delete_object_cache(sChunkCache);
++	if (sMBufCache != NULL)
+ 		delete_object_cache(sMBufCache);
+-		return B_NO_MEMORY;
+-	}
+-
+-	return B_OK;
++	return B_NO_MEMORY;
+ }
+ 
+ 
+@@ -225,5 +274,6 @@
+ {
+ 	delete_object_cache(sMBufCache);
+ 	delete_object_cache(sChunkCache);
++	delete_object_cache(sJumbo9ChunkCache);
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013460.html">[Haiku-commits] r28602 - in	haiku/trunk/src/add-ons/kernel/drivers/network/broadcom570x/dev:	bge mii
+</A></li>
+	<LI>Next message: <A HREF="013462.html">[Haiku-commits] r28604 -	haiku/trunk/src/add-ons/kernel/drivers/network/broadcom570x/dev/bge
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13461">[ date ]</a>
+              <a href="thread.html#13461">[ thread ]</a>
+              <a href="subject.html#13461">[ subject ]</a>
+              <a href="author.html#13461">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

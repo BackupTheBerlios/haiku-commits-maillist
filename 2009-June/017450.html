@@ -1,0 +1,377 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31219 - haiku/trunk/src/apps/debugger
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31219%20-%20haiku/trunk/src/apps/debugger&In-Reply-To=%3C200906240016.n5O0GNRU025228%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017449.html">
+   <LINK REL="Next"  HREF="017451.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31219 - haiku/trunk/src/apps/debugger</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31219%20-%20haiku/trunk/src/apps/debugger&In-Reply-To=%3C200906240016.n5O0GNRU025228%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31219 - haiku/trunk/src/apps/debugger">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Jun 24 02:16:23 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017449.html">[Haiku-commits] r31218 - in haiku/trunk/src/apps/debugger: .	debugger_interface
+</A></li>
+        <LI>Next message: <A HREF="017451.html">[Haiku-commits] r31220 -	haiku/trunk/src/apps/debugger/gui/team_window
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17450">[ date ]</a>
+              <a href="thread.html#17450">[ thread ]</a>
+              <a href="subject.html#17450">[ subject ]</a>
+              <a href="author.html#17450">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-06-24 02:16:22 +0200 (Wed, 24 Jun 2009)
+New Revision: 31219
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31219&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31219&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/debugger/Debugger.cpp
+   haiku/trunk/src/apps/debugger/MessageCodes.h
+   haiku/trunk/src/apps/debugger/TeamDebugger.cpp
+   haiku/trunk/src/apps/debugger/TeamDebugger.h
+Log:
+Fixed the application quit mechanism. Due to the two levels of asynchronous
+message sending the main thread exit()ed before the team debugger could process
+its quit message. We're no longer taking the detour via Debugger when quitting
+a window. The team debugger just quits and synchronously notifies the
+application, which in turn waits until all team debugger threads have gone.
+
+
+Modified: haiku/trunk/src/apps/debugger/Debugger.cpp
+===================================================================
+--- haiku/trunk/src/apps/debugger/Debugger.cpp	2009-06-23 23:09:36 UTC (rev 31218)
++++ haiku/trunk/src/apps/debugger/Debugger.cpp	2009-06-24 00:16:22 UTC (rev 31219)
+@@ -13,6 +13,7 @@
+ #include &lt;Application.h&gt;
+ #include &lt;Message.h&gt;
+ 
++#include &lt;AutoLocker.h&gt;
+ #include &lt;ObjectList.h&gt;
+ 
+ #include &quot;debug_utils.h&quot;
+@@ -163,11 +164,12 @@
+ }
+ 
+ 
+-class Debugger : public BApplication {
++class Debugger : public BApplication, private TeamDebugger::Listener {
+ public:
+ 	Debugger()
+ 		:
+-		BApplication(kDebuggerSignature)
++		BApplication(kDebuggerSignature),
++		fRunningTeamDebuggers(0)
+ 	{
+ 	}
+ 
+@@ -178,17 +180,14 @@
+ 	virtual void MessageReceived(BMessage* message)
+ 	{
+ 		switch (message-&gt;what) {
+-			case MSG_DEBUGGER_QUIT_REQUESTED:
++			case MSG_TEAM_DEBUGGER_QUIT:
+ 			{
+-				TeamDebugger* debugger = NULL;
+-				if (message-&gt;FindPointer(&quot;debugger&quot;,
+-					(void**)&amp;debugger) == B_OK
+-					&amp;&amp; fTeamDebuggers.HasItem(debugger)) {
+-					fTeamDebuggers.RemoveItem(debugger);
+-					debugger-&gt;DeleteSelf();
+-					if (fTeamDebuggers.CountItems() == 0)
+-						PostMessage(B_QUIT_REQUESTED);
+-				}
++				int32 threadID;
++				if (message-&gt;FindInt32(&quot;thread&quot;, &amp;threadID) == B_OK)
++					wait_for_thread(threadID, NULL);
++
++				if (--fRunningTeamDebuggers == 0)
++					Quit();
+ 				break;
+ 			}
+ 			default:
+@@ -255,23 +254,45 @@
+ 			return;
+ 		}
+ 
+-		debugger = new(std::nothrow) TeamDebugger;
++		debugger = new(std::nothrow) TeamDebugger(this);
+ 		if (debugger == NULL) {
+ 			// TODO: Notify the user!
+ 			fprintf(stderr, &quot;Error: Out of memory!\n&quot;);
+ 		}
+ 
+-		if (debugger-&gt;Init(team, thread, stopInMain) == B_OK
+-			&amp;&amp; fTeamDebuggers.AddItem(debugger)) {
++		status_t error = debugger-&gt;Init(team, thread, stopInMain);
++		if (debugger-&gt;Thread())
++			fRunningTeamDebuggers++;
++
++		if (error == B_OK &amp;&amp; fTeamDebuggers.AddItem(debugger)) {
+ printf(&quot;debugger for team %ld created and initialized successfully!\n&quot;, team);
+ 		} else
+ 			delete debugger;
+ 	}
+ 
++private:
++	typedef BObjectList&lt;TeamDebugger&gt;	TeamDebuggerList;
++
++private:
++	// TeamDebugger::Listener
++	virtual void TeamDebuggerQuit(TeamDebugger* debugger)
++	{
++		// Note: Locking here only works, since we're never locking the other
++		// way around. If we even need to do that, we'll have to introduce a
++		// separate lock to protect the list.
++		AutoLocker&lt;Debugger&gt; locker(this);
++		fTeamDebuggers.RemoveItem(debugger);
++		locker.Unlock();
++
++		if (debugger-&gt;Thread() &gt;= 0) {
++			BMessage message(MSG_TEAM_DEBUGGER_QUIT);
++			message.AddInt32(&quot;thread&quot;, debugger-&gt;Thread());
++			PostMessage(&amp;message);
++		}
++	}
++
+ 	virtual bool QuitRequested()
+ 	{
+-		// TODO:...
+-//		return true;
+ 		// NOTE: The default implementation will just ask all windows'
+ 		// QuitRequested() hooks. This in turn will ask the TeamWindows.
+ 		// For now, this is what we want. If we have more windows later,
+@@ -282,12 +303,17 @@
+ 		// QuitReqested() hook or the TeamsWindow and other global windows
+ 		// could always return false in their QuitRequested().
+ 		return BApplication::QuitRequested();
++			// TODO: This is ugly. The team debuggers own the windows, not the
++			// other way around.
+ 	}
+ 
+-private:
+-	typedef BObjectList&lt;TeamDebugger&gt;	TeamDebuggerList;
++	virtual void Quit()
++	{
++		// don't quit before all team debuggers have been quit
++		if (fRunningTeamDebuggers &lt;= 0)
++			BApplication::Quit();
++	}
+ 
+-private:
+ 	TeamDebugger* _TeamDebuggerForTeam(team_id teamID) const
+ 	{
+ 		for (int32 i = 0; TeamDebugger* debugger = fTeamDebuggers.ItemAt(i);
+@@ -301,6 +327,7 @@
+ 
+ private:
+ 	TeamDebuggerList	fTeamDebuggers;
++	int32				fRunningTeamDebuggers;
+ };
+ 
+ 
+
+Modified: haiku/trunk/src/apps/debugger/MessageCodes.h
+===================================================================
+--- haiku/trunk/src/apps/debugger/MessageCodes.h	2009-06-23 23:09:36 UTC (rev 31218)
++++ haiku/trunk/src/apps/debugger/MessageCodes.h	2009-06-24 00:16:22 UTC (rev 31219)
+@@ -21,7 +21,7 @@
+ 	MSG_STACK_FRAME_SOURCE_CODE_CHANGED	= 'sfsc',
+ 	MSG_USER_BREAKPOINT_CHANGED			= 'ubrc',
+ 
+-	MSG_DEBUGGER_QUIT_REQUESTED			= 'dbqt'
++	MSG_TEAM_DEBUGGER_QUIT				= 'dbqt'
+ };
+ 
+ 
+
+Modified: haiku/trunk/src/apps/debugger/TeamDebugger.cpp
+===================================================================
+--- haiku/trunk/src/apps/debugger/TeamDebugger.cpp	2009-06-23 23:09:36 UTC (rev 31218)
++++ haiku/trunk/src/apps/debugger/TeamDebugger.cpp	2009-06-24 00:16:22 UTC (rev 31219)
+@@ -11,7 +11,6 @@
+ #include &lt;new&gt;
+ 
+ #include &lt;Alert.h&gt;
+-#include &lt;Application.h&gt;
+ #include &lt;Message.h&gt;
+ 
+ #include &lt;AutoLocker.h&gt;
+@@ -26,9 +25,10 @@
+ #include &quot;TeamDebugModel.h&quot;
+ 
+ 
+-TeamDebugger::TeamDebugger()
++TeamDebugger::TeamDebugger(Listener* listener)
+ 	:
+ 	BLooper(&quot;team debugger&quot;),
++	fListener(listener),
+ 	fTeam(NULL),
+ 	fDebugModel(NULL),
+ 	fTeamID(-1),
+@@ -63,6 +63,8 @@
+ 	delete fWorker;
+ 	delete fDebugModel;
+ 	delete fTeam;
++
++	fListener-&gt;TeamDebuggerQuit(this);
+ }
+ 
+ 
+@@ -189,14 +191,6 @@
+ 
+ 
+ void
+-TeamDebugger::DeleteSelf()
+-{
+-	Lock();
+-	Quit();
+-}
+-
+-
+-void
+ TeamDebugger::MessageReceived(BMessage* message)
+ {
+ 	switch (message-&gt;what) {
+@@ -323,14 +317,10 @@
+ bool
+ TeamDebugger::TeamWindowQuitRequested(TeamWindow* window)
+ {
+-	// TODO: Is this what shall happen?
+-	if (!fTeam-&gt;Lock())
+-		return true;
+-
++	AutoLocker&lt; ::Team&gt; locker(fTeam);
+ 	BString name(fTeam-&gt;Name());
++	locker.Unlock();
+ 
+-	fTeam-&gt;Unlock();
+-
+ 	BString message;
+ 	message &lt;&lt; &quot;What shall be done about the debugged team '&quot;;
+ 	message &lt;&lt; name;
+@@ -354,14 +344,11 @@
+ 		case 1:
+ 			return false;
+ 		case 2:
+-			// Detach from the team and resume and stopped threads. Seems to be
+-			// the default action anyways.
++			// Detach from the team and resume and stopped threads.
+ 			break;
+ 	}
+ 
+-	BMessage quitMessage(MSG_DEBUGGER_QUIT_REQUESTED);
+-	quitMessage.AddPointer(&quot;debugger&quot;, this);
+-	be_app-&gt;PostMessage(&amp;quitMessage);
++	PostMessage(B_QUIT_REQUESTED);
+ 
+ 	return true;
+ }
+@@ -891,3 +878,11 @@
+ 	// create it and don't care anymore. Maybe an error window, which can
+ 	// display a list of errors would be the better choice.
+ }
++
++
++// #pragma mark - Listener
++
++
++TeamDebugger::Listener::~Listener()
++{
++}
+
+Modified: haiku/trunk/src/apps/debugger/TeamDebugger.h
+===================================================================
+--- haiku/trunk/src/apps/debugger/TeamDebugger.h	2009-06-23 23:09:36 UTC (rev 31218)
++++ haiku/trunk/src/apps/debugger/TeamDebugger.h	2009-06-24 00:16:22 UTC (rev 31219)
+@@ -20,10 +20,13 @@
+ class TeamDebugModel;
+ 
+ 
+-class TeamDebugger : private BLooper, private TeamWindow::Listener,
++class TeamDebugger : public BLooper, private TeamWindow::Listener,
+ 	private JobListener, private Team::Listener {
+ public:
+-								TeamDebugger();
++	class Listener;
++
++public:
++								TeamDebugger(Listener* listener);
+ 								~TeamDebugger();
+ 
+ 			status_t			Init(team_id teamID, thread_id threadID,
+@@ -31,11 +34,9 @@
+ 
+ 			team_id				TeamID() const	{ return fTeamID; }
+ 
+-			void				DeleteSelf();
++	virtual	void				MessageReceived(BMessage* message);
+ 
+ private:
+-	virtual	void				MessageReceived(BMessage* message);
+-
+ 	// TeamWindow::Listener
+ 	virtual	void				StackFrameSourceCodeRequested(
+ 									TeamWindow* window, StackFrame* frame);
+@@ -111,6 +112,7 @@
+ 									const char* text,...);
+ 
+ private:
++			Listener*			fListener;
+ 			::Team*				fTeam;
+ 			TeamDebugModel*		fDebugModel;
+ 			team_id				fTeamID;
+@@ -123,4 +125,13 @@
+ 			bool				fKillTeamOnQuit;
+ };
+ 
++
++class TeamDebugger::Listener {
++public:
++	virtual						~Listener();
++
++	virtual	void				TeamDebuggerQuit(TeamDebugger* debugger) = 0;
++};
++
++
+ #endif	// TEAM_DEBUGGER_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017449.html">[Haiku-commits] r31218 - in haiku/trunk/src/apps/debugger: .	debugger_interface
+</A></li>
+	<LI>Next message: <A HREF="017451.html">[Haiku-commits] r31220 -	haiku/trunk/src/apps/debugger/gui/team_window
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17450">[ date ]</a>
+              <a href="thread.html#17450">[ thread ]</a>
+              <a href="subject.html#17450">[ subject ]</a>
+              <a href="author.html#17450">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

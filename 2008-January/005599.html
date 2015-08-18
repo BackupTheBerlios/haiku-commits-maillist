@@ -1,0 +1,282 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23607 - haiku/trunk/src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23607%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200801181532.m0IFW3ka029945%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005598.html">
+   <LINK REL="Next"  HREF="005600.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23607 - haiku/trunk/src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23607%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200801181532.m0IFW3ka029945%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23607 - haiku/trunk/src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Jan 18 16:32:03 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005598.html">[Haiku-commits] r23606 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="005600.html">[Haiku-commits] r23608 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5599">[ date ]</a>
+              <a href="thread.html#5599">[ thread ]</a>
+              <a href="subject.html#5599">[ subject ]</a>
+              <a href="author.html#5599">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-01-18 16:32:02 +0100 (Fri, 18 Jan 2008)
+New Revision: 23607
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23607&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23607&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/debug/tracing.cpp
+Log:
+* sEntries only counts the &quot;normal&quot; (i.e. non-buffer) entries, now.
+* &quot;traced&quot; command:
+  - Was printing one more entry than asked to.
+  - Fixed broken index handling. They were starting at 0, but the last
+    one was sEntries nevertheless. We consistently let them start at 1,
+    now. 0 can be passed as special index, causing the last entries to
+    be printed.
+  - Added options &quot;backward&quot;/&quot;forward&quot; which will print the entries
+    preceding respectively succeeding the ones printed on the previous
+    invocation. The command is continuable in this case, i.e. simply
+    pressing RET afterwards will reinvoke the command, allowing for
+    comfortable scrolling through a long list of entries.
+  - Added detailed usage message.
+
+
+Modified: haiku/trunk/src/system/kernel/debug/tracing.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/tracing.cpp	2008-01-18 12:09:23 UTC (rev 23606)
++++ haiku/trunk/src/system/kernel/debug/tracing.cpp	2008-01-18 15:32:02 UTC (rev 23607)
+@@ -9,6 +9,7 @@
+ 
+ #include &lt;stdlib.h&gt;
+ 
++#include &lt;debug.h&gt;
+ #include &lt;util/AutoLock.h&gt;
+ 
+ 
+@@ -80,9 +81,10 @@
+ 		if (sBufferStart == NULL)
+ 			sBufferStart = sBufferEnd;
+ 
+-		sEntries--;
+-		if (!(removed-&gt;flags &amp; BUFFER_ENTRY))
++		if (!(removed-&gt;flags &amp; BUFFER_ENTRY)) {
+ 			((TraceEntry*)removed)-&gt;~TraceEntry();
++			sEntries--;
++		}
+ 
+ 		if (needed &lt;= freed)
+ 			break;
+@@ -94,8 +96,8 @@
+ }
+ 
+ 
+-trace_entry*
+-allocate_entry(size_t size)
++static trace_entry*
++allocate_entry(size_t size, uint16 flags)
+ {
+ 	if (sBuffer == NULL)
+ 		return NULL;
+@@ -120,11 +122,15 @@
+ 
+ 	trace_entry* entry = sBufferEnd;
+ 	entry-&gt;size = size;
+-	entry-&gt;flags = 0;
++	entry-&gt;flags = flags;
+ 	sBufferEnd += size &gt;&gt; 2;
+-	sEntries++;
++
++	if (!(flags &amp; BUFFER_ENTRY))
++		sEntries++;
++
+ 	TRACE((&quot;  entry: %p, end %p, start %p, entries %ld\n&quot;, entry, sBufferEnd,
+ 		sBufferStart, sEntries));
++
+ 	return entry;
+ }
+ 
+@@ -168,7 +174,7 @@
+ TraceEntry::operator new(size_t size, const std::nothrow_t&amp;) throw()
+ {
+ #if ENABLE_TRACING
+-	return allocate_entry(size);
++	return allocate_entry(size, 0);
+ #else
+ 	return NULL;
+ #endif
+@@ -188,39 +194,55 @@
+ 	if (argv[argc - 1][0] == '#')
+ 		pattern = argv[--argc] + 1;
+ 
++	// Note: start and index are Pascal-like indices (i.e. in [1, sEntries]).
+ 	int32 count = 30;
+-	int32 start = sEntries - count;
++	int32 start = 0;	// special index: print the last count entries
++	int32 cont = 0;
+ 
+-	if (argc == 2)
+-		start = strtol(argv[1], NULL, 0);
++	if (argc == 2) {
++		if (strcmp(argv[1], &quot;forward&quot;) == 0)
++			cont = 1;
++		else if (strcmp(argv[1], &quot;backward&quot;) == 0)
++			cont = -1;
++		else
++			start = parse_expression(argv[1]);
++	}
+ 
+ 	if (argc == 3) {
+-		start = strtol(argv[1], NULL, 0);
+-		count = strtol(argv[2], NULL, 0);
++		start = parse_expression(argv[1]);
++		count = parse_expression(argv[2]);
+ 	} else if (argc &gt; 3) {
+ 		kprintf(&quot;usage: %s [start] [count] [#pattern]\n&quot;, argv[0]);
+ 		return 0;
+ 	}
+ 
+-	if (start &lt; 0)
+-		start = 0;
++	if (cont != 0) {
++		start = get_debug_variable(&quot;_tracingStart&quot;, start);
++		count = get_debug_variable(&quot;_tracingCount&quot;, count);
++		start = max_c(1, start + count * cont);
++	}
++
++	if ((uint32)count &gt; sEntries)
++		count = sEntries;
++	if (start &lt;= 0)
++		start = max_c(1, sEntries - count + 1);
+ 	if (uint32(start + count) &gt; sEntries)
+-		count = sEntries - start;
++		count = sEntries - start + 1;
+ 
+-	int32 index = 0;
++	int32 index = 1;
+ 	int32 dumped = 0;
+ 
+ 	for (trace_entry* current = sBufferStart; current != NULL;
+ 			current = next_entry(current), index++) {
+-		if (index &lt; start)
+-			continue;
+-		if (index &gt; start + count)
+-			break;
+ 		if ((current-&gt;flags &amp; BUFFER_ENTRY) != 0) {
+ 			// skip buffer entries
+ 			index--;
+ 			continue;
+ 		}
++		if (index &lt; start)
++			continue;
++		if (index &gt;= start + count)
++			break;
+ 
+ 		if ((current-&gt;flags &amp; ENTRY_INITIALIZED) != 0) {
+ 			char buffer[256];
+@@ -230,16 +252,20 @@
+ 			if (pattern != NULL &amp;&amp; strstr(buffer, pattern) == NULL)
+ 				continue;
+ 
+-			dumped++;
+-
+ 			kprintf(&quot;%5ld. %s\n&quot;, index, buffer);
+ 		} else
+ 			kprintf(&quot;%5ld. ** uninitialized entry **\n&quot;, index);
++
++		dumped++;
+ 	}
+ 
+-	kprintf(&quot;%ld entries of entries %ld to %ld (total %ld).\n&quot;, dumped,
+-		start + 1, start + count, sEntries);
+-	return 0;
++	kprintf(&quot;entries %ld to %ld (%ld of %ld).\n&quot;, start, start + count - 1,
++		dumped, sEntries);
++
++	set_debug_variable(&quot;_tracingStart&quot;, start);
++	set_debug_variable(&quot;_tracingCount&quot;, count);
++
++	return cont != 0 ? B_KDEBUG_CONT : 0;
+ }
+ 
+ 
+@@ -253,11 +279,11 @@
+ 		return NULL;
+ 
+ #if	ENABLE_TRACING
+-	trace_entry* entry = allocate_entry(size + sizeof(trace_entry));
++	trace_entry* entry = allocate_entry(size + sizeof(trace_entry),
++		BUFFER_ENTRY);
+ 	if (entry == NULL)
+ 		return NULL;
+ 
+-	entry-&gt;flags = BUFFER_ENTRY;
+ 	return (uint8*)(entry + 1);
+ #else
+ 	return NULL;
+@@ -320,8 +346,22 @@
+ 	sBufferStart = sBuffer;
+ 	sBufferEnd = sBuffer;
+ 
+-	add_debugger_command(&quot;traced&quot;, &amp;dump_tracing,
+-		&quot;Dump recorded trace entries&quot;);
++	add_debugger_command_etc(&quot;traced&quot;, &amp;dump_tracing,
++		&quot;Dump recorded trace entries&quot;,
++		&quot;(\&quot;forward\&quot; | \&quot;backward\&quot;) | ([ &lt;start&gt; [ &lt;count&gt; ] ] &quot;
++			&quot;[ #&lt;pattern&gt; ])\n&quot;
++		&quot;Prints recorded trace entries. If \&quot;backward\&quot; or \&quot;forward\&quot; is\n&quot;
++		&quot;specified, the command continues where the previous invocation left\n&quot;
++		&quot;off, i.e. printing the previous respectively next entries (as many\n&quot;
++		&quot;as printed before). In this case the command is continuable, that is\n&quot;
++		&quot;afterwards entering an empty line in the debugger will reinvoke it.\n&quot;
++		&quot;  &lt;start&gt;    - The index of the first entry to print. The index of\n&quot;
++		&quot;               the first recorded entry is 1. If 0 is specified, the\n&quot;
++		&quot;               last &lt;count&gt; recorded entries are printed. Defaults \n&quot;
++		&quot;               to 0.\n&quot;
++		&quot;  &lt;count&gt;    - The number of entries to be printed. Defaults to 30.\n&quot;
++		&quot;  &lt;pattern&gt;  - If specified only entries containing this string are\n&quot;
++		&quot;               printed.\n&quot;, 0);
+ #endif	// ENABLE_TRACING
+ 	return B_OK;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005598.html">[Haiku-commits] r23606 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="005600.html">[Haiku-commits] r23608 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5599">[ date ]</a>
+              <a href="thread.html#5599">[ thread ]</a>
+              <a href="subject.html#5599">[ subject ]</a>
+              <a href="author.html#5599">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

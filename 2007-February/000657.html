@@ -1,0 +1,152 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20074 - haiku/trunk/src/kits/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20074%20-%20haiku/trunk/src/kits/app&In-Reply-To=%3C200702051604.l15G4lMA011808%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000656.html">
+   <LINK REL="Next"  HREF="000658.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20074 - haiku/trunk/src/kits/app</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20074%20-%20haiku/trunk/src/kits/app&In-Reply-To=%3C200702051604.l15G4lMA011808%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20074 - haiku/trunk/src/kits/app">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Feb  5 17:04:47 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000656.html">[Haiku-commits] r20073 - haiku/trunk/src/apps/bemail
+</A></li>
+        <LI>Next message: <A HREF="000658.html">[Haiku-commits] r20074 - haiku/trunk/src/kits/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#657">[ date ]</a>
+              <a href="thread.html#657">[ thread ]</a>
+              <a href="subject.html#657">[ subject ]</a>
+              <a href="author.html#657">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-02-05 17:04:46 +0100 (Mon, 05 Feb 2007)
+New Revision: 20074
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20074&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20074&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/kits/app/Message.cpp
+Log:
+* In the BMessage assignment operator we do now clear some of the message
+  header flags after copying the header of the original message. Before
+  cloning a message that still needed a reply would result in the clone
+  also needing a reply, which, in the end, led to two replies being sent,
+  thus screwing up the cached reply ports used for synchronous messaging.
+  Fixes bug #1008.
+  BTW, also clearing the reply info breaks Tracker and Deskbar, so I suppose
+  R5 keeps it and Tracker and Deskbar rely on that behavior.
+
+* Added a bit of debug code removing and printing spurious messages from a
+  cached reply port.
+
+* Added TODO in BMessage::~BMessage(). ATM, we only send a B_NO_REPLY in the
+  destructor, but not in case the message is overwritten using the
+  assignment operator or Flatten().
+
+
+
+Modified: haiku/trunk/src/kits/app/Message.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/Message.cpp	2007-02-05 14:43:37 UTC (rev 20073)
++++ haiku/trunk/src/kits/app/Message.cpp	2007-02-05 16:04:46 UTC (rev 20074)
+@@ -102,6 +102,7 @@
+ BMessage::~BMessage()
+ {
+ 	DEBUG_FUNCTION_ENTER;
++	// TODO: Check why we don't do that in _Clear() and fix or comment it.
+ 	if (IsSourceWaiting())
+ 		SendReply(B_NO_REPLY);
+ 
+@@ -119,6 +120,13 @@
+ 	fHeader = (message_header *)malloc(sizeof(message_header));
+ 	memcpy(fHeader, other.fHeader, sizeof(message_header));
+ 
++	// Clear some header flags inherited from the original message that don't
++	// apply to the clone.
++	fHeader-&gt;flags &amp;= ~(MESSAGE_FLAG_REPLY_REQUIRED | MESSAGE_FLAG_REPLY_DONE
++		| MESSAGE_FLAG_IS_REPLY | MESSAGE_FLAG_WAS_DELIVERED
++		| MESSAGE_FLAG_WAS_DROPPED | MESSAGE_FLAG_PASS_BY_AREA);
++	// Note, that BeOS R5 seems to keep the reply info.
++
+ 	if (fHeader-&gt;fields_size &gt; 0) {
+ 		fFields = (field_header *)malloc(fHeader-&gt;fields_size);
+ 		memcpy(fFields, other.fFields, fHeader-&gt;fields_size);
+@@ -1988,8 +1996,36 @@
+ #if 0
+ 	port_info portInfo;
+ 	if (get_port_info(replyPort, &amp;portInfo) == B_OK
+-		&amp;&amp; portInfo.queue_count &gt; 0)
++		&amp;&amp; portInfo.queue_count &gt; 0) {
+ 		debugger(&quot;reply port not empty!&quot;);
++		printf(&quot;  reply port not empty! %ld message(s) in queue\n&quot;,
++			portInfo.queue_count);
++
++		// fetch and print the messages
++		for (int32 i = 0; i &lt; portInfo.queue_count; i++) {
++			char buffer[1024];
++			int32 code;
++			ssize_t size = read_port(replyPort, &amp;code, buffer, sizeof(buffer));
++			if (size &lt; 0) {
++				printf(&quot;failed to read message from reply port\n&quot;);
++				continue;
++			}
++			if (size &gt;= (ssize_t)sizeof(buffer)) {
++				printf(&quot;message from reply port too big\n&quot;);
++				continue;
++			}
++
++			BMemoryIO stream(buffer, size);
++			BMessage reply;
++			if (reply.Unflatten(&amp;stream) != B_OK) {
++				printf(&quot;failed to unflatten message from reply port\n&quot;);
++				continue;
++			}
++
++			printf(&quot;message %ld from reply port:\n&quot;, i);
++			reply.PrintToStream();
++		}
++	}
+ #endif
+ 
+ 	{
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000656.html">[Haiku-commits] r20073 - haiku/trunk/src/apps/bemail
+</A></li>
+	<LI>Next message: <A HREF="000658.html">[Haiku-commits] r20074 - haiku/trunk/src/kits/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#657">[ date ]</a>
+              <a href="thread.html#657">[ thread ]</a>
+              <a href="subject.html#657">[ subject ]</a>
+              <a href="author.html#657">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

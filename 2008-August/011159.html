@@ -1,0 +1,162 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27099 -	haiku/trunk/src/system/kernel/device_manager
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27099%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200808210311.m7L3Bmwq032390%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011158.html">
+   <LINK REL="Next"  HREF="011160.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27099 -	haiku/trunk/src/system/kernel/device_manager</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27099%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200808210311.m7L3Bmwq032390%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27099 -	haiku/trunk/src/system/kernel/device_manager">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug 21 05:11:48 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011158.html">[Haiku-commits] r27098 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="011160.html">[Haiku-commits] r27100 - in haiku/trunk: headers/private/kernel	headers/private/kernel/slab src/system/kernel/slab	src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11159">[ date ]</a>
+              <a href="thread.html#11159">[ thread ]</a>
+              <a href="subject.html#11159">[ subject ]</a>
+              <a href="author.html#11159">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-21 05:11:47 +0200 (Thu, 21 Aug 2008)
+New Revision: 27099
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27099&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27099&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/device_manager/io_requests.cpp
+Log:
+* IOBuffer::Delete(): Check for NULL pointer. The IORequest destructor
+  calls the method unchecked, and the buffer can actually be NULL, if
+  Init() failed.
+* panic() when running out of VIP memory, at least when KDEBUG is
+  set.
+* Use heap_set_get_caller() for the VIP heap, so the heap leak checking
+  produces useful caller addresses.
+
+
+Modified: haiku/trunk/src/system/kernel/device_manager/io_requests.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/io_requests.cpp	2008-08-21 03:05:26 UTC (rev 27098)
++++ haiku/trunk/src/system/kernel/device_manager/io_requests.cpp	2008-08-21 03:11:47 UTC (rev 27099)
+@@ -8,6 +8,8 @@
+ 
+ #include &lt;string.h&gt;
+ 
++#include &lt;arch/debug.h&gt;
++#include &lt;debug.h&gt;
+ #include &lt;heap.h&gt;
+ #include &lt;kernel.h&gt;
+ #include &lt;team.h&gt;
+@@ -86,6 +88,9 @@
+ void
+ IOBuffer::Delete()
+ {
++	if (this == NULL)
++		return;
++
+ 	if (fVIP)
+ 		vip_io_request_free(this);
+ 	else
+@@ -1194,10 +1199,47 @@
+ // #pragma mark - allocator
+ 
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++static addr_t
++get_caller()
++{
++	// Find the first return address outside of the allocator code. Note, that
++	// this makes certain assumptions about how the code for the functions
++	// ends up in the kernel object.
++	addr_t returnAddresses[5];
++	int32 depth = arch_debug_get_stack_trace(returnAddresses, 5, 1, false);
++
++	// find the first return address inside the VIP allocator
++	int32 i = 0;
++	for (i = 0; i &lt; depth; i++) {
++		if (returnAddresses[i] &gt;= (addr_t)&amp;get_caller
++			&amp;&amp; returnAddresses[i] &lt; (addr_t)&amp;vip_io_request_allocator_init) {
++			break;
++		}
++	}
++
++	// now continue until we have the first one outside
++	for (; i &lt; depth; i++) {
++		if (returnAddresses[i] &lt; (addr_t)&amp;get_caller
++			|| returnAddresses[i] &gt; (addr_t)&amp;vip_io_request_allocator_init) {
++			return returnAddresses[i];
++		}
++	}
++
++	return 0;
++}
++#endif
++
++
+ void*
+ vip_io_request_malloc(size_t size)
+ {
+-	return heap_memalign(sVIPHeap, 0, size);
++	void* address = heap_memalign(sVIPHeap, 0, size);
++#if KDEBUG
++	if (address == NULL)
++		panic(&quot;vip_io_request_malloc(): VIP heap %p out of memory&quot;, sVIPHeap);
++#endif
++	return address;
+ }
+ 
+ 
+@@ -1247,6 +1289,10 @@
+ 		return;
+ 	}
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++	heap_set_get_caller(sVIPHeap, &amp;get_caller);
++#endif
++
+ 	dprintf(&quot;vip_io_request_allocator_init(): created VIP I/O heap: %p\n&quot;,
+ 		sVIPHeap);
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011158.html">[Haiku-commits] r27098 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="011160.html">[Haiku-commits] r27100 - in haiku/trunk: headers/private/kernel	headers/private/kernel/slab src/system/kernel/slab	src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11159">[ date ]</a>
+              <a href="thread.html#11159">[ thread ]</a>
+              <a href="subject.html#11159">[ subject ]</a>
+              <a href="author.html#11159">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

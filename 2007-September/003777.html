@@ -1,0 +1,159 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22151 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22151%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200709022221.l82MLQK4032753%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003776.html">
+   <LINK REL="Next"  HREF="003778.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22151 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22151%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200709022221.l82MLQK4032753%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22151 - in haiku/trunk: headers/private/kernel	src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Sep  3 00:21:26 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003776.html">[Haiku-commits] r22150 - in haiku/trunk:	headers/private/kernel/arch src/system/kernel/arch/x86
+</A></li>
+        <LI>Next message: <A HREF="003778.html">[Haiku-commits] r22152 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3777">[ date ]</a>
+              <a href="thread.html#3777">[ thread ]</a>
+              <a href="subject.html#3777">[ subject ]</a>
+              <a href="author.html#3777">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-09-03 00:21:26 +0200 (Mon, 03 Sep 2007)
+New Revision: 22151
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22151&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22151&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/condition_variable.h
+   haiku/trunk/src/system/kernel/condition_variable.cpp
+Log:
+* Fixed incorrect check in condition_variable_interrupt_thread().
+  Condition variables would never be interrupted.
+* ConditionVariableEntry::Add() did not correctly insert the entry into
+  the per-thread list of entries (the next link of the previous entry
+  was not adjusted), which could leave the entry unnotified when the
+  previous entry was notified, thus leaving it in the respective
+  condition variable's list after the end of its life time. This should
+  fix a crashing bug I rarely encountered.
+* Added debug checks in the PrivateConditionVariableEntry
+  constructor/destructor that should have helped me to find
+  forementioned bug hours earlier, had I been bright enough to realize
+  that I didn't include &lt;debug.h&gt; and those KDEBUG guarded checks were
+  never executed. :-/
+
+
+Modified: haiku/trunk/headers/private/kernel/condition_variable.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/condition_variable.h	2007-09-02 22:04:36 UTC (rev 22150)
++++ haiku/trunk/headers/private/kernel/condition_variable.h	2007-09-02 22:21:26 UTC (rev 22151)
+@@ -8,6 +8,8 @@
+ 
+ #include &lt;OS.h&gt;
+ 
++#include &lt;debug.h&gt;
++
+ #ifdef __cplusplus
+ 
+ #include &lt;util/OpenHashTable.h&gt;
+@@ -18,11 +20,28 @@
+ 
+ struct PrivateConditionVariableEntry {
+ public:
++#if KDEBUG
++	inline PrivateConditionVariableEntry()
++		: fVariable(NULL)
++	{
++	}
++
++	inline ~PrivateConditionVariableEntry()
++	{
++		if (fVariable != NULL) {
++			panic(&quot;Destroying condition variable entry %p, but it's still &quot;
++				&quot;attached to variable %p\n&quot;, this, fVariable);
++		}
++	}
++#endif
++
+ 	inline	PrivateConditionVariable* Variable() const
+ 		{ return fVariable; }
+ 
+ 	inline	PrivateConditionVariableEntry* ThreadNext() const
+ 		{ return fThreadNext; }
++	inline	PrivateConditionVariableEntry* ThreadPrevious() const
++		{ return fThreadPrevious; }
+ 
+ 	class Private;
+ 
+
+Modified: haiku/trunk/src/system/kernel/condition_variable.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/condition_variable.cpp	2007-09-02 22:04:36 UTC (rev 22150)
++++ haiku/trunk/src/system/kernel/condition_variable.cpp	2007-09-02 22:21:26 UTC (rev 22151)
+@@ -107,6 +107,8 @@
+ 	if (threadNext) {
+ 		fThreadPrevious = threadNext-&gt;fThreadPrevious;
+ 		threadNext-&gt;fThreadPrevious = this;
++		if (fThreadPrevious)
++			fThreadPrevious-&gt;fThreadNext = this;
+ 	} else
+ 		fThreadPrevious = NULL;
+ 
+@@ -399,7 +401,7 @@
+ 	// re-get the thread and do the checks again
+ 	thread = thread_get_thread_struct_locked(threadID);
+ 
+-	if (thread != NULL || thread-&gt;state != B_THREAD_WAITING
++	if (thread == NULL || thread-&gt;state != B_THREAD_WAITING
+ 		|| thread-&gt;condition_variable_entry == NULL) {
+ 		return B_BAD_VALUE;
+ 	}
+@@ -417,6 +419,7 @@
+ 	PrivateConditionVariableEntry::Private(*entry).SetResult(B_INTERRUPTED);
+ 
+ 	// remove all of the thread's entries from their variables
++	ASSERT(entry-&gt;ThreadPrevious() == NULL);
+ 	while (entry) {
+ 		PrivateConditionVariableEntry::Private(*entry).Remove();
+ 		entry = entry-&gt;ThreadNext();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003776.html">[Haiku-commits] r22150 - in haiku/trunk:	headers/private/kernel/arch src/system/kernel/arch/x86
+</A></li>
+	<LI>Next message: <A HREF="003778.html">[Haiku-commits] r22152 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3777">[ date ]</a>
+              <a href="thread.html#3777">[ thread ]</a>
+              <a href="subject.html#3777">[ subject ]</a>
+              <a href="author.html#3777">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

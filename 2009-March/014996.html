@@ -1,0 +1,221 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29621 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29621%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200903200829.n2K8TqCI007611%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014995.html">
+   <LINK REL="Next"  HREF="014997.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29621 - haiku/trunk/src/system/kernel</H1>
+    <B>axeld at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29621%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200903200829.n2K8TqCI007611%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29621 - haiku/trunk/src/system/kernel">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Mar 20 09:29:52 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014995.html">[Haiku-commits] r29620 - haiku/trunk/src/bin/desklink
+</A></li>
+        <LI>Next message: <A HREF="014997.html">[Haiku-commits] r29622 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14996">[ date ]</a>
+              <a href="thread.html#14996">[ thread ]</a>
+              <a href="subject.html#14996">[ subject ]</a>
+              <a href="author.html#14996">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-03-20 09:29:50 +0100 (Fri, 20 Mar 2009)
+New Revision: 29621
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29621&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29621&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/sem.cpp
+Log:
+* Userland applications can no longer delete kernel semaphores. However, they
+  are still allowed to delete semaphores of other teams...
+* Anyway, this fixes bug #3585.
+
+
+Modified: haiku/trunk/src/system/kernel/sem.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/sem.cpp	2009-03-20 03:26:00 UTC (rev 29620)
++++ haiku/trunk/src/system/kernel/sem.cpp	2009-03-20 08:29:50 UTC (rev 29621)
+@@ -298,6 +298,68 @@
+ }
+ 
+ 
++static status_t
++delete_sem_internal(sem_id id, bool checkPermission)
++{
++	if (sSemsActive == false)
++		return B_NO_MORE_SEMS;
++	if (id &lt; 0)
++		return B_BAD_SEM_ID;
++
++	int32 slot = id % sMaxSems;
++
++	cpu_status state = disable_interrupts();
++	GRAB_SEM_LOCK(sSems[slot]);
++
++	if (sSems[slot].id != id) {
++		RELEASE_SEM_LOCK(sSems[slot]);
++		restore_interrupts(state);
++		TRACE((&quot;delete_sem: invalid sem_id %ld\n&quot;, id));
++		return B_BAD_SEM_ID;
++	}
++
++	if (checkPermission
++		&amp;&amp; sSems[slot].u.used.owner == team_get_kernel_team_id()) {
++		RELEASE_SEM_LOCK(sSems[slot]);
++		restore_interrupts(state);
++		dprintf(&quot;thread %ld tried to delete kernel semaphore %ld.\n&quot;,
++			thread_get_current_thread_id(), id);
++		return B_NOT_ALLOWED;
++	}
++
++	KTRACE(&quot;delete_sem(sem: %ld)&quot;, id);
++
++	notify_sem_select_events(&amp;sSems[slot], B_EVENT_INVALID);
++	sSems[slot].u.used.select_infos = NULL;
++
++	// free any threads waiting for this semaphore
++	GRAB_THREAD_LOCK();
++	while (queued_thread* entry = sSems[slot].queue.RemoveHead()) {
++		entry-&gt;queued = false;
++		thread_unblock_locked(entry-&gt;thread, B_BAD_SEM_ID);
++	}
++	RELEASE_THREAD_LOCK();
++
++	sSems[slot].id = -1;
++	char *name = sSems[slot].u.used.name;
++	sSems[slot].u.used.name = NULL;
++
++	RELEASE_SEM_LOCK(sSems[slot]);
++
++	// append slot to the free list
++	GRAB_SEM_LIST_LOCK();
++	free_sem_slot(slot, id + sMaxSems);
++	atomic_add(&amp;sUsedSems, -1);
++	RELEASE_SEM_LIST_LOCK();
++
++	restore_interrupts(state);
++
++	free(name);
++
++	return B_OK;
++}
++
++ 
+ //	#pragma mark - Private Kernel API
+ 
+ 
+@@ -636,53 +698,7 @@
+ status_t
+ delete_sem(sem_id id)
+ {
+-	if (sSemsActive == false)
+-		return B_NO_MORE_SEMS;
+-	if (id &lt; 0)
+-		return B_BAD_SEM_ID;
+-
+-	int32 slot = id % sMaxSems;
+-
+-	cpu_status state = disable_interrupts();
+-	GRAB_SEM_LOCK(sSems[slot]);
+-
+-	if (sSems[slot].id != id) {
+-		RELEASE_SEM_LOCK(sSems[slot]);
+-		restore_interrupts(state);
+-		TRACE((&quot;delete_sem: invalid sem_id %ld\n&quot;, id));
+-		return B_BAD_SEM_ID;
+-	}
+-
+-	KTRACE(&quot;delete_sem(sem: %ld)&quot;, id);
+-
+-	notify_sem_select_events(&amp;sSems[slot], B_EVENT_INVALID);
+-	sSems[slot].u.used.select_infos = NULL;
+-
+-	// free any threads waiting for this semaphore
+-	GRAB_THREAD_LOCK();
+-	while (queued_thread* entry = sSems[slot].queue.RemoveHead()) {
+-		entry-&gt;queued = false;
+-		thread_unblock_locked(entry-&gt;thread, B_BAD_SEM_ID);
+-	}
+-	RELEASE_THREAD_LOCK();
+-
+-	sSems[slot].id = -1;
+-	char *name = sSems[slot].u.used.name;
+-	sSems[slot].u.used.name = NULL;
+-
+-	RELEASE_SEM_LOCK(sSems[slot]);
+-
+-	// append slot to the free list
+-	GRAB_SEM_LIST_LOCK();
+-	free_sem_slot(slot, id + sMaxSems);
+-	atomic_add(&amp;sUsedSems, -1);
+-	RELEASE_SEM_LIST_LOCK();
+-
+-	restore_interrupts(state);
+-
+-	free(name);
+-
+-	return B_OK;
++	return delete_sem_internal(id, false);
+ }
+ 
+ 
+@@ -741,7 +757,7 @@
+ 		goto err;
+ 	}
+ 
+-	// ToDo: the B_CHECK_PERMISSION flag should be made private, as it
++	// TODO: the B_CHECK_PERMISSION flag should be made private, as it
+ 	//	doesn't have any use outside the kernel
+ 	if ((flags &amp; B_CHECK_PERMISSION) != 0
+ 		&amp;&amp; sSems[slot].u.used.owner == team_get_kernel_team_id()) {
+@@ -1160,7 +1176,7 @@
+ status_t
+ _user_delete_sem(sem_id id)
+ {
+-	return delete_sem(id);
++	return delete_sem_internal(id, true);
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014995.html">[Haiku-commits] r29620 - haiku/trunk/src/bin/desklink
+</A></li>
+	<LI>Next message: <A HREF="014997.html">[Haiku-commits] r29622 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14996">[ date ]</a>
+              <a href="thread.html#14996">[ thread ]</a>
+              <a href="subject.html#14996">[ subject ]</a>
+              <a href="author.html#14996">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

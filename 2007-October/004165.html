@@ -1,0 +1,274 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22466 - in haiku/trunk/src/system/kernel: cache vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22466%20-%20in%20haiku/trunk/src/system/kernel%3A%20cache%20vm&In-Reply-To=%3C200710071332.l97DWDZu026617%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004164.html">
+   <LINK REL="Next"  HREF="004166.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22466 - in haiku/trunk/src/system/kernel: cache vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22466%20-%20in%20haiku/trunk/src/system/kernel%3A%20cache%20vm&In-Reply-To=%3C200710071332.l97DWDZu026617%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22466 - in haiku/trunk/src/system/kernel: cache vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sun Oct  7 15:32:13 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004164.html">[Haiku-commits] r22465 - haiku/trunk/src/system/kernel/cache
+</A></li>
+        <LI>Next message: <A HREF="004166.html">[Haiku-commits] r22467 - haiku/trunk/src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4165">[ date ]</a>
+              <a href="thread.html#4165">[ thread ]</a>
+              <a href="subject.html#4165">[ subject ]</a>
+              <a href="author.html#4165">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-10-07 15:32:13 +0200 (Sun, 07 Oct 2007)
+New Revision: 22466
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22466&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22466&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+Actually forgot this nail: the file cache will now reserve the pages it will
+allocate with the vm_cache locked - this is necessary to be able to steal pages
+from itself (large files...).
+The system doesn't actually lock up anymore, but it still renders itself unusable;
+obviously the page thief does not work correctly, yet. The rest of the experience
+is created by our current scheduler (the page thief runs and runs, but it doesn't
+free any pages anymore).
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-10-07 12:21:18 UTC (rev 22465)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-10-07 13:32:13 UTC (rev 22466)
+@@ -520,7 +520,8 @@
+ */
+ static inline status_t
+ read_into_cache(file_cache_ref *ref, off_t offset, size_t numBytes,
+-	int32 pageOffset, addr_t buffer, size_t bufferSize)
++	int32 pageOffset, addr_t buffer, size_t bufferSize,
++	size_t lastReservedPages, size_t reservePages)
+ {
+ 	TRACE((&quot;read_into_cache(offset = %Ld, size = %lu, pageOffset = %ld, buffer &quot;
+ 		&quot;= %#lx, bufferSize = %lu\n&quot;, offset, size, pageOffset, buffer,
+@@ -540,7 +541,7 @@
+ 	// allocate pages for the cache and mark them busy
+ 	for (size_t pos = 0; pos &lt; numBytes; pos += B_PAGE_SIZE) {
+ 		vm_page *page = pages[pageIndex++] = vm_page_allocate_page(
+-			PAGE_STATE_FREE, false);
++			PAGE_STATE_FREE, true);
+ 		if (page == NULL)
+ 			panic(&quot;no more pages!&quot;);
+ 
+@@ -558,6 +559,7 @@
+ 	}
+ 
+ 	mutex_unlock(&amp;cache-&gt;lock);
++	vm_page_unreserve_pages(lastReservedPages);
+ 
+ 	// read file into reserved pages
+ 	status_t status = pages_io(ref, offset, vecs, vecCount, &amp;numBytes, false);
+@@ -609,6 +611,7 @@
+ 		}
+ 	}
+ 
++	vm_page_reserve_pages(reservePages);
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 
+ 	// make the pages accessible in the cache
+@@ -629,7 +632,8 @@
+ */
+ static inline status_t
+ write_to_cache(file_cache_ref *ref, off_t offset, size_t numBytes,
+-	int32 pageOffset, addr_t buffer, size_t bufferSize)
++	int32 pageOffset, addr_t buffer, size_t bufferSize,
++	size_t lastReservedPages, size_t reservePages)
+ {
+ 	// TODO: We're using way too much stack! Rather allocate a sufficiently
+ 	// large chunk on the heap.
+@@ -651,7 +655,7 @@
+ 		// TODO: the pages we allocate here should have been reserved upfront
+ 		//	in cache_io()
+ 		vm_page *page = pages[pageIndex++] = vm_page_allocate_page(
+-			PAGE_STATE_FREE, false);
++			PAGE_STATE_FREE, true);
+ 		busyConditions[pageIndex - 1].Publish(page, &quot;page&quot;);
+ 
+ 		vm_cache_insert_page(ref-&gt;cache, page, offset + pos);
+@@ -665,6 +669,7 @@
+ 	}
+ 
+ 	mutex_unlock(&amp;ref-&gt;cache-&gt;lock);
++	vm_page_unreserve_pages(lastReservedPages);
+ 
+ 	// copy contents (and read in partially written pages first)
+ 
+@@ -730,6 +735,9 @@
+ 		}
+ 	}
+ 
++	if (status == B_OK)
++		vm_page_reserve_pages(reservePages);
++
+ 	mutex_lock(&amp;ref-&gt;cache-&gt;lock);
+ 
+ 	// unmap the pages again
+@@ -759,22 +767,27 @@
+ 
+ static status_t
+ satisfy_cache_io(file_cache_ref *ref, off_t offset, addr_t buffer,
+-	int32 &amp;pageOffset, size_t bytesLeft, off_t &amp;lastOffset, addr_t &amp;lastBuffer,
+-	int32 &amp;lastPageOffset, size_t &amp;lastLeft, bool doWrite)
++	int32 &amp;pageOffset, size_t bytesLeft, size_t &amp;reservePages,
++	off_t &amp;lastOffset, addr_t &amp;lastBuffer, int32 &amp;lastPageOffset,
++	size_t &amp;lastLeft, size_t &amp;lastReservedPages, bool doWrite)
+ {
+ 	if (lastBuffer == buffer)
+ 		return B_OK;
+ 
+ 	size_t requestSize = buffer - lastBuffer;
++	reservePages = min_c(MAX_IO_VECS,
++		(bytesLeft - requestSize + B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT);
++
+ 	status_t status;
+ 	if (doWrite) {
+ 		status = write_to_cache(ref, lastOffset, requestSize, lastPageOffset,
+-			lastBuffer, requestSize);
++			lastBuffer, requestSize, lastReservedPages, reservePages);
+ 	} else {
+ 		status = read_into_cache(ref, lastOffset, requestSize, lastPageOffset,
+-			lastBuffer, requestSize);
++			lastBuffer, requestSize, lastReservedPages, reservePages);
+ 	}
+ 	if (status == B_OK) {
++		lastReservedPages = reservePages;
+ 		lastBuffer = buffer;
+ 		lastLeft = bytesLeft;
+ 		lastOffset = offset;
+@@ -826,7 +839,11 @@
+ 	int32 lastPageOffset = pageOffset;
+ 	addr_t lastBuffer = buffer;
+ 	off_t lastOffset = offset;
++	size_t lastReservedPages = min_c(MAX_IO_VECS,
++		(bytesLeft + B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT);
++	size_t reservePages = 0;
+ 
++	vm_page_reserve_pages(lastReservedPages);
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 
+ 	while (bytesLeft &gt; 0) {
+@@ -838,8 +855,8 @@
+ 			// we didn't get yet (to make sure no one else interferes in the
+ 			// mean time).
+ 			status_t status = satisfy_cache_io(ref, offset, buffer, pageOffset,
+-				bytesLeft, lastOffset, lastBuffer, lastPageOffset, lastLeft,
+-				doWrite);
++				bytesLeft, reservePages, lastOffset, lastBuffer, lastPageOffset,
++				lastLeft, lastReservedPages, doWrite);
+ 			if (status != B_OK) {
+ 				mutex_unlock(&amp;cache-&gt;lock);
+ 				return status;
+@@ -887,6 +904,7 @@
+ 			if (bytesLeft &lt;= bytesInPage) {
+ 				// we've read the last page, so we're done!
+ 				mutex_unlock(&amp;cache-&gt;lock);
++				vm_page_unreserve_pages(lastReservedPages);
+ 				return B_OK;
+ 			}
+ 
+@@ -907,8 +925,8 @@
+ 
+ 		if (buffer - lastBuffer + lastPageOffset &gt;= kMaxChunkSize) {
+ 			status_t status = satisfy_cache_io(ref, offset, buffer, pageOffset,
+-				bytesLeft, lastOffset, lastBuffer, lastPageOffset, lastLeft,
+-				doWrite);
++				bytesLeft, reservePages, lastOffset, lastBuffer, lastPageOffset,
++				lastLeft, lastReservedPages, doWrite);
+ 			if (status != B_OK) {
+ 				mutex_unlock(&amp;cache-&gt;lock);
+ 				return status;
+@@ -921,10 +939,10 @@
+ 	status_t status;
+ 	if (doWrite) {
+ 		status = write_to_cache(ref, lastOffset, lastLeft, lastPageOffset,
+-			lastBuffer, lastLeft);
++			lastBuffer, lastLeft, lastReservedPages, 0);
+ 	} else {
+ 		status = read_into_cache(ref, lastOffset, lastLeft, lastPageOffset,
+-			lastBuffer, lastLeft);
++			lastBuffer, lastLeft, lastReservedPages, 0);
+ 	}
+ 
+ 	mutex_unlock(&amp;cache-&gt;lock);
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-10-07 12:21:18 UTC (rev 22465)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-10-07 13:32:13 UTC (rev 22466)
+@@ -1179,11 +1179,14 @@
+ void
+ vm_page_unreserve_pages(uint32 count)
+ {
++	if (count == 0)
++		return;
++
+ 	InterruptsSpinLocker locker(sPageLock);
+ 	ASSERT(sReservedPages &gt;= count);
+ 
+ 	sReservedPages -= count;
+-	
++
+ 	if (vm_page_num_free_pages() &lt;= sReservedPages)
+ 		sFreePageCondition.NotifyAll();
+ }
+@@ -1197,6 +1200,9 @@
+ void
+ vm_page_reserve_pages(uint32 count)
+ {
++	if (count == 0)
++		return;
++
+ 	InterruptsSpinLocker locker(sPageLock);
+ 
+ 	sReservedPages += count;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004164.html">[Haiku-commits] r22465 - haiku/trunk/src/system/kernel/cache
+</A></li>
+	<LI>Next message: <A HREF="004166.html">[Haiku-commits] r22467 - haiku/trunk/src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4165">[ date ]</a>
+              <a href="thread.html#4165">[ thread ]</a>
+              <a href="subject.html#4165">[ subject ]</a>
+              <a href="author.html#4165">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

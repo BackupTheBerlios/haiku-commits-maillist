@@ -1,0 +1,263 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27775 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/bin/debug src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27775%20-%20in%20haiku/trunk%3A%20headers/os/kernel%0A%09headers/private/kernel%20src/bin/debug%20src/system/kernel/debug&In-Reply-To=%3C200809290053.m8T0regC021652%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012222.html">
+   <LINK REL="Next"  HREF="012227.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27775 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/bin/debug src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27775%20-%20in%20haiku/trunk%3A%20headers/os/kernel%0A%09headers/private/kernel%20src/bin/debug%20src/system/kernel/debug&In-Reply-To=%3C200809290053.m8T0regC021652%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27775 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/bin/debug src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Sep 29 02:53:40 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012222.html">[Haiku-commits] r27774 - haiku/trunk/src/kits/debug
+</A></li>
+        <LI>Next message: <A HREF="012227.html">[Haiku-commits] r27776 - haiku/trunk/src/apps/cortex/support
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12223">[ date ]</a>
+              <a href="thread.html#12223">[ thread ]</a>
+              <a href="subject.html#12223">[ subject ]</a>
+              <a href="author.html#12223">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-29 02:53:38 +0200 (Mon, 29 Sep 2008)
+New Revision: 27775
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27775&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27775&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/os/kernel/debugger.h
+   haiku/trunk/headers/private/kernel/user_debugger.h
+   haiku/trunk/src/bin/debug/profile.cpp
+   haiku/trunk/src/system/kernel/debug/user_debugger.cpp
+Log:
+Extended the profiling API. When using the variable stack trace depth
+buffer format, the buffer can now also contain other events than just
+stack traces. ATM these are only references to the image events
+(created/deleted). Therefore we no longer have to flush the profiling
+buffer after such an event, since the debugger can exactly match the
+samples. Since we couldn't flush when the profiling timer hit while the
+thread was in the kernel, that wasn't working that well anyway.
+&quot;profile -f&quot; fails to translate stack trace addresses only very rarely,
+now.
+
+
+Modified: haiku/trunk/headers/os/kernel/debugger.h
+===================================================================
+--- haiku/trunk/headers/os/kernel/debugger.h	2008-09-29 00:41:31 UTC (rev 27774)
++++ haiku/trunk/headers/os/kernel/debugger.h	2008-09-29 00:53:38 UTC (rev 27775)
+@@ -180,6 +180,18 @@
+ } debug_debugger_message;
+ 
+ 
++// profile events -- when the buffer is in variable stack depth format, a sample
++// count entry &gt;= B_DEBUG_PROFILE_EVENT_BASE indicates a profile event
++enum {
++	B_DEBUG_PROFILE_EVENT_BASE				= 0x80000000,
++	B_DEBUG_PROFILE_EVENT_PARAMETER_MASK	= 0x0000ffff,
++		// &amp; with to get the event's parameter count
++
++	B_DEBUG_PROFILE_IMAGE_EVENT				= 0x80010001
++		// single parameter: the respective image event counter
++};
++
++
+ // #pragma mark -
+ // #pragma mark ----- messages to the debug nub thread -----
+ 
+
+Modified: haiku/trunk/headers/private/kernel/user_debugger.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/user_debugger.h	2008-09-29 00:41:31 UTC (rev 27774)
++++ haiku/trunk/headers/private/kernel/user_debugger.h	2008-09-29 00:53:38 UTC (rev 27775)
+@@ -96,6 +96,9 @@
+ 		int32			image_event;
+ 			// number of the image event when the first sample was written into
+ 			// the buffer
++		int32			last_image_event;
++			// number of the image event when the last sample was written into
++			// the buffer
+ 		bool			variable_stack_depth;
+ 			// record a variable number of samples per hit
+ 		bool			buffer_full;
+
+Modified: haiku/trunk/src/bin/debug/profile.cpp
+===================================================================
+--- haiku/trunk/src/bin/debug/profile.cpp	2008-09-29 00:41:31 UTC (rev 27774)
++++ haiku/trunk/src/bin/debug/profile.cpp	2008-09-29 00:53:38 UTC (rev 27775)
+@@ -495,9 +495,27 @@
+ 			int32 totalSampleCount = 0;
+ 			int32 tickCount = 0;
+ 			addr_t* samples = fSamples;
++
+ 			while (count &gt; 0) {
+-				int32 sampleCount = *(samples++);
++				addr_t sampleCount = *(samples++);
+ 
++				if (sampleCount &gt;= B_DEBUG_PROFILE_EVENT_BASE) {
++					int32 eventParameterCount
++						= sampleCount &amp; B_DEBUG_PROFILE_EVENT_PARAMETER_MASK;
++					if (sampleCount == B_DEBUG_PROFILE_IMAGE_EVENT) {
++						int32 imageEvent = (int32)samples[0];
++						_RemoveObsoleteImages(imageEvent);
++						_AddNewImages(newImages, imageEvent);
++					} else {
++						fprintf(stderr, &quot;unknown profile event: %#lx\n&quot;,
++							sampleCount);
++					}
++
++					samples += eventParameterCount;
++					count -= eventParameterCount + 1;
++					continue;
++				}
++
+ 				// Sort the samples. This way hits of the same symbol are
+ 				// successive and we can avoid incrementing the hit count of the
+ 				// same symbol twice. Same for images.
+@@ -507,7 +525,7 @@
+ 				ThreadImage* previousImage = NULL;
+ 				int32 previousSymbol = -1;
+ 
+-				for (int32 i = 0; i &lt; sampleCount; i++) {
++				for (uint32 i = 0; i &lt; sampleCount; i++) {
+ 					addr_t address = samples[i];
+ 					ThreadImage* image = FindImage(address);
+ 					int32 symbol = -1;
+@@ -527,7 +545,7 @@
+ 					previousSymbol = symbol;
+ 				}
+ 
+-				if (unknownSamples == sampleCount)
++				if (unknownSamples == (int32)sampleCount)
+ 					fUnkownTicks++;
+ 
+ 				samples += sampleCount;
+@@ -681,8 +699,21 @@
+ 	}
+ 
+ private:
++	typedef DoublyLinkedList&lt;ThreadImage&gt;	ImageList;
++
+ 	void _SynchronizeImages();
+ 
++	void _AddNewImages(ImageList&amp; newImages, int32 event)
++	{
++		ImageList::Iterator it = newImages.GetIterator();
++		while (ThreadImage* image = it.Next()) {
++			if (image-&gt;GetImage()-&gt;CreationEvent() &gt;= event) {
++				it.Remove();
++				fImages.Add(image);
++			}
++		}
++	}
++
+ 	void _RemoveObsoleteImages(int32 event)
+ 	{
+ 		// remove obsolete images
+@@ -711,8 +742,6 @@
+ 	}
+ 
+ private:
+-	typedef DoublyLinkedList&lt;ThreadImage&gt;	ImageList;
+-
+ 	thread_info	fInfo;
+ 	::Team*		fTeam;
+ 	area_id		fSampleArea;
+
+Modified: haiku/trunk/src/system/kernel/debug/user_debugger.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/user_debugger.cpp	2008-09-29 00:41:31 UTC (rev 27774)
++++ haiku/trunk/src/system/kernel/debug/user_debugger.cpp	2008-09-29 00:53:38 UTC (rev 27775)
+@@ -1192,11 +1192,25 @@
+ 
+ 	// Check, whether the buffer is full or an image event occurred since the
+ 	// last sample was taken.
++	int32 maxSamples = debugInfo.profile.max_samples;
+ 	int32 sampleCount = debugInfo.profile.sample_count;
+ 	int32 stackDepth = debugInfo.profile.stack_depth;
+ 	int32 imageEvent = thread-&gt;team-&gt;debug_info.image_event;
+ 	if (debugInfo.profile.sample_count &gt; 0) {
+-		if (debugInfo.profile.image_event &lt; imageEvent
++		if (debugInfo.profile.last_image_event &lt; imageEvent
++			&amp;&amp; debugInfo.profile.variable_stack_depth
++			&amp;&amp; sampleCount + 2 &lt;= maxSamples) {
++			// an image event occurred, but we use variable stack depth and
++			// have enough room in the buffer to indicate an image event
++			addr_t* event = debugInfo.profile.samples + sampleCount;
++			event[0] = B_DEBUG_PROFILE_IMAGE_EVENT;
++			event[1] = imageEvent;
++			sampleCount += 2;
++			debugInfo.profile.sample_count = sampleCount;
++			debugInfo.profile.last_image_event = imageEvent;
++		}
++
++		if (debugInfo.profile.last_image_event &lt; imageEvent
+ 			|| debugInfo.profile.flush_threshold - sampleCount &lt; stackDepth) {
+ 			if (!IS_KERNEL_ADDRESS(arch_debug_get_interrupt_pc())) {
+ 				flushBuffer = true;
+@@ -1206,7 +1220,7 @@
+ 			// We can't flush the buffer now, since we interrupted a kernel
+ 			// function. If the buffer is not full yet, we add the samples,
+ 			// otherwise we have to drop them.
+-			if (debugInfo.profile.max_samples - sampleCount &lt; stackDepth) {
++			if (maxSamples - sampleCount &lt; stackDepth) {
+ 				debugInfo.profile.dropped_ticks++;
+ 				return true;
+ 			}
+@@ -1214,6 +1228,7 @@
+ 	} else {
+ 		// first sample -- set the image event
+ 		debugInfo.profile.image_event = imageEvent;
++		debugInfo.profile.last_image_event = imageEvent;
+ 	}
+ 
+ 	// get the samples
+@@ -2300,6 +2315,8 @@
+ 							threadDebugInfo.profile.interval_left = interval;
+ 							threadDebugInfo.profile.installed_timer = NULL;
+ 							threadDebugInfo.profile.image_event = imageEvent;
++							threadDebugInfo.profile.last_image_event
++								= imageEvent;
+ 						} else
+ 							result = B_BAD_VALUE;
+ 					} else
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012222.html">[Haiku-commits] r27774 - haiku/trunk/src/kits/debug
+</A></li>
+	<LI>Next message: <A HREF="012227.html">[Haiku-commits] r27776 - haiku/trunk/src/apps/cortex/support
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12223">[ date ]</a>
+              <a href="thread.html#12223">[ thread ]</a>
+              <a href="subject.html#12223">[ subject ]</a>
+              <a href="author.html#12223">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

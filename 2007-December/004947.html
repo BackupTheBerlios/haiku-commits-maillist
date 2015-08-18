@@ -1,0 +1,215 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23067 -	haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-December/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23067%20-%0A%09haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86&In-Reply-To=%3C200712052325.lB5NP16w028193%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004946.html">
+   <LINK REL="Next"  HREF="004948.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23067 -	haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23067%20-%0A%09haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86&In-Reply-To=%3C200712052325.lB5NP16w028193%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23067 -	haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Dec  6 00:25:01 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004946.html">[Haiku-commits] r23066 - in	haiku/branches/developer/bonefish/optimization:	headers/private/kernel headers/private/kernel/arch	src/system/kernel src/system/kernel/arch/x86 src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="004948.html">[Haiku-commits] r23068 - in haiku/trunk: build/jam src/bin
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4947">[ date ]</a>
+              <a href="thread.html#4947">[ thread ]</a>
+              <a href="subject.html#4947">[ subject ]</a>
+              <a href="author.html#4947">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-12-06 00:25:01 +0100 (Thu, 06 Dec 2007)
+New Revision: 23067
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23067&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23067&amp;view=rev</A>
+
+Modified:
+   haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/arch_interrupts.S
+Log:
+Some more work on the syscall interrupt handler:
+* Reintroduced user debugging support functionality, including syscall
+  tracing.
+* Use the thread::flags field to skip calling functions, if possible.
+* Small optimizations.
+
+
+Modified: haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/arch_interrupts.S
+===================================================================
+--- haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/arch_interrupts.S	2007-12-05 23:17:20 UTC (rev 23066)
++++ haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/arch_interrupts.S	2007-12-05 23:25:01 UTC (rev 23067)
+@@ -7,6 +7,7 @@
+ ** Distributed under the terms of the NewOS License.
+ */
+ 
++#include &lt;thread_types.h&gt;
+ #include &lt;arch/x86/descriptors.h&gt;
+ #include &lt;arch/x86/arch_kernel.h&gt;
+ 
+@@ -170,7 +171,7 @@
+ 	push	%gs
+ 
+ 	// save %eax, the number of the syscall
+-	movl	%eax, %ecx
++	movl	%eax, %esi
+ 
+ 	movl	$KERNEL_DATA_SEG,%eax
+ 	cld
+@@ -185,18 +186,25 @@
+ 	call	x86_push_iframe_current_thread
+ 	addl	$4, %esp
+ 
++	// disable breakpoints, if installed
++	movl	%dr3, %edi				// thread pointer (pointer to thread::flags)
++	testl	$THREAD_FLAGS_BREAKPOINTS_INSTALLED, (%edi)
++	jz		skip_debug_at_kernel_entry
++	call	i386_exit_user_debug_at_kernel_entry
++  skip_debug_at_kernel_entry:
++
+ 	call	system_time
+ 	push	%edx
+ 	push	%eax
+ 	call	thread_at_kernel_entry
+-	add		$8, %esp
++		// leave the time on the stack (needed for post syscall debugging)
+ 
+ 	sti								// enable interrupts
+ 
+-	cmp		$SYSCALL_COUNT, %ecx	// check syscall number
++	cmp		$SYSCALL_COUNT, %esi	// check syscall number
+ 	jae		bad_syscall_number
+ 	movl	$kSyscallInfos, %eax	// get syscall info
+-	lea		(%eax, %ecx, 8), %esi
++	lea		(%eax, %esi, 8), %esi
+ 
+ 	// copy parameters onto this stack
+ 	subl	$80, %esp				// leave some room for the syscall params
+@@ -217,22 +225,44 @@
+ 	test	%eax, %eax
+ 	jne		bad_syscall_params
+ 
++	// pre syscall debugging
++	testl	$THREAD_FLAGS_DEBUGGER_INSTALLED, (%edi)
++	jnz		do_pre_syscall_debug
++  pre_syscall_debug_done:
++
+ 	// call the syscall function
+ 	call	*(%esi)
+ 
+-  bad_syscall_params:
+-	addl	$80, %esp				// remove syscall params from stack
+-
+-  bad_syscall_number:
+ 	// overwrite the values of %eax and %edx on the stack (the syscall return
+ 	// value)
+ 	movl	%edx, 36(%ebp)
+ 	movl	%eax, 44(%ebp)
+ 
+-	call	thread_at_kernel_exit
++	// post syscall debugging
++	testl	$THREAD_FLAGS_DEBUGGER_INSTALLED, (%edi)
++	jnz		do_post_syscall_debug
++  post_syscall_debug_done:
+ 
++  bad_syscall_params:
++  bad_syscall_number:
++	// if no signals are pending and the thread shall not be debugged, we can
++	// use the quick kernel exit function
++	testl	$(THREAD_FLAGS_SIGNALS_PENDING | THREAD_FLAGS_DEBUG_THREAD), (%edi)
++	jnz		kernel_exit_handle_signals
++	cli								// disable interrupts
++	call	thread_at_kernel_exit_no_signals
++  kernel_exit_done:
++
++	// install breakpoints, if defined
++	testl	$THREAD_FLAGS_BREAKPOINTS_DEFINED, (%edi)
++	jz		skip_debug_at_kernel_exit
++	push	%ebp
++	call	i386_init_user_debug_at_kernel_exit
++  skip_debug_at_kernel_exit:
++
++	movl	%ebp, %esp				// remove all parameters from the stack
++
+ 	// pop iframe
+-	cli								// disable interrupts
+ 	call	x86_pop_iframe_current_thread
+ 	sti								// enable interrupts
+ 
+@@ -245,7 +275,36 @@
+ 	addl	$16,%esp		// ignore the vector, error code, and original eax/edx values
+ 	iret
+ 
++  do_pre_syscall_debug:
++	movl	%esp, %eax				// syscall parameters
++	push	%eax
++	movl	48(%ebp), %eax			// syscall number
++	push	%eax
++	call	user_debug_pre_syscall
++	addl	$8, %esp
++	jmp		pre_syscall_debug_done
+ 
++  do_post_syscall_debug:
++	movl	-4(%ebp), %ecx			// syscall start time
++	push	%ecx
++	movl	-8(%ebp), %ecx
++	push	%ecx
++	push	%edx					// syscall return value
++	push	%eax
++	lea		16(%esp), %eax			// syscall parameters
++	push	%eax
++	movl	48(%ebp), %eax			// syscall number
++	push	%eax
++	call	user_debug_post_syscall
++	addl	$8, %esp
++	jmp		post_syscall_debug_done
++
++  kernel_exit_handle_signals:
++	call	thread_at_kernel_exit
++	cli								// disable interrupts
++	jmp		kernel_exit_done
++	
++
+ _interrupt_stack_offset:
+ .long	0
+ 	// this value will be maintained by the function below
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004946.html">[Haiku-commits] r23066 - in	haiku/branches/developer/bonefish/optimization:	headers/private/kernel headers/private/kernel/arch	src/system/kernel src/system/kernel/arch/x86 src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="004948.html">[Haiku-commits] r23068 - in haiku/trunk: build/jam src/bin
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4947">[ date ]</a>
+              <a href="thread.html#4947">[ thread ]</a>
+              <a href="subject.html#4947">[ subject ]</a>
+              <a href="author.html#4947">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

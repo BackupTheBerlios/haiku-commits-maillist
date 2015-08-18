@@ -1,0 +1,464 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25912 - haiku/trunk/src/apps/terminal
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25912%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200806102143.m5ALhghf005493%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009520.html">
+   <LINK REL="Next"  HREF="009522.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25912 - haiku/trunk/src/apps/terminal</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25912%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200806102143.m5ALhghf005493%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25912 - haiku/trunk/src/apps/terminal">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Jun 10 23:43:42 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009520.html">[Haiku-commits] r25911 - haiku/trunk/src/apps/terminal
+</A></li>
+        <LI>Next message: <A HREF="009522.html">[Haiku-commits] r25913 - in haiku/trunk: build/jam	src/system/kernel/arch/ppc
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9521">[ date ]</a>
+              <a href="thread.html#9521">[ thread ]</a>
+              <a href="subject.html#9521">[ subject ]</a>
+              <a href="author.html#9521">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-06-10 23:43:42 +0200 (Tue, 10 Jun 2008)
+New Revision: 25912
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25912&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25912&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/terminal/BasicTerminalBuffer.cpp
+   haiku/trunk/src/apps/terminal/BasicTerminalBuffer.h
+Log:
+* Added a SetHistoryCapacity() method.
+* Added a ResizeTo() version that allows to set the history capacity at
+  the same time.
+* Added a SynchronizeWith() method that allows synchronizing with (a
+  part of) another buffer.
+* Fixed TODO in _Scroll().
+* Improved the dirty region update code in _Scroll(). It would in
+  certain (not exactly uncommon) situations needlessly invalidate the
+  whole screen.
+
+
+Modified: haiku/trunk/src/apps/terminal/BasicTerminalBuffer.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/BasicTerminalBuffer.cpp	2008-06-10 21:34:50 UTC (rev 25911)
++++ haiku/trunk/src/apps/terminal/BasicTerminalBuffer.cpp	2008-06-10 21:43:42 UTC (rev 25912)
+@@ -57,11 +57,8 @@
+ inline void
+ BasicTerminalBuffer::_Invalidate(int32 top, int32 bottom)
+ {
+-//debug_printf(&quot;BasicTerminalBuffer::_Invalidate(%ld, %ld)\n&quot;, top, bottom);
+-	if (top &lt; fDirtyInfo.dirtyTop)
+-		fDirtyInfo.dirtyTop = top;
+-	if (bottom &gt; fDirtyInfo.dirtyBottom)
+-		fDirtyInfo.dirtyBottom = bottom;
++//debug_printf(&quot;%p-&gt;BasicTerminalBuffer::_Invalidate(%ld, %ld)\n&quot;, this, top, bottom);
++	fDirtyInfo.ExtendDirtyRegion(top, bottom);
+ 
+ 	if (!fDirtyInfo.messageSent) {
+ 		NotifyListener();
+@@ -131,18 +128,26 @@
+ status_t
+ BasicTerminalBuffer::ResizeTo(int32 width, int32 height)
+ {
++	return ResizeTo(width, height, fHistoryCapacity);
++}
++
++
++status_t
++BasicTerminalBuffer::ResizeTo(int32 width, int32 height, int32 historyCapacity)
++{
+ 	if (height &lt; MIN_ROWS || height &gt; MAX_ROWS || width &lt; MIN_COLS
+-			|| width &gt; MAX_COLS) {
++			|| width &gt; MAX_COLS || height &gt; historyCapacity) {
+ 		return B_BAD_VALUE;
+ 	}
+ 
+-//debug_printf(&quot;BasicTerminalBuffer::ResizeTo(): (%ld, %ld) -&gt; (%ld, %ld)\n&quot;,
+-//fWidth, fHeight, width, height);
++//debug_printf(&quot;BasicTerminalBuffer::ResizeTo(): (%ld, %ld, history: %ld) -&gt; &quot;
++//&quot;(%ld, %ld, history: %ld)\n&quot;, fWidth, fHeight, fHistoryCapacity, width, height,
++//historyCapacity);
+ 
+ 	if (width != fWidth) {
+ 		// The width changes. We have to allocate a new line array and re-wrap
+ 		// all lines.
+-		Line** history = _AllocateLines(width, fHistoryCapacity);
++		Line** history = _AllocateLines(width, historyCapacity);
+ 		if (history == NULL)
+ 			return B_NO_MEMORY;
+ 
+@@ -181,34 +186,35 @@
+ 			}
+ 
+ 			int32 toCopy = min_c(sourceLeft, destLeft);
+-			if (toCopy &gt; 0) {
+-				// If the last cell to copy is the first cell of a
+-				// full-width char, don't copy it yet.
+-				if (sourceX + toCopy &gt; 0 &amp;&amp; IS_WIDTH(
+-						sourceLine-&gt;cells[sourceX + toCopy - 1].attributes)) {
++			// If the last cell to copy is the first cell of a
++			// full-width char, don't copy it yet.
++			if (toCopy &gt; 0 &amp;&amp; IS_WIDTH(
++					sourceLine-&gt;cells[sourceX + toCopy - 1].attributes)) {
+ //debug_printf(&quot;      -&gt; last char is full-width -- don't copy it\n&quot;);
+-					toCopy--;
+-				}
++				toCopy--;
++			}
+ 
+-				// translate the cursor position
+-				if (fCursor.y + fHistorySize == sourceIndex
+-					&amp;&amp; fCursor.x &gt;= sourceX
+-					&amp;&amp; (fCursor.x &lt; sourceX + toCopy
+-						|| sourceX + sourceLeft &lt;= fCursor.x)) {
+-					cursor.x = destLine-&gt;length + fCursor.x - sourceX;
+-					cursor.y = destTotalLines;
++			// translate the cursor position
++			if (fCursor.y + fHistorySize == sourceIndex
++				&amp;&amp; fCursor.x &gt;= sourceX
++				&amp;&amp; (fCursor.x &lt; sourceX + toCopy
++					|| destLeft &gt;= sourceLeft
++						&amp;&amp; sourceX + sourceLeft &lt;= fCursor.x)) {
++				cursor.x = destLine-&gt;length + fCursor.x - sourceX;
++				cursor.y = destTotalLines;
+ 
+-					if (cursor.x &gt;= width) {
+-						// The cursor was in free space after the official end
+-						// of line.
+-						cursor.x = width - 1;
+-					}
++				if (cursor.x &gt;= width) {
++					// The cursor was in free space after the official end
++					// of line.
++					cursor.x = width - 1;
++				}
+ //debug_printf(&quot;      cursor: (%ld, %ld)\n&quot;, cursor.x, cursor.y);
+ 
+-					// don't allow the cursor to get out of screen
+-					maxDestTotalLines = cursor.y + fHeight;
+-				}
++				// don't allow the cursor to get out of screen
++				maxDestTotalLines = cursor.y + height - 1;
++			}
+ 
++			if (toCopy &gt; 0) {
+ 				memcpy(destLine-&gt;cells + destLine-&gt;length,
+ 					sourceLine-&gt;cells + sourceX, toCopy * sizeof(Cell));
+ 				destLine-&gt;length += toCopy;
+@@ -227,10 +233,10 @@
+ 			}
+ 
+ 			if (nextDestLine) {
+-				destIndex = (destIndex + 1) % fHistoryCapacity;
++				destIndex = (destIndex + 1) % historyCapacity;
+ 				destTotalLines++;
+ 				newDestLine = true;
+-				if (destTotalLines == maxDestTotalLines)
++				if (destTotalLines &gt;= maxDestTotalLines)
+ 					break;
+ 			}
+ 		}
+@@ -238,7 +244,7 @@
+ 		// If the last source line had a soft break, the last dest line
+ 		// won't have been counted yet.
+ 		if (!newDestLine) {
+-			destIndex = (destIndex + 1) % fHistoryCapacity;
++			destIndex = (destIndex + 1) % historyCapacity;
+ 			destTotalLines++;
+ 		}
+ 
+@@ -248,8 +254,8 @@
+ 		cursor.y -= destScreenOffset;
+ 
+ 		// Re-wrapping might have produced more lines than we have room for.
+-		if (destTotalLines &gt; fHistoryCapacity)
+-			destTotalLines = fHistoryCapacity;
++		if (destTotalLines &gt; historyCapacity)
++			destTotalLines = historyCapacity;
+ 
+ 		// Update the values
+ //debug_printf(&quot;  cursor: (%ld, %ld) -&gt; (%ld, %ld)\n&quot;, fCursor.x, fCursor.y,
+@@ -258,7 +264,7 @@
+ 		fCursor.y = cursor.y;
+ //debug_printf(&quot;  screen offset: %ld -&gt; %ld\n&quot;, fScreenOffset,
+ //destScreenOffset % fHistoryCapacity);
+-		fScreenOffset = destScreenOffset % fHistoryCapacity;
++		fScreenOffset = destScreenOffset % historyCapacity;
+ //debug_printf(&quot;  history size: %ld -&gt; %ld\n&quot;, fHistorySize, destTotalLines - fHeight);
+ 		fHistorySize = destTotalLines - tempHeight;
+ //debug_printf(&quot;  height %ld -&gt; %ld\n&quot;, fHeight, tempHeight);
+@@ -267,8 +273,12 @@
+ 
+ 		_FreeLines(fHistory, fHistoryCapacity);
+ 		fHistory = history;
++		fHistoryCapacity = historyCapacity;
+ 	}
+ 
++	if (historyCapacity &gt; fHistoryCapacity)
++		SetHistoryCapacity(historyCapacity);
++
+ 	if (height == fHeight)
+ 		return B_OK;
+ 
+@@ -304,10 +314,59 @@
+ 	fScrollTop = 0;
+ 	fScrollBottom = fHeight - 1;
+ 
++	if (historyCapacity &lt; fHistoryCapacity)
++		SetHistoryCapacity(historyCapacity);
++
+ 	return B_OK;
+ }
+ 
+ 
++status_t
++BasicTerminalBuffer::SetHistoryCapacity(int32 historyCapacity)
++{
++	if (historyCapacity &lt; fHeight)
++		return B_BAD_VALUE;
++
++	if (fHistoryCapacity == historyCapacity)
++		return B_OK;
++
++	// The history capacity changes.
++	Line** history = _AllocateLines(fWidth, historyCapacity);
++	if (history == NULL)
++		return B_NO_MEMORY;
++
++	int32 totalLines = fHistorySize + fHeight;
++	int32 historyOffset = fHistoryCapacity - fHistorySize;
++		// base for _LineAt() invocations to iterate through the history
++
++	if (totalLines &gt; historyCapacity) {
++		// Our new history capacity is smaller than currently stored line,
++		// so we have to drop lines.
++		historyOffset += totalLines - historyCapacity;
++		totalLines = historyCapacity;
++	}
++
++	for (int32 i = 0; i &lt; totalLines; i++) {
++		Line* sourceLine = _LineAt(historyOffset + i);
++		Line* destLine = history[i];
++		destLine-&gt;length = sourceLine-&gt;length;
++		destLine-&gt;softBreak = sourceLine-&gt;softBreak;
++		if (destLine-&gt;length &gt; 0) {
++			memcpy(destLine-&gt;cells, sourceLine-&gt;cells,
++				destLine-&gt;length * sizeof(Cell));
++		}
++	}
++
++	_FreeLines(fHistory, fHistoryCapacity);
++	fHistory = history;
++	fHistoryCapacity = historyCapacity;
++	fHistorySize = totalLines - fHeight;
++	fScreenOffset = fHistorySize;
++
++	return B_OK;
++}
++
++
+ void
+ BasicTerminalBuffer::Clear()
+ {
+@@ -323,6 +382,45 @@
+ }
+ 
+ 
++void
++BasicTerminalBuffer::SynchronizeWith(const BasicTerminalBuffer* other,
++	int32 offset, int32 dirtyTop, int32 dirtyBottom)
++{
++//debug_printf(&quot;BasicTerminalBuffer::SynchronizeWith(%p, %ld, %ld - %ld)\n&quot;,
++//other, offset, dirtyTop, dirtyBottom);
++
++	// intersect the visible region with the dirty region
++	int32 first = 0;
++	int32 last = fHeight - 1;
++	dirtyTop -= offset;
++	dirtyBottom -= offset;
++
++	if (first &gt; dirtyBottom || dirtyTop &gt; last)
++		return;
++
++	if (first &lt; dirtyTop)
++		first = dirtyTop;
++	if (last &gt; dirtyBottom)
++		last = dirtyBottom;
++
++	// update the dirty lines
++//debug_printf(&quot;  updating: %ld - %ld\n&quot;, first, last);
++	for (int32 i = first; i &lt;= last; i++) {
++		Line* sourceLine = other-&gt;_HistoryLineAt(i + offset);
++		Line* destLine = _LineAt(i);
++		if (sourceLine != NULL) {
++			destLine-&gt;length = sourceLine-&gt;length;
++			destLine-&gt;softBreak = sourceLine-&gt;softBreak;
++			if (destLine-&gt;length &gt; 0) {
++				memcpy(destLine-&gt;cells, sourceLine-&gt;cells,
++					destLine-&gt;length * sizeof(Cell));
++			}
++		} else
++			destLine-&gt;Clear();
++	}
++}
++
++
+ bool
+ BasicTerminalBuffer::IsFullWidthChar(int32 row, int32 column) const
+ {
+@@ -359,7 +457,7 @@
+ {
+ 	Line* line = _HistoryLineAt(row);
+ 	if (line == NULL)
+-		return NO_CHAR;
++		return 0;
+ 
+ 	if (lastColumn &gt;= line-&gt;length)
+ 		lastColumn = line-&gt;length - 1;
+@@ -861,22 +959,21 @@
+ 		return;
+ 
+ 	if (numLines &gt; 0) {
+-		if (numLines &gt; fHistoryCapacity - fHeight) {
+-			numLines = fHistoryCapacity - fHeight;
+-			// TODO: This is not quite correct -- we should replace the complete
+-			// history and screen with empty lines.
+-		}
+-
+ 		// scroll text up
+ 		if (top == 0) {
+ 			// The lines scrolled out of the screen range are transferred to
+ 			// the history.
+ 
++			if (numLines &gt; fHistoryCapacity)
++				numLines = fHistoryCapacity;
++
+ 			// make room for numLines new lines
+ 			if (fHistorySize + fHeight + numLines &gt; fHistoryCapacity) {
+ 				int32 toDrop = fHistorySize + fHeight + numLines
+ 					- fHistoryCapacity;
+ 				fHistorySize -= toDrop;
++					// Note that fHistorySize can temporarily become negative,
++					// but all will be well again, when we offset the screen.
+ 			}
+ 
+ 			// clear numLines after the current screen
+@@ -897,21 +994,18 @@
+ 			fHistorySize += numLines;
+ 
+ 			// scroll/extend dirty range
++
+ 			if (fDirtyInfo.dirtyTop != INT_MAX) {
+-				if (fDirtyInfo.dirtyTop &lt;= bottom
+-					&amp;&amp; top &lt;= fDirtyInfo.dirtyBottom) {
+-					// intersects with the scroll region -- extend
+-					if (top &lt; fDirtyInfo.dirtyTop)
+-						fDirtyInfo.dirtyTop = top - numLines;
+-					else
+-						fDirtyInfo.dirtyTop -= numLines;
+-					if (bottom &gt; fDirtyInfo.dirtyBottom)
+-						fDirtyInfo.dirtyBottom = bottom;
+-				} else if (fDirtyInfo.dirtyBottom &lt; top) {
+-					// does not intersect with the scroll region -- just offset
++				// If the top or bottom of the dirty region are above the
++				// bottom of the scroll region, we have to scroll them up.
++				if (fDirtyInfo.dirtyTop &lt;= bottom) {
+ 					fDirtyInfo.dirtyTop -= numLines;
+-					fDirtyInfo.dirtyBottom -= numLines;
++					if (fDirtyInfo.dirtyBottom &lt;= bottom)
++						fDirtyInfo.dirtyBottom -= numLines;
+ 				}
++
++				// numLines above the bottom become dirty
++				_Invalidate(bottom - numLines + 1, bottom);
+ 			}
+ 
+ 			fDirtyInfo.linesScrolled += numLines;
+
+Modified: haiku/trunk/src/apps/terminal/BasicTerminalBuffer.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/BasicTerminalBuffer.h	2008-06-10 21:34:50 UTC (rev 25911)
++++ haiku/trunk/src/apps/terminal/BasicTerminalBuffer.h	2008-06-10 21:43:42 UTC (rev 25912)
+@@ -26,6 +26,14 @@
+ 		return dirtyTop &lt;= dirtyBottom;
+ 	}
+ 
++	void ExtendDirtyRegion(int32 top, int32 bottom)
++	{
++		if (top &lt; dirtyTop)
++			dirtyTop = top;
++		if (bottom &gt; dirtyBottom)
++			dirtyBottom = bottom;
++	}
++
+ 	void Reset()
+ 	{
+ 		linesScrolled = 0;
+@@ -42,7 +50,7 @@
+ 	virtual						~BasicTerminalBuffer();
+ 
+ 			status_t			Init(int32 width, int32 height,
+-									int32 historySize);
++									int32 historyCapacity);
+ 
+ 			int32				Width() const		{ return fWidth; }
+ 			int32				Height() const		{ return fHeight; }
+@@ -51,8 +59,16 @@
+ 			TerminalBufferDirtyInfo&amp; DirtyInfo()	{ return fDirtyInfo; }
+ 
+ 			status_t			ResizeTo(int32 width, int32 height);
++			status_t			ResizeTo(int32 width, int32 height,
++									int32 historyCapacity);
++			status_t			SetHistoryCapacity(int32 historyCapacity);
+ 			void				Clear();
+ 
++			void				SynchronizeWith(
++									const BasicTerminalBuffer* other,
++									int32 offset, int32 dirtyTop,
++									int32 dirtyBottom);
++
+ 			bool				IsFullWidthChar(int32 row, int32 column) const;
+ 			int					GetChar(int32 row, int32 column,
+ 									UTF8Char&amp; character,
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009520.html">[Haiku-commits] r25911 - haiku/trunk/src/apps/terminal
+</A></li>
+	<LI>Next message: <A HREF="009522.html">[Haiku-commits] r25913 - in haiku/trunk: build/jam	src/system/kernel/arch/ppc
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9521">[ date ]</a>
+              <a href="thread.html#9521">[ thread ]</a>
+              <a href="subject.html#9521">[ subject ]</a>
+              <a href="author.html#9521">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

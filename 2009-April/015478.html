@@ -1,0 +1,615 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29950 - haiku/trunk/src/apps/activitymonitor
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29950%20-%20haiku/trunk/src/apps/activitymonitor&In-Reply-To=%3C200904052105.n35L5qbI004185%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015477.html">
+   <LINK REL="Next"  HREF="015479.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29950 - haiku/trunk/src/apps/activitymonitor</H1>
+    <B>axeld at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29950%20-%20haiku/trunk/src/apps/activitymonitor&In-Reply-To=%3C200904052105.n35L5qbI004185%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29950 - haiku/trunk/src/apps/activitymonitor">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sun Apr  5 23:05:52 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015477.html">[Haiku-commits] r29949 - in haiku/trunk: headers/os/interface	src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="015479.html">[Haiku-commits] r29951 - haiku/trunk/src/apps/activitymonitor
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15478">[ date ]</a>
+              <a href="thread.html#15478">[ thread ]</a>
+              <a href="subject.html#15478">[ subject ]</a>
+              <a href="author.html#15478">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-04-05 23:05:50 +0200 (Sun, 05 Apr 2009)
+New Revision: 29950
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29950&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29950&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/activitymonitor/ActivityView.cpp
+   haiku/trunk/src/apps/activitymonitor/ActivityView.h
+   haiku/trunk/src/apps/activitymonitor/CircularBuffer.h
+   haiku/trunk/src/apps/activitymonitor/SettingsWindow.cpp
+Log:
+* Added a ViewHistory class that stores the current values, so they don't have
+  to be interpolated everytime. This class also makes sure that the values are
+  always from the same offsets, so the flickering is gone.
+* Need to use SetMouseEventMask() or else the mouse up will be ignored when
+  changing the resolution via dragging the mouse.
+* Fixed a bug that prevented the DataHistory data interpolation from working
+  correctly.
+* The refresh threads are now working at B_URGENT_DISPLAY_PRIORITY, making the
+  view updates much more stable with less jitter.
+* Removed the draw refresh, and have it always be the same as the value
+  refresh.
+* Added lower refresh intervals (25, and 75 ms).
+
+
+Modified: haiku/trunk/src/apps/activitymonitor/ActivityView.cpp
+===================================================================
+--- haiku/trunk/src/apps/activitymonitor/ActivityView.cpp	2009-04-05 19:59:53 UTC (rev 29949)
++++ haiku/trunk/src/apps/activitymonitor/ActivityView.cpp	2009-04-05 21:05:50 UTC (rev 29950)
+@@ -9,6 +9,7 @@
+ #include &lt;new&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
++#include &lt;vector.h&gt;
+ 
+ #ifdef __HAIKU__
+ #	include &lt;AbstractLayoutItem.h&gt;
+@@ -20,6 +21,7 @@
+ #include &lt;MenuItem.h&gt;
+ #include &lt;MessageRunner.h&gt;
+ #include &lt;PopUpMenu.h&gt;
++#include &lt;Shape.h&gt;
+ #include &lt;String.h&gt;
+ 
+ #include &quot;ActivityMonitor.h&quot;
+@@ -29,22 +31,92 @@
+ #include &quot;SystemInfoHandler.h&quot;
+ 
+ 
++template&lt;typename ObjectType&gt;
++class ListAddDeleter {
++public:
++	ListAddDeleter(BObjectList&lt;ObjectType&gt;&amp; list, ObjectType* object,
++			int32 spot)
++		:
++		fList(list),
++		fObject(object)
++	{
++		if (fObject != NULL &amp;&amp; !fList.AddItem(fObject, spot)) {
++			delete fObject;
++			fObject = NULL;
++		}
++	}
++
++	~ListAddDeleter()
++	{
++		if (fObject != NULL) {
++			fList.RemoveItem(fObject);
++			delete fObject;
++		}
++	}
++
++	bool Failed() const
++	{
++		return fObject == NULL;
++	}
++
++	void Detach()
++	{
++		fObject = NULL;
++	}
++
++private:
++	BObjectList&lt;ObjectType&gt;&amp;	fList;
++	ObjectType*					fObject;
++};
++
++
++/*!	This class manages the scale of a history with a dynamic scale.
++	Every history value will be input via Update(), and the minimum/maximum
++	is computed from that.
++*/
+ class Scale {
+ public:
+-							Scale(scale_type type);
++								Scale(scale_type type);
+ 
+-			int64			MinimumValue() const { return fMinimumValue; }
+-			int64			MaximumValue() const { return fMaximumValue; }
++			int64				MinimumValue() const { return fMinimumValue; }
++			int64				MaximumValue() const { return fMaximumValue; }
+ 
+-			void			Update(int64 value);
++			void				Update(int64 value);
+ 
+ private:
+-	scale_type				fType;
+-	int64					fMinimumValue;
+-	int64					fMaximumValue;
+-	bool					fInitialized;
++			scale_type			fType;
++			int64				fMinimumValue;
++			int64				fMaximumValue;
++			bool				fInitialized;
+ };
+ 
++/*!	Stores the interpolated on screen view values. This is done so that the
++	interpolation is fixed, and does not change when being scrolled.
++
++	We could also just do this by making sure we always ask for the same
++	interval only, but this way we also save the interpolation.
++*/
++class ViewHistory {
++public:
++								ViewHistory();
++
++			int64				ValueAt(int32 x);
++
++			int32				Start() const
++									{ return fValues.Size()
++										- fValues.CountItems(); }
++
++			void				Update(DataHistory* history, int32 width,
++									int32 resolution, bigtime_t toTime,
++									bigtime_t step, bigtime_t refresh);
++
++private:
++			CircularBuffer&lt;int64&gt; fValues;
++			int32				fResolution;
++			bigtime_t			fRefresh;
++			bigtime_t			fLastTime;
++};
++
+ struct data_item {
+ 	bigtime_t	time;
+ 	int64		value;
+@@ -127,6 +199,75 @@
+ //	#pragma mark -
+ 
+ 
++ViewHistory::ViewHistory()
++	:
++	fValues(1),
++	fResolution(-1),
++	fRefresh(-1),
++	fLastTime(0)
++{
++}
++
++
++int64
++ViewHistory::ValueAt(int32 x)
++{
++	int64* value = fValues.ItemAt(x - Start());
++	if (value != NULL)
++		return *value;
++
++	return 0;
++}
++
++
++void
++ViewHistory::Update(DataHistory* history, int32 width, int32 resolution,
++	bigtime_t toTime, bigtime_t step, bigtime_t refresh)
++{
++	// Check if we need to invalidate the existing values
++	if ((int32)fValues.Size() != width
++		|| fResolution != resolution
++		|| fRefresh != refresh) {
++		fValues.SetSize(width);
++		fLastTime = 0;
++		fResolution = resolution;
++		fRefresh = refresh;
++	}
++
++	// Compute how many new values we need to retrieve
++	if (fLastTime &lt; history-&gt;Start())
++		fLastTime = history-&gt;Start();
++
++	int32 updateWidth = int32((toTime - fLastTime) / step);
++	if (updateWidth &lt; 1)
++		return;
++
++	if (updateWidth &gt; (int32)fValues.Size()) {
++		updateWidth = fValues.Size();
++		fLastTime = toTime - updateWidth * step;
++	}
++
++	for (int32 i = 0; i &lt; updateWidth; i++) {
++		int64 value = history-&gt;ValueAt(fLastTime += step);
++
++		if (step &gt; refresh) {
++			uint32 count = 1;
++			for (bigtime_t offset = refresh; offset &lt; step; offset += refresh) {
++				// TODO: handle int64 overflow correctly!
++				value += history-&gt;ValueAt(fLastTime + offset);
++				count++;
++			}
++			value /= count;
++		}
++
++		fValues.AddItem(value);
++	}
++}
++
++
++//	#pragma mark -
++
++
+ DataHistory::DataHistory(bigtime_t memorize, bigtime_t interval)
+ 	:
+ 	fBuffer(10000),
+@@ -182,7 +323,7 @@
+ 				int64 value = item-&gt;value;
+ 				value += int64(double(nextItem-&gt;value - value)
+ 					/ (nextItem-&gt;time - item-&gt;time) * (time - item-&gt;time));
+-				return item-&gt;value;
++				return value;
+ 			}
+ 
+ 			// search in right part
+@@ -458,7 +599,6 @@
+ 	SetViewColor(B_TRANSPARENT_COLOR);
+ 
+ 	fRefreshInterval = kInitialRefreshInterval;
+-	fDrawInterval = kInitialRefreshInterval * 2;
+ 	fLastRefresh = 0;
+ 	fDrawResolution = 1;
+ 	fZooming = false;
+@@ -610,6 +750,7 @@
+ 
+ 	BAutolock _(fSourcesLock);
+ 
++	// Search for the correct insert spot to maintain the order of the sources
+ 	int32 insert = DataSource::IndexOf(source);
+ 	for (int32 i = 0; i &lt; fSources.CountItems() &amp;&amp; i &lt; insert; i++) {
+ 		DataSource* before = fSources.ItemAt(i);
+@@ -621,6 +762,9 @@
+ 	if (insert &gt; fSources.CountItems())
+ 		insert = fSources.CountItems();
+ 
++	// Generate DataHistory and ViewHistory objects for the source
++	// (one might need one history per CPU)
++
+ 	uint32 count = 1;
+ 	if (source-&gt;PerCPU()) {
+ 		SystemInfo info;
+@@ -630,13 +774,14 @@
+ 	for (uint32 i = 0; i &lt; count; i++) {
+ 		DataHistory* values = new(std::nothrow) DataHistory(10 * 60000000LL,
+ 			RefreshInterval());
+-		if (values == NULL)
+-			return B_NO_MEMORY;
++		ListAddDeleter&lt;DataHistory&gt; valuesDeleter(fValues, values, insert);
+ 
+-		if (!fValues.AddItem(values, insert + i)) {
+-			delete values;
++		ViewHistory* viewValues = new(std::nothrow) ViewHistory;
++		ListAddDeleter&lt;ViewHistory&gt; viewValuesDeleter(fViewValues, viewValues,
++			insert);
++
++		if (valuesDeleter.Failed() || viewValuesDeleter.Failed())
+ 			return B_NO_MEMORY;
+-		}
+ 
+ 		values-&gt;SetScale(_ScaleFor(source-&gt;ScaleType()));
+ 
+@@ -646,6 +791,10 @@
+ 		else
+ 			copy = source-&gt;Copy();
+ 
++		ListAddDeleter&lt;DataSource&gt; sourceDeleter(fSources, copy, insert);
++		if (sourceDeleter.Failed())
++			return B_NO_MEMORY;
++
+ 		BString colorName = source-&gt;Name();
+ 		colorName &lt;&lt; &quot; color&quot;;
+ 		if (state != NULL) {
+@@ -657,11 +806,9 @@
+ 				copy-&gt;SetColor(*color);
+ 		}
+ 
+-		if (!fSources.AddItem(copy, insert + i)) {
+-			fValues.RemoveItem(values);
+-			delete values;
+-			return B_NO_MEMORY;
+-		}
++		valuesDeleter.Detach();
++		viewValuesDeleter.Detach();
++		sourceDeleter.Detach();
+ 	}
+ 
+ #ifdef __HAIKU__
+@@ -723,7 +870,7 @@
+ 
+ 	fRefreshSem = create_sem(0, &quot;refresh sem&quot;);
+ 	fRefreshThread = spawn_thread(&amp;_RefreshThread, &quot;source refresh&quot;,
+-		B_NORMAL_PRIORITY, this);
++		B_URGENT_DISPLAY_PRIORITY, this);
+ 	resume_thread(fRefreshThread);
+ 
+ 	FrameResized(Bounds().Width(), Bounds().Height());
+@@ -808,6 +955,7 @@
+ 		fZoomPoint = where;
+ 		fOriginalResolution = fDrawResolution;
+ 		fZooming = true;
++		SetMouseEventMask(B_POINTER_EVENTS);
+ 		return;
+ 	}
+ 
+@@ -858,7 +1006,6 @@
+ 
+ 	ConvertToScreen(&amp;where);
+ 	menu-&gt;Go(where, true, false, true);
+-
+ }
+ 
+ 
+@@ -953,11 +1100,6 @@
+ 				interval = 10000;
+ 
+ 			atomic_set64(&amp;fRefreshInterval, interval);
+-			
+-			if (interval &gt; 250000)
+-				atomic_set64(&amp;fDrawInterval, interval);
+-			else
+-				atomic_set64(&amp;fDrawInterval, interval * 2);
+ 			break;
+ 
+ 		case kMsgToggleDataSource:
+@@ -1182,47 +1324,32 @@
+ 	BAutolock _(fSourcesLock);
+ 
+ 	for (uint32 i = fSources.CountItems(); i-- &gt; 0;) {
++		ViewHistory* viewValues = fViewValues.ItemAt(i);
+ 		DataSource* source = fSources.ItemAt(i);
+ 		DataHistory* values = fValues.ItemAt(i);
+-		bigtime_t time = now - steps * timeStep;
+-			// for now steps pixels per second
+ 
+-		view-&gt;BeginLineArray(steps);
+-		view-&gt;SetHighColor(source-&gt;Color());
++		viewValues-&gt;Update(values, steps, fDrawResolution, now, timeStep,
++			RefreshInterval());
+ 
+-		float lastY = FLT_MIN;
+-		uint32 lastX = 0;
++		uint32 x = viewValues-&gt;Start() * step;
++		BShape shape;
++		bool first = true;
+ 
+-		for (uint32 x = 0; x &lt; width; x += step, time += timeStep) {
+-			// TODO: compute starting point instead!
+-			if (values-&gt;Start() &gt; time || values-&gt;End() &lt; time)
+-				continue;
++		for (uint32 i = viewValues-&gt;Start(); i &lt; steps; x += step, i++) {
++			float y = _PositionForValue(source, values,
++				viewValues-&gt;ValueAt(i));
+ 
+-			int64 value = values-&gt;ValueAt(time);
+-			if (timeStep &gt; RefreshInterval()) {
+-				// TODO: always start with the same index, so that it always
+-				// uses the same values for computation (currently it jumps)
+-				uint32 count = 1;
+-				for (bigtime_t offset = RefreshInterval(); offset &lt; timeStep;
+-						offset += RefreshInterval()) {
+-					// TODO: handle int64 overflow correctly!
+-					value += values-&gt;ValueAt(time + offset);
+-					count++;
+-				}
+-				value /= count;
+-			}
+-
+-			float y = _PositionForValue(source, values, value);
+-			if (lastY != FLT_MIN) {
+-				view-&gt;AddLine(BPoint(lastX, lastY), BPoint(x, y),
+-					source-&gt;Color());
+-			}
+-
+-			lastX = x;
+-			lastY = y;
++			if (first) {
++				shape.MoveTo(BPoint(x, y));
++				first = false;
++			} else
++				shape.LineTo(BPoint(x, y));
+ 		}
+ 
+-		view-&gt;EndLineArray();
++		view-&gt;SetHighColor(source-&gt;Color());
++		view-&gt;SetLineMode(B_BUTT_CAP, B_ROUND_JOIN);
++		view-&gt;MovePenTo(B_ORIGIN);
++		view-&gt;StrokeShape(&amp;shape);
+ 	}
+ 
+ 	// TODO: add marks when an app started or quit
+@@ -1336,11 +1463,7 @@
+ 
+ 		fSourcesLock.Unlock();
+ 
+-		bigtime_t now = info.Time();
+-		if (fLastRefresh + DrawInterval() &lt;= now) {
+-			target.SendMessage(B_INVALIDATE);
+-			fLastRefresh = now;
+-		}
++		target.SendMessage(B_INVALIDATE);
+ 	}
+ }
+ 
+
+Modified: haiku/trunk/src/apps/activitymonitor/ActivityView.h
+===================================================================
+--- haiku/trunk/src/apps/activitymonitor/ActivityView.h	2009-04-05 19:59:53 UTC (rev 29949)
++++ haiku/trunk/src/apps/activitymonitor/ActivityView.h	2009-04-05 21:05:50 UTC (rev 29950)
+@@ -17,9 +17,9 @@
+ 
+ class BBitmap;
+ class BMessageRunner;
+-class DataSource;
+ class Scale;
+ class SystemInfoHandler;
++class ViewHistory;
+ struct data_item;
+ 
+ 
+@@ -76,8 +76,6 @@
+ 
+ 			bigtime_t	RefreshInterval() const
+ 							{ return atomic_get64((vint64*)&amp;fRefreshInterval); }
+-			bigtime_t	DrawInterval() const
+-							{ return atomic_get64((vint64*)&amp;fDrawInterval); }
+ 
+ protected:
+ 	virtual	void		AttachedToWindow();
+@@ -133,11 +131,11 @@
+ 	mutable BLocker		fSourcesLock;
+ 	BObjectList&lt;DataSource&gt; fSources;
+ 	BObjectList&lt;DataHistory&gt; fValues;
++	BObjectList&lt;ViewHistory&gt; fViewValues;
+ 	thread_id			fRefreshThread;
+ 	sem_id				fRefreshSem;
+ 	bigtime_t			fRefreshInterval;
+ 	bigtime_t			fLastRefresh;
+-	bigtime_t			fDrawInterval;
+ 	int32				fDrawResolution;
+ 	bool				fShowLegend;
+ 	bool				fZooming;
+
+Modified: haiku/trunk/src/apps/activitymonitor/CircularBuffer.h
+===================================================================
+--- haiku/trunk/src/apps/activitymonitor/CircularBuffer.h	2009-04-05 19:59:53 UTC (rev 29949)
++++ haiku/trunk/src/apps/activitymonitor/CircularBuffer.h	2009-04-05 21:05:50 UTC (rev 29950)
+@@ -16,10 +16,9 @@
+ public:
+ 	CircularBuffer(size_t size)
+ 		:
+-		fSize(size)
++		fSize(0)
+ 	{
+-		fBuffer = (Type *)malloc(fSize * sizeof(Type));
+-		MakeEmpty();
++		SetSize(size);
+ 	}
+ 
+ 	~CircularBuffer()
+@@ -32,6 +31,18 @@
+ 		return fBuffer != NULL ? B_OK : B_NO_MEMORY;
+ 	}
+ 
++	status_t SetSize(size_t size)
++	{
++		MakeEmpty();
++
++		if (fSize == size)
++			return B_OK;
++
++		fSize = size;
++		fBuffer = (Type*)malloc(fSize * sizeof(Type));
++		return fBuffer != NULL ? B_OK : B_NO_MEMORY;
++	}
++
+ 	void MakeEmpty()
+ 	{
+ 		fIn = 0;
+@@ -67,6 +78,11 @@
+ 		fBuffer[index % fSize] = item;
+ 	}
+ 
++	size_t Size() const
++	{
++		return fSize;
++	}
++
+ private:
+ 	uint32		fFirst;
+ 	uint32		fIn;
+
+Modified: haiku/trunk/src/apps/activitymonitor/SettingsWindow.cpp
+===================================================================
+--- haiku/trunk/src/apps/activitymonitor/SettingsWindow.cpp	2009-04-05 19:59:53 UTC (rev 29949)
++++ haiku/trunk/src/apps/activitymonitor/SettingsWindow.cpp	2009-04-05 21:05:50 UTC (rev 29950)
+@@ -17,7 +17,11 @@
+ 
+ static const uint32 kMsgUpdateTimeInterval = 'upti';
+ 
+-static const bigtime_t kUpdateIntervals[] = { 50, 100, 250, 500, 1000, 2000 };
++static const bigtime_t kUpdateIntervals[] = {
++	25, 50, 75, 100, 250, 500, 1000, 2000
++};
++static const size_t kNumUpdateIntervals
++	= sizeof(kUpdateIntervals) / sizeof(kUpdateIntervals[0]);
+ 
+ 
+ class IntervalSlider : public BSlider {
+@@ -42,9 +46,7 @@
+ 		// Find closest index
+ 		int32 bestDiff = LONG_MAX;
+ 		uint32 bestIndex = 0;
+-		for (uint32 i = 0;
+-				i &lt; sizeof(kUpdateIntervals) / sizeof(kUpdateIntervals[0]);
+-				i++) {
++		for (uint32 i = 0; i &lt; kNumUpdateIntervals; i++) {
+ 			int32 diff = abs(kUpdateIntervals[i] - interval);
+ 			if (diff &lt; bestDiff) {
+ 				bestDiff = diff;
+@@ -63,7 +65,7 @@
+ private:
+ 	const char* _TextFor(uint32 level) const
+ 	{
+-		if (level &gt;= sizeof(kUpdateIntervals) / sizeof(kUpdateIntervals[0]))
++		if (level &gt;= kNumUpdateIntervals)
+ 			return NULL;
+ 
+ 		bigtime_t interval = kUpdateIntervals[level];
+@@ -90,7 +92,7 @@
+ 	SetLayout(new BGroupLayout(B_VERTICAL));
+ 
+ 	fIntervalSlider = new IntervalSlider(&quot;Update time interval:&quot;,
+-		new BMessage(kMsgUpdateTimeInterval), 6);
++		new BMessage(kMsgUpdateTimeInterval), kNumUpdateIntervals);
+ 	fIntervalSlider-&gt;SetInterval(target-&gt;RefreshInterval());
+ 
+ 	// controls pane
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015477.html">[Haiku-commits] r29949 - in haiku/trunk: headers/os/interface	src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="015479.html">[Haiku-commits] r29951 - haiku/trunk/src/apps/activitymonitor
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15478">[ date ]</a>
+              <a href="thread.html#15478">[ thread ]</a>
+              <a href="subject.html#15478">[ subject ]</a>
+              <a href="author.html#15478">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

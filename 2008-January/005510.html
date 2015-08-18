@@ -1,0 +1,461 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23534 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23534%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200801151518.m0FFI2Sk009923%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005509.html">
+   <LINK REL="Next"  HREF="005511.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23534 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23534%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200801151518.m0FFI2Sk009923%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23534 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Jan 15 16:18:02 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005509.html">[Haiku-commits] r23533 - haiku/trunk/src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="005511.html">[Haiku-commits] r23535 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5510">[ date ]</a>
+              <a href="thread.html#5510">[ thread ]</a>
+              <a href="subject.html#5510">[ subject ]</a>
+              <a href="author.html#5510">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-01-15 16:18:02 +0100 (Tue, 15 Jan 2008)
+New Revision: 23534
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23534&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23534&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.h
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.h
+Log:
+* Fixed bug in the BlockAllocator::Allocate() function which did not 
+  compute the bit offsets correctly if the last block of the whole
+  bitmap was only a partial block.
+* Added new bfs_allocator KDL command.
+* Renamed the KDL command bfsinode to bfs_inode.
+* Added &quot;--help&quot; argument to bfs_inode and bfs KDL commands.
+* Added more tracing in the block allocator.
+* Turned on the ASSERT() macro in non-debug builds.
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp	2008-01-15 15:06:15 UTC (rev 23533)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp	2008-01-15 15:18:02 UTC (rev 23534)
+@@ -95,10 +95,12 @@
+ class Block : public AbstractTraceEntry {
+ 	public:
+ 		Block(const char *label, off_t blockNumber, const uint8 *data,
+-				size_t size)
++				size_t size, uint32 start = 0, uint32 length = 0)
+ 			:
+ 			fBlock(blockNumber),
+-			fData(data)
++			fData(data),
++			fStart(start),
++			fLength(length)
+ 		{
+ 			strlcpy(fLabel, label, sizeof(fLabel));
+ 			fSum = checksum(data, size);
+@@ -109,7 +111,8 @@
+ 		virtual void AddDump(char *buffer, size_t size)
+ 		{
+ 			uint32 length = snprintf(buffer, size, &quot;%s: block %Ld (%p), sum %lu,&quot;
+-				&quot; bytes &quot;, fLabel, fBlock, fData, fSum);
++				&quot; s/l %lu/%lu, bytes &quot;, fLabel, fBlock, fData, fSum, fStart,
++				fLength);
+ 			for (uint32 i = 0; length &lt; size - 1 &amp;&amp; i &lt; sizeof(fBytes); i++) {
+ 				length += snprintf(buffer + length, size - length, &quot;%02x&quot;,
+ 					fBytes[i]);
+@@ -119,6 +122,8 @@
+ 	private:
+ 		off_t		fBlock;
+ 		const uint8	*fData;
++		uint32		fStart;
++		uint32		fLength;
+ 		uint32		fSum;
+ 		char		fLabel[12];
+ 		uint8		fBytes[32];
+@@ -215,7 +220,8 @@
+ 
+ 
+ status_t
+-AllocationBlock::SetToWritable(Transaction &amp;transaction, AllocationGroup &amp;group, uint16 block)
++AllocationBlock::SetToWritable(Transaction &amp;transaction, AllocationGroup &amp;group,
++	uint16 block)
+ {
+ 	// 8 blocks per byte
+ 	fNumBits = fVolume-&gt;BlockSize() &lt;&lt; 3;
+@@ -226,8 +232,8 @@
+ #ifdef DEBUG
+ 	fWritable = true;
+ #endif
+-	return CachedBlock::SetToWritable(transaction, group.Start() + block) != NULL
+-		? B_OK : B_ERROR;
++	return CachedBlock::SetToWritable(transaction, group.Start() + block)
++		!= NULL ? B_OK : B_ERROR;
+ }
+ 
+ 
+@@ -256,13 +262,15 @@
+ 		DIE((&quot;Allocation::Allocate(): tried to allocate too many blocks&quot;));
+ 	}
+ 
++	T(Block(&quot;b-alloc-in&quot;, fBlockNumber, fBlock, fVolume-&gt;BlockSize(),
++		start, numBlocks));
++
+ 	int32 block = start &gt;&gt; 5;
+ 
+ 	while (numBlocks &gt; 0) {
+ 		uint32 mask = 0;
+ 		for (int32 i = start % 32; i &lt; 32 &amp;&amp; numBlocks; i++, numBlocks--)
+-			mask |= 1UL &lt;&lt; (i % 32);
+-
++			mask |= 1UL &lt;&lt; i;
+ #ifdef DEBUG
+ 		// check for already set blocks
+ 		if (HOST_ENDIAN_TO_BFS_INT32(mask) &amp; ((uint32 *)fBlock)[block]) {
+@@ -273,6 +281,8 @@
+ 		Block(block++) |= HOST_ENDIAN_TO_BFS_INT32(mask);
+ 		start = 0;
+ 	}
++	T(Block(&quot;b-alloc-out&quot;, fBlockNumber, fBlock, fVolume-&gt;BlockSize(),
++		start, numBlocks));
+ }
+ 
+ 
+@@ -306,11 +316,10 @@
+ //	#pragma mark -
+ 
+ 
+-/**	The allocation groups are created and initialized in
+- *	BlockAllocator::Initialize() and BlockAllocator::InitializeAndClearBitmap()
+- *	respectively.
+- */
+-
++/*!	The allocation groups are created and initialized in
++	BlockAllocator::Initialize() and BlockAllocator::InitializeAndClearBitmap()
++	respectively.
++*/
+ AllocationGroup::AllocationGroup()
+ 	:
+ 	fFirstFree(-1),
+@@ -339,15 +348,12 @@
+ }
+ 
+ 
+-/** Allocates the specified run in the allocation group.
+- *	Doesn't check if the run is valid or already allocated
+- *	partially, nor does it maintain the free ranges hints
+- *	or the volume's used blocks count.
+- *	It only does the low-level work of allocating some bits
+- *	in the block bitmap.
+- *	Assumes that the block bitmap lock is hold.
+- */
+-
++/*!	Allocates the specified run in the allocation group.
++	Doesn't check if the run is valid or already allocated partially, nor
++	does it maintain the free ranges hints or the volume's used blocks count.
++	It only does the low-level work of allocating some bits in the block bitmap.
++	Assumes that the block bitmap lock is hold.
++*/
+ status_t
+ AllocationGroup::Allocate(Transaction &amp;transaction, uint16 start, int32 length)
+ {
+@@ -389,15 +395,12 @@
+ }
+ 
+ 
+-/** Frees the specified run in the allocation group.
+- *	Doesn't check if the run is valid or was not completely
+- *	allocated, nor does it maintain the free ranges hints
+- *	or the volume's used blocks count.
+- *	It only does the low-level work of freeing some bits
+- *	in the block bitmap.
+- *	Assumes that the block bitmap lock is hold.
+- */
+-
++/*!	Frees the specified run in the allocation group.
++	Doesn't check if the run is valid or was not completely allocated, nor
++	does it maintain the free ranges hints or the volume's used blocks count.
++	It only does the low-level work of freeing some bits in the block bitmap.
++	Assumes that the block bitmap lock is hold.
++*/
+ status_t
+ AllocationGroup::Free(Transaction &amp;transaction, uint16 start, int32 length)
+ {
+@@ -642,10 +645,11 @@
+ 	AllocationBlock cached(fVolume);
+ 	Locker lock(fLock);
+ 
+-	// the first scan through all allocation groups will look for the
++	// The first scan through all allocation groups will look for the
+ 	// wanted maximum of blocks, the second scan will just look to
+ 	// satisfy the minimal requirement
+ 	uint16 numBlocks = maximum;
++	uint32 bitsPerFullBlock = fVolume-&gt;BlockSize() &lt;&lt; 3;
+ 
+ 	for (int32 i = 0; i &lt; fNumGroups * 2; i++, group++, start = 0) {
+ 		group = group % fNumGroups;
+@@ -654,7 +658,7 @@
+ 			continue;
+ 
+ 		if (i &gt;= fNumGroups) {
+-			// if the minimum is the same as the maximum, it's not necessary to
++			// If the minimum is the same as the maximum, it's not necessary to
+ 			// search for in the allocation groups a second time
+ 			if (maximum == minimum)
+ 				return B_DEVICE_FULL;
+@@ -662,8 +666,8 @@
+ 			numBlocks = minimum;
+ 		}
+ 
+-		// The wanted maximum is smaller than the largest free block in the group
+-		// or already smaller than the minimum
++		// The wanted maximum is smaller than the largest free block in the
++		// group or already smaller than the minimum
+ 		// ToDo: disabled because it's currently not maintained after the first allocation
+ 		//if (numBlocks &gt; fGroups[group].fLargest)
+ 		//	continue;
+@@ -671,7 +675,7 @@
+ 		if (start &lt; fGroups[group].fFirstFree)
+ 			start = fGroups[group].fFirstFree;
+ 
+-		// there may be more than one block per allocation group - and
++		// There may be more than one block per allocation group - and
+ 		// we iterate through it to find a place for the allocation.
+ 		// (one allocation can't exceed one allocation group)
+ 
+@@ -682,15 +686,15 @@
+ 			if (cached.SetTo(fGroups[group], block) &lt; B_OK)
+ 				RETURN_ERROR(B_ERROR);
+ 
+-			T(Block(&quot;alloc-in&quot;, block, cached.Block(), fVolume-&gt;BlockSize()));
++			T(Block(&quot;alloc-in&quot;, fGroups[group].Start() + block, cached.Block(), fVolume-&gt;BlockSize(), group, rangeStart));
+ 
+ 			// find a block large enough to hold the allocation
+-			for (uint32 bit = start % cached.NumBlockBits();
++			for (uint32 bit = start % bitsPerFullBlock;
+ 					bit &lt; cached.NumBlockBits(); bit++) {
+ 				if (!cached.IsUsed(bit)) {
+ 					if (range == 0) {
+ 						// start new range
+-						rangeStart = block * cached.NumBlockBits() + bit;
++						rangeStart = block * bitsPerFullBlock + bit;
+ 					}
+ 
+ 					// have we found a range large enough to hold numBlocks?
+@@ -733,7 +737,7 @@
+ 
+ 				T(Allocate(run));
+ 				T(Block(&quot;alloc-out&quot;, block, cached.Block(),
+-					fVolume-&gt;BlockSize()));
++					fVolume-&gt;BlockSize(), group, rangeStart));
+ 				return B_OK;
+ 			}
+ 
+@@ -746,8 +750,8 @@
+ 
+ 
+ status_t
+-BlockAllocator::AllocateForInode(Transaction &amp;transaction, const block_run *parent,
+-	mode_t type, block_run &amp;run)
++BlockAllocator::AllocateForInode(Transaction &amp;transaction,
++	const block_run *parent, mode_t type, block_run &amp;run)
+ {
+ 	// apply some allocation policies here (AllocateBlocks() will break them
+ 	// if necessary) - we will start with those described in Dominic Giampaolo's
+@@ -1407,3 +1411,48 @@
+ 	return B_OK;
+ }
+ 
++
++//	#pragma mark - debugger commands
++
++
++#ifdef BFS_DEBUGGER_COMMANDS
++
++
++void
++BlockAllocator::Dump()
++{
++	kprintf(&quot;allocation groups: %ld\n&quot;, fNumGroups);
++	kprintf(&quot;blocks per group: %ld\n&quot;, fBlocksPerGroup);
++
++	for (int32 i = 0; i &lt; fNumGroups; i++) {
++		AllocationGroup&amp; group = fGroups[i];
++
++		kprintf(&quot;[%3ld] num bits:      %lu\n&quot;, i, group.NumBits());
++		kprintf(&quot;      num blocks:    %lu\n&quot;, group.NumBlocks());
++		kprintf(&quot;      start:         %ld\n&quot;, group.Start());
++		kprintf(&quot;      first free:    %ld\n&quot;, group.fFirstFree);
++		kprintf(&quot;      largest:       %ld\n&quot;, group.fLargest);
++		kprintf(&quot;      largest first: %ld\n&quot;, group.fLargestFirst);
++		kprintf(&quot;      free bits:     %ld\n&quot;, group.fFreeBits);
++	}
++}
++
++
++int
++dump_block_allocator(int argc, char **argv)
++{
++	if (argc != 2 || !strcmp(argv[1], &quot;--help&quot;)) {
++		kprintf(&quot;usage: %s &lt;ptr-to-volume&gt;\n&quot;, argv[0]);
++		return 0;
++	}
++
++	Volume *volume = (Volume *)parse_expression(argv[1]);
++	BlockAllocator &amp;allocator = volume-&gt;Allocator();
++
++	allocator.Dump();
++	return 0;
++}
++
++
++#endif	// BFS_DEBUGGER_COMMANDS
++
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.h	2008-01-15 15:06:15 UTC (rev 23533)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.h	2008-01-15 15:18:02 UTC (rev 23534)
+@@ -1,6 +1,5 @@
+-/* BlockAllocator - block bitmap handling and allocation policies
+- *
+- * Copyright 2001-2006, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++/*
++ * Copyright 2001-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * This file may be used under the terms of the MIT License.
+  */
+ #ifndef BLOCK_ALLOCATOR_H
+@@ -46,6 +45,10 @@
+ 
+ 		size_t BitmapSize() const;
+ 
++#ifdef BFS_DEBUGGER_COMMANDS
++		void Dump();
++#endif
++
+ 	private:
+ 		bool _IsValidCheckControl(check_control *control);
+ 		bool _CheckBitmapIsUsedAt(off_t block) const;
+@@ -63,4 +66,8 @@
+ 		check_cookie	*fCheckCookie;
+ };
+ 
++#ifdef BFS_DEBUGGER_COMMANDS
++int dump_block_allocator(int argc, char **argv);
++#endif
++
+ #endif	/* BLOCK_ALLOCATOR_H */
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.cpp	2008-01-15 15:06:15 UTC (rev 23533)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.cpp	2008-01-15 15:18:02 UTC (rev 23534)
+@@ -7,6 +7,7 @@
+ 
+ 
+ #include &quot;Debug.h&quot;
++#include &quot;BlockAllocator.h&quot;
+ #include &quot;BPlusTree.h&quot;
+ #include &quot;Inode.h&quot;
+ 
+@@ -247,7 +248,7 @@
+ static int
+ dump_inode(int argc, char **argv)
+ {
+-	if (argc != 2) {
++	if (argc != 2 || !strcmp(argv[1], &quot;--help&quot;)) {
+ 		kprintf(&quot;usage: bfsinode &lt;ptr-to-inode&gt;\n&quot;);
+ 		return 0;
+ 	}
+@@ -262,7 +263,7 @@
+ static int
+ dump_volume(int argc, char **argv)
+ {
+-	if (argc != 2) {
++	if (argc != 2 || !strcmp(argv[1], &quot;--help&quot;)) {
+ 		kprintf(&quot;usage: bfs &lt;ptr-to-volume&gt;\n&quot;);
+ 		return 0;
+ 	}
+@@ -281,7 +282,8 @@
+ void
+ remove_debugger_commands()
+ {
+-	remove_debugger_command(&quot;bfsinode&quot;, dump_inode);
++	remove_debugger_command(&quot;bfs_inode&quot;, dump_inode);
++	remove_debugger_command(&quot;bfs_allocator&quot;, dump_block_allocator);
+ 	remove_debugger_command(&quot;bfs&quot;, dump_volume);
+ }
+ 
+@@ -289,7 +291,9 @@
+ void
+ add_debugger_commands()
+ {
+-	add_debugger_command(&quot;bfsinode&quot;, dump_inode, &quot;dump an Inode object&quot;);
++	add_debugger_command(&quot;bfs_inode&quot;, dump_inode, &quot;dump an Inode object&quot;);
++	add_debugger_command(&quot;bfs_allocator&quot;, dump_block_allocator,
++		&quot;dump a BFS block allocator.&quot;);
+ 	add_debugger_command(&quot;bfs&quot;, dump_volume, &quot;dump a BFS volume&quot;);
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.h	2008-01-15 15:06:15 UTC (rev 23533)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.h	2008-01-15 15:18:02 UTC (rev 23534)
+@@ -74,7 +74,8 @@
+ 	#define FUNCTION_START(x) ;
+ 	#define D(x) ;
+ 	#ifndef ASSERT
+-	#	define ASSERT(x) ;
++	#	define ASSERT(x) { if (!(x)) DEBUGGER((&quot;bfs: assert failed: &quot; #x &quot;\n&quot;)); }
++//	#	define ASSERT(x) ;
+ 	#endif
+ #endif
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005509.html">[Haiku-commits] r23533 - haiku/trunk/src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="005511.html">[Haiku-commits] r23535 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5510">[ date ]</a>
+              <a href="thread.html#5510">[ thread ]</a>
+              <a href="subject.html#5510">[ subject ]</a>
+              <a href="author.html#5510">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

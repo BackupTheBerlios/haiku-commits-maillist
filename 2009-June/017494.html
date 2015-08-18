@@ -1,0 +1,176 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31255 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31255%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200906261503.n5QF3iXd012410%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017493.html">
+   <LINK REL="Next"  HREF="017495.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31255 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31255%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200906261503.n5QF3iXd012410%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31255 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Jun 26 17:03:44 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017493.html">[Haiku-commits] r31254 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+        <LI>Next message: <A HREF="017495.html">[Haiku-commits] r31256 - in haiku/trunk/src/apps/debugger: .	debug_info gui/team_window model
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17494">[ date ]</a>
+              <a href="thread.html#17494">[ thread ]</a>
+              <a href="subject.html#17494">[ subject ]</a>
+              <a href="author.html#17494">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-06-26 17:03:42 +0200 (Fri, 26 Jun 2009)
+New Revision: 31255
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31255&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31255&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.cpp
+Log:
+* The block allocator will no longer try to fix a missing allocation on a
+  read-only volume. This fixes bug #3432.
+* Journal::ReplayLog() will now return an error on a read-only device, rendering
+  read-only dirty volumes unmountable.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp	2009-06-26 14:54:54 UTC (rev 31254)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp	2009-06-26 15:03:42 UTC (rev 31255)
+@@ -684,14 +684,20 @@
+ 	uint32 reservedBlocks = volume-&gt;Log().Start() + volume-&gt;Log().Length();
+ 
+ 	if (allocator-&gt;CheckBlocks(0, reservedBlocks) != B_OK) {
+-		Transaction transaction(volume, 0);
+-		if (groups[0].Allocate(transaction, 0, reservedBlocks) != B_OK) {
+-			FATAL((&quot;could not allocate reserved space for block &quot;
+-				&quot;bitmap/log!\n&quot;));
+-			volume-&gt;Panic();
++		if (volume-&gt;IsReadOnly()) {
++			FATAL((&quot;Space for block bitmap or log area is not reserved &quot;
++				&quot;(volume is mounted read-only)!\n&quot;));
+ 		} else {
+-			transaction.Done();
+-			FATAL((&quot;space for block bitmap or log area was not reserved!\n&quot;));
++			Transaction transaction(volume, 0);
++			if (groups[0].Allocate(transaction, 0, reservedBlocks) != B_OK) {
++				FATAL((&quot;Could not allocate reserved space for block &quot;
++					&quot;bitmap/log!\n&quot;));
++				volume-&gt;Panic();
++			} else {
++				transaction.Done();
++				FATAL((&quot;Space for block bitmap or log area was not &quot;
++					&quot;reserved!\n&quot;));
++			}
+ 		}
+ 	}
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2009-06-26 14:54:54 UTC (rev 31254)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2009-06-26 15:03:42 UTC (rev 31255)
+@@ -559,9 +559,14 @@
+ 
+ 	INFORM((&quot;Replay log, disk was not correctly unmounted...\n&quot;));
+ 
+-	if (fVolume-&gt;SuperBlock().flags != SUPER_BLOCK_DISK_DIRTY)
+-		INFORM((&quot;log_start and log_end differ, but disk is marked clean - trying to replay log...\n&quot;));
++	if (fVolume-&gt;SuperBlock().flags != SUPER_BLOCK_DISK_DIRTY) {
++		INFORM((&quot;log_start and log_end differ, but disk is marked clean - &quot;
++			&quot;trying to replay log...\n&quot;));
++	}
+ 
++	if (fVolume-&gt;IsReadOnly())
++		return B_READ_ONLY_DEVICE;
++
+ 	int32 start = fVolume-&gt;LogStart();
+ 	int32 lastStart = -1;
+ 	while (true) {
+@@ -576,8 +581,9 @@
+ 		lastStart = start;
+ 
+ 		status_t status = _ReplayRunArray(&amp;start);
+-		if (status &lt; B_OK) {
+-			FATAL((&quot;replaying log entry from %d failed: %s\n&quot;, (int)start, strerror(status)));
++		if (status != B_OK) {
++			FATAL((&quot;replaying log entry from %d failed: %s\n&quot;, (int)start,
++				strerror(status)));
+ 			return B_ERROR;
+ 		}
+ 		start = start % fLogSize;
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.cpp	2009-06-26 14:54:54 UTC (rev 31254)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.cpp	2009-06-26 15:03:42 UTC (rev 31255)
+@@ -344,7 +344,7 @@
+ 
+ 	// check if the device size is large enough to hold the file system
+ 	off_t diskSize;
+-	if (opener.GetSize(&amp;diskSize) &lt; B_OK)
++	if (opener.GetSize(&amp;diskSize) != B_OK)
+ 		RETURN_ERROR(B_ERROR);
+ 	if (diskSize &lt; (NumBlocks() &lt;&lt; BlockShift()))
+ 		RETURN_ERROR(B_BAD_VALUE);
+@@ -368,7 +368,7 @@
+ 
+ 	// replaying the log is the first thing we will do on this disk
+ 	status = fJournal-&gt;ReplayLog();
+-	if (status &lt; B_OK) {
++	if (status != B_OK) {
+ 		FATAL((&quot;Replaying log failed, data may be corrupted, volume &quot;
+ 			&quot;read-only.\n&quot;));
+ 		fFlags |= VOLUME_READ_ONLY;
+@@ -379,7 +379,7 @@
+ 	}
+ 
+ 	status = fBlockAllocator.Initialize();
+-	if (status &lt; B_OK) {
++	if (status != B_OK) {
+ 		FATAL((&quot;could not initialize block bitmap allocator!\n&quot;));
+ 		return status;
+ 	}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017493.html">[Haiku-commits] r31254 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+	<LI>Next message: <A HREF="017495.html">[Haiku-commits] r31256 - in haiku/trunk/src/apps/debugger: .	debug_info gui/team_window model
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17494">[ date ]</a>
+              <a href="thread.html#17494">[ thread ]</a>
+              <a href="subject.html#17494">[ subject ]</a>
+              <a href="author.html#17494">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

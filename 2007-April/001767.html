@@ -1,0 +1,1077 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20792 - in haiku/trunk/src/tests/system/kernel: .	slab
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20792%20-%20in%20haiku/trunk/src/tests/system/kernel%3A%20.%0A%09slab&In-Reply-To=%3C200704241105.l3OB50Ie030365%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001822.html">
+   <LINK REL="Next"  HREF="001768.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20792 - in haiku/trunk/src/tests/system/kernel: .	slab</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20792%20-%20in%20haiku/trunk/src/tests/system/kernel%3A%20.%0A%09slab&In-Reply-To=%3C200704241105.l3OB50Ie030365%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20792 - in haiku/trunk/src/tests/system/kernel: .	slab">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Tue Apr 24 13:05:00 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001822.html">[Haiku-commits] r20791 - haiku/trunk/headers/private/kernel/util
+</A></li>
+        <LI>Next message: <A HREF="001768.html">[Haiku-commits] r20793 - haiku/trunk/src/tests/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1767">[ date ]</a>
+              <a href="thread.html#1767">[ thread ]</a>
+              <a href="subject.html#1767">[ subject ]</a>
+              <a href="author.html#1767">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-24 13:04:47 +0200 (Tue, 24 Apr 2007)
+New Revision: 20792
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20792&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20792&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/tests/system/kernel/slab/
+   haiku/trunk/src/tests/system/kernel/slab/Jamfile
+   haiku/trunk/src/tests/system/kernel/slab/Slab.cpp
+   haiku/trunk/src/tests/system/kernel/slab/Slab.h
+Log:
+added a test Slab implementation to tests/ (including Depot management for SMP scalability). after a bit more of testing this will be added to the kernel (still without VM integration).
+
+
+Added: haiku/trunk/src/tests/system/kernel/slab/Jamfile
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/slab/Jamfile	2007-04-24 11:04:35 UTC (rev 20791)
++++ haiku/trunk/src/tests/system/kernel/slab/Jamfile	2007-04-24 11:04:47 UTC (rev 20792)
+@@ -0,0 +1,8 @@
++SubDir HAIKU_TOP src tests system kernel slab ;
++
++UsePrivateHeaders kernel ;
++UseHeaders $(TARGET_PRIVATE_KERNEL_HEADERS) : true ;
++
++BinCommand test_slab
++	: Slab.cpp
++	;
+
+Added: haiku/trunk/src/tests/system/kernel/slab/Slab.cpp
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/slab/Slab.cpp	2007-04-24 11:04:35 UTC (rev 20791)
++++ haiku/trunk/src/tests/system/kernel/slab/Slab.cpp	2007-04-24 11:04:47 UTC (rev 20792)
+@@ -0,0 +1,533 @@
++/*
++ * Copyright 2007, Hugo Santos. All Rights Reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * Authors:
++ *      Hugo Santos, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">hugosantos at gmail.com</A>
++ */
++
++#include &quot;Slab.h&quot;
++
++#include &lt;stdio.h&gt;
++#include &lt;malloc.h&gt;
++
++
++// TODO this value should be dynamically tuned per cache.
++static const int kMagazineCapacity = 32;
++
++static const size_t kCacheColorPeriod = 8;
++
++
++template&lt;typename Type&gt; static Type *
++SListPop(Type* &amp;head)
++{
++	Type *oldHead = head;
++	head = head-&gt;next;
++	return oldHead;
++}
++
++
++template&lt;typename Type&gt; static inline void
++SListPush(Type* &amp;head, Type *object)
++{
++	object-&gt;next = head;
++	head = object;
++}
++
++
++status_t
++MallocBackend::AllocatePages(BaseCache *cache, AllocationID *id, void **pages,
++	size_t byteCount, uint32_t flags)
++{
++	size_t alignment = 16;
++
++	if (flags &amp; CACHE_ALIGN_TO_PAGE_TOTAL)
++		alignment = byteCount;
++
++	*pages = memalign(alignment, byteCount);
++	if (*pages == NULL)
++		return B_NO_MEMORY;
++
++	*id = *pages;
++	return B_OK;
++}
++
++void
++MallocBackend::FreePages(BaseCache *cache, void *pages)
++{
++	free(pages);
++}
++
++
++status_t
++AreaBackend::AllocatePages(BaseCache *cache, area_id *id, void **pages,
++	size_t byteCount, uint32_t flags)
++{
++	if (flags &amp; CACHE_ALIGN_TO_PAGE_TOTAL)
++		; // panic()
++
++	area_id areaId = create_area(cache-&gt;Name(), pages, B_ANY_ADDRESS, //B_ANY_KERNEL_ADDRESS,
++		byteCount, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
++	if (areaId &lt; 0)
++		return areaId;
++
++	printf(&quot;AreaBackend::AllocatePages() = { %ld, %p }\n&quot;, areaId, *pages);
++
++	*id = areaId;
++	return B_OK;
++}
++
++void
++AreaBackend::FreePages(BaseCache *cache, area_id area)
++{
++	printf(&quot;AreaBackend::DeletePages(%ld)\n&quot;, area);
++	delete_area(area);
++}
++
++
++BaseCache::BaseCache(const char *_name, size_t objectSize, size_t alignment,
++	Constructor _constructor, Destructor _destructor, void *_cookie)
++	: fConstructor(_constructor), fDestructor(_destructor), fCookie(_cookie)
++{
++	strncpy(fName, _name, sizeof(fName));
++	fName[sizeof(fName) - 1] = 0;
++
++	if (alignment &gt; 0 &amp;&amp; (objectSize &amp; (alignment - 1)))
++		fObjectSize = objectSize + alignment - (objectSize &amp; (alignment - 1));
++	else
++		fObjectSize = objectSize;
++
++	fCacheColorCycle = 0;
++}
++
++
++BaseCache::ObjectLink *BaseCache::AllocateObject()
++{
++	Slab *slab = fPartialSlabs.Head();
++
++	printf(&quot;BaseCache::AllocateObject() from %p, %lu remaining\n&quot;,
++		slab, slab-&gt;count);
++
++	ObjectLink *link = SListPop(slab-&gt;free);
++	slab-&gt;count--;
++	if (slab-&gt;count == 0) {
++		// move the partial slab to the full list
++		fPartialSlabs.Remove(slab);
++		fFullSlabs.Add(slab);
++	}
++
++	return link;
++}
++
++
++bool
++BaseCache::ReturnObject(const ObjectInfo &amp;object)
++{
++	Slab *slab = object.first;
++	ObjectLink *link = object.second;
++
++	// We return true if the slab is completely unused.
++
++	SListPush(slab-&gt;free, link);
++	slab-&gt;count++;
++	if (slab-&gt;count == slab-&gt;size) {
++		fPartialSlabs.Remove(slab);
++		return true;
++	} else if (slab-&gt;count == 1) {
++		fFullSlabs.Remove(slab);
++		fPartialSlabs.Add(slab);
++	}
++
++	return false;
++}
++
++
++BaseCache::Slab *
++BaseCache::ConstructSlab(Slab *slab, void *pages, size_t byteCount,
++	ObjectLink *(*getLink)(void *parent, void *object), void *parent)
++{
++	printf(&quot;BaseCache::ConstructSlab(%p, %p, %lu, %p, %p)\n&quot;, slab, pages,
++		byteCount, getLink, parent);
++
++	slab-&gt;pages = pages;
++	slab-&gt;count = slab-&gt;size = byteCount / fObjectSize;
++	slab-&gt;free = NULL;
++
++	size_t spareBytes = byteCount - (slab-&gt;size * fObjectSize);
++	size_t cycle = fCacheColorCycle;
++
++	if (cycle &gt; spareBytes)
++		cycle = 0;
++	else
++		fCacheColorCycle += kCacheColorPeriod;
++
++	printf(&quot;  %lu objects, %lu spare bytes, cycle %lu\n&quot;,
++		slab-&gt;size, spareBytes, cycle);
++
++	uint8_t *data = ((uint8_t *)pages) + cycle;
++
++	for (size_t i = 0; i &lt; slab-&gt;size; i++) {
++		if (fConstructor)
++			fConstructor(fCookie, data);
++		SListPush(slab-&gt;free, getLink(parent, data));
++		data += fObjectSize;
++	}
++
++	return slab;
++}
++
++
++void
++BaseCache::DestructSlab(Slab *slab)
++{
++	if (fDestructor == NULL)
++		return;
++
++	uint8_t *data = (uint8_t *)slab-&gt;pages;
++
++	for (size_t i = 0; i &lt; slab-&gt;size; i++) {
++		fDestructor(fCookie, data);
++		data += fObjectSize;
++	}
++}
++
++
++static inline bool
++_IsMagazineEmpty(BaseDepot::Magazine *magazine)
++{
++	return magazine-&gt;current_round == 0;
++}
++
++
++static inline bool
++_IsMagazineFull(BaseDepot::Magazine *magazine)
++{
++	return magazine-&gt;current_round == magazine-&gt;round_count;
++}
++
++
++static inline void *
++_PopMagazine(BaseDepot::Magazine *magazine)
++{
++	return magazine-&gt;rounds[--magazine-&gt;current_round];
++}
++
++
++static inline bool
++_PushMagazine(BaseDepot::Magazine *magazine, void *object)
++{
++	if (_IsMagazineFull(magazine))
++		return false;
++	magazine-&gt;rounds[magazine-&gt;current_round++] = object;
++	return true;
++}
++
++
++BaseDepot::BaseDepot()
++	: fFull(NULL), fEmpty(NULL), fFullCount(0), fEmptyCount(0)
++{
++	// benaphore_init(...)
++	fStores = new (std::nothrow) CPUStore[smp_get_num_cpus()];
++
++	if (fStores) {
++		for (int i = 0; i &lt; smp_get_num_cpus(); i++) {
++			// benaphore_init(...)
++			fStores[i].loaded = fStores[i].previous = NULL;
++		}
++	}
++}
++
++
++BaseDepot::~BaseDepot()
++{
++	// MakeEmpty may not be used here as ReturnObject is
++	// no longer available by then.
++
++	delete [] fStores;
++
++	// benaphore_destroy()
++}
++
++
++status_t
++BaseDepot::InitCheck() const
++{
++	return fStores ? B_OK : B_NO_MEMORY;
++}
++
++
++void *
++BaseDepot::ObtainFromStore(CPUStore *store)
++{
++	BenaphoreLocker _(store-&gt;lock);
++
++	// To better understand both the Alloc() and Free() logic refer to
++	// Bonwick's ``Magazines and Vmem'' [in 2001 USENIX proceedings]
++
++	// In a nutshell, we try to get an object from the loaded magazine
++	// if it's not empty, or from the previous magazine if it's full
++	// and finally from the Slab if the magazine depot has no full magazines.
++
++	if (store-&gt;loaded == NULL)
++		return NULL;
++
++	while (true) {
++		if (!_IsMagazineEmpty(store-&gt;loaded))
++			return _PopMagazine(store-&gt;loaded);
++
++		if (store-&gt;previous &amp;&amp; (_IsMagazineFull(store-&gt;previous)
++			|| _ExchangeWithFull(store-&gt;previous)))
++			std::swap(store-&gt;previous, store-&gt;loaded);
++		else
++			return NULL;
++	}
++}
++
++
++bool
++BaseDepot::ReturnToStore(CPUStore *store, void *object)
++{
++	BenaphoreLocker _(store-&gt;lock);
++
++	// We try to add the object to the loaded magazine if we have one
++	// and it's not full, or to the previous one if it is empty. If
++	// the magazine depot doesn't provide us with a new empty magazine
++	// we return the object directly to the slab.
++
++	while (true) {
++		if (store-&gt;loaded &amp;&amp; _PushMagazine(store-&gt;loaded, object))
++			return true;
++
++		if ((store-&gt;previous &amp;&amp; _IsMagazineEmpty(store-&gt;previous))
++			|| _ExchangeWithEmpty(store-&gt;previous))
++			std::swap(store-&gt;loaded, store-&gt;previous);
++		else
++			return false;
++	}
++}
++
++
++void
++BaseDepot::MakeEmpty()
++{
++	for (int i = 0; i &lt; smp_get_num_cpus(); i++) {
++		if (fStores[i].loaded)
++			_EmptyMagazine(fStores[i].loaded);
++		if (fStores[i].previous)
++			_EmptyMagazine(fStores[i].previous);
++		fStores[i].loaded = fStores[i].previous = NULL;
++	}
++
++	while (fFull)
++		_EmptyMagazine(SListPop(fFull));
++
++	while (fEmpty)
++		_EmptyMagazine(SListPop(fEmpty));
++}
++
++
++bool
++BaseDepot::_ExchangeWithFull(Magazine* &amp;magazine)
++{
++	BenaphoreLocker _(fLock);
++
++	if (fFull == NULL)
++		return false;
++
++	fFullCount--;
++	fEmptyCount++;
++
++	SListPush(fEmpty, magazine);
++	magazine = SListPop(fFull);
++	return true;
++}
++
++
++bool
++BaseDepot::_ExchangeWithEmpty(Magazine* &amp;magazine)
++{
++	BenaphoreLocker _(fLock);
++
++	if (fEmpty == NULL) {
++		fEmpty = _AllocMagazine();
++		if (fEmpty == NULL)
++			return false;
++	} else {
++		fEmptyCount--;
++	}
++
++	if (magazine) {
++		SListPush(fFull, magazine);
++		fFullCount++;
++	}
++
++	magazine = SListPop(fEmpty);
++	return true;
++}
++
++
++void
++BaseDepot::_EmptyMagazine(Magazine *magazine)
++{
++	for (uint16_t i = 0; i &lt; magazine-&gt;current_round; i++)
++		ReturnObject(magazine-&gt;rounds[i]);
++	_FreeMagazine(magazine);
++}
++
++
++BaseDepot::Magazine *
++BaseDepot::_AllocMagazine()
++{
++	Magazine *magazine = (Magazine *)malloc(sizeof(Magazine)
++		+ kMagazineCapacity * sizeof(void *));
++	if (magazine) {
++		magazine-&gt;next = NULL;
++		magazine-&gt;current_round = 0;
++		magazine-&gt;round_count = kMagazineCapacity;
++	}
++
++	return magazine;
++}
++
++
++void
++BaseDepot::_FreeMagazine(Magazine *magazine)
++{
++	free(magazine);
++}
++
++
++
++typedef MergedLinkCacheStrategy&lt;MallocBackend&gt; MallocMergedCacheStrategy;
++typedef Cache&lt;MallocMergedCacheStrategy&gt; MallocMergedCache;
++typedef LocalCache&lt;MallocMergedCache&gt; MallocLocalCache;
++
++typedef HashCacheStrategy&lt;MallocBackend&gt; MallocHashCacheStrategy;
++typedef Cache&lt;MallocHashCacheStrategy&gt; MallocHashCache;
++
++object_cache_t
++object_cache_create(const char *name, size_t object_size, size_t alignment,
++	void (*_constructor)(void *, void *), void (*_destructor)(void *, void *),
++	void *cookie)
++{
++	return new (std::nothrow) MallocLocalCache(name, object_size, alignment,
++		_constructor, _destructor, cookie);
++}
++
++
++void *
++object_cache_alloc(object_cache_t cache)
++{
++	return ((MallocLocalCache *)cache)-&gt;Alloc(0);
++}
++
++
++void *
++object_cache_alloc_etc(object_cache_t cache, uint32_t flags)
++{
++	return ((MallocLocalCache *)cache)-&gt;Alloc(flags);
++}
++
++
++void
++object_cache_free(object_cache_t cache, void *object)
++{
++	((MallocLocalCache *)cache)-&gt;Free(object);
++}
++
++
++void
++object_cache_destroy(object_cache_t cache)
++{
++	delete (MallocLocalCache *)cache;
++}
++
++
++void test1()
++{
++	MallocLocalCache cache(&quot;foobar&quot;, sizeof(int), 0, NULL, NULL, NULL);
++
++	static const int N = 4096;
++	void *buf[N];
++
++	for (int i = 0; i &lt; N; i++)
++		buf[i] = cache.Alloc(0);
++
++	for (int i = 0; i &lt; N; i++)
++		cache.Free(buf[i]);
++
++	cache.Destroy();
++}
++
++void test2()
++{
++	TypedCache&lt;int, MallocBackend&gt; cache(&quot;int cache&quot;, 0);
++
++	static const int N = 4096;
++	int *buf[N];
++
++	for (int i = 0; i &lt; N; i++)
++		buf[i] = cache.Alloc(0);
++
++	for (int i = 0; i &lt; N; i++)
++		cache.Free(buf[i]);
++}
++
++void test3()
++{
++	Cache&lt;HashCacheStrategy&lt;AreaBackend&gt; &gt; cache(&quot;512byte hash cache&quot;, 512, 0, NULL,
++		NULL, NULL);
++
++	static const int N = 128;
++	void *buf[N];
++
++	for (int i = 0; i &lt; N; i++)
++		buf[i] = cache.AllocateObject(0);
++
++	for (int i = 0; i &lt; N; i++)
++		cache.ReturnObject(buf[i]);
++}
++
++void test4()
++{
++	LocalCache&lt;MallocHashCache&gt; cache(&quot;foobar&quot;, 512, 0, NULL, NULL, NULL);
++
++	static const int N = 128;
++	void *buf[N];
++
++	for (int i = 0; i &lt; N; i++)
++		buf[i] = cache.Alloc(0);
++
++	for (int i = 0; i &lt; N; i++)
++		cache.Free(buf[i]);
++
++	cache.Destroy();
++}
++
++void test5()
++{
++	object_cache_t cache = object_cache_create(&quot;foobar&quot;, 16, 0,
++		NULL, NULL, NULL);
++
++	static const int N = 1024;
++	void *buf[N];
++
++	for (int i = 0; i &lt; N; i++)
++		buf[i] = object_cache_alloc(cache);
++
++	for (int i = 0; i &lt; N; i++)
++		object_cache_free(cache, buf[i]);
++
++	object_cache_destroy(cache);
++}
++
++
++int main()
++{
++	//test1();
++	//test2();
++	test3();
++	//test4();
++	//test5();
++	return 0;
++}
+
+Added: haiku/trunk/src/tests/system/kernel/slab/Slab.h
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/slab/Slab.h	2007-04-24 11:04:35 UTC (rev 20791)
++++ haiku/trunk/src/tests/system/kernel/slab/Slab.h	2007-04-24 11:04:47 UTC (rev 20792)
+@@ -0,0 +1,518 @@
++/*
++ * Copyright 2007, Hugo Santos. All Rights Reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * Authors:
++ *      Hugo Santos, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">hugosantos at gmail.com</A>
++ */
++
++#ifndef _SLAB_H_
++#define _SLAB_H_
++
++#include &lt;stdint.h&gt;
++#include &lt;stdlib.h&gt;
++
++#include &lt;algorithm&gt; // for swap()
++#include &lt;new&gt;
++#include &lt;utility&gt; // for pair&lt;&gt;
++
++#include &lt;util/AutoLock.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
++#include &lt;util/OpenHashTable.h&gt;
++
++#include &lt;OS.h&gt;
++
++
++#define smp_get_current_cpu() 0
++#define smp_get_num_cpus() 1
++
++
++// C interface
++extern &quot;C&quot; {
++	typedef void *object_cache_t;
++	object_cache_t
++	object_cache_create(const char *name, size_t object_size, size_t alignment,
++		void (*_constructor)(void *, void *), void (*_destructor)(void *, void *),
++		void *cookie);
++	void *object_cache_alloc(object_cache_t cache);
++	void *object_cache_alloc_etc(object_cache_t cache, uint32_t flags);
++	void object_cache_free(object_cache_t cache, void *object);
++	void object_cache_destroy(object_cache_t cache);
++}
++
++
++// TODO this values should be dynamically tuned per cache.
++static const int kMinimumSlabItems = 32;
++
++// base Slab implementation, opaque to the backend used.
++class BaseCache {
++public:
++	typedef void (*Constructor)(void *cookie, void *object);
++	typedef void (*Destructor)(void *cookie, void *object);
++
++	BaseCache(const char *_name, size_t objectSize, size_t alignment,
++		Constructor _constructor, Destructor _destructor, void *_cookie);
++
++	struct ObjectLink {
++		struct ObjectLink *next;
++	};
++
++	struct Slab : DoublyLinkedListLinkImpl&lt;Slab&gt; {
++		void *pages;
++		size_t count, size;
++		ObjectLink *free;
++	};
++
++	typedef std::pair&lt;Slab *, ObjectLink *&gt; ObjectInfo;
++
++	ObjectLink *AllocateObject();
++	bool ReturnObject(const ObjectInfo &amp;object);
++
++	Slab *ConstructSlab(Slab *slab, void *pages, size_t byteCount,
++		ObjectLink *(*getLink)(void *parent, void *object), void *parent);
++	void DestructSlab(Slab *slab);
++
++	const char *Name() const { return fName; }
++	size_t ObjectSize() const { return fObjectSize; }
++
++protected:
++	typedef DoublyLinkedList&lt;Slab&gt; SlabList;
++
++	char fName[32];
++	size_t fObjectSize, fCacheColorCycle;
++	SlabList fPartialSlabs, fFullSlabs;
++
++	Constructor fConstructor;
++	Destructor fDestructor;
++	void *fCookie;
++};
++
++
++enum {
++	CACHE_ALIGN_TO_PAGE_TOTAL	= 1 &lt;&lt; 0,
++};
++
++struct MallocBackend {
++	typedef void *AllocationID;
++
++	static int PageSize() { return 4096; }
++	static status_t AllocatePages(BaseCache *cache, AllocationID *id,
++		void **pages, size_t byteCount, uint32_t flags);
++	static void FreePages(BaseCache *cache, void *pages);
++};
++
++
++struct AreaBackend {
++	typedef area_id AllocationID;
++
++	static int PageSize() { return B_PAGE_SIZE; }
++	static status_t AllocatePages(BaseCache *cache, area_id *id, void **pages,
++		size_t byteCount, uint32_t flags);
++	static void FreePages(BaseCache *cache, area_id id);
++};
++
++
++// Slab implementation, glues together the frontend, backend as
++// well as the Slab strategy used.
++template&lt;typename Strategy&gt;
++class Cache : protected BaseCache {
++public:
++	Cache(const char *_name, size_t objectSize, size_t alignment,
++		Constructor _constructor, Destructor _destructor, void *_cookie)
++		: BaseCache(_name, Strategy::RequiredSpace(objectSize), alignment,
++			_constructor, _destructor, _cookie), fStrategy(this) {}
++
++	void *AllocateObject(uint32_t flags)
++	{
++		if (fPartialSlabs.IsEmpty()) {
++			Slab *newSlab = fStrategy.NewSlab(flags);
++			if (newSlab == NULL)
++				return NULL;
++			fPartialSlabs.Add(newSlab);
++		}
++
++		return fStrategy.Object(BaseCache::AllocateObject());
++	}
++
++	void ReturnObject(void *object)
++	{
++		ObjectInfo location = fStrategy.ObjectInformation(object);
++
++		if (BaseCache::ReturnObject(location))
++			fStrategy.ReturnSlab(location.first);
++	}
++
++private:
++	Strategy fStrategy;
++};
++
++
++static inline const void *
++LowerBoundary(void *object, size_t byteCount)
++{
++	const uint8_t *null = (uint8_t *)NULL;
++	return null + ((((uint8_t *)object) - null) &amp; ~(byteCount - 1));
++}
++
++
++template&lt;typename Backend&gt;
++class BaseCacheStrategy {
++protected:
++	typedef BaseCache::ObjectLink ObjectLink;
++
++	BaseCacheStrategy(BaseCache *parent)
++		: fParent(parent) {}
++
++	size_t SlabSize(size_t tailSpace) const
++	{
++		size_t pageCount = (kMinimumSlabItems * fParent-&gt;ObjectSize()
++			+ tailSpace) / Backend::PageSize();
++		if (pageCount &lt; 1)
++			pageCount = 1;
++		return pageCount * Backend::PageSize();
++	}
++
++	struct Slab : BaseCache::Slab {
++		typename Backend::AllocationID id;
++	};
++
++	BaseCache::Slab *_ConstructSlab(Slab *slab, void *pages, size_t tailSpace,
++		ObjectLink *(*getLink)(void *parent, void *object), void *parent)
++	{
++		return fParent-&gt;ConstructSlab(slab, pages, SlabSize(tailSpace)
++			- tailSpace, getLink, parent);
++	}
++
++	void _DestructSlab(BaseCache::Slab *slab)
++	{
++		fParent-&gt;DestructSlab(slab);
++		Backend::FreePages(fParent, ((Slab *)slab)-&gt;id);
++	}
++
++	BaseCache *fParent;
++};
++
++
++// This slab strategy includes the ObjectLink at the end of each object and the
++// slab at the end of the allocated pages. It uses aligned allocations to
++// provide object to slab mapping with zero storage, thus there is only one
++// word of overhead per object. This is optimized for small objects.
++template&lt;typename Backend&gt;
++class MergedLinkCacheStrategy : public BaseCacheStrategy&lt;Backend&gt; {
++public:
++	typedef typename BaseCacheStrategy&lt;Backend&gt;::Slab Slab;
++	typedef BaseCache::ObjectLink Link;
++	typedef BaseCache::ObjectInfo ObjectInfo;
++
++	MergedLinkCacheStrategy(BaseCache *parent)
++		: BaseCacheStrategy&lt;Backend&gt;(parent) {}
++
++	static size_t RequiredSpace(size_t objectSize)
++	{
++		return objectSize + sizeof(Link);
++	}
++
++	void *Object(Link *link) const
++	{
++		return ((uint8_t *)link) - (fParent-&gt;ObjectSize() - sizeof(Link));
++	}
++
++	ObjectInfo ObjectInformation(void *object) const
++	{
++		Slab *slab = _SlabInPages(LowerBoundary(object, _SlabSize()));
++		return ObjectInfo(slab, _Linkage(object));
++	}
++
++	BaseCache::Slab *NewSlab(uint32_t flags)
++	{
++		typename Backend::AllocationID id;
++		void *pages;
++
++		// in order to save a pointer per object or a hash table to
++		// map objects to slabs we required this set of pages to be
++		// aligned in a (pageCount * PAGE_SIZE) boundary.
++		if (Backend::AllocatePages(fParent, &amp;id, &amp;pages, _SlabSize(),
++				CACHE_ALIGN_TO_PAGE_TOTAL | flags) &lt; B_OK)
++			return NULL;
++
++		_SlabInPages(pages)-&gt;id = id;
++
++		return BaseCacheStrategy&lt;Backend&gt;::_ConstructSlab(_SlabInPages(pages),
++			pages, sizeof(Slab), _Linkage, this);
++	}
++
++	void ReturnSlab(BaseCache::Slab *slab)
++	{
++		BaseCacheStrategy&lt;Backend&gt;::_DestructSlab(slab);
++	}
++
++private:
++	size_t _SlabSize() const
++	{
++		return BaseCacheStrategy&lt;Backend&gt;::SlabSize(sizeof(Slab));
++	}
++
++	Link *_Linkage(void *object) const
++	{
++		return (Link *)(((uint8_t *)object)
++			+ (fParent-&gt;ObjectSize() - sizeof(Link)));
++	}
++
++	Slab *_SlabInPages(const void *pages) const
++	{
++		return (Slab *)(((uint8_t *)pages) + _SlabSize() - sizeof(Slab));
++	}
++
++	static Link *_Linkage(void *_this, void *object)
++	{
++		return ((MergedLinkCacheStrategy *)_this)-&gt;_Linkage(object);
++	}
++};
++
++
++template&lt;typename Type, typename Backend&gt;
++class TypedCache : public Cache&lt;MergedLinkCacheStrategy&lt;Backend&gt; &gt; {
++public:
++	typedef MergedLinkCacheStrategy&lt;Backend&gt; Strategy;
++	typedef Cache&lt;Strategy&gt; BaseType;
++
++	TypedCache(const char *name, size_t alignment)
++		: BaseType(name, sizeof(Type), alignment, _ConstructObject,
++			_DestructObject, this) {}
++	virtual ~TypedCache() {}
++
++	Type *Alloc(uint32_t flags) { return (Type *)BaseType::AllocateObject(flags); }
++	void Free(Type *object) { BaseType::ReturnObject(object); }
++
++private:
++	static void _ConstructObject(void *cookie, void *object)
++	{
++		((TypedCache *)cookie)-&gt;ConstructObject((Type *)object);
++	}
++
++	static void _DestructObject(void *cookie, void *object)
++	{
++		((TypedCache *)cookie)-&gt;DestructObject((Type *)object);
++	}
++
++	virtual void ConstructObject(Type *object) {}
++	virtual void DestructObject(Type *object) {}
++};
++
++
++static inline int
++Fls(size_t value)
++{
++	for (int i = 31; i &gt;= 0; i--) {
++		if ((value &gt;&gt; i) &amp; 1)
++			return i + 1;
++	}
++
++	return -1;
++}
++
++
++template&lt;typename Backend&gt;
++struct HashCacheStrategy : BaseCacheStrategy&lt;Backend&gt; {
++	typedef typename BaseCacheStrategy&lt;Backend&gt;::Slab Slab;
++	typedef HashCacheStrategy&lt;Backend&gt; Strategy;
++	typedef BaseCache::ObjectLink ObjectLink;
++	typedef BaseCache::ObjectInfo ObjectInfo;
++
++	struct Link : ObjectLink {
++		Slab *slab;
++		void *buffer;
++	};
++
++	struct HashTableDefinition {
++		typedef Strategy *	ParentType;
++		typedef void *		KeyType;
++		typedef Link		ValueType;
++
++		static size_t HashKey(Strategy *parent, void *key)
++		{
++			return (((uint8_t *)key) - ((uint8_t *)0)) &gt;&gt; parent-&gt;fLowerBoundary;
++		}
++
++		static size_t Hash(Strategy *parent, Link *value)
++		{
++			return HashKey(parent, value-&gt;buffer);
++		}
++
++		static bool Compare(Strategy *parent, void *key, Link *value)
++		{
++			return value-&gt;buffer == key;
++		}
++	};
++
++	// for g++ 2.95
++	friend class HashTableDefinition;
++
++	typedef OpenHashTable&lt;HashTableDefinition&gt; HashTable;
++
++	HashCacheStrategy(BaseCache *parent)
++		: BaseCacheStrategy&lt;Backend&gt;(parent), fHashTable(this),
++			fSlabCache(&quot;slab cache&quot;, 0), fLinkCache(&quot;link cache&quot;, 0),
++			fLowerBoundary(Fls(parent-&gt;ObjectSize()) - 1) {}
++
++	static size_t RequiredSpace(size_t objectSize)
++	{
++		return objectSize;
++	}
++
++	void *Object(ObjectLink *link) const
++	{
++		return ((Link *)link)-&gt;buffer;
++	}
++
++	ObjectInfo ObjectInformation(void *object) const
++	{
++		Link *link = _Linkage(object);
++		return ObjectInfo(link-&gt;slab, link);
++	}
++
++	BaseCache::Slab *NewSlab(uint32_t flags)
++	{
++		size_t byteCount = _SlabSize();
++
++		Slab *slab = fSlabCache.Alloc(flags);
++		if (slab == NULL)
++			return NULL;
++
++		void *pages;
++		if (Backend::AllocatePages(fParent, &amp;slab-&gt;id, &amp;pages, byteCount,
++				flags) &lt; B_OK) {
++			fSlabCache.Free(slab);
++			return NULL;
++		}
++
++		uint8_t *data = (uint8_t *)pages;
++		for (uint8_t *it = data;
++				it &lt; (data + byteCount); it += fParent-&gt;ObjectSize()) {
++			Link *link = fLinkCache.Alloc(flags);
++			link-&gt;slab = slab;
++			link-&gt;buffer = it;
++			fHashTable.Insert(link);
++		}
++
++		return BaseCacheStrategy&lt;Backend&gt;::_ConstructSlab(slab, pages, 0,
++			_Linkage, this);
++	}
++
++	void ReturnSlab(BaseCache::Slab *slab)
++	{
++		uint8_t *data = (uint8_t *)slab-&gt;pages;
++		size_t byteCount = _SlabSize();
++
++		for (uint8_t *it = data;
++				it &lt; (data + byteCount); it += fParent-&gt;ObjectSize()) {
++			Link *link = fHashTable.Lookup(it);
++			fHashTable.Remove(link);
++			fLinkCache.Free(link);
++		}
++
++		BaseCacheStrategy&lt;Backend&gt;::_DestructSlab(slab);
++		fSlabCache.Free((Slab *)slab);
++	}
++
++private:
++	size_t _SlabSize() const
++	{
++		return BaseCacheStrategy&lt;Backend&gt;::SlabSize(0);
++	}
++
++	Link *_Linkage(void *object) const
++	{
++		return fHashTable.Lookup(object);
++	}
++
++	static ObjectLink *_Linkage(void *_this, void *object)
++	{
++		return ((Strategy *)_this)-&gt;_Linkage(object);
++	}
++
++	HashTable fHashTable;
++	TypedCache&lt;Slab, Backend&gt; fSlabCache;
++	TypedCache&lt;Link, Backend&gt; fLinkCache;
++	const size_t fLowerBoundary;
++};
++
++
++class BaseDepot {
++public:
+
+[... truncated: 77 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001822.html">[Haiku-commits] r20791 - haiku/trunk/headers/private/kernel/util
+</A></li>
+	<LI>Next message: <A HREF="001768.html">[Haiku-commits] r20793 - haiku/trunk/src/tests/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1767">[ date ]</a>
+              <a href="thread.html#1767">[ thread ]</a>
+              <a href="subject.html#1767">[ subject ]</a>
+              <a href="author.html#1767">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

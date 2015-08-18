@@ -1,0 +1,135 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21971 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21971%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200708152311.l7FNBHou030617%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003554.html">
+   <LINK REL="Next"  HREF="003556.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21971 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21971%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200708152311.l7FNBHou030617%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21971 - haiku/trunk/src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug 16 01:11:17 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003554.html">[Haiku-commits] r21970 - haiku/trunk/src/preferences/network
+</A></li>
+        <LI>Next message: <A HREF="003556.html">[Haiku-commits] r21972 - in haiku/trunk: headers/private/interface	src/kits/interface src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3555">[ date ]</a>
+              <a href="thread.html#3555">[ thread ]</a>
+              <a href="subject.html#3555">[ subject ]</a>
+              <a href="author.html#3555">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-08-16 01:11:15 +0200 (Thu, 16 Aug 2007)
+New Revision: 21971
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21971&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21971&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+Log:
+* vm_soft_fault() no longer sets all pages it touches to &quot;active&quot;; instead, it now honours
+  if the page was already in the &quot;modified&quot; list before. Also, the source page (which is
+  either mapped directly or copied to the target page) is no longer marked busy before its
+  final destiny is decided (it didn't have any effect, anyway, since we had its cache
+  locked for the whole time, but it now preserves the modified state). This fixes bug #1369.
+* vm_cache_write_modified() now filters out temporary caches (it's currently called on area
+  deletion).
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-15 21:57:41 UTC (rev 21970)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-15 23:11:15 UTC (rev 21971)
+@@ -2389,7 +2389,9 @@
+ 
+ 	map-&gt;ops-&gt;unlock(map);
+ 
+-	vm_page_set_state(page, PAGE_STATE_ACTIVE);
++	if (page-&gt;state != PAGE_STATE_MODIFIED)
++		vm_page_set_state(page, PAGE_STATE_ACTIVE);
++
+ 	return B_OK;
+ }
+ 
+@@ -3570,13 +3572,7 @@
+ 		for (;;) {
+ 			page = vm_cache_lookup_page(cache, cacheOffset);
+ 			if (page != NULL &amp;&amp; page-&gt;state != PAGE_STATE_BUSY) {
+-				// Note: We set the page state to busy, but we don't need a
+-				// condition variable here, since we keep the cache locked
+-				// till we mark the page unbusy again (in fault_get_page()
+-				// the source page, or in vm_soft_fault() when mapping the
+-				// page), so no one will ever know the page was busy in the
+-				// first place.
+-				vm_page_set_state(page, PAGE_STATE_BUSY);
++				// we found the page
+ 				break;
+ 			}
+ 			if (page == NULL || page == &amp;dummyPage)
+@@ -3861,7 +3857,8 @@
+ 		map-&gt;ops-&gt;put_physical_page((addr_t)source);
+ 		map-&gt;ops-&gt;put_physical_page((addr_t)dest);
+ 
+-		vm_page_set_state(sourcePage, PAGE_STATE_ACTIVE);
++		if (sourcePage-&gt;state != PAGE_STATE_MODIFIED)
++			vm_page_set_state(sourcePage, PAGE_STATE_ACTIVE);
+ 
+ 		mutex_unlock(&amp;cache-&gt;lock);
+ 		mutex_lock(&amp;topCache-&gt;lock);
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-08-15 21:57:41 UTC (rev 21970)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-08-15 23:11:15 UTC (rev 21971)
+@@ -362,6 +362,9 @@
+ 
+ 	TRACE((&quot;vm_cache_write_modified(cache = %p)\n&quot;, cache));
+ 
++	if (cache-&gt;temporary)
++		return B_OK;
++
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 	status = vm_page_write_modified(cache, fsReenter);
+ 	mutex_unlock(&amp;cache-&gt;lock);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003554.html">[Haiku-commits] r21970 - haiku/trunk/src/preferences/network
+</A></li>
+	<LI>Next message: <A HREF="003556.html">[Haiku-commits] r21972 - in haiku/trunk: headers/private/interface	src/kits/interface src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3555">[ date ]</a>
+              <a href="thread.html#3555">[ thread ]</a>
+              <a href="subject.html#3555">[ subject ]</a>
+              <a href="author.html#3555">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

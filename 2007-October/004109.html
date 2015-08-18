@@ -1,0 +1,343 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22421 - haiku/trunk/src/add-ons/kernel/drivers/tty
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22421%20-%20haiku/trunk/src/add-ons/kernel/drivers/tty&In-Reply-To=%3C200710031904.l93J4jWP007736%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004108.html">
+   <LINK REL="Next"  HREF="004110.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22421 - haiku/trunk/src/add-ons/kernel/drivers/tty</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22421%20-%20haiku/trunk/src/add-ons/kernel/drivers/tty&In-Reply-To=%3C200710031904.l93J4jWP007736%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22421 - haiku/trunk/src/add-ons/kernel/drivers/tty">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Oct  3 21:04:45 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004108.html">[Haiku-commits] r22420 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+        <LI>Next message: <A HREF="004110.html">[Haiku-commits] r22422 - haiku/trunk/src/add-ons/kernel/drivers/tty
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4109">[ date ]</a>
+              <a href="thread.html#4109">[ thread ]</a>
+              <a href="subject.html#4109">[ subject ]</a>
+              <a href="author.html#4109">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-10-03 21:04:44 +0200 (Wed, 03 Oct 2007)
+New Revision: 22421
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22421&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22421&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/tty/driver.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h
+Log:
+* Added debugger command &quot;tty&quot;, which dumps some info about a tty.
+* RequestOwner was removing the wrong request from the second queue,
+  which could cause the list structure to become invalid and result in
+  bug #1526.
+* In the writer loops we do now call tty_notify_if_available() when
+  we're potentially going to wait and had written something before, so
+  that a waiting reader will be woken up also when we write more bytes
+  than fit into the ring buffer.
+
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/driver.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/driver.cpp	2007-10-03 17:57:09 UTC (rev 22420)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/driver.cpp	2007-10-03 19:04:44 UTC (rev 22421)
+@@ -100,6 +100,8 @@
+ 		}
+ 	}
+ 
++	tty_add_debugger_commands();
++
+ 	return B_OK;
+ }
+ 
+@@ -109,6 +111,8 @@
+ {
+ 	TRACE((DRIVER_NAME &quot;: uninit_driver()\n&quot;));
+ 
++	tty_remove_debugger_commands();
++
+ 	for (int32 i = 0; i &lt; (int32)kNumTTYs * 2; i++)
+ 		free(sDeviceNames[i]);
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp	2007-10-03 17:57:09 UTC (rev 22420)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp	2007-10-03 19:04:44 UTC (rev 22421)
+@@ -223,6 +223,18 @@
+ }
+ 
+ 
++void
++Request::Dump(const char* prefix)
++{
++	kprintf(&quot;%srequest: %p\n&quot;, prefix, this);
++	kprintf(&quot;%s  owner:        %p\n&quot;, prefix, fOwner);
++	kprintf(&quot;%s  cookie:       %p\n&quot;, prefix, fCookie);
++	kprintf(&quot;%s  bytes needed: %lu\n&quot;, prefix, fBytesNeeded);
++	kprintf(&quot;%s  notified:     %s\n&quot;, prefix, fNotified ? &quot;true&quot; : &quot;false&quot;);
++	kprintf(&quot;%s  error:        %s\n&quot;, prefix, fError ? &quot;true&quot; : &quot;false&quot;);
++}
++
++
+ // #pragma mark -
+ 
+ 
+@@ -290,6 +302,15 @@
+ }
+ 
+ 
++void
++RequestQueue::Dump(const char* prefix)
++{
++	RequestList::Iterator it = fRequests.GetIterator();
++	while (Request* request = it.Next())
++		request-&gt;Dump(prefix);
++}
++
++
+ // #pragma mark -
+ 
+ 
+@@ -345,7 +366,10 @@
+ 	if (fRequestQueues[0])
+ 		fRequestQueues[0]-&gt;Remove(&amp;fRequests[0]);
+ 	if (fRequestQueues[1])
+-		fRequestQueues[1]-&gt;Remove(&amp;fRequests[0]);
++		fRequestQueues[1]-&gt;Remove(&amp;fRequests[1]);
++
++	fRequestQueues[0] = NULL;
++	fRequestQueues[1] = NULL;
+ }
+ 
+ 
+@@ -1458,12 +1482,15 @@
+ 		&quot;length = %lu%s)\n&quot;, source, target, length,
+ 		(echo ? &quot;, echo mode&quot; : &quot;&quot;)));
+ 
++	// Make sure we are first in the writer queue(s) and AvailableBytes() is
++	// initialized.
+ 	status_t status = locker.AcquireWriter(dontBlock, 0);
+ 	if (status != B_OK) {
+ 		*_length = 0;
+ 		return status;
+ 	}
+ 	size_t writable = locker.AvailableBytes();
++	size_t writtenSinceLastNotify = 0;
+ 
+ 	while (bytesWritten &lt; length) {
+ 		// fetch next char and do input processing
+@@ -1489,6 +1516,13 @@
+ 		// If there's not enough space to write what we have, we need to wait
+ 		// until it is available.
+ 		if (writable &lt; bytesNeeded) {
++			if (writtenSinceLastNotify &gt; 0) {
++				tty_notify_if_available(target, source, true);
++				if (echo)
++					tty_notify_if_available(source, target, true);
++				writtenSinceLastNotify = 0;
++			}
++
+ 			status = locker.AcquireWriter(dontBlock, bytesNeeded);
+ 			if (status != B_OK) {
+ 				*_length = bytesWritten;
+@@ -1514,6 +1548,7 @@
+ 		writable -= bytesNeeded;
+ 		data++;
+ 		bytesWritten++;
++		writtenSinceLastNotify++;
+ 	}
+ 
+ 	return B_OK;
+@@ -1582,12 +1617,15 @@
+ 	TRACE((&quot;tty_write_to_tty_slave(source = %p, target = %p, length = %lu)\n&quot;,
+ 		sourceCookie-&gt;tty, target, length));
+ 
++	// Make sure we are first in the writer queue(s) and AvailableBytes() is
++	// initialized.
+ 	status_t status = locker.AcquireWriter(dontBlock, 0);
+ 	if (status != B_OK) {
+ 		*_length = 0;
+ 		return status;
+ 	}
+ 	size_t writable = locker.AvailableBytes();
++	size_t writtenSinceLastNotify = 0;
+ 
+ 	while (bytesWritten &lt; length) {
+ 		// fetch next char and do output processing
+@@ -1598,6 +1636,11 @@
+ 		// If there's not enough space to write what we have, we need to wait
+ 		// until it is available.
+ 		if (writable &lt; bytesNeeded) {
++			if (writtenSinceLastNotify &gt; 0) {
++				tty_notify_if_available(target, sourceCookie-&gt;tty, true);
++				writtenSinceLastNotify = 0;
++			}
++
+ 			status = locker.AcquireWriter(dontBlock, bytesNeeded);
+ 			if (status != B_OK) {
+ 				*_length = bytesWritten;
+@@ -1618,6 +1661,7 @@
+ 		writable -= bytesNeeded;
+ 		data++;
+ 		bytesWritten++;
++		writtenSinceLastNotify++;
+ 	}
+ 
+ 	return B_OK;
+@@ -1771,3 +1815,80 @@
+ 	return remove_select_sync_pool_entry(&amp;tty-&gt;select_pool, sync, event);
+ }
+ 
++
++static void
++dump_tty_settings(struct tty_settings&amp; settings)
++{
++	kprintf(&quot;  pgrp_id:      %ld\n&quot;, settings.pgrp_id);
++	kprintf(&quot;  session_id:   %ld\n&quot;, settings.session_id);
++	// struct termios		termios;
++	// struct winsize		window_size;
++
++}
++
++static void
++dump_tty_struct(struct tty&amp; tty)
++{
++	kprintf(&quot;  index:        %ld\n&quot;, tty.index);
++	kprintf(&quot;  is_master:    %s\n&quot;, tty.is_master ? &quot;true&quot; : &quot;false&quot;);
++	kprintf(&quot;  open_count:   %ld\n&quot;, tty.open_count);
++	kprintf(&quot;  select_pool:  %p\n&quot;, tty.select_pool);
++	kprintf(&quot;  pending_eof:  %lu\n&quot;, tty.pending_eof);
++	kprintf(&quot;  lock.sem:     %ld\n&quot;, tty.lock-&gt;sem);
++
++	kprintf(&quot;  input_buffer:\n&quot;);
++	kprintf(&quot;    first:      %ld\n&quot;, tty.input_buffer.first);
++	kprintf(&quot;    in:         %lu\n&quot;, tty.input_buffer.in);
++	kprintf(&quot;    size:       %lu\n&quot;, tty.input_buffer.size);
++	kprintf(&quot;    buffer:     %p\n&quot;, tty.input_buffer.buffer);
++
++	kprintf(&quot;  reader queue:\n&quot;);
++	tty.reader_queue.Dump(&quot;    &quot;);
++	kprintf(&quot;  writer queue:\n&quot;);
++	tty.writer_queue.Dump(&quot;    &quot;);
++
++	kprintf(&quot;  cookies:     &quot;);
++	TTYCookieList::Iterator it = tty.cookies.GetIterator();
++	while (tty_cookie* cookie = it.Next())
++		kprintf(&quot; %p&quot;, cookie);
++	kprintf(&quot;\n&quot;);
++}
++
++
++static int
++dump_tty(int argc, char** argv)
++{
++	if (argc &lt; 2) {
++		kprintf(&quot;Usage: %s &lt;tty index&gt;\n&quot;, argv[0]);
++		return 0;
++	}
++
++	int32 index = atol(argv[1]);
++	if (index &lt; 0 || index &gt;= (int32)kNumTTYs) {
++		kprintf(&quot;Invalid tty index.\n&quot;);
++		return 0;
++	}
++
++	kprintf(&quot;master:\n&quot;);
++	dump_tty_struct(gMasterTTYs[index]);
++	kprintf(&quot;slave:\n&quot;);
++	dump_tty_struct(gSlaveTTYs[index]);
++	kprintf(&quot;settings:\n&quot;);
++	dump_tty_settings(gTTYSettings[index]);
++
++	return 0;
++}
++
++
++void
++tty_add_debugger_commands()
++{
++	add_debugger_command(&quot;tty&quot;, &amp;dump_tty, &quot;Dump info on a tty&quot;);
++}
++
++
++void
++tty_remove_debugger_commands()
++{
++	remove_debugger_command(&quot;tty&quot;, &amp;dump_tty);
++}
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h	2007-10-03 17:57:09 UTC (rev 22420)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h	2007-10-03 19:04:44 UTC (rev 22421)
+@@ -47,6 +47,8 @@
+ 		bool WasNotified() const		{ return fNotified; }
+ 		bool HasError() const			{ return fError; }
+ 
++		void Dump(const char* prefix);
++
+ 	private:
+ 		RequestOwner	*fOwner;
+ 		tty_cookie		*fCookie;
+@@ -70,6 +72,8 @@
+ 		void NotifyError(status_t error);
+ 		void NotifyError(tty_cookie *cookie, status_t error);
+ 
++		void Dump(const char* prefix);
++
+ 	private:
+ 		typedef DoublyLinkedList&lt;Request&gt; RequestList;
+ 
+@@ -181,4 +185,7 @@
+ 					selectsync *sync);
+ extern status_t tty_deselect(tty_cookie *cookie, uint8 event, selectsync *sync);
+ 
++extern void tty_add_debugger_commands();
++extern void tty_remove_debugger_commands();
++
+ #endif	/* TTY_PRIVATE_H */
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004108.html">[Haiku-commits] r22420 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+	<LI>Next message: <A HREF="004110.html">[Haiku-commits] r22422 - haiku/trunk/src/add-ons/kernel/drivers/tty
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4109">[ date ]</a>
+              <a href="thread.html#4109">[ thread ]</a>
+              <a href="subject.html#4109">[ subject ]</a>
+              <a href="author.html#4109">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

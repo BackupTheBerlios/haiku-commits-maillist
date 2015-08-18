@@ -1,0 +1,386 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22864 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22864%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200711091709.lA9H9sd5031699%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004673.html">
+   <LINK REL="Next"  HREF="004675.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22864 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22864%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200711091709.lA9H9sd5031699%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22864 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Nov  9 18:09:54 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004673.html">[Haiku-commits] r22863 -	haiku/trunk/src/add-ons/kernel/busses/ide/silicon_image_3112
+</A></li>
+        <LI>Next message: <A HREF="004675.html">[Haiku-commits] r22865 - in haiku/trunk: headers/posix	src/system/libroot/posix/signal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4674">[ date ]</a>
+              <a href="thread.html#4674">[ thread ]</a>
+              <a href="subject.html#4674">[ subject ]</a>
+              <a href="author.html#4674">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-11-09 18:09:54 +0100 (Fri, 09 Nov 2007)
+New Revision: 22864
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22864&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22864&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/cache/file_map.cpp
+Log:
+Extracted file_map API for later use.
+
+
+Added: haiku/trunk/src/system/kernel/cache/file_map.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_map.cpp	2007-11-09 16:36:59 UTC (rev 22863)
++++ haiku/trunk/src/system/kernel/cache/file_map.cpp	2007-11-09 17:09:54 UTC (rev 22864)
+@@ -0,0 +1,308 @@
++/*
++ * Copyright 2004-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include &lt;unistd.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++
++#include &lt;KernelExport.h&gt;
++#include &lt;fs_cache.h&gt;
++
++#include &lt;condition_variable.h&gt;
++#include &lt;file_cache.h&gt;
++#include &lt;generic_syscall.h&gt;
++#include &lt;util/AutoLock.h&gt;
++#include &lt;util/kernel_cpp.h&gt;
++#include &lt;vfs.h&gt;
++#include &lt;vm.h&gt;
++#include &lt;vm_page.h&gt;
++#include &lt;vm_cache.h&gt;
++#include &lt;vm_low_memory.h&gt;
++
++
++//#define TRACE_FILE_MAP
++#ifdef TRACE_FILE_MAP
++#	define TRACE(x) dprintf x
++#else
++#	define TRACE(x) ;
++#endif
++
++#define CACHED_FILE_EXTENTS	2
++	// must be smaller than MAX_FILE_IO_VECS
++	// ToDo: find out how much of these are typically used
++
++struct file_extent {
++	off_t			offset;
++	file_io_vec		disk;
++};
++
++struct file_map {
++	file_map();
++	~file_map();
++
++	file_extent *operator[](uint32 index);
++	file_extent *ExtentAt(uint32 index);
++	status_t Add(file_io_vec *vecs, size_t vecCount, off_t &amp;lastOffset);
++	void Free();
++
++	union {
++		file_extent	direct[CACHED_FILE_EXTENTS];
++		file_extent	*array;
++	};
++	size_t			count;
++	struct vnode	*vnode;
++};
++
++
++file_map::file_map()
++{
++	array = NULL;
++	count = 0;
++}
++
++
++file_map::~file_map()
++{
++	Free();
++}
++
++
++file_extent *
++file_map::operator[](uint32 index)
++{
++	return ExtentAt(index);
++}
++
++
++file_extent *
++file_map::ExtentAt(uint32 index)
++{
++	if (index &gt;= count)
++		return NULL;
++
++	if (count &gt; CACHED_FILE_EXTENTS)
++		return &amp;array[index];
++
++	return &amp;direct[index];
++}
++
++
++status_t
++file_map::Add(file_io_vec *vecs, size_t vecCount, off_t &amp;lastOffset)
++{
++	TRACE((&quot;file_map::Add(vecCount = %ld)\n&quot;, vecCount));
++
++	off_t offset = 0;
++
++	if (vecCount &lt;= CACHED_FILE_EXTENTS &amp;&amp; count == 0) {
++		// just use the reserved area in the file_cache_ref structure
++	} else {
++		// TODO: once we can invalidate only parts of the file map,
++		//	we might need to copy the previously cached file extends
++		//	from the direct range
++		file_extent *newMap = (file_extent *)realloc(array,
++			(count + vecCount) * sizeof(file_extent));
++		if (newMap == NULL)
++			return B_NO_MEMORY;
++
++		array = newMap;
++
++		if (count != 0) {
++			file_extent *extent = ExtentAt(count - 1);
++			offset = extent-&gt;offset + extent-&gt;disk.length;
++		}
++	}
++
++	int32 start = count;
++	count += vecCount;
++
++	for (uint32 i = 0; i &lt; vecCount; i++) {
++		file_extent *extent = ExtentAt(start + i);
++
++		extent-&gt;offset = offset;
++		extent-&gt;disk = vecs[i];
++
++		offset += extent-&gt;disk.length;
++	}
++
++#ifdef TRACE_FILE_CACHE
++	for (uint32 i = 0; i &lt; count; i++) {
++		file_extent *extent = ExtentAt(i);
++		dprintf(&quot;[%ld] extend offset %Ld, disk offset %Ld, length %Ld\n&quot;,
++			i, extent-&gt;offset, extent-&gt;disk.offset, extent-&gt;disk.length);
++	}
++#endif
++
++	lastOffset = offset;
++	return B_OK;
++}
++
++
++void
++file_map::Free()
++{
++	if (count &gt; CACHED_FILE_EXTENTS)
++		free(array);
++
++	array = NULL;
++	count = 0;
++}
++
++
++//	#pragma mark -
++
++
++static file_extent *
++find_file_extent(file_map &amp;map, off_t offset, uint32 *_index)
++{
++	// TODO: do binary search
++
++	for (uint32 index = 0; index &lt; map.count; index++) {
++		file_extent *extent = map[index];
++
++		if (extent-&gt;offset &lt;= offset
++			&amp;&amp; extent-&gt;offset + extent-&gt;disk.length &gt; offset) {
++			if (_index)
++				*_index = index;
++			return extent;
++		}
++	}
++
++	return NULL;
++}
++
++
++//	#pragma mark - public FS API
++
++
++extern &quot;C&quot; void *
++file_map_create(dev_t mountID, ino_t vnodeID)
++{
++	TRACE((&quot;file_map_create(mountID = %ld, vnodeID = %Ld)\n&quot;, mountID, vnodeID));
++
++	file_map *map = new file_map;
++	if (map == NULL)
++		return NULL;
++
++	// Get the vnode for the object
++	// (note, this does not grab a reference to the node)
++	if (vfs_lookup_vnode(mountID, vnodeID, &amp;map-&gt;vnode) != B_OK) {
++		delete map;
++		return NULL;
++	}
++
++	return map;
++}
++
++
++extern &quot;C&quot; void
++file_map_delete(void *_map)
++{
++	file_map *map = (file_map *)_map;
++	if (map == NULL)
++		return;
++
++	TRACE((&quot;file_map_delete(map = %p)\n&quot;, map));
++	delete map;
++}
++
++
++extern &quot;C&quot; void
++file_map_invalidate(void *_map, off_t offset, off_t size)
++{
++	// TODO: honour offset/size parameters
++	file_map *map = (file_map *)_map;
++	map-&gt;Free();
++}
++
++
++extern &quot;C&quot; status_t
++file_map_translate(void *_map, off_t offset, size_t size, file_io_vec *vecs,
++	size_t *_count)
++{
++	file_map &amp;map = *(file_map *)_map;
++	size_t maxVecs = *_count;
++	status_t status = B_OK;
++
++	if (map.count == 0) {
++		// we don't yet have the map of this file, so let's grab it
++		// (ordered by offset, so that we can do a binary search on them)
++		size_t vecCount = maxVecs;
++		off_t mapOffset = 0;
++
++		while (true) {
++			status = vfs_get_file_map(map.vnode, mapOffset, ~0UL, vecs,
++				&amp;vecCount);
++			if (status &lt; B_OK &amp;&amp; status != B_BUFFER_OVERFLOW)
++				return status;
++
++			status_t addStatus = map.Add(vecs, vecCount, mapOffset);
++			if (addStatus != B_OK) {
++				// only clobber the status in case of failure
++				status = addStatus;
++			}
++
++			if (status != B_BUFFER_OVERFLOW)
++				break;
++
++			// when we are here, the map has been stored in the array, and
++			// the array size was still too small to cover the whole file
++			vecCount = maxVecs;
++		}
++	}
++
++	if (status != B_OK) {
++		// We must invalidate the (part of the) map we already
++		// have, as we cannot know if it's complete or not
++		map.Free();
++		return status;
++	}
++
++	// We now have cached the map of this file, we now need to
++	// translate it for the requested access.
++
++	uint32 index;
++	file_extent *fileExtent = find_file_extent(map, offset, &amp;index);
++	if (fileExtent == NULL) {
++		// access outside file bounds? But that's not our problem
++		*_count = 0;
++		return B_OK;
++	}
++
++	offset -= fileExtent-&gt;offset;
++	vecs[0].offset = fileExtent-&gt;disk.offset + offset;
++	vecs[0].length = fileExtent-&gt;disk.length - offset;
++
++	if (vecs[0].length &gt;= size || index &gt;= map.count - 1) {
++		*_count = 1;
++		return B_OK;
++	}
++
++	// copy the rest of the vecs
++
++	size -= vecs[0].length;
++
++	for (index = 1; index &lt; map.count;) {
++		fileExtent++;
++
++		vecs[index] = fileExtent-&gt;disk;
++		index++;
++
++		if (size &lt;= fileExtent-&gt;disk.length)
++			break;
++
++		if (index &gt;= maxVecs) {
++			*_count = index;
++			return B_BUFFER_OVERFLOW;
++		}
++
++		size -= fileExtent-&gt;disk.length;
++	}
++
++	*_count = index;
++	return B_OK;
++}
++
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004673.html">[Haiku-commits] r22863 -	haiku/trunk/src/add-ons/kernel/busses/ide/silicon_image_3112
+</A></li>
+	<LI>Next message: <A HREF="004675.html">[Haiku-commits] r22865 - in haiku/trunk: headers/posix	src/system/libroot/posix/signal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4674">[ date ]</a>
+              <a href="thread.html#4674">[ thread ]</a>
+              <a href="subject.html#4674">[ subject ]</a>
+              <a href="author.html#4674">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

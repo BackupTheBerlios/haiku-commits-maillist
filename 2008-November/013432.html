@@ -1,0 +1,1103 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28590 - in	haiku/trunk/src/add-ons/input_server/devices: keyboard mouse	touchpad
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28590%20-%20in%0A%09haiku/trunk/src/add-ons/input_server/devices%3A%20keyboard%20mouse%0A%09touchpad&In-Reply-To=%3C200811101116.mAABGA7W013596%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013429.html">
+   <LINK REL="Next"  HREF="013433.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28590 - in	haiku/trunk/src/add-ons/input_server/devices: keyboard mouse	touchpad</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28590%20-%20in%0A%09haiku/trunk/src/add-ons/input_server/devices%3A%20keyboard%20mouse%0A%09touchpad&In-Reply-To=%3C200811101116.mAABGA7W013596%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28590 - in	haiku/trunk/src/add-ons/input_server/devices: keyboard mouse	touchpad">stippi at mail.berlios.de
+       </A><BR>
+    <I>Mon Nov 10 12:16:10 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013429.html">[Haiku-commits] r28589 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="013433.html">[Haiku-commits] r28591 -	haiku/trunk/src/add-ons/input_server/devices/mouse
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13432">[ date ]</a>
+              <a href="thread.html#13432">[ thread ]</a>
+              <a href="subject.html#13432">[ subject ]</a>
+              <a href="author.html#13432">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2008-11-10 12:16:02 +0100 (Mon, 10 Nov 2008)
+New Revision: 28590
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28590&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28590&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/input_server/devices/keyboard/KeyboardInputDevice.cpp
+   haiku/trunk/src/add-ons/input_server/devices/keyboard/KeyboardInputDevice.h
+   haiku/trunk/src/add-ons/input_server/devices/mouse/MouseInputDevice.cpp
+   haiku/trunk/src/add-ons/input_server/devices/mouse/MouseInputDevice.h
+   haiku/trunk/src/add-ons/input_server/devices/touchpad/TouchpadInputDevice.cpp
+   haiku/trunk/src/add-ons/input_server/devices/touchpad/TouchpadInputDevice.h
+Log:
+* Cleanup and refactoring, made several Mouse-/Keyboard-/TouchpadDevice
+  functions private and moved them accordingly in the file.
+* I forgot to initialize the BObjectList to own the items in
+  TouchpadInputDevice.
+* Changed the methods that read and apply settings in all three addons to be
+  executed from the control threads only, which fixes race conditions.
+* The success of opening a device is no longer checked in the Start() method
+  of the *Devices. Instead, the control thread checks the device before it
+  enters the polling loop and cleans up if there was an error. This fixes
+  non-running devices in the input_server because the PS/2 driver publishes
+  devices which is has not checked yet for other reasons. It is important,
+  however, to open() the devices in the Start() hook and not the control
+  thread, otherwise there are unwanted race conditions in case node monitoring
+  events are received more than once for the same device. That's the case
+  for some reason on one of my computers for the AT 0 keyboard.
+
+TODO:
+* Combine the Touchpad and Mouse device addon into one, it's almost the
+  same code except the Touchpad knows more settings and one more control
+  message.
+* Refactor a common base class for Keyboard and Mouse device addon.
+* Fix the mouse speed/acceleration. If the speed is lowered from the default
+  in the preflet, the mouse becomes almost unusable. To fix this, the same
+  trick should be used as I used in the touchpad kernel driver, which is to
+  sum up previous mouse moved fractional offsets.
+
+
+Modified: haiku/trunk/src/add-ons/input_server/devices/keyboard/KeyboardInputDevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/input_server/devices/keyboard/KeyboardInputDevice.cpp	2008-11-10 05:52:43 UTC (rev 28589)
++++ haiku/trunk/src/add-ons/input_server/devices/keyboard/KeyboardInputDevice.cpp	2008-11-10 11:16:02 UTC (rev 28590)
+@@ -26,18 +26,62 @@
+ #include &quot;kb_mouse_driver.h&quot;
+ 
+ 
+-//#define TRACE_KEYBOARD_DEVICE
++#undef TRACE
++#define TRACE_KEYBOARD_DEVICE
+ #ifdef TRACE_KEYBOARD_DEVICE
+-#	define LOG(text...) debug_printf(text)
+-#	define LOG_ERR(text...) LOG(text)
++
++	class FunctionTracer {
++	public:
++		FunctionTracer(const void* pointer, const char* className,
++				const char* functionName,
++				int32&amp; depth)
++			: fFunctionName(),
++			  fPrepend(),
++			  fFunctionDepth(depth),
++			  fPointer(pointer)
++		{
++			fFunctionDepth++;
++			fPrepend.Append(' ', fFunctionDepth * 2);
++			fFunctionName &lt;&lt; className &lt;&lt; &quot;::&quot; &lt;&lt; functionName &lt;&lt; &quot;()&quot;;
++	
++			debug_printf(&quot;%p -&gt; %s%s {\n&quot;, fPointer, fPrepend.String(),
++				fFunctionName.String());
++		}
++	
++		 ~FunctionTracer()
++		{
++			debug_printf(&quot;%p -&gt; %s}\n&quot;, fPointer, fPrepend.String());
++			fFunctionDepth--;
++		}
++	
++	private:
++		BString	fFunctionName;
++		BString	fPrepend;
++		int32&amp;	fFunctionDepth;
++		const void* fPointer;
++	};
++
++
++	static int32 sFunctionDepth = -1;
++#	define KD_CALLED(x...)	FunctionTracer _ft(this, &quot;KeyboardDevice&quot;, \
++								__FUNCTION__, sFunctionDepth)
++#	define KID_CALLED(x...)	FunctionTracer _ft(this, &quot;KeyboardInputDevice&quot;, \
++								__FUNCTION__, sFunctionDepth)
++#	define TRACE(x...)	{ BString _to; \
++							_to.Append(' ', (sFunctionDepth + 1) * 2); \
++							debug_printf(&quot;%p -&gt; %s&quot;, this, _to.String()); \
++							debug_printf(x); }
++#	define LOG_EVENT(text...) do {} while (0)
++#	define LOG_ERR(text...) TRACE(text)
+ #else
+-#	define LOG(text...) do {} while (0)
++#	define TRACE(x...) do {} while (0)
++#	define KD_CALLED(x...) TRACE(x)
++#	define KID_CALLED(x...) TRACE(x)
+ #	define LOG_ERR(text...) debug_printf(text)
++#	define LOG_EVENT(text...) TRACE(x)
+ #endif
+ 
+-#define CALLED() LOG(&quot;%s\n&quot;, __PRETTY_FUNCTION__)
+ 
+-
+ const static uint32 kKeyboardThreadPriority = B_FIRST_REAL_TIME_PRIORITY + 4;
+ const static char* kKeyboardDevicesDirectory = &quot;/dev/input/keyboard&quot;;
+ 
+@@ -346,7 +390,6 @@
+ static char*
+ get_short_name(const char* longName)
+ {
+-	CALLED();
+ 	BString string(longName);
+ 	BString name;
+ 
+@@ -379,8 +422,12 @@
+ 	fThread(-1),
+ 	fActive(false),
+ 	fInputMethodStarted(false),
++	fUpdateSettings(false),
++	fSettingsCommand(0),
+ 	fKeymapLock(&quot;keymap lock&quot;)
+ {
++	KD_CALLED();
++
+ 	strcpy(fPath, path);
+ 	fDeviceRef.name = get_short_name(path);
+ 	fDeviceRef.type = B_KEYBOARD_DEVICE;
+@@ -397,6 +444,9 @@
+ 
+ KeyboardDevice::~KeyboardDevice()
+ {
++	KD_CALLED();
++	TRACE(&quot;delete\n&quot;);
++
+ 	if (fActive)
+ 		Stop();
+ 
+@@ -409,37 +459,11 @@
+ }
+ 
+ 
+-status_t
+-KeyboardDevice::EnqueueInlineInputMethod(int32 opcode,
+-	const char* string, bool confirmed, BMessage* keyDown)
+-{
+-	BMessage* message = new BMessage(B_INPUT_METHOD_EVENT);
+-	if (message == NULL)
+-		return B_NO_MEMORY;
+-
+-	message-&gt;AddInt32(&quot;be:opcode&quot;, opcode);
+-	message-&gt;AddBool(&quot;be:inline_only&quot;, true);
+-
+-	if (string != NULL)
+-		message-&gt;AddString(&quot;be:string&quot;, string);
+-	if (confirmed)
+-		message-&gt;AddBool(&quot;be:confirmed&quot;, true);
+-	if (keyDown)
+-		message-&gt;AddMessage(&quot;be:translated&quot;, keyDown);
+-	if (opcode == B_INPUT_METHOD_STARTED)
+-		message-&gt;AddMessenger(&quot;be:reply_to&quot;, this);
+-
+-	status_t status = fOwner-&gt;EnqueueMessage(message);
+-	if (status != B_OK)
+-		delete message;
+-
+-	return status;
+-}
+-
+-
+ void
+ KeyboardDevice::MessageReceived(BMessage* message)
+ {
++	KD_CALLED();
++
+ 	if (message-&gt;what != B_INPUT_METHOD_EVENT) {
+ 		BHandler::MessageReceived(message);
+ 		return;
+@@ -457,22 +481,21 @@
+ status_t
+ KeyboardDevice::Start()
+ {
+-	if ((fFD = open(fPath, O_RDWR)) &lt; B_OK) {
+-		fprintf(stderr, &quot;error when opening %s: %s\n&quot;, fPath, strerror(errno));
+-		return B_ERROR;
+-	}
++	KD_CALLED();
++	TRACE(&quot;name: %s\n&quot;, fDeviceRef.name);
+ 
+-	InitFromSettings();
++	fFD = open(fPath, O_RDWR);
++		// let the control thread handle any error on opening the device
+ 
+ 	char threadName[B_OS_NAME_LENGTH];
+ 	snprintf(threadName, B_OS_NAME_LENGTH, &quot;%s watcher&quot;, fDeviceRef.name);
+ 
+-	fActive = true;
+-	fThread = spawn_thread(_ThreadEntry, threadName,
++	fThread = spawn_thread(_ControlThreadEntry, threadName,
+ 		kKeyboardThreadPriority, this);
+ 	if (fThread &lt; B_OK)
+ 		return fThread;
+ 
++	fActive = true;
+ 	resume_thread(fThread);
+ 	return B_OK;
+ }
+@@ -480,6 +503,9 @@
+ void
+ KeyboardDevice::Stop()
+ {
++	KD_CALLED();
++	TRACE(&quot;name: %s\n&quot;, fDeviceRef.name);
++
+ 	fActive = false;
+ 
+ 	close(fFD);
+@@ -495,70 +521,48 @@
+ 
+ 
+ status_t
+-KeyboardDevice::InitFromSettings(uint32 opcode)
++KeyboardDevice::UpdateSettings(uint32 opcode)
+ {
+-	CALLED();
++	KD_CALLED();
+ 
+-	if (opcode == 0 || opcode == B_KEY_REPEAT_RATE_CHANGED) {
+-		if (get_key_repeat_rate(&amp;fSettings.key_repeat_rate) != B_OK)
+-			LOG_ERR(&quot;error when get_key_repeat_rate\n&quot;);
+-		else if (ioctl(fFD, KB_SET_KEY_REPEAT_RATE,
+-			&amp;fSettings.key_repeat_rate) != B_OK)
+-			LOG_ERR(&quot;error when KB_SET_KEY_REPEAT_RATE, fd:%d\n&quot;, fFD);
+-	}
++	if (fThread &lt; 0)
++		return B_ERROR;
+ 
+-	if (opcode == 0 || opcode == B_KEY_REPEAT_DELAY_CHANGED) {
+-		if (get_key_repeat_delay(&amp;fSettings.key_repeat_delay) != B_OK)
+-			LOG_ERR(&quot;error when get_key_repeat_delay\n&quot;);
+-		else if (ioctl(fFD, KB_SET_KEY_REPEAT_DELAY,
+-			&amp;fSettings.key_repeat_delay) != B_OK)
+-			LOG_ERR(&quot;error when KB_SET_KEY_REPEAT_DELAY, fd:%d\n&quot;, fFD);
+-	}
++	// schedule updating the settings from within the control thread
++	fSettingsCommand = opcode;
++	fUpdateSettings = true;
+ 
+-	if (opcode == 0 || opcode == B_KEY_MAP_CHANGED
+-		|| opcode == B_KEY_LOCKS_CHANGED) {
+-		BAutolock lock(fKeymapLock);
+-		fKeymap.LoadCurrent();
+-		fModifiers = fKeymap.Locks();
+-		UpdateLEDs();
+-	}
+-
+ 	return B_OK;
+ }
+ 
+ 
+-void
+-KeyboardDevice::UpdateLEDs()
+-{
+-	if (fFD &lt; 0)
+-		return;
++// #pragma mark - control thread
+ 
+-	uint32 locks = fModifiers;
+-	char lockIO[3];
+-	memset(lockIO, 0, sizeof(lockIO));
+-	if (locks &amp; B_NUM_LOCK)
+-		lockIO[0] = 1;
+-	if (locks &amp; B_CAPS_LOCK)
+-		lockIO[1] = 1;
+-	if (locks &amp; B_SCROLL_LOCK)
+-		lockIO[2] = 1;
+ 
+-	ioctl(fFD, KB_SET_LEDS, &amp;lockIO);
+-}
+-
+-
+ /*static*/ int32
+-KeyboardDevice::_ThreadEntry(void* arg)
++KeyboardDevice::_ControlThreadEntry(void* arg)
+ {
+ 	KeyboardDevice* device = (KeyboardDevice*)arg;
+-	return device-&gt;_Thread();
++	return device-&gt;_ControlThread();
+ }
+ 
+ 
+ int32
+-KeyboardDevice::_Thread()
++KeyboardDevice::_ControlThread()
+ {
+-	CALLED();
++	KD_CALLED();
++	TRACE(&quot;fPath: %s\n&quot;, fPath);
++
++	if (fFD &lt; B_OK) {
++		LOG_ERR(&quot;KeyboardDevice: error when opening %s: %s\n&quot;,
++			fPath, strerror(errno));
++		_ControlThreadCleanup();
++		// TOAST!
++		return B_ERROR;
++	}
++
++	_UpdateSettings(0);
++
+ 	uint8 buffer[16];
+ 	uint8 activeDeadKey = 0;
+ 	uint32 lastKeyCode = 0;
+@@ -568,29 +572,24 @@
+ 
+ 	memset(states, 0, sizeof(states));
+ 
+-	LOG(&quot;%s\n&quot;, __PRETTY_FUNCTION__);
+-
+ 	while (fActive) {
+ 		if (ioctl(fFD, KB_READ, &amp;buffer) != B_OK) {
+-			if (fActive) {
+-				fThread = -1;
+-				fOwner-&gt;_RemoveDevice(fPath);
+-			} else {
+-				// In case fActive is already false, another thread
+-				// waits for this thread to quit, and may already hold
+-				// locks that _RemoveDevice() wants to acquire. In another
+-				// words, the device is already being removed, so we simply
+-				// quit here.
+-			}
++			_ControlThreadCleanup();
+ 			// TOAST!
+ 			return 0;
+ 		}
+ 
++		// Update the settings from this thread if necessary
++		if (fUpdateSettings) {
++			_UpdateSettings(fSettingsCommand);
++			fUpdateSettings = false;
++		}
++
+ 		uint32 keycode = 0;
+ 		bool isKeyDown = false;
+ 		bigtime_t timestamp = 0;
+ 
+-		LOG(&quot;KB_READ :&quot;);
++		LOG_EVENT(&quot;KB_READ :&quot;);
+ 
+ 		if (fIsAT) {
+ 			at_kbd_io* atKeyboard = (at_kbd_io*)buffer;
+@@ -598,7 +597,7 @@
+ 				keycode = kATKeycodeMap[atKeyboard-&gt;scancode - 1];
+ 			isKeyDown = atKeyboard-&gt;is_keydown;
+ 			timestamp = atKeyboard-&gt;timestamp;
+-			LOG(&quot; %02x&quot;, atKeyboard-&gt;scancode);
++			LOG_EVENT(&quot; %02x&quot;, atKeyboard-&gt;scancode);
+ 		} else {
+ 			raw_key_info* rawKeyInfo= (raw_key_info*)buffer;
+ 			isKeyDown = rawKeyInfo-&gt;is_keydown;
+@@ -609,7 +608,7 @@
+ 		if (keycode == 0)
+ 			continue;
+ 
+-		LOG(&quot; %Ld, %02x, %02lx\n&quot;, timestamp, isKeyDown, keycode);
++		LOG_EVENT(&quot; %Ld, %02x, %02lx\n&quot;, timestamp, isKeyDown, keycode);
+ 
+ 		if (isKeyDown &amp;&amp; keycode == 0x68) {
+ 			// MENU KEY for Tracker
+@@ -638,7 +637,7 @@
+ 		if (isKeyDown &amp;&amp; keycode == 0x34 // DELETE KEY
+ 			&amp;&amp; (states[0x5c &gt;&gt; 3] &amp; (1 &lt;&lt; (7 - (0x5c &amp; 0x7))))
+ 			&amp;&amp; (states[0x5d &gt;&gt; 3] &amp; (1 &lt;&lt; (7 - (0x5d &amp; 0x7))))) {
+-			LOG(&quot;TeamMonitor called\n&quot;);
++			LOG_EVENT(&quot;TeamMonitor called\n&quot;);
+ 
+ 			// show the team monitor
+ 			if (fOwner-&gt;fTeamMonitorWindow == NULL)
+@@ -686,7 +685,7 @@
+ 				delete msg;
+ 
+ 			if (modifiers &amp; (B_CAPS_LOCK | B_NUM_LOCK | B_SCROLL_LOCK))
+-				UpdateLEDs();
++				_UpdateLEDs();
+ 		}
+ 
+ 		uint8 newDeadKey = 0;
+@@ -745,25 +744,25 @@
+ 			if (isKeyDown &amp;&amp; !modifiers &amp;&amp; activeDeadKey != 0
+ 				&amp;&amp; fInputMethodStarted) {
+ 				// a dead key was completed
+-				EnqueueInlineInputMethod(B_INPUT_METHOD_CHANGED,
++				_EnqueueInlineInputMethod(B_INPUT_METHOD_CHANGED,
+ 					string, true, msg);
+ 			} else if (fOwner-&gt;EnqueueMessage(msg) != B_OK)
+ 				delete msg;
+ 		} else if (isKeyDown) {
+ 			// start of a dead key
+-			if (EnqueueInlineInputMethod(B_INPUT_METHOD_STARTED) == B_OK) {
++			if (_EnqueueInlineInputMethod(B_INPUT_METHOD_STARTED) == B_OK) {
+ 				char* string = NULL;
+ 				int32 numBytes = 0;
+ 				fKeymap.GetChars(keycode, fModifiers, 0, &amp;string, &amp;numBytes);
+ 
+-				if (EnqueueInlineInputMethod(B_INPUT_METHOD_CHANGED, string) == B_OK)
++				if (_EnqueueInlineInputMethod(B_INPUT_METHOD_CHANGED, string) == B_OK)
+ 					fInputMethodStarted = true;
+ 			}
+ 		}
+ 
+ 		if (!isKeyDown &amp;&amp; !modifiers) {
+ 			if (activeDeadKey != 0) {
+-				EnqueueInlineInputMethod(B_INPUT_METHOD_STOPPED);
++				_EnqueueInlineInputMethod(B_INPUT_METHOD_STOPPED);
+ 				fInputMethodStarted = false;
+ 			}
+ 
+@@ -777,15 +776,116 @@
+ }
+ 
+ 
++void
++KeyboardDevice::_ControlThreadCleanup()
++{
++	// NOTE: Only executed when the control thread detected an error
++	// and from within the control thread!
++
++	if (fActive) {
++		fThread = -1;
++		fOwner-&gt;_RemoveDevice(fPath);
++	} else {
++		// In case active is already false, another thread
++		// waits for this thread to quit, and may already hold
++		// locks that _RemoveDevice() wants to acquire. In another
++		// words, the device is already being removed, so we simply
++		// quit here.
++	}
++}
++
++
++void
++KeyboardDevice::_UpdateSettings(uint32 opcode)
++{
++	KD_CALLED();
++
++	if (opcode == 0 || opcode == B_KEY_REPEAT_RATE_CHANGED) {
++		if (get_key_repeat_rate(&amp;fSettings.key_repeat_rate) != B_OK) {
++			LOG_ERR(&quot;error when get_key_repeat_rate\n&quot;);
++		} else if (ioctl(fFD, KB_SET_KEY_REPEAT_RATE,
++			&amp;fSettings.key_repeat_rate) != B_OK) {
++			LOG_ERR(&quot;error when KB_SET_KEY_REPEAT_RATE, fd:%d\n&quot;, fFD);
++		}
++	}
++
++	if (opcode == 0 || opcode == B_KEY_REPEAT_DELAY_CHANGED) {
++		if (get_key_repeat_delay(&amp;fSettings.key_repeat_delay) != B_OK) {
++			LOG_ERR(&quot;error when get_key_repeat_delay\n&quot;);
++		} else if (ioctl(fFD, KB_SET_KEY_REPEAT_DELAY,
++			&amp;fSettings.key_repeat_delay) != B_OK) {
++			LOG_ERR(&quot;error when KB_SET_KEY_REPEAT_DELAY, fd:%d\n&quot;, fFD);
++		}
++	}
++
++	if (opcode == 0 || opcode == B_KEY_MAP_CHANGED
++		|| opcode == B_KEY_LOCKS_CHANGED) {
++		BAutolock lock(fKeymapLock);
++		fKeymap.LoadCurrent();
++		fModifiers = fKeymap.Locks();
++		_UpdateLEDs();
++	}
++}
++
++
++void
++KeyboardDevice::_UpdateLEDs()
++{
++	if (fFD &lt; 0)
++		return;
++
++	uint32 locks = fModifiers;
++	char lockIO[3];
++	memset(lockIO, 0, sizeof(lockIO));
++	if (locks &amp; B_NUM_LOCK)
++		lockIO[0] = 1;
++	if (locks &amp; B_CAPS_LOCK)
++		lockIO[1] = 1;
++	if (locks &amp; B_SCROLL_LOCK)
++		lockIO[2] = 1;
++
++	ioctl(fFD, KB_SET_LEDS, &amp;lockIO);
++}
++
++
++status_t
++KeyboardDevice::_EnqueueInlineInputMethod(int32 opcode,
++	const char* string, bool confirmed, BMessage* keyDown)
++{
++	BMessage* message = new BMessage(B_INPUT_METHOD_EVENT);
++	if (message == NULL)
++		return B_NO_MEMORY;
++
++	message-&gt;AddInt32(&quot;be:opcode&quot;, opcode);
++	message-&gt;AddBool(&quot;be:inline_only&quot;, true);
++
++	if (string != NULL)
++		message-&gt;AddString(&quot;be:string&quot;, string);
++	if (confirmed)
++		message-&gt;AddBool(&quot;be:confirmed&quot;, true);
++	if (keyDown)
++		message-&gt;AddMessage(&quot;be:translated&quot;, keyDown);
++	if (opcode == B_INPUT_METHOD_STARTED)
++		message-&gt;AddMessenger(&quot;be:reply_to&quot;, this);
++
++	status_t status = fOwner-&gt;EnqueueMessage(message);
++	if (status != B_OK)
++		delete message;
++
++	return status;
++}
++
++
+ //	#pragma mark -
+ 
+ 
+ KeyboardInputDevice::KeyboardInputDevice()
+ 	:
+ 	fDevices(2, true),
++	fDeviceListLock(&quot;KeyboardInputDevice list&quot;),
+ 	fTeamMonitorWindow(NULL)
+ {
+-	CALLED();
++	KID_CALLED();
+ 
+ 	StartMonitoringDevice(kKeyboardDevicesDirectory);
+ 	_RecursiveScan(kKeyboardDevicesDirectory);
+@@ -794,7 +894,7 @@
+ 
+ KeyboardInputDevice::~KeyboardInputDevice()
+ {
+-	CALLED();
++	KID_CALLED();
+ 
+ 	if (fTeamMonitorWindow) {
+ 		fTeamMonitorWindow-&gt;PostMessage(B_QUIT_REQUESTED);
+@@ -809,7 +909,7 @@
+ status_t
+ KeyboardInputDevice::SystemShuttingDown()
+ {
+-	CALLED();
++	KID_CALLED();
+ 	if (fTeamMonitorWindow)
+ 		fTeamMonitorWindow-&gt;PostMessage(SYSTEM_SHUTTING_DOWN);
+ 
+@@ -820,7 +920,7 @@
+ status_t
+ KeyboardInputDevice::InitCheck()
+ {
+-	CALLED();
++	KID_CALLED();
+ 	return BInputServerDevice::InitCheck();
+ }
+ 
+@@ -828,7 +928,9 @@
+ status_t
+ KeyboardInputDevice::Start(const char* name, void* cookie)
+ {
+-	CALLED();
++	KID_CALLED();
++	TRACE(&quot;name %s\n&quot;, name);
++
+ 	KeyboardDevice* device = (KeyboardDevice*)cookie;
+ 
+ 	return device-&gt;Start();
+@@ -838,11 +940,11 @@
+ status_t
+ KeyboardInputDevice::Stop(const char* name, void* cookie)
+ {
+-	CALLED();
++	KID_CALLED();
++	TRACE(&quot;name %s\n&quot;, name);
++
+ 	KeyboardDevice* device = (KeyboardDevice*)cookie;
+ 
+-	LOG(&quot;Stop(%s)\n&quot;, name);
+-
+ 	device-&gt;Stop();
+ 	return B_OK;
+ }
+@@ -852,15 +954,15 @@
+ KeyboardInputDevice::Control(const char* name, void* cookie,
+ 	uint32 command, BMessage* message)
+ {
+-	CALLED();
+-	LOG(&quot;Control(%s, code: %lu)\n&quot;, name, command);
++	KID_CALLED();
++	TRACE(&quot;KeyboardInputDevice::Control(%s, code: %lu)\n&quot;, name, command);
+ 
+ 	if (command == B_NODE_MONITOR)
+ 		_HandleMonitor(message);
+ 	else if (command &gt;= B_KEY_MAP_CHANGED
+ 		&amp;&amp; command &lt;= B_KEY_REPEAT_RATE_CHANGED) {
+ 		KeyboardDevice* device = (KeyboardDevice*)cookie;
+-		device-&gt;InitFromSettings(command);
++		device-&gt;UpdateSettings(command);
+ 	}
+ 	return B_OK;
+ }
+@@ -869,7 +971,7 @@
+ status_t
+ KeyboardInputDevice::_HandleMonitor(BMessage* message)
+ {
+-	CALLED();
++	KID_CALLED();
+ 
+ 	const char* path;
+ 	int32 opcode;
+@@ -906,8 +1008,11 @@
+ status_t
+ KeyboardInputDevice::_AddDevice(const char* path)
+ {
+-	CALLED();
++	KID_CALLED();
++	TRACE(&quot;path: %s\n&quot;, path);
+ 
++	BAutolock _(fDeviceListLock);
++
+ 	_RemoveDevice(path);
+ 
+ 	KeyboardDevice* device = new(std::nothrow) KeyboardDevice(this, path);
+@@ -927,12 +1032,15 @@
+ status_t
+ KeyboardInputDevice::_RemoveDevice(const char* path)
+ {
+-	CALLED();
++	BAutolock _(fDeviceListLock);
+ 
+ 	KeyboardDevice* device = _FindDevice(path);
+ 	if (device == NULL)
+ 		return B_ENTRY_NOT_FOUND;
+ 
++	KID_CALLED();
++	TRACE(&quot;path: %s\n&quot;, path);
++
+ 	input_device_ref* devices[2];
+ 	devices[0] = device-&gt;DeviceRef();
+ 	devices[1] = NULL;
+@@ -948,7 +1056,9 @@
+ void
+ KeyboardInputDevice::_RecursiveScan(const char* directory)
+ {
+-	CALLED();
++	KID_CALLED();
++	TRACE(&quot;directory: %s\n&quot;, directory);
++
+ 	BEntry entry;
+ 	BDirectory dir(directory);
+ 	while (dir.GetNextEntry(&amp;entry) == B_OK) {
+
+Modified: haiku/trunk/src/add-ons/input_server/devices/keyboard/KeyboardInputDevice.h
+===================================================================
+--- haiku/trunk/src/add-ons/input_server/devices/keyboard/KeyboardInputDevice.h	2008-11-10 05:52:43 UTC (rev 28589)
++++ haiku/trunk/src/add-ons/input_server/devices/keyboard/KeyboardInputDevice.h	2008-11-10 11:16:02 UTC (rev 28590)
+@@ -10,7 +10,6 @@
+ #include &lt;Handler.h&gt;
+ #include &lt;InputServerDevice.h&gt;
+ #include &lt;Locker.h&gt;
+-#include &lt;List.h&gt;
+ 
+ #include &lt;InputServerTypes.h&gt;
+ #include &lt;ObjectList.h&gt;
+@@ -29,23 +28,24 @@
+ 	virtual						~KeyboardDevice();
+ 
+ 	virtual	void				MessageReceived(BMessage* message);
+-			status_t			EnqueueInlineInputMethod(int32 opcode,
+-									const char* string = NULL,
+-									bool confirmed = false,
+-									BMessage* keyDown = NULL);
+-
+ 			status_t			Start();
+ 			void				Stop();
+ 
+-			status_t			InitFromSettings(uint32 opcode = 0);
+-			void				UpdateLEDs();
++			status_t			UpdateSettings(uint32 opcode = 0);
+ 
+ 			const char*			Path() const { return fPath; }
+ 			input_device_ref*	DeviceRef() { return &fDeviceRef; }
+ 
+ private:
+-	static	int32				_ThreadEntry(void* arg);
+-			int32				_Thread();
++	static	int32				_ControlThreadEntry(void* arg);
++			int32				_ControlThread();
++			void				_ControlThreadCleanup();
++			void				_UpdateSettings(uint32 opcode);
++			void				_UpdateLEDs();
++			status_t			_EnqueueInlineInputMethod(int32 opcode,
++									const char* string = NULL,
++									bool confirmed = false,
++									BMessage* keyDown = NULL);
+ 
+ private:
+ 			KeyboardInputDevice* fOwner;
+@@ -59,6 +59,9 @@
+ 	volatile bool				fInputMethodStarted;
+ 			uint32				fModifiers;
+ 
++	volatile bool				fUpdateSettings;
++	volatile uint32				fSettingsCommand;
++
+ 			Keymap				fKeymap;
+ 			BLocker				fKeymapLock;
+ };
+@@ -92,6 +95,7 @@
+ 			status_t			_RemoveDevice(const char* path);
+ 
+ 			BObjectList&lt;KeyboardDevice&gt; fDevices;
++			BLocker				fDeviceListLock;
+ 			TeamMonitorWindow*	fTeamMonitorWindow;
+ };
+ 
+
+Modified: haiku/trunk/src/add-ons/input_server/devices/mouse/MouseInputDevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/input_server/devices/mouse/MouseInputDevice.cpp	2008-11-10 05:52:43 UTC (rev 28589)
++++ haiku/trunk/src/add-ons/input_server/devices/mouse/MouseInputDevice.cpp	2008-11-10 11:16:02 UTC (rev 28590)
+@@ -18,6 +18,7 @@
+ #include &lt;stdlib.h&gt;
+ #include &lt;unistd.h&gt;
+ 
++#include &lt;Autolock.h&gt;
+ #include &lt;Debug.h&gt;
+ #include &lt;Directory.h&gt;
+ #include &lt;Entry.h&gt;
+@@ -31,7 +32,6 @@
+ 
+ 
+ #undef TRACE
+-#undef CALLED
+ //#define TRACE_MOUSE_DEVICE
+ #ifdef TRACE_MOUSE_DEVICE
+ 
+@@ -76,64 +76,63 @@
+ 							_to.Append(' ', (sFunctionDepth + 1) * 2); \
+ 							debug_printf(&quot;%p -&gt; %s&quot;, this, _to.String()); \
+ 							debug_printf(x); }
+-#	define LOG(text...) debug_printf(text)
+ #	define LOG_EVENT(text...) do {} while (0)
+-#	define LOG_ERR(text...) LOG(text)
++#	define LOG_ERR(text...) TRACE(text)
+ #else
+ #	define TRACE(x...) do {} while (0)
+ #	define MD_CALLED(x...) TRACE(x)
+ #	define MID_CALLED(x...) TRACE(x)
+-#	define LOG(text...) TRACE(x)
+ #	define LOG_ERR(text...) debug_printf(text)
+ #	define LOG_EVENT(text...) TRACE(x)
+ #endif
+ 
+ 
+-//#define LOG_DEVICES(text...) debug_printf(text)
+-#define LOG_DEVICES(text...) LOG(text)
+-
+-
+-
+ const static uint32 kMouseThreadPriority = B_FIRST_REAL_TIME_PRIORITY + 4;
+ const static char* kMouseDevicesDirectory = &quot;/dev/input/mouse&quot;;
+ 
+ 
+ class MouseDevice {
+-	public:
+-		MouseDevice(MouseInputDevice&amp; target, const char* path);
+-		~MouseDevice();
++public:
++								MouseDevice(MouseInputDevice&amp; target,
++									const char* path);
++								~MouseDevice();
+ 
+-		status_t Start();
+-		void Stop();
++			status_t			Start();
++			void				Stop();
+ 
+-		status_t UpdateSettings();
++			status_t			UpdateSettings();
+ 
+-		const char* Path() const { return fPath.String(); }
+-		input_device_ref* DeviceRef() { return &fDeviceRef; }
++			const char*			Path() const { return fPath.String(); }
++			input_device_ref*	DeviceRef() { return &fDeviceRef; }
+ 
+-	private:
+-		void _Run();
+-		static status_t _ThreadFunction(void* arg);
++private:
++			char*				_BuildShortName() const;
+ 
+-		BMessage* _BuildMouseMessage(uint32 what, uint64 when, uint32 buttons,
+-					int32 deltaX, int32 deltaY) const;
+-		void _ComputeAcceleration(const mouse_movement&amp; movements,
+-					int32&amp; deltaX, int32&amp; deltaY) const;
+-		uint32 _RemapButtons(uint32 buttons) const;
++	static	status_t			_ControlThreadEntry(void* arg);
++			void				_ControlThread();
++			void				_ControlThreadCleanup();
++			void				_UpdateSettings();
+ 
+-		char* _BuildShortName() const;
++			BMessage*			_BuildMouseMessage(uint32 what,
++									uint64 when, uint32 buttons,
++									int32 deltaX, int32 deltaY) const;
++			void				_ComputeAcceleration(
++									const mouse_movement&amp; movements,
++									int32&amp; deltaX, int32&amp; deltaY) const;
++			uint32				_RemapButtons(uint32 buttons) const;
+ 
+-	private:
+-		MouseInputDevice&amp;	fTarget;
+-		BString				fPath;
+-		int					fDevice;
++private:
++			MouseInputDevice&amp;	fTarget;
++			BString				fPath;
++			int					fDevice;
+ 
+-		input_device_ref	fDeviceRef;
+-		mouse_settings		fSettings;
+-		bool				fDeviceRemapsButtons;
++			input_device_ref	fDeviceRef;
++			mouse_settings		fSettings;
++			bool				fDeviceRemapsButtons;
+ 
+-		thread_id			fThread;
+-		volatile bool		fActive;
++			thread_id			fThread;
++	volatile bool				fActive;
++	volatile bool				fUpdateSettings;
+ };
+ 
+ 
+@@ -154,7 +153,8 @@
+ 	fDevice(-1),
+ 	fDeviceRemapsButtons(false),
+ 	fThread(-1),
+-	fActive(false)
++	fActive(false),
++	fUpdateSettings(false)
+ {
+ 	MD_CALLED();
+ 
+@@ -175,9 +175,6 @@
+ 	MD_CALLED();
+ 	TRACE(&quot;delete\n&quot;);
+ 
+-	if (fTarget._HasDevice(this))
+-		TRACE(&quot;still in the list!\n&quot;);
+-
+ 	if (fActive)
+ 		Stop();
+ 
+@@ -191,15 +188,12 @@
+ 	MD_CALLED();
+ 
+ 	fDevice = open(fPath.String(), O_RDWR);
+-	if (fDevice &lt; 0)
+-		return errno;
++		// let the control thread handle any error on opening the device
+ 
+-	UpdateSettings();
+-
+ 	char threadName[B_OS_NAME_LENGTH];
+ 	snprintf(threadName, B_OS_NAME_LENGTH, &quot;%s watcher&quot;, fDeviceRef.name);
+ 
+-	fThread = spawn_thread(_ThreadFunction, threadName,
++	fThread = spawn_thread(_ControlThreadEntry, threadName,
+ 		kMouseThreadPriority, (void*)this);
+ 
+ 	status_t status;
+@@ -213,7 +207,6 @@
+ 	if (status &lt; B_OK) {
+ 		LOG_ERR(&quot;%s: can't spawn/resume watching thread: %s\n&quot;,
+ 			fDeviceRef.name, strerror(status));
+-		close(fDevice);
+ 		return status;
+ 	}
+ 
+@@ -248,45 +241,63 @@
+ {
+ 	MD_CALLED();
+ 
+-	// retrieve current values
++	if (fThread &lt; 0)
++		return B_ERROR;
+ 
+-	if (get_mouse_map(&amp;fSettings.map) != B_OK)
+-		LOG_ERR(&quot;error when get_mouse_map\n&quot;);
+-	else
+-		fDeviceRemapsButtons = ioctl(fDevice, MS_SET_MAP, &amp;fSettings.map) == B_OK;
++	fUpdateSettings = true;
++		// This will provoke the control thread to update the settings.
+ 
+-	if (get_click_speed(&amp;fSettings.click_speed) != B_OK)
+-		LOG_ERR(&quot;error when get_click_speed\n&quot;);
+-	else
+-		ioctl(fDevice, MS_SET_CLICKSPEED, &amp;fSettings.click_speed);
++	return B_OK;
++}
+ 
+-	if (get_mouse_speed(&amp;fSettings.accel.speed) != B_OK)
+-		LOG_ERR(&quot;error when get_mouse_speed\n&quot;);
+-	else {
+-		if (get_mouse_acceleration(&amp;fSettings.accel.accel_factor) != B_OK)
+-			LOG_ERR(&quot;error when get_mouse_acceleration\n&quot;);
+-		else {
+-			mouse_accel accel;
+-			ioctl(fDevice, MS_GET_ACCEL, &amp;accel);
+-			accel.speed = fSettings.accel.speed;
+-			accel.accel_factor = fSettings.accel.accel_factor;
+-			ioctl(fDevice, MS_SET_ACCEL, &amp;fSettings.accel);
+-		}
+-	}
+ 
+-	if (get_mouse_type(&amp;fSettings.type) != B_OK)
+-		LOG_ERR(&quot;error when get_mouse_type\n&quot;);
++char*
++MouseDevice::_BuildShortName() const
++{
++	BString string(fPath);
++	BString name;
++
++	int32 slash = string.FindLast(&quot;/&quot;);
++	string.CopyInto(name, slash + 1, string.Length() - slash);
++	int32 index = atoi(name.String()) + 1;
++
++	int32 previousSlash = string.FindLast(&quot;/&quot;, slash);
++	string.CopyInto(name, previousSlash + 1, slash - previousSlash - 1);
++
++	if (name == &quot;ps2&quot;)
++		name = &quot;PS/2&quot;;
+ 	else
+-		ioctl(fDevice, MS_SET_TYPE, &amp;fSettings.type);
++		name.Capitalize();
+ 
+-	return B_OK;
++	name &lt;&lt; &quot; Mouse &quot; &lt;&lt; index;
+ 
++	return strdup(name.String());
+ }
+ 
+ 
++// #pragma mark - control thread
++
++
++status_t
++MouseDevice::_ControlThreadEntry(void* arg)
++{
++	MouseDevice* device = (MouseDevice*)arg;
++	device-&gt;_ControlThread();
++	return B_OK;
++}
++
++
+ void
+-MouseDevice::_Run()
++MouseDevice::_ControlThread()
+ {
++	if (fDevice &lt; 0) {
++		_ControlThreadCleanup();
++		// TOAST!
++		return;
++	}
++
++	_UpdateSettings();
++
+ 	uint32 lastButtons = 0;
+ 
+ 	while (fActive) {
+@@ -294,20 +305,17 @@
+ 		memset(&amp;movements, 0, sizeof(movements));
+ 
+ 		if (ioctl(fDevice, MS_READ, &amp;movements) != B_OK) {
+-			if (fActive) {
+-				fThread = -1;
+-				fTarget._RemoveDevice(fPath.String());
+-			} else {
+-				// In case active is already false, another thread
+-				// waits for this thread to quit, and may already hold
+-				// locks that _RemoveDevice() wants to acquire. In another
+-				// words, the device is already being removed, so we simply
+-				// quit here.
+-			}
++			_ControlThreadCleanup();
+ 			// TOAST!
+ 			return;
+ 		}
+ 
++		// take care of updating the settings first, if necessary
++		if (fUpdateSettings) {
++			_UpdateSettings();
++			fUpdateSettings = false;
++		}
++
+ 		uint32 buttons = lastButtons ^ movements.buttons;
+ 
+ 		uint32 remappedButtons = _RemapButtons(movements.buttons);
+@@ -361,15 +369,65 @@
+ }
+ 
+ 
+-status_t
+-MouseDevice::_ThreadFunction(void* arg)
++void
++MouseDevice::_ControlThreadCleanup()
+ {
+-	MouseDevice* device = (MouseDevice*)arg;
+-	device-&gt;_Run();
+-	return B_OK;
++	// NOTE: Only executed when the control thread detected an error
++	// and from within the control thread!
++
++	if (fActive) {
++		fThread = -1;
++		fTarget._RemoveDevice(fPath.String());
++	} else {
++		// In case active is already false, another thread
++		// waits for this thread to quit, and may already hold
++		// locks that _RemoveDevice() wants to acquire. In another
++		// words, the device is already being removed, so we simply
++		// quit here.
++	}
+ }
+ 
+ 
++void
+
+[... truncated: 731 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013429.html">[Haiku-commits] r28589 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="013433.html">[Haiku-commits] r28591 -	haiku/trunk/src/add-ons/input_server/devices/mouse
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13432">[ date ]</a>
+              <a href="thread.html#13432">[ thread ]</a>
+              <a href="subject.html#13432">[ subject ]</a>
+              <a href="author.html#13432">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

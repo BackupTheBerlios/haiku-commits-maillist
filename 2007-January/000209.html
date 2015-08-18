@@ -1,0 +1,191 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r19801 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19801%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200701142329.l0ENTOkk017398%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000208.html">
+   <LINK REL="Next"  HREF="000210.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r19801 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19801%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200701142329.l0ENTOkk017398%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r19801 - haiku/trunk/src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Jan 15 00:29:24 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000208.html">[Haiku-commits] r19800 - in haiku/trunk: headers/private/kernel	src/system/kernel/arch/x86 src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="000210.html">[Haiku-commits] r19802 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#209">[ date ]</a>
+              <a href="thread.html#209">[ thread ]</a>
+              <a href="subject.html#209">[ subject ]</a>
+              <a href="author.html#209">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-01-15 00:29:23 +0100 (Mon, 15 Jan 2007)
+New Revision: 19801
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=19801&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=19801&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm_cache.c
+Log:
+vm_cache_remove_consumer() did not only access vm_cache_ref::cache without having
+had the cache_ref locked, it also locked two refs in the wrong order (bottom-up);
+there was even a TODO item for this...
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.c	2007-01-14 23:26:20 UTC (rev 19800)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.c	2007-01-14 23:29:23 UTC (rev 19801)
+@@ -407,13 +407,14 @@
+ void
+ vm_cache_remove_consumer(vm_cache_ref *cacheRef, vm_cache *consumer)
+ {
+-	vm_cache *cache = cacheRef-&gt;cache;
+ 	vm_cache *newSource = NULL;
++	vm_cache *cache;
+ 
+-	TRACE((&quot;remove consumer vm cache %p from cache %p\n&quot;, consumer, cache));
++	TRACE((&quot;remove consumer vm cache %p from cache %p\n&quot;, consumer, cacheRef-&gt;cache));
+ 	ASSERT_LOCKED_MUTEX(&amp;consumer-&gt;ref-&gt;lock);
+ 
+ 	mutex_lock(&amp;cacheRef-&gt;lock);
++	cache = cacheRef-&gt;cache;
+ 	list_remove_item(&amp;cache-&gt;consumers, consumer);
+ 	consumer-&gt;source = NULL;
+ 
+@@ -423,36 +424,73 @@
+ 		// The cache is not really needed anymore - it can be merged with its only
+ 		// consumer left.
+ 		vm_cache_ref *consumerRef;
+-		vm_page *page, *nextPage;
++		bool merge = false;
+ 
+-		consumer = list_remove_head_item(&amp;cache-&gt;consumers);
++		consumer = list_get_first_item(&amp;cache-&gt;consumers);
+ 		consumerRef = consumer-&gt;ref;
+ 
+-		mutex_lock(&amp;consumerRef-&gt;lock);
+-			// TODO: is it okay to lock them in this direction?
++		// Our cache doesn't have a ref to its consumer (only the other way around), 
++		// so we cannot just acquire it here; it might be deleted right now
++		while (true) {
++			int32 count = consumerRef-&gt;ref_count;
++			if (count == 0)
++				break;
+ 
+-		TRACE((&quot;merge vm cache %p (ref == %ld) with vm cache %p\n&quot;,
+-			cache, cacheRef-&gt;ref_count, consumer));
++			if (atomic_test_and_set(&amp;consumerRef-&gt;ref_count, count + 1, count) == count) {
++				// we managed to grab a reference to the consumer
++				merge = true;
++				break;
++			}
++		}
+ 
+-		for (page = cache-&gt;page_list; page != NULL; page = nextPage) {
+-			nextPage = page-&gt;cache_next;
+-			vm_cache_remove_page(cacheRef, page);
++		if (merge) {
++			// But since we need to keep the locking order upper-&gt;lower cache, we
++			// need to unlock our cache now
++			mutex_unlock(&amp;cacheRef-&gt;lock);
+ 
+-			if (vm_cache_lookup_page(consumerRef,
+-					(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT) != NULL) {
+-				// the page already is in the consumer cache - this copy is no
+-				// longer needed, and can be freed
+-				vm_page_set_state(page, PAGE_STATE_FREE);
+-				continue;
++			mutex_lock(&amp;consumerRef-&gt;lock);
++			mutex_lock(&amp;cacheRef-&gt;lock);
++
++			// the cache and the situation might have changed
++			cache = cacheRef-&gt;cache;
++			if (cacheRef-&gt;areas != NULL || cache-&gt;source == NULL
++				|| list_is_empty(&amp;cache-&gt;consumers)
++				|| cache-&gt;consumers.link.next != cache-&gt;consumers.link.prev
++				|| consumerRef != list_get_first_item(&amp;cache-&gt;consumers)) {
++				merge = false;
++				mutex_unlock(&amp;consumerRef-&gt;lock);
+ 			}
++		}
+ 
+-			// move the page into the consumer cache
+-			vm_cache_insert_page(consumerRef, page,
+-				(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++		if (merge) {
++			vm_page *page, *nextPage;
++
++			consumer = list_remove_head_item(&amp;cache-&gt;consumers);
++
++			TRACE((&quot;merge vm cache %p (ref == %ld) with vm cache %p\n&quot;,
++				cache, cacheRef-&gt;ref_count, consumer));
++
++			for (page = cache-&gt;page_list; page != NULL; page = nextPage) {
++				nextPage = page-&gt;cache_next;
++				vm_cache_remove_page(cacheRef, page);
++
++				if (vm_cache_lookup_page(consumerRef,
++						(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT) != NULL) {
++					// the page already is in the consumer cache - this copy is no
++					// longer needed, and can be freed
++					vm_page_set_state(page, PAGE_STATE_FREE);
++					continue;
++				}
++
++				// move the page into the consumer cache
++				vm_cache_insert_page(consumerRef, page,
++					(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++			}
++
++			newSource = cache-&gt;source;
++			mutex_unlock(&amp;consumerRef-&gt;lock);
+ 		}
+-
+-		newSource = cache-&gt;source;
+-		mutex_unlock(&amp;consumerRef-&gt;lock);
++		vm_cache_release_ref(consumerRef);
+ 	}
+ 
+ 	if (newSource != NULL) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000208.html">[Haiku-commits] r19800 - in haiku/trunk: headers/private/kernel	src/system/kernel/arch/x86 src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="000210.html">[Haiku-commits] r19802 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#209">[ date ]</a>
+              <a href="thread.html#209">[ thread ]</a>
+              <a href="subject.html#209">[ subject ]</a>
+              <a href="author.html#209">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,563 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27606 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27606%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200809180003.m8I03atL012264%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012012.html">
+   <LINK REL="Next"  HREF="011958.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27606 - haiku/trunk/src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27606%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200809180003.m8I03atL012264%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27606 - haiku/trunk/src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Sep 18 02:03:36 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012012.html">[Haiku-commits] r27605 - in haiku/trunk/src/apps: . screenshot
+</A></li>
+        <LI>Next message: <A HREF="011958.html">[Haiku-commits] r27607 - haiku/trunk/src/kits/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11957">[ date ]</a>
+              <a href="thread.html#11957">[ thread ]</a>
+              <a href="subject.html#11957">[ subject ]</a>
+              <a href="author.html#11957">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-18 02:03:25 +0200 (Thu, 18 Sep 2008)
+New Revision: 27606
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27606&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27606&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/image.cpp
+Removed:
+   haiku/trunk/src/system/kernel/image.c
+Modified:
+   haiku/trunk/src/system/kernel/Jamfile
+Log:
+* image.c -&gt; image.cpp
+* Added global hash table for images.
+* Improved a bit of code by using the new image hash table. E.g.
+  _get_image_info() can return infos for images of any team, now.
+* Fixed remove_images() comment: The function must not be invoked with
+  the team lock being held.
+
+
+Modified: haiku/trunk/src/system/kernel/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/Jamfile	2008-09-17 22:59:09 UTC (rev 27605)
++++ haiku/trunk/src/system/kernel/Jamfile	2008-09-18 00:03:25 UTC (rev 27606)
+@@ -24,7 +24,7 @@
+ 	cpu.c
+ 	elf.cpp
+ 	heap.cpp
+-	image.c
++	image.cpp
+ 	int.c
+ 	kernel_daemon.cpp
+ 	linkhack.c
+
+Deleted: haiku/trunk/src/system/kernel/image.c
+
+Copied: haiku/trunk/src/system/kernel/image.cpp (from rev 27604, haiku/trunk/src/system/kernel/image.c)
+===================================================================
+--- haiku/trunk/src/system/kernel/image.c	2008-09-17 22:56:18 UTC (rev 27604)
++++ haiku/trunk/src/system/kernel/image.cpp	2008-09-18 00:03:25 UTC (rev 27606)
+@@ -0,0 +1,460 @@
++/*
++ * Copyright 2003-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++/*! User Runtime Loader support in the kernel */
++
++
++#include &lt;KernelExport.h&gt;
++
++#include &lt;kernel.h&gt;
++#include &lt;kimage.h&gt;
++#include &lt;kscheduler.h&gt;
++#include &lt;lock.h&gt;
++#include &lt;team.h&gt;
++#include &lt;thread.h&gt;
++#include &lt;thread_types.h&gt;
++#include &lt;user_debugger.h&gt;
++#include &lt;util/OpenHashTable.h&gt;
++
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++
++
++//#define TRACE_IMAGE
++#ifdef TRACE_IMAGE
++#	define TRACE(x) dprintf x
++#else
++#	define TRACE(x) ;
++#endif
++
++#define ADD_DEBUGGER_COMMANDS
++
++struct image {
++	struct image*			next;
++	struct image*			prev;
++	HashTableLink&lt;image&gt;	hash_link;
++	image_info				info;
++	team_id					team;
++};
++
++
++struct ImageTableDefinition {
++	typedef image_id		KeyType;
++	typedef struct image	ValueType;
++
++	size_t HashKey(image_id key) const { return key; }
++	size_t Hash(struct image* value) const { return value-&gt;info.id; }
++	bool Compare(image_id key, struct image* value) const
++		{ return value-&gt;info.id == key; }
++	HashTableLink&lt;struct image&gt;* GetLink(struct image* value) const
++		{ return &amp;value-&gt;hash_link; }
++};
++
++typedef OpenHashTable&lt;ImageTableDefinition&gt; ImageTable;
++
++
++static image_id sNextImageID = 1;
++static mutex sImageMutex = MUTEX_INITIALIZER(&quot;image&quot;);
++static ImageTable* sImageTable;
++
++
++/*!	Registers an image with the specified team.
++*/
++image_id
++register_image(struct team *team, image_info *_info, size_t size)
++{
++	image_id id = atomic_add(&amp;sNextImageID, 1);
++	struct image *image;
++
++	image = (struct image*)malloc(sizeof(struct image));
++	if (image == NULL)
++		return B_NO_MEMORY;
++
++	memcpy(&amp;image-&gt;info, _info, sizeof(image_info));
++	image-&gt;team = team-&gt;id;
++
++	mutex_lock(&amp;sImageMutex);
++
++	image-&gt;info.id = id;
++	list_add_item(&amp;team-&gt;image_list, image);
++	sImageTable-&gt;Insert(image);
++
++	mutex_unlock(&amp;sImageMutex);
++
++	TRACE((&quot;register_image(team = %p, image id = %ld, image = %p\n&quot;, team, id, image));
++	return id;
++}
++
++
++/*!	Unregisters an image from the specified team.
++*/
++status_t
++unregister_image(struct team *team, image_id id)
++{
++	status_t status = B_ENTRY_NOT_FOUND;
++
++	mutex_lock(&amp;sImageMutex);
++
++	struct image *image = sImageTable-&gt;Lookup(id);
++	if (image != NULL &amp;&amp; image-&gt;team == team-&gt;id) {
++		list_remove_link(image);
++		sImageTable-&gt;Remove(image);
++		status = B_OK;
++	}
++
++	mutex_unlock(&amp;sImageMutex);
++
++	if (status == B_OK) {
++		// notify the debugger
++		user_debug_image_deleted(&amp;image-&gt;info);
++
++		free(image);
++	}
++
++	return status;
++}
++
++
++/*!	Counts the registered images from the specified team.
++	The team lock must be held when you call this function.
++*/
++int32
++count_images(struct team *team)
++{
++	struct image *image = NULL;
++	int32 count = 0;
++
++	while ((image = (struct image*)list_get_next_item(&amp;team-&gt;image_list, image))
++			!= NULL) {
++		count++;
++	}
++
++	return count;
++}
++
++
++/*!	Removes all images from the specified team. Must only be called
++	with a team that has already been removed from the list (in thread_exit()).
++*/
++status_t
++remove_images(struct team *team)
++{
++	struct image *image;
++
++	ASSERT(team != NULL);
++
++	mutex_lock(&amp;sImageMutex);
++
++	while ((image = (struct image*)list_remove_head_item(&amp;team-&gt;image_list))
++			!= NULL) {
++		sImageTable-&gt;Remove(image);
++		free(image);
++	}
++
++	mutex_unlock(&amp;sImageMutex);
++
++	return B_OK;
++}
++
++
++status_t
++_get_image_info(image_id id, image_info *info, size_t size)
++{
++	status_t status = B_ENTRY_NOT_FOUND;
++
++	mutex_lock(&amp;sImageMutex);
++
++	struct image *image = sImageTable-&gt;Lookup(id);
++	if (image != NULL) {
++		memcpy(info, &amp;image-&gt;info, size);
++		status = B_OK;
++	}
++
++	mutex_unlock(&amp;sImageMutex);
++
++	return status;
++}
++
++
++status_t
++_get_next_image_info(team_id teamID, int32 *cookie, image_info *info,
++	size_t size)
++{
++	status_t status = B_ENTRY_NOT_FOUND;
++	struct team *team;
++	cpu_status state;
++
++	mutex_lock(&amp;sImageMutex);
++
++	state = disable_interrupts();
++	GRAB_TEAM_LOCK();
++
++	if (teamID == B_CURRENT_TEAM)
++		team = thread_get_current_thread()-&gt;team;
++	else if (teamID == B_SYSTEM_TEAM)
++		team = team_get_kernel_team();
++	else
++		team = team_get_team_struct_locked(teamID);
++
++	if (team) {
++		struct image *image = NULL;
++		int32 count = 0;
++
++		while ((image = (struct image*)list_get_next_item(&amp;team-&gt;image_list,
++				image)) != NULL) {
++			if (count == *cookie) {
++				memcpy(info, &amp;image-&gt;info, size);
++				status = B_OK;
++				(*cookie)++;
++				break;
++			}
++			count++;
++		}
++	} else
++		status = B_BAD_TEAM_ID;
++
++	RELEASE_TEAM_LOCK();
++	restore_interrupts(state);
++
++	mutex_unlock(&amp;sImageMutex);
++
++	return status;
++}
++
++
++#ifdef ADD_DEBUGGER_COMMANDS
++static int
++dump_images_list(int argc, char **argv)
++{
++	struct image *image = NULL;
++	struct team *team;
++
++	if (argc &gt; 1) {
++		team_id id = strtol(argv[1], NULL, 0);
++		team = team_get_team_struct_locked(id);
++		if (team == NULL) {
++			kprintf(&quot;No team with ID %ld found\n&quot;, id);
++			return 1;
++		}
++	} else
++		team = thread_get_current_thread()-&gt;team;
++
++	kprintf(&quot;Registered images of team %ld\n&quot;, team-&gt;id);
++	kprintf(&quot;    ID text       size    data       size    name\n&quot;);
++
++	while ((image = (struct image*)list_get_next_item(&amp;team-&gt;image_list, image))
++			!= NULL) {
++		image_info *info = &amp;image-&gt;info;
++
++		kprintf(&quot;%6ld %p %-7ld %p %-7ld %s\n&quot;, info-&gt;id, info-&gt;text, info-&gt;text_size,
++			info-&gt;data, info-&gt;data_size, info-&gt;name);
++	}
++
++	return 0;
++}
++#endif
++
++
++status_t
++image_debug_lookup_user_symbol_address(struct team *team, addr_t address,
++	addr_t *_baseAddress, const char **_symbolName, const char **_imageName,
++	bool *_exactMatch)
++{
++	// TODO: work together with ELF reader and runtime_loader
++
++	struct image *image = NULL;
++
++	while ((image = (struct image*)list_get_next_item(&amp;team-&gt;image_list, image))
++			!= NULL) {
++		image_info *info = &amp;image-&gt;info;
++
++		if ((address &lt; (addr_t)info-&gt;text
++				|| address &gt;= (addr_t)info-&gt;text + info-&gt;text_size)
++			&amp;&amp; (address &lt; (addr_t)info-&gt;data
++				|| address &gt;= (addr_t)info-&gt;data + info-&gt;data_size))
++			continue;
++
++		// found image
++		*_symbolName = NULL;
++		*_imageName = info-&gt;name;
++		*_baseAddress = (addr_t)info-&gt;text;
++		*_exactMatch = false;
++
++		return B_OK;
++	}
++
++	return B_ENTRY_NOT_FOUND;
++}
++
++
++status_t
++image_init(void)
++{
++	sImageTable = new(std::nothrow) ImageTable;
++	if (sImageTable == NULL) {
++		panic(&quot;image_init(): Failed to allocate image table!&quot;);
++		return B_NO_MEMORY;
++	}
++
++	status_t error = sImageTable-&gt;Init();
++	if (error != B_OK) {
++		panic(&quot;image_init(): Failed to init image table: %s&quot;, strerror(error));
++		return error;
++	}
++
++#ifdef ADD_DEBUGGER_COMMANDS
++	add_debugger_command(&quot;team_images&quot;, &amp;dump_images_list, &quot;Dump all registered images from the current team&quot;);
++#endif
++
++	return B_OK;
++}
++
++
++static void
++notify_loading_app(status_t result, bool suspend)
++{
++	cpu_status state;
++	struct team *team;
++
++	state = disable_interrupts();
++	GRAB_TEAM_LOCK();
++
++	team = thread_get_current_thread()-&gt;team;
++	if (team-&gt;loading_info) {
++		// there's indeed someone waiting
++		struct team_loading_info *loadingInfo = team-&gt;loading_info;
++		team-&gt;loading_info = NULL;
++
++		loadingInfo-&gt;result = result;
++		loadingInfo-&gt;done = true;
++
++		// we're done with the team stuff, get the thread lock instead
++		RELEASE_TEAM_LOCK();
++		GRAB_THREAD_LOCK();
++
++		// wake up the waiting thread
++		if (loadingInfo-&gt;thread-&gt;state == B_THREAD_SUSPENDED)
++			scheduler_enqueue_in_run_queue(loadingInfo-&gt;thread);
++
++		// suspend ourselves, if desired
++		if (suspend) {
++			thread_get_current_thread()-&gt;next_state = B_THREAD_SUSPENDED;
++			scheduler_reschedule();
++		}
++
++		RELEASE_THREAD_LOCK();
++	} else {
++		// no-one is waiting
++		RELEASE_TEAM_LOCK();
++	}
++
++	restore_interrupts(state);
++}
++
++
++//	#pragma mark -
++//	Functions exported for the user space
++
++
++status_t
++_user_unregister_image(image_id id)
++{
++	return unregister_image(thread_get_current_thread()-&gt;team, id);
++}
++
++
++image_id
++_user_register_image(image_info *userInfo, size_t size)
++{
++	image_info info;
++
++	if (size != sizeof(image_info))
++		return B_BAD_VALUE;
++
++	if (!IS_USER_ADDRESS(userInfo)
++		|| user_memcpy(&amp;info, userInfo, size) &lt; B_OK)
++		return B_BAD_ADDRESS;
++
++	return register_image(thread_get_current_thread()-&gt;team, &amp;info, size);
++}
++
++
++void
++_user_image_relocated(image_id id)
++{
++	image_info info;
++	status_t error;
++
++	// get an image info
++	error = _get_image_info(id, &amp;info, sizeof(image_info));
++	if (error != B_OK) {
++		dprintf(&quot;_user_image_relocated(%ld): Failed to get image info: %lx\n&quot;,
++			id, error);
++		return;
++	}
++
++	// notify the debugger
++	user_debug_image_created(&amp;info);
++
++	// If the image is the app image, loading is done. We need to notify the
++	// thread who initiated the process and is now waiting for us to be done.
++	if (info.type == B_APP_IMAGE)
++		notify_loading_app(B_OK, true);
++}
++
++
++void
++_user_loading_app_failed(status_t error)
++{
++	if (error &gt;= B_OK)
++		error = B_ERROR;
++
++	notify_loading_app(error, false);
++
++	_user_exit_team(error);
++}
++
++
++status_t
++_user_get_image_info(image_id id, image_info *userInfo, size_t size)
++{
++	image_info info;
++	status_t status;
++
++	if (size != sizeof(image_info))
++		return B_BAD_VALUE;
++
++	if (!IS_USER_ADDRESS(userInfo))
++		return B_BAD_ADDRESS;
++
++	status = _get_image_info(id, &amp;info, size);
++
++	if (user_memcpy(userInfo, &amp;info, size) &lt; B_OK)
++		return B_BAD_ADDRESS;
++
++	return status;
++}
++
++
++status_t
++_user_get_next_image_info(team_id team, int32 *_cookie, image_info *userInfo, size_t size)
++{
++	image_info info;
++	status_t status;
++
++	if (size != sizeof(image_info))
++		return B_BAD_VALUE;
++
++	if (!IS_USER_ADDRESS(userInfo) || !IS_USER_ADDRESS(_cookie))
++		return B_BAD_ADDRESS;
++
++	status = _get_next_image_info(team, _cookie, &amp;info, size);
++
++	if (user_memcpy(userInfo, &amp;info, size) &lt; B_OK)
++		return B_BAD_ADDRESS;
++
++	return status;
++}
++
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012012.html">[Haiku-commits] r27605 - in haiku/trunk/src/apps: . screenshot
+</A></li>
+	<LI>Next message: <A HREF="011958.html">[Haiku-commits] r27607 - haiku/trunk/src/kits/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11957">[ date ]</a>
+              <a href="thread.html#11957">[ thread ]</a>
+              <a href="subject.html#11957">[ subject ]</a>
+              <a href="author.html#11957">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

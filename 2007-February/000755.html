@@ -1,0 +1,292 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20131 - in haiku/trunk:	headers/private/kernel/arch/x86 src/system/kernel/arch/x86
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20131%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/arch/x86%20src/system/kernel/arch/x86&In-Reply-To=%3C200702140625.l1E6P0w9020434%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000754.html">
+   <LINK REL="Next"  HREF="000756.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20131 - in haiku/trunk:	headers/private/kernel/arch/x86 src/system/kernel/arch/x86</H1>
+    <B>geist at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20131%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/arch/x86%20src/system/kernel/arch/x86&In-Reply-To=%3C200702140625.l1E6P0w9020434%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20131 - in haiku/trunk:	headers/private/kernel/arch/x86 src/system/kernel/arch/x86">geist at mail.berlios.de
+       </A><BR>
+    <I>Wed Feb 14 07:25:00 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000754.html">[Haiku-commits] r20130 - haiku/trunk/src/apps/abouthaiku
+</A></li>
+        <LI>Next message: <A HREF="000756.html">[Haiku-commits] r20132 - haiku/trunk
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#755">[ date ]</a>
+              <a href="thread.html#755">[ thread ]</a>
+              <a href="subject.html#755">[ subject ]</a>
+              <a href="author.html#755">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: geist
+Date: 2007-02-14 07:24:59 +0100 (Wed, 14 Feb 2007)
+New Revision: 20131
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20131&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20131&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h
+   haiku/trunk/src/system/kernel/arch/x86/arch_cpu.c
+   haiku/trunk/src/system/kernel/arch/x86/arch_int.c
+Log:
+clean up TSS initialization.
+
+Now two complete tss structures exist within the per-cpu structure. Instead
+of having to create a seperate area per each one, initialize them in place.
+Also, the old mechanism to getting all of the cpus to get initialized was 
+subtly broken, but still managed to work. Now, just force all the cpus to
+initialize at boot, which makes the actual swapping of esp0 somewhat simpler.
+
+
+Modified: haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h	2007-02-13 08:31:21 UTC (rev 20130)
++++ haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h	2007-02-14 06:24:59 UTC (rev 20131)
+@@ -158,6 +158,7 @@
+ };
+ 
+ typedef struct arch_cpu_info {
++	// saved cpu info
+ 	enum x86_vendors vendor;
+ 	enum x86_feature_type feature[FEATURE_NUM];
+ 	char model_name[49];
+@@ -167,6 +168,10 @@
+ 	int stepping;
+ 	int model;
+ 	char feature_string[256];
++
++	// local TSS for this cpu
++	struct tss tss;
++	struct tss double_fault_tss;
+ } arch_cpu_info;
+ 
+ #ifdef __cplusplus
+@@ -203,7 +208,6 @@
+ void x86_set_mtrr(uint32 index, uint64 base, uint64 length, uint8 type);
+ status_t x86_get_mtrr(uint32 index, uint64 *_base, uint64 *_length, uint8 *_type);
+ bool x86_check_feature(uint32 feature, enum x86_feature_type type);
+-struct tss *x86_get_main_tss(void);
+ 
+ 
+ #define read_cr3(value) \
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_cpu.c
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_cpu.c	2007-02-13 08:31:21 UTC (rev 20130)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_cpu.c	2007-02-14 06:24:59 UTC (rev 20131)
+@@ -65,10 +65,6 @@
+ void (*gX86SwapFPUFunc)(void *oldState, const void *newState);
+ bool gHasSSE = false;
+ 
+-static struct tss **sTSS;
+-//static struct tss **sDoubleFaultTSS;
+-struct tss **sDoubleFaultTSS;
+-static int *sIsTSSLoaded;
+ static vint32 sWaitAllCPUs;
+ 
+ segment_descriptor *gGDT = NULL;
+@@ -79,15 +75,6 @@
+ 
+ static x86_cpu_module_info *sCpuModule;
+ 
+-
+-struct tss *
+-x86_get_main_tss(void)
+-{
+-	int cpuNum = smp_get_current_cpu();
+-	return sTSS[cpuNum];
+-}
+-
+-
+ /**	Disable CPU caches, and invalidate them. */
+ 
+ static void
+@@ -208,13 +195,11 @@
+ 
+ 
+ static void
+-load_tss(void *data, int cpu)
++load_tss(int cpu)
+ {
+ 	short seg = ((TSS_BASE_SEGMENT + cpu) &lt;&lt; 3) | DPL_KERNEL;
+ 	asm(&quot;movw  %0, %%ax;&quot;
+ 		&quot;ltr %%ax;&quot; : : &quot;r&quot; (seg) : &quot;eax&quot;);
+-
+-	sIsTSSLoaded[cpu] = true;
+ }
+ 
+ 
+@@ -223,7 +208,7 @@
+ {
+ 	/* set up the double fault tss */
+ 	/* TODO: Axel - fix SMP support */
+-	struct tss *tss = sDoubleFaultTSS[cpuNum];
++	struct tss *tss = &amp;gCPU[cpuNum].arch.tss;
+ 	
+ 	memset(tss, 0, sizeof(struct tss));
+ 	tss-&gt;sp0 = (uint32)sDoubleFaultStack + sizeof(sDoubleFaultStack);
+@@ -462,6 +447,11 @@
+ {
+ 	detect_cpu(args, curr_cpu);
+ 
++	// load the TSS for this cpu
++	// note the main cpu gets initialized in arch_cpu_init_post_vm()
++	if (curr_cpu != 0)
++		load_tss(curr_cpu);
++
+ 	return 0;
+ }
+ 
+@@ -490,60 +480,20 @@
+ 	//i386_selector_init(gGDT);  // pass the new gdt
+ 
+ 	// setup task-state segments
+-
+-	sTSS = malloc(sizeof(struct tss *) * args-&gt;num_cpus);
+-	if (sTSS == NULL) {
+-		panic(&quot;arch_cpu_init_post_vm: could not allocate buffer for tss pointers\n&quot;);
+-		return B_NO_MEMORY;
+-	}
+-	
+-	sDoubleFaultTSS = malloc(sizeof(struct tss *) * args-&gt;num_cpus);
+-	if (sDoubleFaultTSS == NULL) {
+-		panic(&quot;arch_cpu_init_post_vm: could not allocate buffer for double fault tss pointers\n&quot;);
+-		return B_NO_MEMORY;
+-	}
+-
+-	sIsTSSLoaded = malloc(sizeof(int) * args-&gt;num_cpus);
+-	if (sIsTSSLoaded == NULL) {
+-		panic(&quot;arch_cpu_init_post_vm: could not allocate buffer for tss booleans\n&quot;);
+-		return B_NO_MEMORY;
+-	}
+-	memset(sIsTSSLoaded, 0, sizeof(int) * args-&gt;num_cpus);
+-
+ 	for (i = 0; i &lt; args-&gt;num_cpus; i++) {
+-		char tssName[32];
+-		area_id area;
++		// initialize the regular and double fault tss stored in the per-cpu structure
++		memset(&amp;gCPU[i].arch.tss, 0, sizeof(struct tss));
++		gCPU[i].arch.tss.ss0 = KERNEL_DATA_SEG;
+ 
+-		// create standard tasks
+-		sprintf(tssName, &quot;tss%lu&quot;, i);
+-		area = create_area(tssName, (void **)&amp;sTSS[i], B_ANY_KERNEL_ADDRESS, B_PAGE_SIZE,
+-			B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+-		if (area &lt; 0) {
+-			panic(&quot;arch_cpu_init2: unable to create region for tss\n&quot;);
+-			return B_NO_MEMORY;
+-		}
+-
+-		// initialize TSS
+-		memset(sTSS[i], 0, sizeof(struct tss));
+-		sTSS[i]-&gt;ss0 = KERNEL_DATA_SEG;
+-
+ 		// add TSS descriptor for this new TSS
+-		set_tss_descriptor(&amp;gGDT[TSS_BASE_SEGMENT + i], (addr_t)sTSS[i], sizeof(struct tss));
++		set_tss_descriptor(&amp;gGDT[TSS_BASE_SEGMENT + i], (addr_t)&amp;gCPU[i].arch.tss, sizeof(struct tss));
+ 
+-		// create double-fault task
+-		sprintf(tssName, &quot;double_fault_tss%lu&quot;, i);
+-		area = create_area(tssName, (void **)&amp;sDoubleFaultTSS[i], B_ANY_KERNEL_ADDRESS, B_PAGE_SIZE,
+-			B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+-		if (area &lt; 0) {
+-			panic(&quot;arch_cpu_init2: unable to create region for tss\n&quot;);
+-			return B_NO_MEMORY;
+-		}
+-
+-		// initialize TSS
++		// initialize the double fault tss
+ 		init_double_fault(i);
+ 	}
+ 
+-	call_all_cpus(&amp;load_tss, NULL);
++	// set the current hardware task on cpu 0
++	load_tss(0);
+ 
+ 	x86_set_task_gate(8, DOUBLE_FAULT_TSS_BASE_SEGMENT &lt;&lt; 3);
+ 
+@@ -590,19 +540,9 @@
+ void
+ i386_set_tss_and_kstack(addr_t kstack)
+ {
+-	int32 currentCPU = smp_get_current_cpu();
+-
+-	if (!sIsTSSLoaded[currentCPU]) {
+-		short seg = ((TSS_BASE_SEGMENT + currentCPU) &lt;&lt; 3) | DPL_KERNEL;
+-		asm(&quot;movw  %0, %%ax;&quot;
+-			&quot;ltr %%ax;&quot; : : &quot;r&quot; (seg) : &quot;eax&quot;);
+-		sIsTSSLoaded[currentCPU] = true;
+-	}
+-
+-	sTSS[currentCPU]-&gt;sp0 = kstack;
++	get_cpu_struct()-&gt;arch.tss.sp0 = kstack;
+ }
+ 
+-
+ void
+ arch_cpu_global_TLB_invalidate(void)
+ {
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_int.c
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_int.c	2007-02-13 08:31:21 UTC (rev 20130)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_int.c	2007-02-14 06:24:59 UTC (rev 20131)
+@@ -386,13 +386,16 @@
+ 
+ 		case 8:		// Double Fault Exception (#DF)
+ 		{
++#if 0
++			// XXX what is this supposed to do?
+ 			struct tss *tss = x86_get_main_tss();
+ 			
+ 			frame.cs = tss-&gt;cs;
+ 			frame.eip = tss-&gt;eip;
+ 			frame.esp = tss-&gt;esp;
+ 			frame.flags = tss-&gt;eflags;
+-			
++#endif
++
+ 			panic(&quot;double fault! errorcode = 0x%lx\n&quot;, frame.error_code);
+ 
+ 			break;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000754.html">[Haiku-commits] r20130 - haiku/trunk/src/apps/abouthaiku
+</A></li>
+	<LI>Next message: <A HREF="000756.html">[Haiku-commits] r20132 - haiku/trunk
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#755">[ date ]</a>
+              <a href="thread.html#755">[ thread ]</a>
+              <a href="subject.html#755">[ subject ]</a>
+              <a href="author.html#755">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,255 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27181 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27181%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808232339.m7NNd1uV005104%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011317.html">
+   <LINK REL="Next"  HREF="011290.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27181 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27181%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808232339.m7NNd1uV005104%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27181 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Aug 24 01:39:01 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011317.html">[Haiku-commits] r27180 - haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+        <LI>Next message: <A HREF="011290.html">[Haiku-commits] r27182 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11289">[ date ]</a>
+              <a href="thread.html#11289">[ thread ]</a>
+              <a href="subject.html#11289">[ subject ]</a>
+              <a href="author.html#11289">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-24 01:38:59 +0200 (Sun, 24 Aug 2008)
+New Revision: 27181
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27181&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27181&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* The LIMIT_AVAILABLE_MEMORY macro can be defined to limit the amount of
+  RAM Haiku uses (for debugging purposes).
+* &quot;page_stats&quot; prints some more infos now.
+* page_writer():
+  - Moved the low_resource_state() invocation out of the inner loop.
+    Reduces lock contention on the sLowResourceLock recursive lock.
+  - Additional debug output: Every 1024 written pages the page writer
+    prints a message.
+* steal_pages(): Addressed the TODO: When there should be pages to
+  steal, but we can't get them ATM, we now timeout on the free pages
+  condition variable instead of snoozing unconditionally, so that we
+  wake up earlier when someone frees pages in the meantime.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2008-08-23 22:16:12 UTC (rev 27180)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2008-08-23 23:38:59 UTC (rev 27181)
+@@ -44,6 +44,10 @@
+ #define SCRUB_SIZE 16
+ 	// this many pages will be cleared at once in the page scrubber thread
+ 
++// for debugging: limit the amount of available RAM (in MB)
++//#define LIMIT_AVAILABLE_MEMORY	256
++
++
+ typedef struct page_queue {
+ 	vm_page *head;
+ 	vm_page *tail;
+@@ -605,6 +609,8 @@
+ static int
+ dump_page_stats(int argc, char **argv)
+ {
++	page_num_t swappableModified = 0;
++	page_num_t swappableModifiedInactive = 0;
+ 	uint32 counter[8];
+ 	addr_t i;
+ 
+@@ -615,9 +621,17 @@
+ 			panic(&quot;page %li at %p has invalid state!\n&quot;, i, &amp;sPages[i]);
+ 
+ 		counter[sPages[i].state]++;
++
++		if (sPages[i].state == PAGE_STATE_MODIFIED &amp;&amp; sPages[i].cache != NULL
++			&amp;&amp; sPages[i].cache-&gt;temporary &amp;&amp; sPages[i].wired_count == 0) {
++			swappableModified++;
++			if (sPages[i].usage_count &lt; 0)
++				swappableModifiedInactive++;
++		}
+ 	}
+ 
+ 	kprintf(&quot;page stats:\n&quot;);
++	kprintf(&quot;total: %lu\n&quot;, sNumPages);
+ 	kprintf(&quot;active: %lu\ninactive: %lu\nbusy: %lu\nunused: %lu\n&quot;,
+ 		counter[PAGE_STATE_ACTIVE], counter[PAGE_STATE_INACTIVE],
+ 		counter[PAGE_STATE_BUSY], counter[PAGE_STATE_UNUSED]);
+@@ -632,8 +646,9 @@
+ 		sFreePageQueue.count);
+ 	kprintf(&quot;clear queue: %p, count = %ld\n&quot;, &amp;sClearPageQueue,
+ 		sClearPageQueue.count);
+-	kprintf(&quot;modified queue: %p, count = %ld (%ld temporary)\n&quot;,
+-		&amp;sModifiedPageQueue, sModifiedPageQueue.count, sModifiedTemporaryPages);
++	kprintf(&quot;modified queue: %p, count = %ld (%ld temporary, %lu swappable, &quot;
++		&quot;inactive: %lu)\n&quot;, &amp;sModifiedPageQueue, sModifiedPageQueue.count,
++		sModifiedTemporaryPages, swappableModified, swappableModifiedInactive);
+ 	kprintf(&quot;active queue: %p, count = %ld\n&quot;, &amp;sActivePageQueue,
+ 		sActivePageQueue.count);
+ 	kprintf(&quot;inactive queue: %p, count = %ld\n&quot;, &amp;sInactivePageQueue,
+@@ -1120,6 +1135,8 @@
+ 	// TODO: once the I/O scheduler is there, we should write
+ 	// a lot more pages back.
+ 	const uint32 kNumPages = 32;
++	uint32 writtenPages = 0;
++	bigtime_t lastWrittenTime = 0;
+ 
+ 	PageWriterRun run;
+ 	if (run.Init(kNumPages) != B_OK) {
+@@ -1151,6 +1168,10 @@
+ 		// enough to do).
+ 
+ 		// collect pages to be written
++#if ENABLE_SWAP_SUPPORT
++		bool lowOnPages = low_resource_state(B_KERNEL_RESOURCE_PAGES)
++			!= B_NO_LOW_RESOURCE;
++#endif
+ 
+ 		while (numPages &lt; kNumPages) {
+ 			vm_page *page = next_modified_page(marker);
+@@ -1164,12 +1185,12 @@
+ 			vm_cache *cache = page-&gt;cache;
+ 
+ 			// Don't write back wired (locked) pages and don't write RAM pages
+-			// until we're low on pages.
++			// until we're low on pages. Also avoid writing temporary pages that
++			// are active.
+ 			if (page-&gt;wired_count &gt; 0
+ 				|| cache-&gt;temporary
+ #if ENABLE_SWAP_SUPPORT
+-					&amp;&amp; low_resource_state(B_KERNEL_RESOURCE_PAGES)
+-							== B_NO_LOW_RESOURCE
++					&amp;&amp; (!lowOnPages /*|| page-&gt;usage_count &gt; 0*/)
+ #endif
+ 				) {
+ 				continue;
+@@ -1210,6 +1231,16 @@
+ 
+ 		// write pages to disk and do all the cleanup
+ 		run.Go();
++
++		// debug output only...
++		writtenPages += numPages;
++		if (writtenPages &gt;= 1024) {
++			bigtime_t now = system_time();
++			dprintf(&quot;page writer: wrote 1024 pages (%llu ms)\n&quot;,
++				(now - lastWrittenTime) / 1000);
++			writtenPages -= 1024;
++			lastWrittenTime = now;
++		}
+ 	}
+ 
+ 	remove_page_marker(marker);
+@@ -1362,19 +1393,6 @@
+ 			count++;
+ 			continue;
+ 		}
+-		if (tried) {
+-			// We tried all potential pages, but one or more couldn't be stolen
+-			// at that time (likely because their cache was locked). No one
+-			// else will have any better luck, so we'll just retry a little
+-			// later.
+-			// TODO: Think about better strategies. E.g. if our condition
+-			// variables had timeouts, we could just wait with timeout on
+-			// the free page queue condition variable, which could might
+-			// succeed earlier.
+-			locker.Unlock();
+-			snooze(10000);
+-			continue;
+-		}
+ 
+ 		// we need to wait for pages to become inactive
+ 
+@@ -1383,11 +1401,19 @@
+ 		freeConditionEntry.Add(&amp;sFreePageQueue);
+ 		locker.Unlock();
+ 
+-		low_resource(B_KERNEL_RESOURCE_PAGES, count, B_RELATIVE_TIMEOUT, 0);
+-		//snooze(50000);
+-			// sleep for 50ms
++		if (tried) {
++			// We tried all potential pages, but one or more couldn't be stolen
++			// at that time (likely because their cache was locked). No one
++			// else will have any better luck, so we'll just retry a little
++			// later.
++			freeConditionEntry.Wait(B_RELATIVE_TIMEOUT, 10000);
++		} else {
++			low_resource(B_KERNEL_RESOURCE_PAGES, count, B_RELATIVE_TIMEOUT, 0);
++			//snooze(50000);
++				// sleep for 50ms
+ 
+-		freeConditionEntry.Wait();
++			freeConditionEntry.Wait();
++		}
+ 
+ 		locker.Lock();
+ 		sPageDeficit--;
+@@ -1556,6 +1582,11 @@
+ 		physicalPagesEnd));
+ 
+ 	sNumPages = physicalPagesEnd - sPhysicalPageOffset;
++
++#ifdef LIMIT_AVAILABLE_MEMORY
++	if (sNumPages &gt; LIMIT_AVAILABLE_MEMORY * 256)
++		sNumPages = LIMIT_AVAILABLE_MEMORY * 256;
++#endif
+ }
+ 
+ 
+@@ -1580,6 +1611,7 @@
+ 		sPages[i].wired_count = 0;
+ 		sPages[i].usage_count = 0;
+ 		sPages[i].busy_writing = false;
++		sPages[i].merge_swap = false;
+ 		sPages[i].cache = NULL;
+ 		#ifdef DEBUG_PAGE_QUEUE
+ 			sPages[i].queue = NULL;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011317.html">[Haiku-commits] r27180 - haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+	<LI>Next message: <A HREF="011290.html">[Haiku-commits] r27182 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11289">[ date ]</a>
+              <a href="thread.html#11289">[ thread ]</a>
+              <a href="subject.html#11289">[ subject ]</a>
+              <a href="author.html#11289">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,306 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r33321 - haiku/trunk/src/servers/bluetooth
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r33321%20-%20haiku/trunk/src/servers/bluetooth&In-Reply-To=%3C200909271909.n8RJ9DqE001403%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020940.html">
+   <LINK REL="Next"  HREF="020942.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r33321 - haiku/trunk/src/servers/bluetooth</H1>
+    <B>oruizdorantes at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r33321%20-%20haiku/trunk/src/servers/bluetooth&In-Reply-To=%3C200909271909.n8RJ9DqE001403%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r33321 - haiku/trunk/src/servers/bluetooth">oruizdorantes at mail.berlios.de
+       </A><BR>
+    <I>Sun Sep 27 21:09:13 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020940.html">[Haiku-commits] r33320 -	haiku/trunk/src/add-ons/kernel/network/protocols/l2cap
+</A></li>
+        <LI>Next message: <A HREF="020942.html">[Haiku-commits] r33322 - in haiku/trunk: build/jam	headers/private/locale src/kits/locale	src/preferences/bluetooth src/preferences/cpufrequency	src/preferences/locale src/tools/locale
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20941">[ date ]</a>
+              <a href="thread.html#20941">[ thread ]</a>
+              <a href="subject.html#20941">[ subject ]</a>
+              <a href="author.html#20941">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: oruizdorantes
+Date: 2009-09-27 21:09:13 +0200 (Sun, 27 Sep 2009)
+New Revision: 33321
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=33321&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=33321&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/bluetooth/BluetoothServer.cpp
+   haiku/trunk/src/servers/bluetooth/BluetoothServer.h
+   haiku/trunk/src/servers/bluetooth/Jamfile
+Log:
+Implement/Fake a temporal SDP server, to allow pairing of devices
+
+Modified: haiku/trunk/src/servers/bluetooth/BluetoothServer.cpp
+===================================================================
+--- haiku/trunk/src/servers/bluetooth/BluetoothServer.cpp	2009-09-27 19:07:24 UTC (rev 33320)
++++ haiku/trunk/src/servers/bluetooth/BluetoothServer.cpp	2009-09-27 19:09:13 UTC (rev 33321)
+@@ -7,6 +7,7 @@
+ #include &lt;stdio.h&gt;
+ #include &lt;fcntl.h&gt;
+ #include &lt;unistd.h&gt;
++#include &lt;sys/select.h&gt;
+ 
+ #include &lt;Entry.h&gt;
+ #include &lt;Deskbar.h&gt;
+@@ -21,6 +22,8 @@
+ 
+ #include &lt;bluetoothserver_p.h&gt;
+ #include &lt;bluetooth/HCI/btHCI_command.h&gt;
++#include &lt;bluetooth/L2CAP/btL2CAP.h&gt;
++#include &lt;bluetooth/bluetooth.h&gt;
+ #include &lt;bluetooth/bluetooth_util.h&gt;
+ 
+ #include &quot;BluetoothServer.h&quot;
+@@ -53,7 +56,10 @@
+ }
+ 
+ 
+-BluetoothServer::BluetoothServer() : BApplication(BLUETOOTH_SIGNATURE)
++BluetoothServer::BluetoothServer()
++	: BApplication(BLUETOOTH_SIGNATURE)
++	, fSDPThreadID(-1)
++	, fIsShuttingDown(false)
+ {
+ 	Output::Instance()-&gt;Run();
+ 	Output::Instance()-&gt;SetTitle(&quot;Bluetooth message gathering&quot;);
+@@ -61,6 +67,7 @@
+ 	Output::Instance()-&gt;AddTab(&quot;General&quot;, BLACKBOARD_GENERAL);
+ 	Output::Instance()-&gt;AddTab(&quot;Device Manager&quot;, BLACKBOARD_DEVICEMANAGER);
+ 	Output::Instance()-&gt;AddTab(&quot;Kit&quot;, BLACKBOARD_KIT);
++	Output::Instance()-&gt;AddTab(&quot;SDP&quot;, BLACKBOARD_SDP);
+ 
+ 	fDeviceManager = new DeviceManager();
+ 	fLocalDevicesList.MakeEmpty();
+@@ -81,8 +88,14 @@
+ 		delete lDeviceImpl;
+  
+  	_RemoveDeskbarIcon();
++ 	
++ 	/* stop the SDP server thread */
++ 	fIsShuttingDown = true;
++ 	status_t threadReturnStatus;
++ 	wait_for_thread(fSDPThreadID, &amp;threadReturnStatus);
++ 	printf(&quot;SDP server thread exited with: %s\n&quot;, strerror(threadReturnStatus));
+  
+-	printf(&quot;Accepting quitting of the application\n&quot;);
++	printf(&quot;Shutting down bluetooth_server.\n&quot;);
+ 	return BApplication::QuitRequested();
+ }
+ 
+@@ -99,19 +112,28 @@
+ 
+ void BluetoothServer::ReadyToRun(void)
+ {
++	ShowWindow(Output::Instance());
++	
+ 	fDeviceManager-&gt;StartMonitoringDevice(&quot;bluetooth/h2&quot;);
+ 	fDeviceManager-&gt;StartMonitoringDevice(&quot;bluetooth/h3&quot;);
+ 	fDeviceManager-&gt;StartMonitoringDevice(&quot;bluetooth/h4&quot;);
+ 	fDeviceManager-&gt;StartMonitoringDevice(&quot;bluetooth/h5&quot;);
+ 
+ 	if (fEventListener2-&gt;Launch() != B_OK)
+-		Output::Instance()-&gt;Post(&quot;Bluetooth port listener failed\n&quot;, BLACKBOARD_GENERAL);
++		Output::Instance()-&gt;Post(&quot;Bluetooth event listener failed\n&quot;, BLACKBOARD_GENERAL);
+ 	else
+-		Output::Instance()-&gt;Post(&quot;Bluetooth server Ready\n&quot;, BLACKBOARD_GENERAL);
++		Output::Instance()-&gt;Post(&quot;Bluetooth event listener Ready\n&quot;, BLACKBOARD_GENERAL);
+ 
+-	ShowWindow(Output::Instance());
+-
+ 	_InstallDeskbarIcon();
++	
++	// Spawn the SDP server thread
++	fSDPThreadID = spawn_thread(SDPServerThread, &quot;SDP server thread&quot;,
++		B_NORMAL_PRIORITY, this);
++		
++	if (fSDPThreadID &lt;= 0 || resume_thread(fSDPThreadID) != B_OK) {
++		Output::Instance()-&gt;Postf(BLACKBOARD_SDP,
++			&quot;Failed launching the SDP server thread: %x\n&quot;,	fSDPThreadID);
++	}
+ }
+ 
+ 
+@@ -422,9 +444,94 @@
+ #endif
+ 
+ int32 
+-BluetoothServer::sdp_server_Thread(void* data)
++BluetoothServer::SDPServerThread(void* data)
+ {
++	const BluetoothServer *server = (BluetoothServer *)data;
++	
++	/* Set up the SDP socket. */
++	struct sockaddr_l2cap loc_addr = { 0 };
++    int socketServer;
++    int client;
++    status_t status;
++    char buff[512] = &quot;&quot;;
++    
+ 
++	Output::Instance()-&gt;Postf(BLACKBOARD_SDP, &quot;SDP server thread up...\n&quot;);
++
++    socketServer = socket(PF_BLUETOOTH, SOCK_STREAM /*SOCK_SEQPACKET*/, BLUETOOTH_PROTO_L2CAP);
++
++	if (socketServer &lt; 0) {
++		Output::Instance()-&gt;Post(&quot;Could not create server socket ...\n&quot;, BLACKBOARD_SDP);
++		return B_ERROR;
++	}
++
++    // bind socket to port 0x1001 of the first available 
++    // bluetooth adapter
++    loc_addr.l2cap_family = AF_BLUETOOTH;
++    loc_addr.l2cap_bdaddr = *BDADDR_ANY;
++    loc_addr.l2cap_psm = B_HOST_TO_LENDIAN_INT16(1); // correct?
++	loc_addr.l2cap_len = sizeof(struct sockaddr_l2cap);
++
++	status = bind(socketServer, (struct sockaddr *)&amp;loc_addr, sizeof(struct sockaddr_l2cap));
++
++	if (status &lt; 0) {
++		Output::Instance()-&gt;Postf(BLACKBOARD_SDP, &quot;Could not bind server socket %d ...\n&quot;, status);
++		return status;
++	}
++   
++	// setsockopt(sock, SOL_L2CAP, SO_L2CAP_OMTU, &amp;omtu, len );
++	// getsockopt(sock, SOL_L2CAP, SO_L2CAP_IMTU, &amp;omtu, &amp;len );
++
++    /* Listen for up to 10 connections. */
++    status = listen(socketServer, 10);
++	
++	if (status != B_OK) {
++		Output::Instance()-&gt;Postf(BLACKBOARD_SDP, &quot;Could not listen server socket %d ...\n&quot;, status);
++		return status;
++	}
++	
++	
++	while (!server-&gt;fIsShuttingDown) {
++
++		Output::Instance()-&gt;Postf(BLACKBOARD_SDP, &quot;Waiting connection for socket %d ...\n&quot;, socketServer);
++		
++		uint len = sizeof(struct sockaddr_l2cap);
++   		client = accept(socketServer, (struct sockaddr *) &amp;loc_addr, &amp;len);
++
++		Output::Instance()-&gt;Postf(BLACKBOARD_SDP, &quot;Incomming connection... %ld\n&quot;, client);
++
++		ssize_t leng = recv(client, buff, 29 , 0);
++		if (leng == -1) {
++			Output::Instance()-&gt;Post(&quot;Error reading client socket\n&quot;, BLACKBOARD_SDP);
++			
++		}
++		
++		Output::Instance()-&gt;Postf(BLACKBOARD_SDP, &quot;Received from SDP client: %ld:\n&quot;, leng);
++		for (int i = 0; i &lt; leng ; i++)
++			Output::Instance()-&gt;Postf(BLACKBOARD_SDP, &quot;%x:&quot;, buff[i]);
++			
++		Output::Instance()-&gt;Post(&quot;\n&quot;, BLACKBOARD_SDP);	
++		
++
++/*		fd_set fdSet;
++		FD_ZERO(&amp;fdSet);
++		FD_SET(s, &amp;fdSet);
++		
++		struct timeval timeout;
++		memset(&amp;timeout, 0, sizeof(timeout));
++		// TODO initialize timeout!
++		
++		int ret = select(1, &amp;fdSet, NULL, NULL, &amp;timeout);
++		printf(&quot;ready to read descriptors: %d\n&quot;, ret);
++*/		
++
++		snooze(5000000);
++		Output::Instance()-&gt;Post(&quot;Waiting for next connection...\n&quot;, BLACKBOARD_SDP);
++	}
++	
++	/* Close the socket */
++	close(socketServer);
++	
+ 	return B_NO_ERROR;	
+ }
+ 
+
+Modified: haiku/trunk/src/servers/bluetooth/BluetoothServer.h
+===================================================================
+--- haiku/trunk/src/servers/bluetooth/BluetoothServer.h	2009-09-27 19:07:24 UTC (rev 33320)
++++ haiku/trunk/src/servers/bluetooth/BluetoothServer.h	2009-09-27 19:09:13 UTC (rev 33321)
+@@ -28,6 +28,7 @@
+ 	BLACKBOARD_GENERAL = 0,
+ 	BLACKBOARD_DEVICEMANAGER,
+ 	BLACKBOARD_KIT,
++	BLACKBOARD_SDP,
+ 	// more blackboards
+ 	BLACKBOARD_END
+ } BluetoothServerBlackBoardIndex;
+@@ -54,7 +55,7 @@
+ 	virtual void AppActivated(bool act);
+ 	virtual void MessageReceived(BMessage *message);
+ 
+-	static int32 sdp_server_Thread(void* data);
++	static int32 SDPServerThread(void* data);
+ 	
+ 	/* Messages reply */
+ 	status_t	HandleLocalDevicesCount(BMessage* message, BMessage* reply);
+@@ -84,6 +85,10 @@
+ 	DeviceManager*			fDeviceManager;
+ 	
+ 	BPoint 					fCenter;
++	
++	thread_id				fSDPThreadID;
++	
++	bool					fIsShuttingDown;
+ };
+ 
+ #endif
+
+Modified: haiku/trunk/src/servers/bluetooth/Jamfile
+===================================================================
+--- haiku/trunk/src/servers/bluetooth/Jamfile	2009-09-27 19:07:24 UTC (rev 33320)
++++ haiku/trunk/src/servers/bluetooth/Jamfile	2009-09-27 19:09:13 UTC (rev 33321)
+@@ -17,6 +17,6 @@
+ 	LocalDeviceHandler.cpp
+ 	LocalDeviceImpl.cpp  
+ 	Output.cpp
+-	: be libbluetooth.so
++	: be network libbluetooth.so
+ 	$(TARGET_LIBSTDC++)
+ ;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020940.html">[Haiku-commits] r33320 -	haiku/trunk/src/add-ons/kernel/network/protocols/l2cap
+</A></li>
+	<LI>Next message: <A HREF="020942.html">[Haiku-commits] r33322 - in haiku/trunk: build/jam	headers/private/locale src/kits/locale	src/preferences/bluetooth src/preferences/cpufrequency	src/preferences/locale src/tools/locale
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20941">[ date ]</a>
+              <a href="thread.html#20941">[ thread ]</a>
+              <a href="subject.html#20941">[ subject ]</a>
+              <a href="author.html#20941">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

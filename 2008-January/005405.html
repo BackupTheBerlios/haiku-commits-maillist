@@ -1,0 +1,306 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23441 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23441%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200801121605.m0CG5HOC026320%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005404.html">
+   <LINK REL="Next"  HREF="005406.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23441 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23441%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200801121605.m0CG5HOC026320%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23441 - haiku/trunk/src/system/kernel/fs">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sat Jan 12 17:05:17 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005404.html">[Haiku-commits] r23440 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+        <LI>Next message: <A HREF="005406.html">[Haiku-commits] r23442 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5405">[ date ]</a>
+              <a href="thread.html#5405">[ thread ]</a>
+              <a href="subject.html#5405">[ subject ]</a>
+              <a href="author.html#5405">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-01-12 17:05:17 +0100 (Sat, 12 Jan 2008)
+New Revision: 23441
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23441&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23441&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/devfs.cpp
+Log:
+* Properly implement rescan in devfs (rescan when closed and republish when open)
+* Cache the looked up image symbols as well as the API version in the driver entry
+
+Modified: haiku/trunk/src/system/kernel/fs/devfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/devfs.cpp	2008-01-12 16:04:44 UTC (rev 23440)
++++ haiku/trunk/src/system/kernel/fs/devfs.cpp	2008-01-12 16:05:17 UTC (rev 23441)
+@@ -129,9 +129,19 @@
+ 	ino_t			node;
+ 	time_t			last_modified;
+ 	image_id		image;
++
++	// driver image information
++	int32			*api_version;
++	device_hooks	*(*find_device)(const char *);
++	const char		**(*publish_devices)(void);
+ };
+ 
+ 
++struct node_path_entry : DoublyLinkedListLinkImpl&lt;node_path_entry&gt; {
++	char			path[B_PATH_NAME_LENGTH];
++};
++
++
+ static void get_device_name(struct devfs_vnode *vnode, char *buffer,
+ 	size_t size);
+ static status_t publish_device(struct devfs *fs, const char *path,
+@@ -141,6 +151,7 @@
+ 
+ /* the one and only allowed devfs instance */
+ static struct devfs *sDeviceFileSystem = NULL;
++static int32 sDefaultApiVersion = 1;
+ 
+ 
+ //	#pragma mark - driver private
+@@ -198,20 +209,19 @@
+ 
+ 	// For a valid device driver the following exports are required
+ 
+-	int32 defaultApiVersion = 1;
+-	int32 *apiVersion = &defaultApiVersion;
++	driver-&gt;api_version = &sDefaultApiVersion;
+ 	if (get_image_symbol(image, &quot;api_version&quot;, B_SYMBOL_TYPE_DATA,
+-			(void **)&amp;apiVersion) == B_OK) {
++			(void **)&amp;driver-&gt;api_version) == B_OK) {
+ #if B_CUR_DRIVER_API_VERSION != 2
+ 		// just in case someone decides to bump up the api version
+ #error Add checks here for new vs old api version!
+ #endif
+-		if (*apiVersion &gt; B_CUR_DRIVER_API_VERSION) {
+-			dprintf(&quot;%s: api_version %ld not handled\n&quot;, name, *apiVersion);
++		if (*driver-&gt;api_version &gt; B_CUR_DRIVER_API_VERSION) {
++			dprintf(&quot;%s: api_version %ld not handled\n&quot;, name, *driver-&gt;api_version);
+ 			status = B_BAD_VALUE;
+ 			goto error1;
+ 		}
+-		if (*apiVersion &lt; 1) {
++		if (*driver-&gt;api_version &lt; 1) {
+ 			dprintf(&quot;%s: api_version invalid\n&quot;, name);
+ 			status = B_BAD_VALUE;
+ 			goto error1;
+@@ -219,12 +229,10 @@
+ 	} else
+ 		dprintf(&quot;%s: api_version missing\n&quot;, name);
+ 
+-	device_hooks *(*find_device)(const char *);
+-	const char **(*publish_devices)(void);
+ 	if (get_image_symbol(image, &quot;publish_devices&quot;, B_SYMBOL_TYPE_TEXT,
+-				(void **)&amp;publish_devices) != B_OK
++				(void **)&amp;driver-&gt;publish_devices) != B_OK
+ 		|| get_image_symbol(image, &quot;find_device&quot;, B_SYMBOL_TYPE_TEXT,
+-				(void **)&amp;find_device) != B_OK) {
++				(void **)&amp;driver-&gt;find_device) != B_OK) {
+ 		dprintf(&quot;%s: mandatory driver symbol(s) missing!\n&quot;, name);
+ 		status = B_BAD_VALUE;
+ 		goto error1;
+@@ -255,7 +263,7 @@
+ 	// ToDo: we could/should always unload drivers until they will be used for real
+ 	// ToDo: this function is probably better kept in devfs, so that it could remember
+ 	//	the driver stuff (and even keep it loaded if there is enough memory)
+-	devicePaths = publish_devices();
++	devicePaths = driver-&gt;publish_devices();
+ 	if (devicePaths == NULL) {
+ 		dprintf(&quot;%s: publish_devices() returned NULL.\n&quot;, name);
+ 		status = ENXIO;
+@@ -263,11 +271,11 @@
+ 	}
+ 
+ 	for (; devicePaths[0]; devicePaths++) {
+-		device_hooks *hooks = find_device(devicePaths[0]);
++		device_hooks *hooks = driver-&gt;find_device(devicePaths[0]);
+ 
+ 		if (hooks != NULL
+ 			&amp;&amp; publish_device(sDeviceFileSystem, devicePaths[0],
+-					NULL, NULL, driver, hooks, *apiVersion) == B_OK)
++					NULL, NULL, driver, hooks, *driver-&gt;api_version) == B_OK)
+ 			exported++;
+ 	}
+ 
+@@ -980,6 +988,103 @@
+ }
+ 
+ 
++static status_t
++republish_driver(driver_entry *driver)
++{
++	if (driver-&gt;image &lt; 0)
++		return B_NO_INIT;
++
++	RecursiveLocker locker(&amp;sDeviceFileSystem-&gt;lock);
++
++	// build the list of currently present devices by iterating through all
++	// present nodes
++	struct hash_iterator i;
++	hash_open(sDeviceFileSystem-&gt;vnode_hash, &amp;i);
++
++	devfs_vnode *vnode = (devfs_vnode *)hash_next(
++		sDeviceFileSystem-&gt;vnode_hash, &amp;i);
++
++	DoublyLinkedList&lt;node_path_entry&gt; currentNodes;
++	while (vnode) {
++		if (S_ISCHR(vnode-&gt;stream.type)) {
++			if (vnode-&gt;stream.u.dev.driver == driver) {
++				node_path_entry *path = new(std::nothrow) node_path_entry;
++				if (!path) {
++					while ((path = currentNodes.RemoveHead()))
++						delete path;
++					hash_close(sDeviceFileSystem-&gt;vnode_hash, &amp;i, false);
++					return B_NO_MEMORY;
++				}
++
++				get_device_name(vnode, path-&gt;path, sizeof(path-&gt;path));
++				currentNodes.Add(path);
++			}
++		}
++
++		vnode = (devfs_vnode *)hash_next(sDeviceFileSystem-&gt;vnode_hash, &amp;i);
++	}
++	hash_close(sDeviceFileSystem-&gt;vnode_hash, &amp;i, false);
++
++	// now ask the driver for it's currently published devices
++	const char **devicePaths = driver-&gt;publish_devices();
++	if (devicePaths == NULL) {
++		node_path_entry *entry = NULL;
++		while ((entry = currentNodes.RemoveHead()))
++			delete entry;
++		return B_ERROR;
++	}
++
++	int32 exported = 0;
++	for (; devicePaths[0]; devicePaths++) {
++		bool present = false;
++		node_path_entry *entry = currentNodes.Head();
++		while (entry) {
++			if (strncmp(entry-&gt;path, devicePaths[0], B_PATH_NAME_LENGTH) == 0) {
++				// this device was present before and still is -&gt; no republish
++				currentNodes.Remove(entry);
++				delete entry;
++				exported++;
++				present = true;
++				break;
++			}
++
++			entry = currentNodes.GetNext(entry);
++		}
++
++		if (present)
++			continue;
++
++		// the device was not present before -&gt; publish it now
++		device_hooks *hooks = driver-&gt;find_device(devicePaths[0]);
++		if (hooks == NULL)
++			continue;
++
++		dprintf(&quot;devfs: publishing new device \&quot;%s\&quot;\n&quot;, devicePaths[0]);
++		if (publish_device(sDeviceFileSystem, devicePaths[0], NULL, NULL,
++			driver, hooks, *driver-&gt;api_version) == B_OK)
++			exported++;
++	}
++
++	// what's left in currentNodes was present but is not anymore -&gt; unpublish
++	node_path_entry *entry = currentNodes.Head();
++	while (entry) {
++		dprintf(&quot;devfs: unpublishing no more present \&quot;%s\&quot;\n&quot;, entry-&gt;path);
++		devfs_unpublish_device(entry-&gt;path, true);
++		node_path_entry *next = currentNodes.GetNext(entry);
++		currentNodes.Remove(entry);
++		delete entry;
++		entry = next;
++	}
++
++	if (exported == 0) {
++		dprintf(&quot;devfs: driver \&quot;%s\&quot; does not publish any more nodes and could be unloaded\n&quot;, driver-&gt;path);
++		// ToDo: here we could unload the driver if it doesn't publish anything
++	}
++
++	return B_OK;
++}
++
++
+ /** Construct complete device name (as used for device_open()).
+  *	This is safe to use only when the device is in use (and therefore
+  *	cannot be unpublished during the iteration).
+@@ -2455,6 +2560,7 @@
+ 	if (status == B_OK &amp;&amp; disconnect)
+ 		vfs_disconnect_vnode(sDeviceFileSystem-&gt;id, node-&gt;id);
+ 
++	remove_vnode(sDeviceFileSystem-&gt;id, node-&gt;id);
+ 	put_vnode(sDeviceFileSystem-&gt;id, node-&gt;id);
+ 	return status;
+ }
+@@ -2482,6 +2588,8 @@
+ {
+ 	TRACE((&quot;devfs_rescan_driver: %s\n&quot;, driverName));
+ 
++	RecursiveLocker locker(&amp;sDeviceFileSystem-&gt;lock);
++
+ 	// iterate over the drivers and search a matching driverName
+ 	struct hash_iterator i;
+ 	hash_open(sDeviceFileSystem-&gt;driver_hash, &amp;i);
+@@ -2497,8 +2605,13 @@
+ 
+ 		if (!strcmp(name, driverName)) {
+ 			hash_close(sDeviceFileSystem-&gt;driver_hash, &amp;i, false);
+-			// ToDo: force a uninit/init cycle on the driver if loaded
+-			return load_driver(driver);
++			if (driver-&gt;image &lt; 0) {
++				// The driver is not yet loaded
++				return load_driver(driver);
++			} else {
++				// The driver is loaded, just republish its entries
++				return republish_driver(driver);
++			}
+ 		}
+ 
+ 		driver = (driver_entry *)hash_next(sDeviceFileSystem-&gt;driver_hash, &amp;i);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005404.html">[Haiku-commits] r23440 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+	<LI>Next message: <A HREF="005406.html">[Haiku-commits] r23442 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5405">[ date ]</a>
+              <a href="thread.html#5405">[ thread ]</a>
+              <a href="subject.html#5405">[ subject ]</a>
+              <a href="author.html#5405">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

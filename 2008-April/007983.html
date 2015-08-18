@@ -1,0 +1,379 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25070 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25070%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/unix&In-Reply-To=%3C200804200307.m3K37sxV019425%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007982.html">
+   <LINK REL="Next"  HREF="008124.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25070 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25070%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/unix&In-Reply-To=%3C200804200307.m3K37sxV019425%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25070 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Apr 20 05:07:54 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007982.html">[Haiku-commits] r25069 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix
+</A></li>
+        <LI>Next message: <A HREF="008124.html">[Haiku-commits] r25070 - haiku/trunk/src/add-ons/kernel/network/protocols/unix
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7983">[ date ]</a>
+              <a href="thread.html#7983">[ thread ]</a>
+              <a href="subject.html#7983">[ subject ]</a>
+              <a href="author.html#7983">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-04-20 05:07:53 +0200 (Sun, 20 Apr 2008)
+New Revision: 25070
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25070&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25070&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.h
+Log:
+* Riddled UnixBufferQueue class with debug code.
+* Implemented temporary work-around for net_buffer append_cloned(),
+  which doesn't seem to work right in combination with remove_header().
+  Or maybe I'm just misunderstood how it is supposed to be used. Anyway,
+  this fixed invalid data in the stream when buffers were split by a
+  read.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp	2008-04-20 02:59:23 UTC (rev 25069)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp	2008-04-20 03:07:53 UTC (rev 25070)
+@@ -5,6 +5,8 @@
+ 
+ #include &quot;UnixFifo.h&quot;
+ 
++#include &lt;AutoDeleter.h&gt;
++
+ #include &quot;unix.h&quot;
+ 
+ 
+@@ -13,11 +15,28 @@
+ #include &quot;UnixDebug.h&quot;
+ 
+ 
++#if TRACE_BUFFER_QUEUE
++#	define TRACEBQ(x...)	ktrace_printf(x)
++#	define TRACEBQ_ONLY(x)	x
++#else
++#	define TRACEBQ(x...)	do {} while (false)
++#	define TRACEBQ_ONLY(x)
++#endif
++
++
+ UnixBufferQueue::UnixBufferQueue(size_t capacity)
+ 	:
+ 	fSize(0),
+ 	fCapacity(capacity)
++#if TRACE_BUFFER_QUEUE
++	, fWritten(0)
++	, fRead(0)
++#endif
+ {
++	TRACEBQ_ONLY(
++		fParanoiaCheckBuffer = (uint8*)malloc(UNIX_FIFO_MAXIMAL_CAPACITY);
++		fParanoiaCheckBuffer2 = (uint8*)malloc(UNIX_FIFO_MAXIMAL_CAPACITY);
++	)
+ }
+ 
+ 
+@@ -25,6 +44,11 @@
+ {
+ 	while (net_buffer* buffer = fBuffers.RemoveHead())
+ 		gBufferModule-&gt;free(buffer);
++
++	TRACEBQ_ONLY(
++		free(fParanoiaCheckBuffer);
++		free(fParanoiaCheckBuffer2);
++	)
+ }
+ 
+ 
+@@ -34,23 +58,53 @@
+ 	if (size &gt; fSize)
+ 		size = fSize;
+ 
++	TRACEBQ(&quot;unix: UnixBufferQueue::Read(%lu): fSize: %lu, fRead: %lld, &quot;
++		&quot;fWritten: %lld&quot;, size, fSize, fRead, fWritten);
++
++	TRACEBQ_ONLY(
++		MethodDeleter&lt;UnixBufferQueue&gt; _(this, &amp;UnixBufferQueue::PostReadWrite);
++	)
++
+ 	if (size == 0)
+ 		return B_BAD_VALUE;
+ 
++TRACEBQ_ONLY(
++	if (fParanoiaCheckBuffer) {
++		size_t bufferSize = 0;
++		for (BufferList::Iterator it = fBuffers.GetIterator();
++			net_buffer* buffer = it.Next();) {
++			size_t toWrite = min_c(buffer-&gt;size, size - bufferSize);
++			if (toWrite == 0)
++				break;
++
++			gBufferModule-&gt;read(buffer, 0,
++				fParanoiaCheckBuffer + bufferSize, toWrite);
++			bufferSize += toWrite;
++		}
++	}
++	*_buffer = NULL;
++)
++
+ 	// If the first buffer has the right size or is smaller, we can just
+ 	// dequeue it.
+ 	net_buffer* buffer = fBuffers.Head();
+ 	if (buffer-&gt;size &lt;= size) {
+ 		fBuffers.RemoveHead();
+ 		fSize -= buffer-&gt;size;
++		TRACEBQ_ONLY(fRead += buffer-&gt;size);
+ 		*_buffer = buffer;
+ 
+ 		if (buffer-&gt;size == size)
++{
++TRACEBQ(&quot;unix:   read full buffer %p (%lu)&quot;, buffer, buffer-&gt;size);
++TRACEBQ_ONLY(ParanoiaReadCheck(*_buffer));
+ 			return B_OK;
++}
+ 
+ 		// buffer is too small
+ 
+  		size_t bytesLeft = size - buffer-&gt;size;
++TRACEBQ(&quot;unix:   read short buffer %p (%lu/%lu)&quot;, buffer, size, buffer-&gt;size);
+ 
+ 		// Append from the following buffers, until we've read as much as we're
+ 		// supposed to.
+@@ -58,18 +112,46 @@
+ 			net_buffer* nextBuffer = fBuffers.Head();
+ 			size_t toCopy = min_c(bytesLeft, nextBuffer-&gt;size);
+ 
++TRACEBQ(&quot;unix:   read next buffer %p (%lu/%lu)&quot;, nextBuffer, bytesLeft, nextBuffer-&gt;size);
++#if 0
+ 			if (gBufferModule-&gt;append_cloned(buffer, nextBuffer, 0, toCopy)
+ 					!= B_OK) {
+ 				// Too bad, but we've got some data, so we don't fail.
++TRACEBQ_ONLY(ParanoiaReadCheck(*_buffer));
+ 				return B_OK;
+ 			}
++#endif
+ 
++// TODO: Temporary work-around for the append_cloned() call above, which
++// doesn't seem to work right. Or maybe that's just in combination with the
++// remove_header() below.
++{
++	void* tmpBuffer = malloc(toCopy);
++	if (tmpBuffer == NULL)
++		return B_OK;
++	MemoryDeleter tmpBufferDeleter(tmpBuffer);
++
++	size_t offset = buffer-&gt;size;
++	if (gBufferModule-&gt;read(nextBuffer, 0, tmpBuffer, toCopy) != B_OK
++		|| gBufferModule-&gt;append_size(buffer, toCopy, NULL) != B_OK) {
++		return B_OK;
++	}
++
++	if (gBufferModule-&gt;write(buffer, offset, tmpBuffer, toCopy) != B_OK) {
++		gBufferModule-&gt;remove_trailer(buffer, toCopy);
++		return B_OK;
++	}
++}
++
+ 			// transfer the ancillary data
+ 			gBufferModule-&gt;transfer_ancillary_data(nextBuffer, buffer);
+ 
+ 			if (nextBuffer-&gt;size &gt; toCopy) {
+ 				// remove the part we've copied
++//gBufferModule-&gt;read(nextBuffer, toCopy, fParanoiaCheckBuffer,
++//nextBuffer-&gt;size - toCopy);
+ 				gBufferModule-&gt;remove_header(nextBuffer, toCopy);
++//TRACEBQ_ONLY(ParanoiaReadCheck(nextBuffer));
+ 			} else {
+ 				// get rid of the buffer completely
+ 				fBuffers.RemoveHead();
+@@ -78,8 +160,10 @@
+ 
+ 			bytesLeft -= toCopy;
+ 			fSize -= toCopy;
++			TRACEBQ_ONLY(fRead += toCopy);
+ 		}
+ 
++TRACEBQ_ONLY(ParanoiaReadCheck(*_buffer));
+ 		return B_OK;
+ 	}
+ 
+@@ -100,11 +184,14 @@
+ 	gBufferModule-&gt;transfer_ancillary_data(buffer, newBuffer);
+ 
+ 	// remove the part we've copied
++TRACEBQ(&quot;unix:   read long buffer %p (%lu/%lu)&quot;, buffer, size, buffer-&gt;size);
+ 	gBufferModule-&gt;remove_header(buffer, size);
+ 
+ 	fSize -= size;
++	TRACEBQ_ONLY(fRead += size);
+ 	*_buffer = newBuffer;
+ 
++TRACEBQ_ONLY(ParanoiaReadCheck(*_buffer));
+ 	return B_OK;
+ }
+ 
+@@ -112,11 +199,19 @@
+ status_t
+ UnixBufferQueue::Write(net_buffer* buffer)
+ {
++	TRACEBQ(&quot;unix: UnixBufferQueue::Write(%lu): fSize: %lu, fRead: %lld, &quot;
++		&quot;fWritten: %lld&quot;, buffer-&gt;size, fSize, fRead, fWritten);
++
++	TRACEBQ_ONLY(
++		MethodDeleter&lt;UnixBufferQueue&gt; _(this, &amp;UnixBufferQueue::PostReadWrite);
++	)
++
+ 	if (buffer-&gt;size &gt; Writable())
+ 		return ENOBUFS;
+ 
+ 	fBuffers.Add(buffer);
+ 	fSize += buffer-&gt;size;
++	TRACEBQ_ONLY(fWritten += buffer-&gt;size);
+ 
+ 	return B_OK;
+ }
+@@ -129,6 +224,58 @@
+ }
+ 
+ 
++#if TRACE_BUFFER_QUEUE
++
++void
++UnixBufferQueue::ParanoiaReadCheck(net_buffer* buffer)
++{
++	if (!buffer || !fParanoiaCheckBuffer || !fParanoiaCheckBuffer2)
++		return;
++
++	gBufferModule-&gt;read(buffer, 0, fParanoiaCheckBuffer2, buffer-&gt;size);
++
++	if (memcmp(fParanoiaCheckBuffer, fParanoiaCheckBuffer2, buffer-&gt;size)
++			!= 0) {
++		// find offset of first difference
++		size_t i = 0;
++		for (; i &lt; buffer-&gt;size; i++) {
++			if (fParanoiaCheckBuffer[i] != fParanoiaCheckBuffer2[i])
++				break;
++		}
++
++		panic(&quot;unix: UnixBufferQueue::ParanoiaReadCheck(): incorrect read! &quot;
++			&quot;offset of first difference: %lu&quot;, i);
++	}
++}
++
++
++void
++UnixBufferQueue::PostReadWrite()
++{
++	TRACEBQ(&quot;unix: post read/write: fSize: %lu, fRead: %lld, fWritten: %lld&quot;,
++		fSize, fRead, fWritten);
++
++	if (fWritten - fRead != fSize) {
++		panic(&quot;UnixBufferQueue::PostReadWrite(): fSize: %lu, fRead: %lld, &quot;
++			&quot;fWritten: %lld&quot;, fSize, fRead, fWritten);
++	}
++
++	// check buffer size sum
++	size_t bufferSize = 0;
++	for (BufferList::Iterator it = fBuffers.GetIterator();
++		 net_buffer* buffer = it.Next();) {
++		bufferSize += buffer-&gt;size;
++	}
++
++	if (bufferSize != fSize) {
++		panic(&quot;UnixBufferQueue::PostReadWrite(): fSize: %lu, bufferSize: %lu&quot;,
++			fSize, bufferSize);
++	}
++}
++
++#endif	// TRACE_BUFFER_QUEUE
++
++
+ // #pragma mark -
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.h	2008-04-20 02:59:23 UTC (rev 25069)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.h	2008-04-20 03:07:53 UTC (rev 25070)
+@@ -24,6 +24,9 @@
+ #define UNIX_FIFO_MAXIMAL_CAPACITY	(128 * 1024)
+ 
+ 
++#define TRACE_BUFFER_QUEUE	1
++
++
+ class UnixBufferQueue {
+ public:
+ 	UnixBufferQueue(size_t capacity);
+@@ -39,6 +42,11 @@
+ 	size_t Capacity() const		{ return fCapacity; }
+ 	void SetCapacity(size_t capacity);
+ 
++#if TRACE_BUFFER_QUEUE
++	void ParanoiaReadCheck(net_buffer* buffer);
++	void PostReadWrite();
++#endif
++
+ private:
+ 	typedef DoublyLinkedList&lt;net_buffer, DoublyLinkedListCLink&lt;net_buffer&gt; &gt;
+ 		BufferList;
+@@ -46,6 +54,12 @@
+ 	BufferList	fBuffers;
+ 	size_t		fSize;
+ 	size_t		fCapacity;
++#if TRACE_BUFFER_QUEUE
++	off_t		fWritten;
++	off_t		fRead;
++	uint8*		fParanoiaCheckBuffer;
++	uint8*		fParanoiaCheckBuffer2;
++#endif
+ };
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007982.html">[Haiku-commits] r25069 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix
+</A></li>
+	<LI>Next message: <A HREF="008124.html">[Haiku-commits] r25070 - haiku/trunk/src/add-ons/kernel/network/protocols/unix
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7983">[ date ]</a>
+              <a href="thread.html#7983">[ thread ]</a>
+              <a href="subject.html#7983">[ subject ]</a>
+              <a href="author.html#7983">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

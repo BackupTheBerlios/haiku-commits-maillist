@@ -1,0 +1,446 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32016 - in haiku/trunk/src:	add-ons/media/plugins/ffmpeg servers/media
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32016%20-%20in%20haiku/trunk/src%3A%0A%09add-ons/media/plugins/ffmpeg%20servers/media&In-Reply-To=%3C200907311306.n6VD6bqd002654%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018589.html">
+   <LINK REL="Next"  HREF="018591.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32016 - in haiku/trunk/src:	add-ons/media/plugins/ffmpeg servers/media</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32016%20-%20in%20haiku/trunk/src%3A%0A%09add-ons/media/plugins/ffmpeg%20servers/media&In-Reply-To=%3C200907311306.n6VD6bqd002654%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32016 - in haiku/trunk/src:	add-ons/media/plugins/ffmpeg servers/media">stippi at mail.berlios.de
+       </A><BR>
+    <I>Fri Jul 31 15:06:37 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018589.html">[Haiku-commits] r32015 -	haiku/trunk/src/add-ons/media/plugins/ffmpeg
+</A></li>
+        <LI>Next message: <A HREF="018591.html">[Haiku-commits] r32017 - haiku/trunk/src/preferences/screen
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18590">[ date ]</a>
+              <a href="thread.html#18590">[ thread ]</a>
+              <a href="subject.html#18590">[ subject ]</a>
+              <a href="author.html#18590">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-07-31 15:06:34 +0200 (Fri, 31 Jul 2009)
+New Revision: 32016
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32016&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32016&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp
+   haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h
+   haiku/trunk/src/add-ons/media/plugins/ffmpeg/EncoderTable.cpp
+   haiku/trunk/src/add-ons/media/plugins/ffmpeg/FFmpegPlugin.cpp
+   haiku/trunk/src/servers/media/AddOnManager.cpp
+Log:
+* Let the Encoders use the media_codec_info.sub_id field for their own purposes.
+* Implemented some of AVCodecEncoder. Maybe video encoding already works, but
+  we don't know until the AVFormatWriter is more than just stubs... but I doubt
+  it. :-)
+
+
+Modified: haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp	2009-07-31 13:04:14 UTC (rev 32015)
++++ haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.cpp	2009-07-31 13:06:34 UTC (rev 32016)
+@@ -6,9 +6,15 @@
+ 
+ #include &quot;AVCodecEncoder.h&quot;
+ 
++#include &lt;new&gt;
++
+ #include &lt;stdio.h&gt;
+ 
++extern &quot;C&quot; {
++	#include &quot;rational.h&quot;
++}
+ 
++
+ #undef TRACE
+ #define TRACE_AV_CODEC_ENCODER
+ #ifdef TRACE_AV_CODEC_ENCODER
+@@ -18,17 +24,40 @@
+ #endif
+ 
+ 
+-AVCodecEncoder::AVCodecEncoder(const char* shortName)
++static const size_t kDefaultChunkBufferSize = FF_MIN_BUFFER_SIZE;
++
++
++AVCodecEncoder::AVCodecEncoder(uint32 codecID)
+ 	:
+-	Encoder()
++	Encoder(),
++	fCodec(NULL),
++	fContext(avcodec_alloc_context()),
++	fInputPicture(avcodec_alloc_frame()),
++//	fOutputPicture(avcodec_alloc_frame()),
++	fCodecInitDone(false),
++	fChunkBuffer(new(std::nothrow) uint8[kDefaultChunkBufferSize])
+ {
+ 	TRACE(&quot;AVCodecEncoder::AVCodecEncoder()\n&quot;);
++
++	fCodec = avcodec_find_encoder((enum CodecID)codecID);
++	TRACE(&quot;  found AVCodec: %p\n&quot;, fCodec);
++
++	memset(&amp;fInputFormat, 0, sizeof(media_format));
+ }
+ 
+ 
+ AVCodecEncoder::~AVCodecEncoder()
+ {
+ 	TRACE(&quot;AVCodecEncoder::~AVCodecEncoder()\n&quot;);
++
++	if (fCodecInitDone)
++		avcodec_close(fContext);
++
++//	free(fOutputPicture);
++	free(fInputPicture);
++	free(fContext);
++
++	delete[] fChunkBuffer;
+ }
+ 
+ 
+@@ -56,10 +85,48 @@
+ {
+ 	TRACE(&quot;AVCodecEncoder::SetUp()\n&quot;);
+ 
++	if (fContext == NULL || fCodec == NULL)
++		return B_NO_INIT;
++
+ 	if (inputFormat == NULL)
+ 		return B_BAD_VALUE;
+ 
+-	return B_NOT_SUPPORTED;
++	fInputFormat = *inputFormat;
++
++	if (fInputFormat.type == B_MEDIA_RAW_VIDEO) {
++		fContext-&gt;width = fInputFormat.u.raw_video.display.line_width;
++		fContext-&gt;height = fInputFormat.u.raw_video.display.line_count;
++//		fContext-&gt;gop_size = 12;
++		fContext-&gt;pix_fmt = PIX_FMT_BGR32;
++//		fContext-&gt;rate_emu = 0;
++		// TODO: Setup rate control:
++//		fContext-&gt;rc_eq = NULL;
++//		fContext-&gt;rc_max_rate = 0;
++//		fContext-&gt;rc_min_rate = 0;
++		fContext-&gt;sample_aspect_ratio.num
++			= fInputFormat.u.raw_video.pixel_width_aspect;
++		fContext-&gt;sample_aspect_ratio.den
++			= fInputFormat.u.raw_video.pixel_height_aspect;
++		if (fContext-&gt;sample_aspect_ratio.num == 0
++			|| fContext-&gt;sample_aspect_ratio.den == 0) {
++			av_reduce(&amp;fContext-&gt;sample_aspect_ratio.num,
++				&amp;fContext-&gt;sample_aspect_ratio.den, fContext-&gt;width,
++				fContext-&gt;height, 256);
++		}
++
++		// TODO: This should already happen in AcceptFormat()
++		fInputFormat.u.raw_video.display.bytes_per_row = fContext-&gt;width * 4;
++	} else {
++		return B_NOT_SUPPORTED;
++	}
++
++	// Open the codec
++	int result = avcodec_open(fContext, fCodec);
++	fCodecInitDone = (result &gt;= 0);
++
++	TRACE(&quot;  avcodec_open(): %d\n&quot;, result);
++
++	return fCodecInitDone ? B_OK : B_ERROR;
+ }
+ 
+ 
+@@ -87,5 +154,67 @@
+ {
+ 	TRACE(&quot;AVCodecEncoder::Encode(%p, %lld, %p)\n&quot;, buffer, frameCount, info);
+ 
++	if (fInputFormat.type == B_MEDIA_RAW_AUDIO)
++		return _EncodeAudio(buffer, frameCount, info);
++	else if (fInputFormat.type == B_MEDIA_RAW_VIDEO)
++		return _EncodeVideo(buffer, frameCount, info);
++	else
++		return B_NO_INIT;
++}
++
++
++// #pragma mark -
++
++
++status_t
++AVCodecEncoder::_EncodeAudio(const void* buffer, int64 frameCount,
++	media_encode_info* info)
++{
++	TRACE(&quot;AVCodecEncoder::_EncodeAudio(%p, %lld, %p)\n&quot;, buffer, frameCount,
++		info);
++
+ 	return B_NOT_SUPPORTED;
+ }
++
++
++status_t
++AVCodecEncoder::_EncodeVideo(const void* buffer, int64 frameCount,
++	media_encode_info* info)
++{
++	TRACE(&quot;AVCodecEncoder::_EncodeVideo(%p, %lld, %p)\n&quot;, buffer, frameCount,
++		info);
++
++	if (fChunkBuffer == NULL)
++		return B_NO_MEMORY;
++
++	status_t ret = B_OK;
++
++	while (frameCount &gt; 0) {
++		size_t bpr = fInputFormat.u.raw_video.display.bytes_per_row;
++		size_t bufferSize = fInputFormat.u.raw_video.display.line_count * bpr;
++
++		fInputPicture-&gt;data[0] = (uint8_t*)buffer;
++		fInputPicture-&gt;linesize[0] = bpr;
++
++		int usedBytes = avcodec_encode_video(fContext, fChunkBuffer,
++			kDefaultChunkBufferSize, fInputPicture);
++
++		if (usedBytes &lt; 0) {
++			TRACE(&quot;  avcodec_encode_video() failed: %d\n&quot;, usedBytes);
++			return B_ERROR;
++		}
++
++		// Write the chunk
++		ret = WriteChunk(fChunkBuffer, usedBytes, info);
++		if (ret != B_OK)
++			break;
++
++		// Skip to the next frame (but usually, there is only one to encode
++		// for video).
++		frameCount--;
++		buffer = (const void*)((const uint8*)buffer + bufferSize);
++	}
++
++	return ret;
++}
++
+
+Modified: haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h	2009-07-31 13:04:14 UTC (rev 32015)
++++ haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVCodecEncoder.h	2009-07-31 13:06:34 UTC (rev 32016)
+@@ -8,12 +8,16 @@
+ 
+ #include &lt;MediaFormats.h&gt;
+ 
++extern &quot;C&quot; {
++	#include &quot;avcodec.h&quot;
++}
++
+ #include &quot;EncoderPlugin.h&quot;
+ 
+ 
+ class AVCodecEncoder : public Encoder {
+ public:
+-								AVCodecEncoder(const char* shortName);
++								AVCodecEncoder(uint32 codecID);
+ 
+ 	virtual						~AVCodecEncoder();
+ 
+@@ -32,6 +36,29 @@
+ 									media_encode_info* info);
+ 
+ private:
++			status_t			_EncodeAudio(const void* buffer,
++									int64 frameCount,
++									media_encode_info* info);
++
++			status_t			_EncodeVideo(const void* buffer,
++									int64 frameCount,
++									media_encode_info* info);
++
++private:
++			media_format		fInputFormat;
++
++			// FFmpeg related members
++			// TODO: Refactor common base class from AVCodec[De|En]Coder!
++			AVCodec*			fCodec;
++			AVCodecContext*		fContext;
++			AVFrame*			fInputPicture;
++//			AVFrame*			fOutputPicture;
++
++			uint32				fAVCodecID;
++
++			bool				fCodecInitDone;
++
++			uint8*				fChunkBuffer;
+ };
+ 
+ #endif // AVCODEC_ENCODER_H
+
+Modified: haiku/trunk/src/add-ons/media/plugins/ffmpeg/EncoderTable.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/ffmpeg/EncoderTable.cpp	2009-07-31 13:04:14 UTC (rev 32015)
++++ haiku/trunk/src/add-ons/media/plugins/ffmpeg/EncoderTable.cpp	2009-07-31 13:06:34 UTC (rev 32016)
+@@ -6,14 +6,18 @@
+ 
+ #include &quot;EncoderTable.h&quot;
+ 
++extern &quot;C&quot; {
++	#include &quot;avcodec.h&quot;
++}
+ 
++
+ const EncoderDescription gEncoderTable[] = {
+ 	{
+ 		{
+-			&quot;MPEG2 Video&quot;,
+-			&quot;mpeg2video&quot;,
++			&quot;MPEG4 Video&quot;,
++			&quot;mpeg4&quot;,
+ 			0,
+-			0,
++			CODEC_ID_MPEG4,
+ 			{ 0 }
+ 		},
+ 		B_ANY_FORMAT_FAMILY,
+@@ -22,10 +26,10 @@
+ 	},
+ 	{
+ 		{
+-			&quot;WAV&quot;,
+-			&quot;wav&quot;,
++			&quot;MP3 Audio&quot;,
++			&quot;mp3&quot;,
+ 			0,
+-			0,
++			CODEC_ID_MP3,
+ 			{ 0 }
+ 		},
+ 		B_ANY_FORMAT_FAMILY,
+
+Modified: haiku/trunk/src/add-ons/media/plugins/ffmpeg/FFmpegPlugin.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/ffmpeg/FFmpegPlugin.cpp	2009-07-31 13:04:14 UTC (rev 32015)
++++ haiku/trunk/src/add-ons/media/plugins/ffmpeg/FFmpegPlugin.cpp	2009-07-31 13:06:34 UTC (rev 32016)
+@@ -134,7 +134,7 @@
+ Encoder*
+ FFmpegPlugin::NewEncoder(const media_codec_info&amp; codecInfo)
+ {
+-	return new(std::nothrow)AVCodecEncoder(codecInfo.short_name);
++	return new(std::nothrow)AVCodecEncoder(codecInfo.sub_id);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/servers/media/AddOnManager.cpp
+===================================================================
+--- haiku/trunk/src/servers/media/AddOnManager.cpp	2009-07-31 13:04:14 UTC (rev 32015)
++++ haiku/trunk/src/servers/media/AddOnManager.cpp	2009-07-31 13:06:34 UTC (rev 32016)
+@@ -120,10 +120,10 @@
+ 			return B_OK;
+ 		}
+ 	}
+-	return B_ENTRY_NOT_FOUND;	
++	return B_ENTRY_NOT_FOUND;
+ }
+-									
+ 
++
+ status_t
+ AddOnManager::GetReaders(xfer_entry_ref* outRefs, int32* outCount,
+ 	int32 maxCount)
+@@ -152,7 +152,7 @@
+ 		if (info-&gt;internalID == (uint32)id) {
+ 			printf(&quot;AddOnManager::GetEncoderForFormat: found encoder %s for &quot;
+ 				&quot;id %ld\n&quot;, info-&gt;ref.name, id);
+-	
++
+ 			*_encoderRef = info-&gt;ref;
+ 			return B_OK;
+ 		}
+@@ -161,10 +161,10 @@
+ 	printf(&quot;AddOnManager::GetEncoderForFormat: failed to find encoder for id &quot;
+ 		&quot;%ld\n&quot;, id);
+ 
+-	return B_ENTRY_NOT_FOUND;	
++	return B_ENTRY_NOT_FOUND;
+ }
+-									
+ 
++
+ status_t
+ AddOnManager::GetWriter(xfer_entry_ref* _ref, uint32 internalID)
+ {
+@@ -275,7 +275,7 @@
+ 		_RegisterEncoder(encoder, ref);
+ 
+ 	delete plugin;
+-	
++
+ 	return B_OK;
+ }
+ 
+@@ -347,7 +347,7 @@
+ 
+ 		if (find_directory(directories[i], &amp;path) == B_OK
+ 			&amp;&amp; path.Append(&quot;media/plugins&quot;) == B_OK
+-			&amp;&amp; directory.SetTo(path.Path()) == B_OK 
++			&amp;&amp; directory.SetTo(path.Path()) == B_OK
+ 			&amp;&amp; directory.GetNodeRef(&amp;nref) == B_OK) {
+ 			fHandler-&gt;AddDirectory(&amp;nref);
+ 		}
+@@ -475,7 +475,6 @@
+ 	info.internalID = fNextEncoderCodecInfoID++;
+ 
+ 	int32 cookie = 0;
+-	int32 subID = 0;
+ 
+ 	while (true) {
+ 		memset(&amp;info.codecInfo, 0, sizeof(media_codec_info));
+@@ -487,7 +486,9 @@
+ 			break;
+ 		}
+ 		info.codecInfo.id = info.internalID;
+-		info.codecInfo.sub_id = subID++;
++		// NOTE: info.codecInfo.sub_id is for private use by the Encoder,
++		// we don't touch it, but it is maintained and passed back to the
++		// EncoderPlugin in NewEncoder(media_codec_info).
+ 
+ 		if (!fEncoderList.Insert(info))
+ 			break;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018589.html">[Haiku-commits] r32015 -	haiku/trunk/src/add-ons/media/plugins/ffmpeg
+</A></li>
+	<LI>Next message: <A HREF="018591.html">[Haiku-commits] r32017 - haiku/trunk/src/preferences/screen
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18590">[ date ]</a>
+              <a href="thread.html#18590">[ thread ]</a>
+              <a href="subject.html#18590">[ subject ]</a>
+              <a href="author.html#18590">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

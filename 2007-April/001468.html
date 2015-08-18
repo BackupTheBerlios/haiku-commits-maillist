@@ -1,0 +1,258 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20601 - in haiku/trunk/src/add-ons/kernel/network:	devices/ethernet stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20601%20-%20in%20haiku/trunk/src/add-ons/kernel/network%3A%0A%09devices/ethernet%20stack&In-Reply-To=%3C200704060948.l369mFMs028437%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001470.html">
+   <LINK REL="Next"  HREF="001473.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20601 - in haiku/trunk/src/add-ons/kernel/network:	devices/ethernet stack</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20601%20-%20in%20haiku/trunk/src/add-ons/kernel/network%3A%0A%09devices/ethernet%20stack&In-Reply-To=%3C200704060948.l369mFMs028437%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20601 - in haiku/trunk/src/add-ons/kernel/network:	devices/ethernet stack">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Fri Apr  6 11:48:15 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001470.html">[Haiku-commits] r20600 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+        <LI>Next message: <A HREF="001473.html">[Haiku-commits] r20602 - in haiku/trunk/build: jam scripts
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1468">[ date ]</a>
+              <a href="thread.html#1468">[ thread ]</a>
+              <a href="subject.html#1468">[ subject ]</a>
+              <a href="author.html#1468">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-06 11:48:02 +0200 (Fri, 06 Apr 2007)
+New Revision: 20601
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20601&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20601&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/devices/ethernet/ethernet.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp
+Log:
+a bit more work towards proper locking including a fix to a refcount bug
+
+ - fixed a issue in add_interface_to_domain where the device interface's refcount was always incremented since that function was getting the device interface handle and not returning it unconditionlly
+ - if the ethernet device goes down, and the fd is close()ed, return B_FILE_ERROR instead of calling into the driver again
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/devices/ethernet/ethernet.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/devices/ethernet/ethernet.cpp	2007-04-06 06:23:35 UTC (rev 20600)
++++ haiku/trunk/src/add-ons/kernel/network/devices/ethernet/ethernet.cpp	2007-04-06 09:48:02 UTC (rev 20601)
+@@ -221,6 +221,7 @@
+ 		sCheckList.Remove(device);
+ 
+ 	close(device-&gt;fd);
++	device-&gt;fd = -1;
+ }
+ 
+ 
+@@ -290,6 +291,9 @@
+ {
+ 	ethernet_device *device = (ethernet_device *)_device;
+ 
++	if (device-&gt;fd == -1)
++		return B_FILE_ERROR;
++
+ 	// TODO: better header space
+ 	net_buffer *buffer = gBufferModule-&gt;create(256);
+ 	if (buffer == NULL)
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp	2007-04-06 06:23:35 UTC (rev 20600)
++++ haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp	2007-04-06 09:48:02 UTC (rev 20601)
+@@ -44,14 +44,12 @@
+ 	net_device_interface *interface = (net_device_interface *)_interface;
+ 	net_device *device = interface-&gt;device;
+ 	status_t status = B_OK;
+-	int32 tries = 0;
+ 
+ 	while ((device-&gt;flags &amp; IFF_UP) != 0) {
+ 		net_buffer *buffer;
+ 		status = device-&gt;module-&gt;receive_data(device, &amp;buffer);
+ 		if (status == B_OK) {
+ 			//dprintf(&quot;received buffer of %ld bytes length\n&quot;, buffer-&gt;size);
+-			tries = 0;
+ 
+ 			// feed device monitors
+ 			// TODO: locking!
+@@ -88,18 +86,24 @@
+ 			}
+ 
+ 			gNetBufferModule.free(buffer);
+-		}
+-
+-		if (status &lt; B_OK) {
+-			// this is a near real-time thread - don't render the system unusable
+-			// in case of a device going down
++		} else {
++			// In case of error, give the other threads some
++			// time to run since this is a near real time thread.
++			//
++			// TODO: can this value be lower? 1000 works fine in
++			//       my system. 10ms seems a bit too much and adds
++			//       as latency.
+ 			snooze(10000);
+-
+-			if (++tries &gt; 20) {
+-				// TODO: bring down the interface!
+-				break;
+-			}
+ 		}
++
++		// if the interface went down IFF_UP was removed
++		// and the receive_data() above should have been
++		// interrupted. One check should be enough, specially
++		// considering the snooze above.
++		//
++		// TODO: make sure that when receive_data() returns
++		//       after closing the new device-&gt;flags are
++		//       already visible in all processors.
+ 	}
+ 
+ 	return status;
+@@ -254,19 +258,13 @@
+ 			if (user_memcpy(&amp;request, value, sizeof(struct ifreq)) &lt; B_OK)
+ 				return B_BAD_ADDRESS;
+ 
+-			benaphore_lock(&amp;domain-&gt;lock);
+-			status_t status;
++			BenaphoreLocker _(domain-&gt;lock);
+ 
+ 			net_interface *interface = find_interface(domain,
+ 				request.ifr_name);
+-			if (interface != NULL)
+-				status = remove_interface_from_domain(interface);
+-			else
+-				status = ENODEV;
+-
+-			benaphore_unlock(&amp;domain-&gt;lock);
+-
+-			return status;
++			if (interface == NULL)
++				return ENODEV;
++			return remove_interface_from_domain(interface);
+ 		}
+ 
+ 		case SIOCGIFCOUNT:
+@@ -321,7 +319,7 @@
+ 			if (user_memcpy(&amp;request, value, sizeof(struct ifreq)) &lt; B_OK)
+ 				return B_BAD_ADDRESS;
+ 
+-			benaphore_lock(&amp;domain-&gt;lock);
++			BenaphoreLocker _(domain-&gt;lock);
+ 			status_t status = B_OK;
+ 
+ 			net_interface *interface = find_interface(domain,
+@@ -355,7 +353,6 @@
+ 			} else
+ 				status = B_BAD_VALUE;
+ 
+-			benaphore_unlock(&amp;domain-&gt;lock);
+ 			return status;
+ 		}
+ 	}
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp	2007-04-06 06:23:35 UTC (rev 20600)
++++ haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp	2007-04-06 09:48:02 UTC (rev 20601)
+@@ -154,27 +154,30 @@
+ 
+ 	const char *deviceName = request.ifr_parameter.device[0]
+ 		? request.ifr_parameter.device : request.ifr_name;
++	const char *baseName = request.ifr_parameter.base_name[0]
++		? request.ifr_parameter.base_name : request.ifr_name;
++
+ 	net_device_interface *deviceInterface = get_device_interface(deviceName);
+ 	if (deviceInterface == NULL)
+ 		return ENODEV;
+ 
+ 	BenaphoreLocker locker(domain-&gt;lock);
+ 
++	net_interface_private *interface = NULL;
++	status_t status;
++
+ 	if (find_interface(domain, request.ifr_name) != NULL)
+-		return B_NAME_IN_USE;
++		status = B_NAME_IN_USE;
++	else
++		status = create_interface(domain, request.ifr_name,
++			baseName, deviceInterface, &amp;interface);
+ 
+-	net_interface_private *interface;
+-	status_t status = create_interface(domain,
+-		request.ifr_name, request.ifr_parameter.base_name[0]
+-			? request.ifr_parameter.base_name : request.ifr_name,
+-		deviceInterface, &amp;interface);
+-	if (status &lt; B_OK) {
+-		put_device_interface(deviceInterface);
+-		return status;
+-	}
++	put_device_interface(deviceInterface);
+ 
+-	list_add_item(&amp;domain-&gt;interfaces, interface);
+-	return B_OK;
++	if (status == B_OK)
++		list_add_item(&amp;domain-&gt;interfaces, interface);
++
++	return status;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp	2007-04-06 06:23:35 UTC (rev 20600)
++++ haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp	2007-04-06 09:48:02 UTC (rev 20601)
+@@ -652,7 +652,6 @@
+ 
+ 	// TODO: make sure all readers are gone
+ 	//       make sure all watchers are gone
+-	//       remove device interface
+ 
+ 	return B_OK;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001470.html">[Haiku-commits] r20600 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+	<LI>Next message: <A HREF="001473.html">[Haiku-commits] r20602 - in haiku/trunk/build: jam scripts
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1468">[ date ]</a>
+              <a href="thread.html#1468">[ thread ]</a>
+              <a href="subject.html#1468">[ subject ]</a>
+              <a href="author.html#1468">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

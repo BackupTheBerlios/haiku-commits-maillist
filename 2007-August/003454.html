@@ -1,0 +1,184 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21887 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21887%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200708110031.l7B0VHnr017413%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003453.html">
+   <LINK REL="Next"  HREF="003455.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21887 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21887%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200708110031.l7B0VHnr017413%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21887 - haiku/trunk/src/system/kernel/cache">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Aug 11 02:31:17 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003453.html">[Haiku-commits] r21886 - in haiku/trunk: headers/private/kernel	src/system/libroot/posix/unistd src/system/runtime_loader
+</A></li>
+        <LI>Next message: <A HREF="003455.html">[Haiku-commits] r21888 - in haiku/trunk/src/tests/kits/interface: .	flatten_picture
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3454">[ date ]</a>
+              <a href="thread.html#3454">[ thread ]</a>
+              <a href="subject.html#3454">[ subject ]</a>
+              <a href="author.html#3454">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-08-11 02:31:14 +0200 (Sat, 11 Aug 2007)
+New Revision: 21887
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21887&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21887&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+Log:
+Removed special dummy page handling. It became obsolete with r21816,
+since fault_find_page() does no longer insert a dummy page into a cache
+that has a store from which it can read the page.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-08-11 00:14:26 UTC (rev 21886)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-08-11 00:31:14 UTC (rev 21887)
+@@ -892,7 +892,6 @@
+ 		// check if this page is already in memory
+ 	restart:
+ 		vm_page *page = vm_cache_lookup_page(cache, offset);
+-		vm_page *dummyPage = NULL;
+ 		if (page != NULL) {
+ 			// The page is busy - since we need to unlock the cache sometime
+ 			// in the near future, we need to satisfy the request of the pages
+@@ -918,21 +917,12 @@
+ 			}
+ 
+ 			if (page-&gt;state == PAGE_STATE_BUSY) {
+-				if (page-&gt;type == PAGE_TYPE_DUMMY) {
+-					dummyPage = page;
+-					page = vm_page_allocate_page(PAGE_STATE_FREE);
+-					if (page == NULL) {
+-						mutex_unlock(&amp;cache-&gt;lock);
+-						return B_NO_MEMORY;
+-					}
+-				} else {
+-					ConditionVariableEntry&lt;vm_page&gt; entry;
+-					entry.Add(page);
+-					mutex_unlock(&amp;cache-&gt;lock);
+-					entry.Wait();
+-					mutex_lock(&amp;cache-&gt;lock);
+-					goto restart;
+-				}
++				ConditionVariableEntry&lt;vm_page&gt; entry;
++				entry.Add(page);
++				mutex_unlock(&amp;cache-&gt;lock);
++				entry.Wait();
++				mutex_lock(&amp;cache-&gt;lock);
++				goto restart;
+ 			}
+ 		}
+ 
+@@ -944,24 +934,6 @@
+ 			vm_get_physical_page(page-&gt;physical_page_number * B_PAGE_SIZE,
+ 				&amp;virtualAddress, PHYSICAL_PAGE_CAN_WAIT);
+ 
+-			if (dummyPage != NULL &amp;&amp; (!doWrite || bytesInPage != B_PAGE_SIZE)) {
+-				// This page is currently in-use by someone else - since we cannot
+-				// know if this someone does what we want, and if it even can do
+-				// what we want (we may own a lock the blocks the other request),
+-				// we need to handle this case specifically
+-				iovec vec;
+-				vec.iov_base = (void *)virtualAddress;
+-				vec.iov_len = B_PAGE_SIZE;
+-
+-				size_t size = B_PAGE_SIZE;
+-				status_t status = pages_io(ref, offset, &amp;vec, 1, &amp;size, false);
+-				if (status != B_OK) {
+-					vm_put_physical_page(virtualAddress);
+-					mutex_unlock(&amp;cache-&gt;lock);
+-					return status;
+-				}
+-			}
+-
+ 			// and copy the contents of the page already in memory
+ 			if (doWrite) {
+ 				user_memcpy((void *)(virtualAddress + pageOffset), (void *)buffer, bytesInPage);
+@@ -974,43 +946,6 @@
+ 
+ 			vm_put_physical_page(virtualAddress);
+ 
+-			if (dummyPage != NULL) {
+-				// check if the dummy page is still in place
+-			restart_dummy_lookup:
+-				vm_page *currentPage = vm_cache_lookup_page(cache, offset);
+-				if (currentPage == NULL) {
+-					// there is no page in place anymore, we'll put ours
+-					// into it
+-					vm_cache_insert_page(cache, page, offset);
+-				} else if (currentPage-&gt;state == PAGE_STATE_BUSY) {
+-					if (currentPage-&gt;type == PAGE_TYPE_DUMMY) {
+-						// we let the other party add our page
+-						currentPage-&gt;queue_next = page;
+-					} else {
+-						ConditionVariableEntry&lt;vm_page&gt; entry;
+-						entry.Add(page);
+-						mutex_unlock(&amp;cache-&gt;lock);
+-						entry.Wait();
+-						mutex_lock(&amp;cache-&gt;lock);
+-						goto restart_dummy_lookup;
+-					}
+-				} else {
+-					// we need to copy our new page into the old one
+-					addr_t destinationAddress;
+-					vm_get_physical_page(page-&gt;physical_page_number * B_PAGE_SIZE,
+-						&amp;virtualAddress, PHYSICAL_PAGE_CAN_WAIT);
+-					vm_get_physical_page(currentPage-&gt;physical_page_number * B_PAGE_SIZE,
+-						&amp;destinationAddress, PHYSICAL_PAGE_CAN_WAIT);
+-
+-					memcpy((void *)destinationAddress, (void *)virtualAddress, B_PAGE_SIZE);
+-
+-					vm_put_physical_page(destinationAddress);
+-					vm_put_physical_page(virtualAddress);
+-
+-					vm_page_set_state(page, PAGE_STATE_FREE);
+-				}
+-			}
+-
+ 			if (bytesLeft &lt;= bytesInPage) {
+ 				// we've read the last page, so we're done!
+ 				mutex_unlock(&amp;cache-&gt;lock);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003453.html">[Haiku-commits] r21886 - in haiku/trunk: headers/private/kernel	src/system/libroot/posix/unistd src/system/runtime_loader
+</A></li>
+	<LI>Next message: <A HREF="003455.html">[Haiku-commits] r21888 - in haiku/trunk/src/tests/kits/interface: .	flatten_picture
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3454">[ date ]</a>
+              <a href="thread.html#3454">[ thread ]</a>
+              <a href="subject.html#3454">[ subject ]</a>
+              <a href="author.html#3454">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

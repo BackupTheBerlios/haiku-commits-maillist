@@ -1,0 +1,757 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20624 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20624%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704090935.l399Z1S9032316%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001503.html">
+   <LINK REL="Next"  HREF="001505.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20624 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20624%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704090935.l399Z1S9032316%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20624 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Mon Apr  9 11:35:01 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001503.html">[Haiku-commits] r20623 - in haiku/trunk/src/apps/icon-o-matic:	. generic/command generic/gui generic/gui/stateview	import_export/svg shape shape/commands transformable
+</A></li>
+        <LI>Next message: <A HREF="001505.html">[Haiku-commits] r20625 -	haiku/trunk/src/apps/icon-o-matic/shape/commands
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1497">[ date ]</a>
+              <a href="thread.html#1497">[ thread ]</a>
+              <a href="subject.html#1497">[ subject ]</a>
+              <a href="author.html#1497">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-09 11:34:47 +0200 (Mon, 09 Apr 2007)
+New Revision: 20624
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20624&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20624&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h
+Log:
+fixed multiple TCP issues.
+
+ - Moved FIN handling to after Segment Text handling, it matches the RFC and fixes a possible issue with a user missing some final segment data when receiving a FIN.
+ - Fixed the FIN handling to better terminate connections (no more senseless chatter in the end with RSTs etc).
+ - When Bind()ing, set the socket address so a call to getsockname() gets the allocated port correctly.
+ - After reaching the ESTABLISHED state, try to wake all pending threads (still needs work).
+ - Corrected the maximum amount of time we wait in SendData() to respect socket-&gt;send.timeout.
+ - Now ReadData() behaves correctly in all possible states.
+ - There was a missing handling of MSG_DONTWAIT, fixed.
+ - Better internal handling of PSH.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp	2007-04-09 08:30:28 UTC (rev 20623)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp	2007-04-09 09:34:47 UTC (rev 20624)
+@@ -355,7 +355,10 @@
+ }
+ 
+ void
+-BufferQueue::SetPushPointer(tcp_sequence sequence)
++BufferQueue::SetPushPointer()
+ {
+-	fPushPointer = sequence;
++	if (fList.IsEmpty())
++		fPushPointer = 0;
++	else
++		fPushPointer = fList.Tail()-&gt;sequence + fList.Tail()-&gt;size;
+ }
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h	2007-04-09 08:30:28 UTC (rev 20623)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h	2007-04-09 09:34:47 UTC (rev 20624)
+@@ -33,9 +33,16 @@
+ 		size_t Available() const { return fContiguousBytes; }
+ 		size_t Available(tcp_sequence sequence) const;
+ 
+-		size_t PushedData() const { return fPushPointer &gt; fFirstSequence ? fPushPointer - fFirstSequence : 0; }
+-		void SetPushPointer(tcp_sequence sequence);
++		size_t PushedData() const
++		{
++			// we must check if fPushPointer is not 0 here due to
++			// `tcp_sequence's special handling of &gt;
++			return fPushPointer != 0 &amp;&amp; fPushPointer &gt; fFirstSequence ?
++				fPushPointer - fFirstSequence : 0;
++		}
+ 
++		void SetPushPointer();
++
+ 		size_t Used() const { return fNumBytes; }
+ 		size_t Free() const { return fMaxBytes - fNumBytes; }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp	2007-04-09 08:30:28 UTC (rev 20623)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp	2007-04-09 09:34:47 UTC (rev 20624)
+@@ -132,6 +132,8 @@
+ EndpointManager::SetConnection(TCPEndpoint *endpoint,
+ 	const sockaddr *local, const sockaddr *peer, const sockaddr *interfaceLocal)
+ {
++	TRACE((&quot;EndpointManager::SetConnection(%p)\n&quot;, endpoint));
++
+ 	RecursiveLocker locker(&amp;fLock);
+ 	sockaddr localBuffer;
+ 
+@@ -212,6 +214,8 @@
+ status_t
+ EndpointManager::Bind(TCPEndpoint *endpoint, sockaddr *address)
+ {
++	TRACE((&quot;EndpointManager::Bind(%p, %s)\n&quot;, endpoint, AddressString(gDomain, address, true).Data()));
++
+ 	if (gAddressModule-&gt;is_empty_address(address, true))
+ 		return B_BAD_VALUE;
+ 
+@@ -255,6 +259,8 @@
+ 	} else
+ 		hash_insert(fEndpointHash, endpoint);
+ 
++	gAddressModule-&gt;set_to((sockaddr *)&amp;endpoint-&gt;socket-&gt;address, address);
++
+ 	endpoint-&gt;fEndpointNextWithSamePort = NULL;
+ 	hash_insert(fConnectionHash, endpoint);
+ 
+@@ -265,6 +271,8 @@
+ status_t
+ EndpointManager::BindToEphemeral(TCPEndpoint *endpoint, sockaddr *address)
+ {
++	TRACE((&quot;EndpointManager::BindToEphemeral(%p)\n&quot;, endpoint));
++
+ 	RecursiveLocker locker(&amp;fLock);
+ 
+ 	uint32 max = kFirstEphemeralPort + 65536;
+@@ -284,7 +292,10 @@
+ 			TCPEndpoint *other = _LookupEndpoint(port);
+ 			if (other == NULL) {
+ 				// found a port
++				gAddressModule-&gt;set_to_empty_address((sockaddr *)&amp;endpoint-&gt;socket-&gt;address);
+ 				gAddressModule-&gt;set_port((sockaddr *)&amp;endpoint-&gt;socket-&gt;address, port);
++				TRACE((&quot;   EndpointManager::BindToEphemeral(%p) -&gt; %s\n&quot;, endpoint,
++					AddressString(gDomain, (sockaddr *)&amp;endpoint-&gt;socket-&gt;address, true).Data()));
+ 				endpoint-&gt;fEndpointNextWithSamePort = NULL;
+ 				hash_insert(fEndpointHash, endpoint);
+ 				hash_insert(fConnectionHash, endpoint);
+@@ -308,9 +319,6 @@
+ 
+ 	RecursiveLocker locker(&amp;fLock);
+ 
+-	if (!endpoint-&gt;IsBound())
+-		return B_BAD_VALUE;
+-
+ 	TCPEndpoint *other = _LookupEndpoint(gAddressModule-&gt;get_port((sockaddr *)&amp;endpoint-&gt;socket-&gt;address));
+ 	if (other != endpoint) {
+ 		// remove endpoint from the list of endpoints with the same port
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-09 08:30:28 UTC (rev 20623)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-09 09:34:47 UTC (rev 20624)
+@@ -59,10 +59,30 @@
+ 	FLAG_OPTION_WINDOW_SHIFT	= 0x01,
+ 	FLAG_OPTION_TIMESTAMP		= 0x02,
+ 	FLAG_NO_RECEIVE				= 0x04,
+-	FLAG_NO_SEND				= 0x08,
+ };
+ 
+ 
++static status_t
++wait_on_locker(RecursiveLocker &amp;locker, sem_id sem, bigtime_t timeout)
++{
++	locker.Unlock();
++	status_t status = acquire_sem_etc(sem, 1, B_ABSOLUTE_TIMEOUT |
++		B_CAN_INTERRUPT, timeout);
++	locker.Lock();
++	return status;
++}
++
++
++static inline bigtime_t
++absolute_timeout(bigtime_t timeout)
++{
++	if (timeout == 0 || timeout == B_INFINITE_TIMEOUT)
++		return timeout;
++
++	return timeout + system_time();
++}
++
++
+ TCPEndpoint::TCPEndpoint(net_socket *socket)
+ 	:
+ 	fOptions(0),
+@@ -167,27 +187,23 @@
+ 	if (status != B_OK)
+ 		return status;
+ 
+-	TRACE(&quot;Close(): Entering state %d&quot;, fState);
++	TRACE(&quot;Close(): Entering state %s&quot;, name_for_state(fState));
+ 
+ 	if (socket-&gt;options &amp; SO_LINGER) {
+ 		TRACE(&quot;Close(): Lingering for %i secs&quot;, socket-&gt;linger);
+ 
+-		bigtime_t maximum = system_time() + socket-&gt;linger * 1000000LL;
++		bigtime_t maximum = absolute_timeout(socket-&gt;linger * 1000000LL);
+ 
+ 		while (fSendQueue.Used() &gt; 0) {
+-			lock.Unlock();
+-			status = acquire_sem_etc(fSendLock, 1, B_CAN_INTERRUPT
+-										| B_ABSOLUTE_TIMEOUT, maximum);
+-			if (status == B_TIMED_OUT) {
+-				TRACE(&quot;Close(): Lingering made me wait, but not all data was sent.&quot;);
+-				return B_OK;
+-			} else if (status &lt; B_OK)
++			status = wait_on_locker(lock, fSendLock, maximum);
++			if (status == B_TIMED_OUT)
++				break;
++			else if (status &lt; B_OK)
+ 				return status;
+-
+-			lock.Lock();
+ 		}
+ 
+-		TRACE(&quot;Close(): Waited for all data to be sent with success&quot;);
++		TRACE(&quot;Close(): after waiting, the SendQ was left with %lu bytes.&quot;,
++			fSendQueue.Used());
+ 	}
+ 
+ 	// TODO: do i need to wait until fState returns to CLOSED?
+@@ -225,7 +241,7 @@
+ 
+ 	RecursiveLocker locker(&amp;fLock);
+ 
+-	TRACE(&quot;  Connect(): in state %d&quot;, fState);
++	TRACE(&quot;  Connect(): in state %s&quot;, name_for_state(fState));
+ 
+ 	// Can only call connect() from CLOSED or LISTEN states
+ 	// otherwise endpoint is considered already connected
+@@ -319,6 +335,9 @@
+ status_t
+ TCPEndpoint::Bind(sockaddr *address)
+ {
++	if (address == NULL)
++		return B_BAD_VALUE;
++
+ 	TRACE(&quot;Bind() on address %s&quot;,
+ 		  AddressString(gDomain, address, true).Data());
+ 
+@@ -376,9 +395,8 @@
+ 
+ 	RecursiveLocker lock(fLock);
+ 
+-	if (direction == SHUT_RD || direction == SHUT_RDWR) {
++	if (direction == SHUT_RD || direction == SHUT_RDWR)
+ 		fFlags |= FLAG_NO_RECEIVE;
+-	}
+ 
+ 	if (direction == SHUT_WR || direction == SHUT_RDWR)
+ 		_ShutdownEgress(false);
+@@ -398,14 +416,25 @@
+ 
+ 	RecursiveLocker lock(fLock);
+ 
+-	if (fFlags &amp; FLAG_NO_SEND) {
++	if (fState == CLOSED)
++		return ENOTCONN;
++	else if (fState == LISTEN) {
++		// TODO change socket from passive to active.
++		return EOPNOTSUPP;
++	} else if (fState == FINISH_SENT || fState == FINISH_ACKNOWLEDGED
++				|| fState == CLOSING || fState == WAIT_FOR_FINISH_ACKNOWLEDGE
++				|| fState == TIME_WAIT) {
+ 		// TODO: send SIGPIPE signal to app?
+ 		return EPIPE;
+ 	}
+ 
+ 	size_t bytesLeft = buffer-&gt;size;
+ 
++	bigtime_t timeout = absolute_timeout(socket-&gt;send.timeout);
++
+ 	do {
++		// TODO we should not segment here, but on TX.
++
+ 		net_buffer *chunk;
+ 		if (bytesLeft &gt; socket-&gt;send.buffer_size) {
+ 			// divide the buffer in multiple of the maximum segment size
+@@ -421,14 +450,9 @@
+ 			chunk = buffer;
+ 
+ 		while (fSendQueue.Free() &lt; chunk-&gt;size) {
+-			lock.Unlock();
+-
+-			status_t status = acquire_sem_etc(fSendLock, 1,
+-				B_RELATIVE_TIMEOUT | B_CAN_INTERRUPT, socket-&gt;send.timeout);
++			status_t status = wait_on_locker(lock, fSendLock, timeout);
+ 			if (status &lt; B_OK)
+ 				return status;
+-
+-			lock.Lock();
+ 		}
+ 
+ 		// TODO: check state!
+@@ -441,8 +465,11 @@
+ 		size_t chunkSize = chunk-&gt;size;
+ 		fSendQueue.Add(chunk);
+ 
+-		status_t status = _SendQueued();
++		status_t status = B_OK;
+ 
++		if (fState == ESTABLISHED || fState == FINISH_RECEIVED)
++			status = _SendQueued();
++
+ 		if (buffer != chunk) {
+ 			// as long as we didn't eat the buffer, we can still return an error code
+ 			// (we don't own the buffer if we return an error code)
+@@ -474,31 +501,25 @@
+ 
+ 	RecursiveLocker locker(fLock);
+ 
++	*_buffer = NULL;
++
++	if (fState == CLOSED)
++		return ENOTCONN;
++
++	bigtime_t timeout = absolute_timeout(socket-&gt;receive.timeout);
++
+ 	if (fState == SYNCHRONIZE_SENT || fState == SYNCHRONIZE_RECEIVED) {
+-		// we need to wait until the connection becomes established
+ 		if (flags &amp; MSG_DONTWAIT)
+ 			return B_WOULD_BLOCK;
+ 
+-		locker.Unlock();
+-
+-		status_t status = acquire_sem_etc(fSendLock, 1,
+-			B_RELATIVE_TIMEOUT | B_CAN_INTERRUPT, socket-&gt;receive.timeout);
+-		if (status &lt; B_OK)
+-			return status;
+-
+-		locker.Lock();
++		while (fState != ESTABLISHED) {
++			// we need to wait until the connection becomes established
++			status_t status = wait_on_locker(locker, fSendLock, timeout);
++			if (status &lt; B_OK)
++				return status;
++		}
+ 	}
+ 
+-	if ((fFlags &amp; FLAG_NO_RECEIVE) != 0 &amp;&amp; fReceiveQueue.Available() == 0) {
+-		// there is no data left in the queue, and we can't receive anything,
+-		// anymore
+-		*_buffer = NULL;
+-		return B_OK;
+-	}
+-
+-	// read data out of buffer
+-	// TODO: add support for urgent data (MSG_OOB)
+-
+ 	size_t dataNeeded = socket-&gt;receive.low_water_mark;
+ 
+ 	// When MSG_WAITALL is set then the function should block
+@@ -506,49 +527,65 @@
+ 	if (flags &amp; MSG_WAITALL)
+ 		dataNeeded = numBytes;
+ 
+-	bigtime_t timeout = socket-&gt;receive.timeout;
+-	if (timeout != B_INFINITE_TIMEOUT)
+-		timeout += system_time();
++	// TODO: add support for urgent data (MSG_OOB)
+ 
+-	while ((fFlags &amp; FLAG_NO_RECEIVE) == 0
+-			&amp;&amp; fReceiveQueue.Available() &lt; dataNeeded
+-			&amp;&amp; (fReceiveQueue.PushedData() == 0
+-				|| fReceiveQueue.Available() &lt; fReceiveQueue.PushedData())) {
+-		locker.Unlock();
++	while (true) {
++		if (fState == CLOSING || fState == WAIT_FOR_FINISH_ACKNOWLEDGE
++				|| fState == TIME_WAIT) {
++			// ``Connection closing''.
++			return B_OK;
++		}
+ 
+-		status_t status = acquire_sem_etc(fReceiveLock, 1,
+-			B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, timeout);
++		if (fReceiveQueue.Available() &gt; dataNeeded ||
++				(fReceiveQueue.PushedData() &gt; 0
++					&amp;&amp; (fReceiveQueue.PushedData() &gt;= fReceiveQueue.Available())))
++			break;
+ 
+-		locker.Lock();
++		if (fState == FINISH_RECEIVED) {
++			// ``If no text is awaiting delivery, the RECEIVE will
++			//   get a Connection closing''.
++			return B_OK;
++		}
+ 
++		if (flags &amp; MSG_DONTWAIT)
++			return B_WOULD_BLOCK;
++
++		status_t status = wait_on_locker(locker, fReceiveLock, timeout);
+ 		if (status &lt; B_OK) {
+ 			// The Open Group base specification mentions that EINTR should be
+ 			// returned if the recv() is interrupted before _any data_ is
+ 			// available. So we actually check if there is data, and if so,
+ 			// push it to the user.
+ 			if ((status == B_TIMED_OUT || status == B_INTERRUPTED)
+-				&amp;&amp; fReceiveQueue.Available() &gt; 0)
++					&amp;&amp; fReceiveQueue.Available() &gt; 0)
+ 				break;
++
+ 			return status;
+ 		}
+ 	}
+ 
+-	TRACE(&quot;ReadData(): read %lu bytes, %lu are available (flags 0x%x)&quot;,
+-		  numBytes, fReceiveQueue.Available(), (unsigned int)fFlags);
++	TRACE(&quot;  ReadData(): read %lu bytes, %lu are available.&quot;,
++		  numBytes, fReceiveQueue.Available());
+ 
+ 	if (numBytes &lt; fReceiveQueue.Available())
+ 		release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+ 
+-	return fReceiveQueue.Get(numBytes, (flags &amp; MSG_PEEK) == 0, _buffer);
++	ssize_t receivedBytes = fReceiveQueue.Get(numBytes,
++		(flags &amp; MSG_PEEK) == 0, _buffer);
++
++	TRACE(&quot;  ReadData(): %lu bytes kept.&quot;, fReceiveQueue.Available());
++
++	return receivedBytes;
+ }
+ 
+ 
+ ssize_t
+ TCPEndpoint::ReadAvailable()
+ {
+-	TRACE(&quot;ReadAvailable()&quot;);
++	RecursiveLocker locker(fLock);
+ 
+-	RecursiveLocker locker(fLock);
++	TRACE(&quot;ReadAvailable(): %li&quot;, _AvailableData());
++
+ 	return _AvailableData();
+ }
+ 
+@@ -743,9 +780,7 @@
+ 			release_sem_etc(fAcceptSemaphore, 1, B_DO_NOT_RESCHEDULE);
+ 		}
+ 
+-		release_sem_etc(fSendLock, 1, B_DO_NOT_RESCHEDULE);
+-		release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+-			// TODO: this is not enough - we need to use B_RELEASE_ALL
++		release_sem_etc(fSendLock, 0, B_DO_NOT_RESCHEDULE | B_RELEASE_ALL);
+ 		_NotifyReader();
+ 	} else {
+ 		// simultaneous open
+@@ -762,8 +797,8 @@
+ int32
+ TCPEndpoint::Receive(tcp_segment_header &amp;segment, net_buffer *buffer)
+ {
+-	TRACE(&quot;Receive(): Connection in state %d received packet %p (%lu bytes) with flags 0x%x, seq %lu, ack %lu!&quot;,
+-		  fState, buffer, buffer-&gt;size, segment.flags, segment.sequence, segment.acknowledge);
++	TRACE(&quot;Receive(): Connection in state %s received packet %p (%lu bytes) with flags 0x%x, seq %lu, ack %lu!&quot;,
++		  name_for_state(fState), buffer, buffer-&gt;size, segment.flags, segment.sequence, segment.acknowledge);
+ 
+ 	// TODO: rethink locking!
+ 
+@@ -804,25 +839,21 @@
+ 			}
+ 		} else if (segment.acknowledge == fSendUnacknowledged
+ 			&amp;&amp; fReceiveQueue.IsContiguous()
+-			&amp;&amp; fReceiveQueue.Free() &gt;= buffer-&gt;size) {
++			&amp;&amp; fReceiveQueue.Free() &gt;= buffer-&gt;size
++			&amp;&amp; !(fFlags &amp; FLAG_NO_RECEIVE)) {
+ 			TRACE(&quot;Receive(): header prediction receive!&quot;);
+ 			// we're on the receiving end of the connection, and this segment
+ 			// is the one we were expecting, in-sequence
+-			if (fFlags &amp; FLAG_NO_RECEIVE) {
+-				return DROP;
+-			} else {
+-				fReceiveNext += buffer-&gt;size;
+-				TRACE(&quot;Receive(): receive next = %lu&quot;, (uint32)fReceiveNext);
+-				fReceiveQueue.Add(buffer, segment.sequence);
+-				if (segment.flags &amp; TCP_FLAG_PUSH)
+-					fReceiveQueue.SetPushPointer(fReceiveNext);
++			fReceiveNext += buffer-&gt;size;
++			TRACE(&quot;Receive(): receive next = %lu&quot;, (uint32)fReceiveNext);
++			fReceiveQueue.Add(buffer, segment.sequence);
++			if (segment.flags &amp; TCP_FLAG_PUSH)
++				fReceiveQueue.SetPushPointer();
+ 
+-				release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+-					// TODO: real conditional locking needed!
+-				_NotifyReader();
++			_NotifyReader();
+ 
+-				return KEEP | ACKNOWLEDGE;
+-			}
++			return KEEP | (segment.flags &amp; TCP_FLAG_PUSH ?
++					IMMEDIATE_ACKNOWLEDGE : ACKNOWLEDGE);
+ 		}
+ 	}
+ 
+@@ -845,8 +876,6 @@
+ 			}
+ 
+ 			if (fState != TIME_WAIT &amp;&amp; fReceiveQueue.Available() &gt; 0) {
+-				release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+-					// TODO: real conditional locking needed!
+ 				_NotifyReader();
+ 			} else {
+ 				return DELETE | DROP;
+@@ -927,9 +956,7 @@
+ 
+ 			fState = ESTABLISHED;
+ 
+-			release_sem_etc(fSendLock, 1, B_DO_NOT_RESCHEDULE);
+-			release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+-				// TODO: real conditional locking needed!
++			release_sem_etc(fSendLock, 0, B_DO_NOT_RESCHEDULE | B_RELEASE_ALL);
+ 			_NotifyReader();
+ 		}
+ 
+@@ -1009,64 +1036,60 @@
+ 		}
+ 	}
+ 
+-	// TODO: ignore data *after* FIN
++	bool notify = false;
+ 
++	if (buffer-&gt;size &gt; 0 &amp;&amp;	_ShouldReceive()) {
++		fReceiveQueue.Add(buffer, segment.sequence);
++		fReceiveNext += buffer-&gt;size;
++		notify = true;
++		TRACE(&quot;Receive(): adding data, receive next = %lu. Now have %lu bytes.&quot;,
++				(uint32)fReceiveNext, fReceiveQueue.Available());
++
++		if (segment.flags &amp; TCP_FLAG_PUSH)
++			fReceiveQueue.SetPushPointer();
++	} else {
++		action = (action &amp; ~KEEP) | DROP;
++	}
++
+ 	if (segment.flags &amp; TCP_FLAG_FINISH) {
+-		TRACE(&quot;Receive(): peer is finishing connection!&quot;);
+-		fReceiveNext++;
++		if (fState != CLOSED &amp;&amp; fState != LISTEN &amp;&amp; fState != SYNCHRONIZE_SENT) {
++			TRACE(&quot;Receive(): peer is finishing connection!&quot;);
++			fReceiveNext++;
++			notify = true;
+ 
+-		release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+-			// TODO: real conditional locking needed!
+-		_NotifyReader();
++			// FIN implies PSH
++			fReceiveQueue.SetPushPointer();
+ 
+-		// other side is closing connection; change states
+-		switch (fState) {
+-			case ESTABLISHED:
+-			case SYNCHRONIZE_RECEIVED:
+-				fState = FINISH_RECEIVED;
+-				action |= IMMEDIATE_ACKNOWLEDGE;
+-				break;
+-			case FINISH_ACKNOWLEDGED:
+-				fState = TIME_WAIT;
+-				_EnterTimeWait();
+-				break;
+-			case FINISH_RECEIVED:
+-				// a second FIN?
+-				break;
+-			case FINISH_SENT:
+-				// simultaneous close
+-				fState = CLOSING;
+-				break;
++			// RFC 793 states that we must send an ACK to FIN
++			action |= IMMEDIATE_ACKNOWLEDGE;
+ 
+-			default:
+-				break;
++			// other side is closing connection; change states
++			switch (fState) {
++				case ESTABLISHED:
++				case SYNCHRONIZE_RECEIVED:
++					fState = FINISH_RECEIVED;
++					break;
++				case FINISH_SENT:
++					// simultaneous close
++					fState = CLOSING;
++					break;
++				case FINISH_ACKNOWLEDGED:
++					fState = TIME_WAIT;
++					_EnterTimeWait();
++					break;
++				default:
++					break;
++			}
+ 		}
+ 	}
+ 
+-	if (buffer-&gt;size &gt; 0 || (segment.flags &amp; (TCP_FLAG_SYNCHRONIZE | TCP_FLAG_FINISH)) != 0)
+-		action |= ACKNOWLEDGE;
+-
+-	TRACE(&quot;Receive():Entering state %d, segment action %ld&quot;, fState, action);
+-
+-	// state machine is done switching states and the data is good.
+-	// put it in the receive buffer
+-
+-	if (buffer-&gt;size &gt; 0 &amp;&amp; (fFlags &amp; FLAG_NO_RECEIVE) == 0) {
+-		fReceiveQueue.Add(buffer, segment.sequence);
+-		fReceiveNext += buffer-&gt;size;
+-		TRACE(&quot;Receive(): adding data, receive next = %lu!&quot;, (uint32)fReceiveNext);
+-
+-		release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+-			// TODO: real conditional locking needed!
++	if (notify)
+ 		_NotifyReader();
+-	} else
+-		gBufferModule-&gt;free(buffer);
+ 
+-	if (segment.flags &amp; TCP_FLAG_PUSH)
+-		fReceiveQueue.SetPushPointer(fReceiveQueue.LastSequence());
++	if (buffer-&gt;size &gt; 0 || (segment.flags &amp; TCP_FLAG_SYNCHRONIZE) != 0)
++		action |= ACKNOWLEDGE;
+ 
+-	if (segment.flags &amp; TCP_FLAG_FINISH)
+-		fFlags |= FLAG_NO_RECEIVE;
++	TRACE(&quot;Receive():Entering state %s, segment action %ld&quot;, name_for_state(fState), action);
+ 
+ 	return action;
+ }
+@@ -1316,8 +1339,6 @@
+ 		fState = FINISH_SENT;
+ 	else if (fState == FINISH_RECEIVED)
+ 		fState = WAIT_FOR_FINISH_ACKNOWLEDGE;
+-	else if (closing)
+-		fState = CLOSED;
+ 	else
+ 		return B_OK;
+ 
+@@ -1327,8 +1348,6 @@
+ 		return status;
+ 	}
+ 
+-	fFlags |= FLAG_NO_SEND;
+-
+ 	return B_OK;
+ }
+ 
+@@ -1338,9 +1357,7 @@
+ {
+ 	ssize_t availableData = fReceiveQueue.Available();
+ 
+-	// FLAG_NO_RECEIVE is set whenever the socket is in a state
+-	// where read() would be non-blocking and return 0.
+-	if ((fFlags &amp; FLAG_NO_RECEIVE) &amp;&amp; availableData == 0)
++	if (availableData == 0 &amp;&amp; !_ShouldReceive())
+ 		return ENOTCONN;
+ 
+ 	return availableData;
+@@ -1350,10 +1367,24 @@
+ void
+ TCPEndpoint::_NotifyReader()
+ {
++	// TODO maintain a waiting receiver count so we know whether
++	//      we should release or not.
++	release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+ 	gSocketModule-&gt;notify(socket, B_SELECT_READ, _AvailableData());
+ }
+ 
+ 
++bool
++TCPEndpoint::_ShouldReceive() const
++{
++	if (fFlags &amp; FLAG_NO_RECEIVE)
++		return false;
++
++	return fState == ESTABLISHED || fState == FINISH_SENT
++			|| fState == FINISH_ACKNOWLEDGED;
++}
++
++
+ //	#pragma mark - timer
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-09 08:30:28 UTC (rev 20623)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-09 09:34:47 UTC (rev 20624)
+@@ -69,6 +69,7 @@
+ 		status_t _ShutdownEgress(bool closing);
+ 		ssize_t _AvailableData() const;
+ 		void _NotifyReader();
++		bool _ShouldReceive() const;
+ 
+ 		static void _TimeWaitTimer(net_timer *timer, void *data);
+ 		static void _RetransmitTimer(net_timer *timer, void *data);
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp	2007-04-09 08:30:28 UTC (rev 20623)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp	2007-04-09 09:34:47 UTC (rev 20624)
+@@ -260,7 +260,7 @@
+ }
+ 
+ 
+-static const char *
++const char *
+ name_for_state(tcp_state state)
+ {
+ 	switch (state) {
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h	2007-04-09 08:30:28 UTC (rev 20623)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h	2007-04-09 09:34:47 UTC (rev 20624)
+@@ -168,4 +168,6 @@
+ 
+ status_t add_tcp_header(tcp_segment_header &amp;segment, net_buffer *buffer);
+ 
++const char *name_for_state(tcp_state state);
++
+ #endif	// TCP_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001503.html">[Haiku-commits] r20623 - in haiku/trunk/src/apps/icon-o-matic:	. generic/command generic/gui generic/gui/stateview	import_export/svg shape shape/commands transformable
+</A></li>
+	<LI>Next message: <A HREF="001505.html">[Haiku-commits] r20625 -	haiku/trunk/src/apps/icon-o-matic/shape/commands
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1497">[ date ]</a>
+              <a href="thread.html#1497">[ thread ]</a>
+              <a href="subject.html#1497">[ subject ]</a>
+              <a href="author.html#1497">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

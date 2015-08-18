@@ -1,0 +1,743 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21512 - in haiku/trunk/src/servers/app: . drawing
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21512%20-%20in%20haiku/trunk/src/servers/app%3A%20.%20drawing&In-Reply-To=%3C200706271129.l5RBTLTO012700%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002902.html">
+   <LINK REL="Next"  HREF="002904.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21512 - in haiku/trunk/src/servers/app: . drawing</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21512%20-%20in%20haiku/trunk/src/servers/app%3A%20.%20drawing&In-Reply-To=%3C200706271129.l5RBTLTO012700%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21512 - in haiku/trunk/src/servers/app: . drawing">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Jun 27 13:29:21 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002902.html">[Haiku-commits] r21511 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="002904.html">[Haiku-commits] r21513 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2903">[ date ]</a>
+              <a href="thread.html#2903">[ thread ]</a>
+              <a href="subject.html#2903">[ subject ]</a>
+              <a href="author.html#2903">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-06-27 13:29:20 +0200 (Wed, 27 Jun 2007)
+New Revision: 21512
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21512&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21512&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/BitmapManager.cpp
+   haiku/trunk/src/servers/app/BitmapManager.h
+   haiku/trunk/src/servers/app/ServerApp.cpp
+   haiku/trunk/src/servers/app/ServerBitmap.cpp
+   haiku/trunk/src/servers/app/ServerBitmap.h
+   haiku/trunk/src/servers/app/ServerScreen.cpp
+   haiku/trunk/src/servers/app/drawing/Overlay.cpp
+   haiku/trunk/src/servers/app/drawing/Overlay.h
+Log:
+* Implemented the overlay suspend/resume protocol on mode changes; not really tested
+  yet. Also, BBitmap::LockBits() should probably fail when the Bits() are NULL.
+* The downside is that many more classes now know of each other.
+* Cleaned up the work divided between the BitmapManager and the Overlay class.
+* Fixed a memory leak in AS_CREATE_BITMAP in case the bitmap could not be added to
+  the ServerApp's bitmap list.
+
+
+Modified: haiku/trunk/src/servers/app/BitmapManager.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/BitmapManager.cpp	2007-06-27 10:43:48 UTC (rev 21511)
++++ haiku/trunk/src/servers/app/BitmapManager.cpp	2007-06-27 11:29:20 UTC (rev 21512)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2006, Haiku.
++ * Copyright 2001-2007, Haiku.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -19,15 +19,19 @@
+ #include &quot;ClientMemoryAllocator.h&quot;
+ #include &quot;HWInterface.h&quot;
+ #include &quot;Overlay.h&quot;
++#include &quot;ServerApp.h&quot;
+ #include &quot;ServerBitmap.h&quot;
+ #include &quot;ServerProtocol.h&quot;
+ #include &quot;ServerTokenSpace.h&quot;
+ 
+ #include &lt;BitmapPrivate.h&gt;
++#include &lt;ObjectList.h&gt;
+ #include &lt;video_overlay.h&gt;
+ 
++#include &lt;AppDefs.h&gt;
+ #include &lt;Autolock.h&gt;
+ #include &lt;Bitmap.h&gt;
++#include &lt;Message.h&gt;
+ 
+ #include &lt;new&gt;
+ #include &lt;stdio.h&gt;
+@@ -36,13 +40,20 @@
+ using std::nothrow;
+ 
+ 
+-//! The bitmap allocator for the server. Memory is allocated/freed by the AppServer class
++//! The one and only bitmap manager for the server, created by the AppServer
+ BitmapManager *gBitmapManager = NULL;
+ 
+-//! Number of bytes to allocate to each area used for bitmap storage
+-#define BITMAP_AREA_SIZE	B_PAGE_SIZE * 16
+ 
++int
++compare_app_pointer(const ServerApp* a, const ServerApp* b)
++{
++	return (addr_t)b - (addr_t)b;
++}
+ 
++
++//	#pragma mark -
++
++
+ //! Sets up stuff to be ready to allocate space for bitmaps
+ BitmapManager::BitmapManager()
+ 	:
+@@ -77,9 +88,9 @@
+ 	\return A new ServerBitmap or NULL if unable to allocate one.
+ */
+ ServerBitmap*
+-BitmapManager::CreateBitmap(ClientMemoryAllocator* allocator, HWInterface&amp; hwInterface,
+-	BRect bounds, color_space space, int32 flags, int32 bytesPerRow, screen_id screen,
+-	uint8* _allocationFlags)
++BitmapManager::CreateBitmap(ClientMemoryAllocator* allocator,
++	HWInterface&amp; hwInterface, BRect bounds, color_space space, int32 flags,
++	int32 bytesPerRow, screen_id screen, uint8* _allocationFlags)
+ {
+ 	BAutolock locker(fLock);
+ 
+@@ -100,7 +111,8 @@
+ 		}
+ 	}
+ 
+-	ServerBitmap* bitmap = new(nothrow) ServerBitmap(bounds, space, flags, bytesPerRow);
++	ServerBitmap* bitmap = new(nothrow) ServerBitmap(bounds, space, flags,
++		bytesPerRow);
+ 	if (bitmap == NULL) {
+ 		if (overlayToken != NULL)
+ 			hwInterface.ReleaseOverlayChannel(overlayToken);
+@@ -112,7 +124,8 @@
+ 	uint8* buffer = NULL;
+ 
+ 	if (flags &amp; B_BITMAP_WILL_OVERLAY) {
+-		Overlay* overlay = new (std::nothrow) Overlay(hwInterface);
++		Overlay* overlay = new (std::nothrow) Overlay(hwInterface, bitmap,
++			overlayToken);
+ 
+ 		const overlay_buffer* overlayBuffer = NULL;
+ 		overlay_client_data* clientData = NULL;
+@@ -123,25 +136,20 @@
+ 			// and buffer location to the BBitmap
+ 			cookie = allocator-&gt;Allocate(sizeof(overlay_client_data),
+ 				(void**)&amp;clientData, newArea);
+-			if (cookie != NULL) {
+-				overlayBuffer = hwInterface.AllocateOverlayBuffer(bitmap-&gt;Width(),
+-					bitmap-&gt;Height(), space);
+-			}
+ 		}
+ 
+-		if (overlayBuffer != NULL) {
+-			overlay-&gt;SetOverlayData(overlayBuffer, overlayToken, clientData);
++		if (cookie != NULL) {
++			overlay-&gt;SetClientData(clientData);
+ 
+ 			bitmap-&gt;fAllocator = allocator;
+ 			bitmap-&gt;fAllocationCookie = cookie;
+ 			bitmap-&gt;SetOverlay(overlay);
+ 			bitmap-&gt;fBytesPerRow = overlayBuffer-&gt;bytes_per_row;
+ 
+-			buffer = (uint8*)overlayBuffer-&gt;buffer;
++			buffer = (uint8*)overlay-&gt;OverlayBuffer()-&gt;buffer;
+ 			if (_allocationFlags)
+ 				*_allocationFlags = kFramebuffer | (newArea ? kNewAllocatorArea : 0);
+ 		} else {
+-			hwInterface.ReleaseOverlayChannel(overlayToken);			
+ 			delete overlay;
+ 			allocator-&gt;Free(cookie);
+ 		}
+@@ -168,7 +176,17 @@
+ 		}
+ 	}
+ 
+-	if (buffer &amp;&amp; fBitmapList.AddItem(bitmap)) {
++	bool success = false;
++	if (buffer != NULL) {
++		success = fBitmapList.AddItem(bitmap);
++		if (success &amp;&amp; bitmap-&gt;Overlay() != NULL) {
++			success = fOverlays.AddItem(bitmap);
++			if (!success)
++				fBitmapList.RemoveItem(bitmap);
++		}
++	}
++
++	if (success) {
+ 		bitmap-&gt;fBuffer = buffer;
+ 		bitmap-&gt;fToken = gTokenSpace.NewToken(kBitmapToken, bitmap);
+ 
+@@ -207,6 +225,68 @@
+ 	if (!locker.IsLocked())
+ 		return;
+ 
++	if (bitmap-&gt;Overlay() != NULL)
++		fOverlays.AddItem(bitmap);
++
+ 	if (fBitmapList.RemoveItem(bitmap))
+ 		delete bitmap;
+ }
++
++
++void
++BitmapManager::SuspendOverlays()
++{
++	BAutolock locker(fLock);
++	if (!locker.IsLocked())
++		return;
++
++	// first, tell all applications owning an overlay to release their locks
++
++	BObjectList&lt;ServerApp&gt; apps;
++	for (int32 i = 0; i &lt; fOverlays.CountItems(); i++) {
++		ServerBitmap* bitmap = (ServerBitmap*)fOverlays.ItemAt(i);
++		apps.BinaryInsert(bitmap-&gt;Owner(), &amp;compare_app_pointer);
++	}
++	for (int32 i = 0; i &lt; apps.CountItems(); i++) {
++		BMessage notify(B_RELEASE_OVERLAY_LOCK);
++		apps.ItemAt(i)-&gt;SendMessageToClient(&amp;notify);
++	}
++
++	// suspend overlays
++
++	for (int32 i = 0; i &lt; fOverlays.CountItems(); i++) {
++		ServerBitmap* bitmap = (ServerBitmap*)fOverlays.ItemAt(i);
++		bitmap-&gt;Overlay()-&gt;Suspend(bitmap, false);
++	}	
++}
++
++
++void
++BitmapManager::ResumeOverlays()
++{
++	BAutolock locker(fLock);
++	if (!locker.IsLocked())
++		return;
++
++	// first, tell all applications owning an overlay that
++	// they can reacquire their locks
++
++	BObjectList&lt;ServerApp&gt; apps;
++	for (int32 i = 0; i &lt; fOverlays.CountItems(); i++) {
++		ServerBitmap* bitmap = (ServerBitmap*)fOverlays.ItemAt(i);
++		apps.BinaryInsert(bitmap-&gt;Owner(), &amp;compare_app_pointer);
++	}
++	for (int32 i = 0; i &lt; apps.CountItems(); i++) {
++		BMessage notify(B_RELEASE_OVERLAY_LOCK);
++		apps.ItemAt(i)-&gt;SendMessageToClient(&amp;notify);
++	}
++
++	// resume overlays
++
++	for (int32 i = 0; i &lt; fOverlays.CountItems(); i++) {
++		ServerBitmap* bitmap = (ServerBitmap*)fOverlays.ItemAt(i);
++
++		bitmap-&gt;Overlay()-&gt;Resume(bitmap);
++	}	
++}
++
+
+Modified: haiku/trunk/src/servers/app/BitmapManager.h
+===================================================================
+--- haiku/trunk/src/servers/app/BitmapManager.h	2007-06-27 10:43:48 UTC (rev 21511)
++++ haiku/trunk/src/servers/app/BitmapManager.h	2007-06-27 11:29:20 UTC (rev 21512)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2006, Haiku.
++ * Copyright 2001-2007, Haiku.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -31,8 +31,12 @@
+ 							uint8* _allocationFlags = NULL);
+ 		void			DeleteBitmap(ServerBitmap* bitmap);
+ 
++		void			SuspendOverlays();
++		void			ResumeOverlays();
++
+ 	protected:
+ 		BList			fBitmapList;
++		BList			fOverlays;
+ 		BLocker			fLock;
+ };
+ 
+
+Modified: haiku/trunk/src/servers/app/ServerApp.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ServerApp.cpp	2007-06-27 10:43:48 UTC (rev 21511)
++++ haiku/trunk/src/servers/app/ServerApp.cpp	2007-06-27 11:29:20 UTC (rev 21512)
+@@ -624,6 +624,8 @@
+ 				Signature(), frame.Width() + 1, frame.Height() + 1));
+ 
+ 			if (bitmap != NULL &amp;&amp; fBitmapList.AddItem(bitmap)) {
++				bitmap-&gt;SetOwner(this);
++
+ 				fLink.StartMessage(B_OK);
+ 				fLink.Attach&lt;int32&gt;(bitmap-&gt;Token());
+ 				fLink.Attach&lt;uint8&gt;(allocationFlags);
+@@ -633,8 +635,12 @@
+ 
+ 				if (allocationFlags &amp; kFramebuffer)
+ 					fLink.Attach&lt;int32&gt;(bitmap-&gt;BytesPerRow());
+-			} else
++			} else {
++				if (bitmap != NULL)
++					gBitmapManager-&gt;DeleteBitmap(bitmap);
++
+ 				fLink.StartMessage(B_NO_MEMORY);
++			}
+ 
+ 			fLink.Flush();
+ 			break;
+
+Modified: haiku/trunk/src/servers/app/ServerBitmap.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ServerBitmap.cpp	2007-06-27 10:43:48 UTC (rev 21511)
++++ haiku/trunk/src/servers/app/ServerBitmap.cpp	2007-06-27 11:29:20 UTC (rev 21512)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2006, Haiku.
++ * Copyright 2001-2007, Haiku.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -68,7 +68,8 @@
+ 	fBytesPerRow(0),
+ 	fSpace(space),
+ 	fFlags(flags),
+-	fBitsPerPixel(0)
++	fBitsPerPixel(0),
++	fOwner(NULL)
+ 	// fToken is initialized (if used) by the BitmapManager
+ {
+ 	_HandleSpace(space, bytesPerRow);
+@@ -76,7 +77,7 @@
+ 
+ 
+ //! Copy constructor does not copy the buffer.
+-ServerBitmap::ServerBitmap(const ServerBitmap* bmp)
++ServerBitmap::ServerBitmap(const ServerBitmap* bitmap)
+ 	:
+ 	fAllocator(NULL),
+ 	fAllocationCookie(NULL),
+@@ -84,13 +85,14 @@
+ 	fBuffer(NULL),
+ 	fReferenceCount(1)
+ {
+-	if (bmp) {
+-		fWidth			= bmp-&gt;fWidth;
+-		fHeight			= bmp-&gt;fHeight;
+-		fBytesPerRow	= bmp-&gt;fBytesPerRow;
+-		fSpace			= bmp-&gt;fSpace;
+-		fFlags			= bmp-&gt;fFlags;
+-		fBitsPerPixel	= bmp-&gt;fBitsPerPixel;
++	if (bitmap) {
++		fWidth			= bitmap-&gt;fWidth;
++		fHeight			= bitmap-&gt;fHeight;
++		fBytesPerRow	= bitmap-&gt;fBytesPerRow;
++		fSpace			= bitmap-&gt;fSpace;
++		fFlags			= bitmap-&gt;fFlags;
++		fBitsPerPixel	= bitmap-&gt;fBitsPerPixel;
++		fOwner			= bitmap-&gt;fOwner;
+ 	} else {
+ 		fWidth			= 0;
+ 		fHeight			= 0;
+@@ -98,6 +100,7 @@
+ 		fSpace			= B_NO_COLOR_SPACE;
+ 		fFlags			= 0;
+ 		fBitsPerPixel	= 0;
++		fOwner			= NULL;
+ 	}
+ }
+ 
+@@ -305,9 +308,9 @@
+ 
+ 
+ void
+-ServerBitmap::SetOverlay(::Overlay* cookie)
++ServerBitmap::SetOverlay(::Overlay* overlay)
+ {
+-	fOverlay = cookie;
++	fOverlay = overlay;
+ }
+ 
+ 
+@@ -319,6 +322,20 @@
+ 
+ 
+ void
++ServerBitmap::SetOwner(ServerApp* owner)
++{
++	fOwner = owner;
++}
++
++
++ServerApp*
++ServerBitmap::Owner() const
++{
++	return fOwner;
++}
++
++
++void
+ ServerBitmap::PrintToStream()
+ {
+ 	printf(&quot;Bitmap@%p: (%ld:%ld), space %ld, bpr %ld, buffer %p\n&quot;,
+
+Modified: haiku/trunk/src/servers/app/ServerBitmap.h
+===================================================================
+--- haiku/trunk/src/servers/app/ServerBitmap.h	2007-06-27 10:43:48 UTC (rev 21511)
++++ haiku/trunk/src/servers/app/ServerBitmap.h	2007-06-27 11:29:20 UTC (rev 21512)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2006, Haiku.
++ * Copyright 2001-2007, Haiku.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -20,6 +20,7 @@
+ class ClientMemoryAllocator;
+ class HWInterface;
+ class Overlay;
++class ServerApp;
+ 
+ 
+ /*!
+@@ -66,9 +67,12 @@
+ 			area_id			Area() const;
+ 			uint32			AreaOffset() const;
+ 
+-			void			SetOverlay(::Overlay* cookie);
++			void			SetOverlay(::Overlay* overlay);
+ 			::Overlay*		Overlay() const;
+ 
++			void			SetOwner(ServerApp* owner);
++			ServerApp*		Owner() const;
++
+ 	//! Does a shallow copy of the bitmap passed to it
+ 	inline	void			ShallowCopy(const ServerBitmap *from);
+ 
+@@ -116,6 +120,8 @@
+ 			color_space		fSpace;
+ 			int32			fFlags;
+ 			int				fBitsPerPixel;
++
++			ServerApp*		fOwner;
+ 			int32			fToken;
+ };
+ 
+
+Modified: haiku/trunk/src/servers/app/ServerScreen.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ServerScreen.cpp	2007-06-27 10:43:48 UTC (rev 21511)
++++ haiku/trunk/src/servers/app/ServerScreen.cpp	2007-06-27 11:29:20 UTC (rev 21512)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2001-2006, Haiku, Inc.
++ * Copyright (c) 2001-2007, Haiku, Inc.
+  * Distributed under the terms of the MIT license.
+  *
+  * Authors:
+@@ -9,6 +9,12 @@
+  */
+ 
+ 
++#include &quot;ServerScreen.h&quot;
++
++#include &quot;BitmapManager.h&quot;
++#include &quot;DrawingEngine.h&quot;
++#include &quot;HWInterface.h&quot;
++
+ #include &lt;Accelerant.h&gt;
+ #include &lt;Point.h&gt;
+ #include &lt;GraphicsDefs.h&gt;
+@@ -16,12 +22,7 @@
+ #include &lt;stdlib.h&gt;
+ #include &lt;stdio.h&gt;
+ 
+-#include &quot;DrawingEngine.h&quot;
+-#include &quot;HWInterface.h&quot;
+ 
+-#include &quot;ServerScreen.h&quot;
+-
+-
+ static float
+ get_mode_frequency(const display_mode&amp; mode)
+ {
+@@ -87,9 +88,13 @@
+ status_t
+ Screen::SetMode(display_mode mode, bool makeDefault)
+ {
++	gBitmapManager-&gt;SuspendOverlays();
++
+ 	status_t status = fHWInterface-&gt;SetMode(mode);
+ 		// any attached DrawingEngines will be notified
+ 
++	gBitmapManager-&gt;ResumeOverlays();
++
+ 	if (status &gt;= B_OK)
+ 		fIsDefault = makeDefault;
+ 
+
+Modified: haiku/trunk/src/servers/app/drawing/Overlay.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/Overlay.cpp	2007-06-27 10:43:48 UTC (rev 21511)
++++ haiku/trunk/src/servers/app/drawing/Overlay.cpp	2007-06-27 11:29:20 UTC (rev 21512)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2006, Haiku, Inc.
++ * Copyright 2006-2007, Haiku, Inc.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -7,15 +7,54 @@
+  */
+ 
+ 
+-#include &quot;HWInterface.h&quot;
+ #include &quot;Overlay.h&quot;
+ 
++#include &quot;HWInterface.h&quot;
++#include &quot;ServerBitmap.h&quot;
++
+ #include &lt;BitmapPrivate.h&gt;
+ 
+ #include &lt;InterfaceDefs.h&gt;
+ 
+ 
+-Overlay::Overlay(HWInterface&amp; interface)
++const static bigtime_t kOverlayTimeout = 1000000LL;
++	// after 1 second, the team holding the lock will be killed
++
++class SemaphoreLocker {
++	public:
++		SemaphoreLocker(sem_id semaphore,
++				bigtime_t timeout = B_INFINITE_TIMEOUT)
++			: fSemaphore(semaphore)
++		{
++			do {
++				fStatus = acquire_sem_etc(fSemaphore, 1, B_RELATIVE_TIMEOUT,
++					timeout);
++			} while (fStatus == B_INTERRUPTED);
++		}
++
++		~SemaphoreLocker()
++		{
++			if (fStatus == B_OK)
++				release_sem_etc(fSemaphore, 1, B_DO_NOT_RESCHEDULE);
++		}
++
++		status_t
++		LockStatus()
++		{
++			return fStatus;
++		}
++
++	private:
++		sem_id		fSemaphore;
++		status_t	fStatus;
++};
++
++
++//	#pragma mark -
++
++
++Overlay::Overlay(HWInterface&amp; interface, ServerBitmap* bitmap,
++		overlay_token token)
+ 	:
+ 	fHWInterface(interface),
+ 	fOverlayBuffer(NULL),
+@@ -32,13 +71,15 @@
+ 	fWindow.offset_bottom = 0;
+ 
+ 	fWindow.flags = B_OVERLAY_COLOR_KEY;
++
++	_AllocateBuffer(bitmap);
+ }
+ 
+ 
+ Overlay::~Overlay()
+ {
+ 	fHWInterface.ReleaseOverlayChannel(fOverlayToken);
+-	fHWInterface.FreeOverlayBuffer(fOverlayBuffer);
++	_FreeBuffer();
+ 
+ 	delete_sem(fSemaphore);
+ }
+@@ -47,17 +88,71 @@
+ status_t
+ Overlay::InitCheck() const
+ {
+-	return fSemaphore &gt;= B_OK ? B_OK : fSemaphore;
++	if (fSemaphore &lt; B_OK)
++		return fSemaphore;
++
++	if (fOverlayBuffer == NULL)
++		return B_NO_MEMORY;
++
++	return B_OK;
+ }
+ 
+ 
++status_t
++Overlay::Resume(ServerBitmap* bitmap)
++{
++	SemaphoreLocker locker(fSemaphore, kOverlayTimeout);
++	if (locker.LockStatus() == B_TIMED_OUT) {
++		// TODO: kill app!
++	}
++
++	status_t status = _AllocateBuffer(bitmap);
++	if (status &lt; B_OK)
++		return status;
++
++	fClientData-&gt;buffer = (uint8*)fOverlayBuffer-&gt;buffer;
++	return B_OK;
++}
++
++
++status_t
++Overlay::Suspend(ServerBitmap* bitmap, bool needTemporary)
++{
++	SemaphoreLocker locker(fSemaphore, kOverlayTimeout);
++	if (locker.LockStatus() == B_TIMED_OUT) {
++		// TODO: kill app!
++	}
++
++	_FreeBuffer();
++	fClientData-&gt;buffer = NULL;
++
++	return B_OK;
++}
++
++
+ void
+-Overlay::SetOverlayData(const overlay_buffer* overlayBuffer,
+-	overlay_token token, overlay_client_data* clientData)
++Overlay::_FreeBuffer()
+ {
+-	fOverlayBuffer = overlayBuffer;
+-	fOverlayToken = token;
++	fHWInterface.FreeOverlayBuffer(fOverlayBuffer);
++	fOverlayBuffer = NULL;
++}
+ 
++
++status_t
++Overlay::_AllocateBuffer(ServerBitmap* bitmap)
++{
++	fOverlayBuffer = fHWInterface.AllocateOverlayBuffer(bitmap-&gt;Width(),
++		bitmap-&gt;Height(), bitmap-&gt;ColorSpace());
++	if (fOverlayBuffer == NULL)
++		return B_NO_MEMORY;
++
++	return B_OK;
++}
++
++
++void
++Overlay::SetClientData(overlay_client_data* clientData)
++{
+ 	fClientData = clientData;
+ 	fClientData-&gt;lock = fSemaphore;
+ 	fClientData-&gt;buffer = (uint8*)fOverlayBuffer-&gt;buffer;
+
+Modified: haiku/trunk/src/servers/app/drawing/Overlay.h
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/Overlay.h	2007-06-27 10:43:48 UTC (rev 21511)
++++ haiku/trunk/src/servers/app/drawing/Overlay.h	2007-06-27 11:29:20 UTC (rev 21512)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2006, Haiku, Inc.
++ * Copyright 2006-2007, Haiku, Inc.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -15,18 +15,22 @@
+ 
+ 
+ class HWInterface;
++class ServerBitmap;
+ struct overlay_client_data;
+ 
+ 
+ class Overlay {
+ 	public:
+-		Overlay(HWInterface&amp; interface);
++		Overlay(HWInterface&amp; interface, ServerBitmap* bitmap,
++			overlay_token token);
+ 		~Overlay();
+ 
+ 		status_t InitCheck() const;
+ 
+-		void SetOverlayData(const overlay_buffer* overlayBuffer,
+-			overlay_token token, overlay_client_data* clientData);
++		status_t Suspend(ServerBitmap* bitmap, bool needTemporary);
++		status_t Resume(ServerBitmap* bitmap);
++
++		void SetClientData(overlay_client_data* clientData);
+ 		void SetFlags(uint32 flags);
+ 		void TakeOverToken(Overlay* other);
+ 
+@@ -51,6 +55,9 @@
+ 		void Hide();
+ 
+ 	private:
++		void _FreeBuffer();
++		status_t _AllocateBuffer(ServerBitmap* bitmap);
++
+ 		HWInterface&amp;			fHWInterface;
+ 		const overlay_buffer*	fOverlayBuffer;
+ 		overlay_client_data*	fClientData;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002902.html">[Haiku-commits] r21511 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="002904.html">[Haiku-commits] r21513 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2903">[ date ]</a>
+              <a href="thread.html#2903">[ thread ]</a>
+              <a href="subject.html#2903">[ subject ]</a>
+              <a href="author.html#2903">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

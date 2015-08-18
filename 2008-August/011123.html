@@ -1,0 +1,171 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27079 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27079%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/cdda&In-Reply-To=%3C200808201310.m7KDAJkQ028651%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011128.html">
+   <LINK REL="Next"  HREF="011124.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27079 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda</H1>
+    <B>bga at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27079%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/cdda&In-Reply-To=%3C200808201310.m7KDAJkQ028651%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27079 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda">bga at mail.berlios.de
+       </A><BR>
+    <I>Wed Aug 20 15:10:19 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011128.html">[Haiku-commits] r27078 - haiku/trunk/src/add-ons/kernel/file_systems/udf
+</A></li>
+        <LI>Next message: <A HREF="011124.html">[Haiku-commits] r27079 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11123">[ date ]</a>
+              <a href="thread.html#11123">[ thread ]</a>
+              <a href="subject.html#11123">[ subject ]</a>
+              <a href="author.html#11123">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bga
+Date: 2008-08-20 15:10:18 +0200 (Wed, 20 Aug 2008)
+New Revision: 27079
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27079&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27079&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp
+Log:
+- Add a new CD:do_lookup attribute. It will be used by userland programs (like
+  cddblinkd) to know if they should lookup the CD or not. It will be true
+  unless:
+
+  1 - The CD has CD-Text information.
+  2 - The user (or a userland program) changed the Volume name.
+  3 - The user (or a userland program) changed any track names.
+
+- Moved (again) attribute creation to before the stored attributes are read. As
+  attribute operations happen in memory in cdda, we don't need to care about
+  the IO cost and this way it is more in line with all the other attributes
+  created.
+
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp	2008-08-20 12:28:16 UTC (rev 27078)
++++ haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp	2008-08-20 13:10:18 UTC (rev 27079)
+@@ -248,6 +248,7 @@
+ static const uint32 kMaxAttributes = 64;
+ 
+ static const char* kCddbIdAttribute = &quot;CD:cddbid&quot;;
++static const char* kDoLookupAttribute = &quot;CD:do_lookup&quot;;
+ 
+ extern fs_volume_ops gCDDAVolumeOps;
+ extern fs_vnode_ops gCDDAVnodeOps;
+@@ -571,9 +572,12 @@
+ 		return status;
+ 	}
+ 
++	bool do_lookup = true;
+ 	cdtext text;
+ 	if (read_cdtext(fDevice, text) &lt; B_OK)
+ 		dprintf(&quot;CDDA: no CD-Text found.\n&quot;);
++	else
++		do_lookup = false;
+ 
+ 	int32 trackCount = toc-&gt;last_track + 1 - toc-&gt;first_track;
+ 	off_t totalFrames = 0;
+@@ -635,13 +639,16 @@
+ 		inode-&gt;AddAttribute(&quot;BEOS:TYPE&quot;, B_MIME_STRING_TYPE, &quot;audio/x-wav&quot;);
+ 	}
+ 
++	// Add CD:cddbid attribute.
++	fRootNode-&gt;AddAttribute(kCddbIdAttribute, B_UINT32_TYPE, fDiscID);
++
++	// Add CD:do_lookup attribute.
++	fRootNode-&gt;AddAttribute(kDoLookupAttribute, B_BOOL_TYPE, true,
++		(const uint8*)&amp;do_lookup, sizeof(bool));
++
+ 	_RestoreSharedAttributes();
+ 	_RestoreAttributes();
+ 
+-	// Only add CD:cddbid attribute if it does not exist yet.
+-	if (fRootNode-&gt;FindAttribute(kCddbIdAttribute) == NULL)
+-		fRootNode-&gt;AddAttribute(kCddbIdAttribute, B_UINT32_TYPE, fDiscID);
+-
+ 	free(toc);
+ 
+ 	// determine volume title
+@@ -1381,8 +1388,18 @@
+ 
+ 	status_t status = B_BAD_VALUE;
+ 
+-	if ((mask &amp; FS_WRITE_FSINFO_NAME) != 0)
++	if ((mask &amp; FS_WRITE_FSINFO_NAME) != 0) {
+ 		status = volume-&gt;SetName(info-&gt;volume_name);
++		if (status == B_OK) {
++			// The volume had its name changed from outside the filesystem
++			// add-on. Disable CDDB lookups. Note this will usually mean that
++			// the user manually renamed the volume or that cddblinkd (or other
++			// program) did this so we do not want to do it again.
++			bool do_lookup = false;
++			volume-&gt;RootNode().AddAttribute(kDoLookupAttribute, B_BOOL_TYPE,
++				true, (const uint8*)&amp;do_lookup, sizeof(bool));
++		}
++	}
+ 
+ 	return status;
+ }
+@@ -1644,7 +1661,18 @@
+ 	if (volume-&gt;Find(newName) != NULL)
+ 		return B_NAME_IN_USE;
+ 
+-	return inode-&gt;SetName(newName);
++	status_t result = inode-&gt;SetName(newName);
++	if (result == B_OK) {
++		// One of the tracks had its name edited from outside the filesystem
++		// add-on. Disable CDDB lookups. Note this will usually mean that the
++		// user manually renamed a track or that cddblinkd (or other program)
++		// did this so we do not want to do it again.
++		bool do_lookup = false;
++		volume-&gt;RootNode().AddAttribute(kDoLookupAttribute, B_BOOL_TYPE, true,
++			(const uint8*)&amp;do_lookup, sizeof(bool));
++	}
++
++	return result;
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011128.html">[Haiku-commits] r27078 - haiku/trunk/src/add-ons/kernel/file_systems/udf
+</A></li>
+	<LI>Next message: <A HREF="011124.html">[Haiku-commits] r27079 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11123">[ date ]</a>
+              <a href="thread.html#11123">[ thread ]</a>
+              <a href="subject.html#11123">[ subject ]</a>
+              <a href="author.html#11123">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

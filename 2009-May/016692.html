@@ -1,0 +1,266 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30732 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30732%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/cdda&In-Reply-To=%3C200905122247.n4CMlrgT018122%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016712.html">
+   <LINK REL="Next"  HREF="016693.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30732 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda</H1>
+    <B>bga at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30732%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/cdda&In-Reply-To=%3C200905122247.n4CMlrgT018122%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30732 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda">bga at mail.berlios.de
+       </A><BR>
+    <I>Wed May 13 00:47:53 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016712.html">[Haiku-commits] r30731 - haiku/trunk/src/apps/deskbar
+</A></li>
+        <LI>Next message: <A HREF="016693.html">[Haiku-commits] r30733 - haiku/trunk/src/kits/media
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16692">[ date ]</a>
+              <a href="thread.html#16692">[ thread ]</a>
+              <a href="subject.html#16692">[ subject ]</a>
+              <a href="author.html#16692">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bga
+Date: 2009-05-13 00:47:22 +0200 (Wed, 13 May 2009)
+New Revision: 30732
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30732&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30732&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp
+Log:
+- If the name of a CD was changed, return this name instead of the generic
+  &quot;Audio CD&quot; or CD Text obtained one.
+
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp	2009-05-12 21:19:02 UTC (rev 30731)
++++ haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp	2009-05-12 22:47:22 UTC (rev 30732)
+@@ -102,7 +102,8 @@
+ 		size_t		BufferSize() const { return 32 * kFrameSize; }
+ 			// TODO: for now
+ 
+-		static void	DetermineName(cdtext&amp; text, char* name, size_t length);
++		static void	DetermineName(uint32 cddbId, int DeviceFD, char* name,
++			size_t length);
+ 
+ 	private:
+ 		Inode*		_CreateNode(Inode* parent, const char* name,
+@@ -437,6 +438,58 @@
+ }
+ 
+ 
++static int
++open_attributes(uint32 cddbId, int deviceFD, int mode,
++	enum attr_mode attrMode)
++{
++	char* path = (char*)malloc(B_PATH_NAME_LENGTH);
++	if (path == NULL)
++		return -1;
++
++	bool create = (mode &amp; O_WRONLY) != 0;
++
++	if (find_directory(B_USER_SETTINGS_DIRECTORY, -1, create, path,
++			B_PATH_NAME_LENGTH) != B_OK) {
++		free(path);
++		return -1;
++	}
++
++	strlcat(path, &quot;/cdda&quot;, B_PATH_NAME_LENGTH);
++	if (create)
++		mkdir(path, 0755);
++
++	if (attrMode == kDiscIDAttributes) {
++		char id[64];
++		snprintf(id, sizeof(id), &quot;/%08lx&quot;, cddbId);
++		strlcat(path, id, B_PATH_NAME_LENGTH);
++	} else if (attrMode == kDeviceAttributes) {
++		uint32 length = strlen(path);
++		char* device = path + length;
++		if (ioctl(deviceFD, B_GET_PATH_FOR_DEVICE, device,
++				B_PATH_NAME_LENGTH - length) &lt; B_OK) {
++			free(path);
++			return B_ERROR;
++		}
++
++		device++;
++
++		// replace slashes in the device path
++		while (device[0]) {
++			if (device[0] == '/')
++				device[0] = '_';
++
++			device++;
++		}
++	} else
++		strlcat(path, &quot;/shared&quot;, B_PATH_NAME_LENGTH);
++
++	int fd = open(path, mode | (create ? O_CREAT | O_TRUNC : 0), 0644);
++
++	free(path);
++	return fd;
++}
++
++
+ static void
+ fill_stat_buffer(Volume* volume, Inode* inode, Attribute* attribute,
+ 	struct stat&amp; stat)
+@@ -545,15 +598,33 @@
+ 
+ 
+ /*static*/ void
+-Volume::DetermineName(cdtext&amp; text, char* name, size_t length)
++Volume::DetermineName(uint32 cddbId, int deviceFD, char* name, size_t length)
+ {
+-	if (text.artist != NULL &amp;&amp; text.album != NULL)
+-		snprintf(name, length, &quot;%s - %s&quot;, text.artist, text.album);
+-	else if (text.artist != NULL || text.album != NULL) {
+-		snprintf(name, length, &quot;%s&quot;, text.artist != NULL
+-			? text.artist : text.album);
+-	} else
+-		strlcpy(name, &quot;Audio CD&quot;, length);
++	int attrFD = open_attributes(cddbId, deviceFD, O_RDONLY,
++		kDiscIDAttributes);
++	if (attrFD &lt; 0) {
++		// We do not have attributes set. Read CD text.
++		cdtext text;
++		read_cdtext(deviceFD, text);
++		if (text.artist != NULL &amp;&amp; text.album != NULL)
++			snprintf(name, length, &quot;%s - %s&quot;, text.artist, text.album);
++		else if (text.artist != NULL || text.album != NULL) {
++			snprintf(name, length, &quot;%s&quot;, text.artist != NULL
++				? text.artist : text.album);
++		} else
++			strlcpy(name, &quot;Audio CD&quot;, length);
++	} else {
++		// We have an attribute file. Read name from it.
++		char line[B_FILE_NAME_LENGTH];
++		if (!read_line(attrFD, line, B_FILE_NAME_LENGTH)) {
++			// Could not get name from attribute file. use default name.
++			strlcpy(name, &quot;Audio CD&quot;, length);
++		} else {
++			// We got a name. Use it.
++			strlcpy(name, line, length);
++		}
++		close(attrFD);
++	}
+ }
+ 
+ 
+@@ -685,7 +756,7 @@
+ 	free(toc);
+ 
+ 	// determine volume title
+-	DetermineName(text, title, sizeof(title));
++	DetermineName(fDiscID, fDevice, title, sizeof(title));
+ 
+ 	fName = strdup(title);
+ 	if (fName == NULL)
+@@ -787,51 +858,7 @@
+ int
+ Volume::_OpenAttributes(int mode, enum attr_mode attrMode)
+ {
+-	char* path = (char*)malloc(B_PATH_NAME_LENGTH);
+-	if (path == NULL)
+-		return -1;
+-
+-	bool create = (mode &amp; O_WRONLY) != 0;
+-
+-	if (find_directory(B_USER_SETTINGS_DIRECTORY, -1, create, path,
+-			B_PATH_NAME_LENGTH) != B_OK) {
+-		free(path);
+-		return -1;
+-	}
+-
+-	strlcat(path, &quot;/cdda&quot;, B_PATH_NAME_LENGTH);
+-	if (create)
+-		mkdir(path, 0755);
+-
+-	if (attrMode == kDiscIDAttributes) {
+-		char id[64];
+-		snprintf(id, sizeof(id), &quot;/%08lx&quot;, fDiscID);
+-		strlcat(path, id, B_PATH_NAME_LENGTH);
+-	} else if (attrMode == kDeviceAttributes) {
+-		uint32 length = strlen(path);
+-		char* device = path + length;
+-		if (ioctl(fDevice, B_GET_PATH_FOR_DEVICE, device,
+-				B_PATH_NAME_LENGTH - length) &lt; B_OK) {
+-			free(path);
+-			return B_ERROR;
+-		}
+-
+-		device++;
+-
+-		// replace slashes in the device path
+-		while (device[0]) {
+-			if (device[0] == '/')
+-				device[0] = '_';
+-
+-			device++;
+-		}
+-	} else
+-		strlcat(path, &quot;/shared&quot;, B_PATH_NAME_LENGTH);
+-
+-	int fd = open(path, mode | (create ? O_CREAT | O_TRUNC : 0), 0644);
+-
+-	free(path);
+-	return fd;
++	return open_attributes(fDiscID, fDevice, mode, attrMode);
+ }
+ 
+ 
+@@ -1357,11 +1384,9 @@
+ 
+ 	// determine volume title
+ 
+-	cdtext text;
+-	read_cdtext(fd, text);
+-
++	uint32 cddbId = compute_cddb_disc_id(*toc);
+ 	char name[256];
+-	Volume::DetermineName(text, name, sizeof(name));
++	Volume::DetermineName(cddbId, fd, name, sizeof(name));
+ 	partition-&gt;content_name = strdup(name);
+ 	if (partition-&gt;content_name == NULL)
+ 		return B_NO_MEMORY;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016712.html">[Haiku-commits] r30731 - haiku/trunk/src/apps/deskbar
+</A></li>
+	<LI>Next message: <A HREF="016693.html">[Haiku-commits] r30733 - haiku/trunk/src/kits/media
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16692">[ date ]</a>
+              <a href="thread.html#16692">[ thread ]</a>
+              <a href="subject.html#16692">[ subject ]</a>
+              <a href="author.html#16692">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

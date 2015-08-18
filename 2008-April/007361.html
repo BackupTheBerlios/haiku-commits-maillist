@@ -1,0 +1,196 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24739 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24739%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200804021044.m32AiAan006548%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007358.html">
+   <LINK REL="Next"  HREF="007362.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24739 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24739%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200804021044.m32AiAan006548%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24739 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Apr  2 12:44:10 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007358.html">[Haiku-commits] r24738 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+        <LI>Next message: <A HREF="007362.html">[Haiku-commits] r24740 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7361">[ date ]</a>
+              <a href="thread.html#7361">[ thread ]</a>
+              <a href="subject.html#7361">[ subject ]</a>
+              <a href="author.html#7361">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-04-02 12:44:08 +0200 (Wed, 02 Apr 2008)
+New Revision: 24739
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24739&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24739&amp;view=rev</A>
+
+Removed:
+   haiku/trunk/src/system/kernel/cache/block_cache_private.h
+Modified:
+   haiku/trunk/src/system/kernel/cache/block_cache.cpp
+Log:
+* block_cache_private.h is no longer needed, moved its contents into
+  block_cache.cpp.
+* Fixed warning.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-04-02 09:46:34 UTC (rev 24738)
++++ haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-04-02 10:44:08 UTC (rev 24739)
+@@ -4,7 +4,7 @@
+  */
+ 
+ 
+-#include &quot;block_cache_private.h&quot;
++#include &lt;block_cache.h&gt;
+ 
+ #include &lt;unistd.h&gt;
+ #include &lt;signal.h&gt;
+@@ -15,9 +15,9 @@
+ #include &lt;KernelExport.h&gt;
+ #include &lt;fs_cache.h&gt;
+ 
+-#include &lt;block_cache.h&gt;
+ #include &lt;lock.h&gt;
+ #include &lt;vm_low_memory.h&gt;
++#include &lt;slab/Slab.h&gt;
+ #include &lt;tracing.h&gt;
+ #include &lt;util/kernel_cpp.h&gt;
+ #include &lt;util/DoublyLinkedList.h&gt;
+@@ -42,7 +42,7 @@
+ #endif
+ 
+ #define DEBUG_BLOCK_CACHE
+-//#define DEBUG_CHANGED
++#define DEBUG_CHANGED
+ 
+ // This macro is used for fatal situations that are acceptable in a running
+ // system, like out of memory situations - should only panic for debugging.
+@@ -52,6 +52,74 @@
+ static const bigtime_t kTransactionIdleTime = 2000000LL;
+ 	// a transaction is considered idle after 2 seconds of inactivity
+ 
++
++struct cache_transaction;
++struct cached_block;
++struct block_cache;
++typedef DoublyLinkedListLink&lt;cached_block&gt; block_link;
++
++struct cached_block {
++	cached_block	*next;			// next in hash
++	cached_block	*transaction_next;
++	block_link		link;
++	off_t			block_number;
++	void			*current_data;
++	void			*original_data;
++	void			*parent_data;
++#ifdef DEBUG_CHANGED
++	void			*compare;
++#endif
++	int32			ref_count;
++	int32			accessed;
++	bool			busy : 1;
++	bool			is_writing : 1;
++	bool			is_dirty : 1;
++	bool			unused : 1;
++	cache_transaction *transaction;
++	cache_transaction *previous_transaction;
++
++	static int Compare(void *_cacheEntry, const void *_block);
++	static uint32 Hash(void *_cacheEntry, const void *_block, uint32 range);
++};
++
++typedef DoublyLinkedList&lt;cached_block,
++	DoublyLinkedListMemberGetLink&lt;cached_block,
++		&amp;cached_block::link&gt; &gt; block_list;
++
++struct block_cache : DoublyLinkedListLinkImpl&lt;block_cache&gt; {
++	hash_table		*hash;
++	recursive_lock	lock;
++	int				fd;
++	off_t			max_blocks;
++	size_t			block_size;
++	int32			next_transaction_id;
++	cache_transaction *last_transaction;
++	hash_table		*transaction_hash;
++
++	object_cache	*buffer_cache;
++	block_list		unused_blocks;
++
++	uint32			num_dirty_blocks;
++	bool			read_only;
++
++	block_cache(int fd, off_t numBlocks, size_t blockSize, bool readOnly);
++	~block_cache();
++
++	status_t InitCheck();
++
++	void RemoveUnusedBlocks(int32 maxAccessed = LONG_MAX,
++		int32 count = LONG_MAX);
++	void FreeBlock(cached_block *block);
++	cached_block *NewBlock(off_t blockNumber);
++	void Free(void *buffer);
++	void *Allocate();
++
++	static void LowMemoryHandler(void *data, int32 level);
++
++private:
++	cached_block *_GetUnusedBlock();
++};
++
+ struct cache_hook : DoublyLinkedListLinkImpl&lt;cache_hook&gt; {
+ 	transaction_notification_hook	hook;
+ 	void							*data;
+@@ -1065,7 +1133,7 @@
+ 	kprintf(&quot; sub num block:  %ld\n&quot;, transaction-&gt;sub_num_blocks);
+ 	kprintf(&quot; has sub:        %d\n&quot;, transaction-&gt;has_sub_transaction);
+ 	kprintf(&quot; state:          %s\n&quot;, transaction-&gt;open ? &quot;open&quot; : &quot;closed&quot;);
+-	kprintf(&quot; idle:           %ld secs\n&quot;,
++	kprintf(&quot; idle:           %Ld secs\n&quot;,
+ 		(system_time() - transaction-&gt;last_used) / 1000000);
+ 
+ 	if (!showBlocks)
+
+Deleted: haiku/trunk/src/system/kernel/cache/block_cache_private.h
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007358.html">[Haiku-commits] r24738 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+	<LI>Next message: <A HREF="007362.html">[Haiku-commits] r24740 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7361">[ date ]</a>
+              <a href="thread.html#7361">[ thread ]</a>
+              <a href="subject.html#7361">[ subject ]</a>
+              <a href="author.html#7361">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

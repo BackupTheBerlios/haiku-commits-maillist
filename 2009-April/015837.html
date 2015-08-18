@@ -1,0 +1,345 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30167 -	haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30167%20-%0A%09haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp&In-Reply-To=%3C200904151029.n3FATXXW005549%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015836.html">
+   <LINK REL="Next"  HREF="015838.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30167 -	haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30167%20-%0A%09haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp&In-Reply-To=%3C200904151029.n3FATXXW005549%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30167 -	haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Apr 15 12:29:33 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015836.html">[Haiku-commits] r30166 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+        <LI>Next message: <A HREF="015838.html">[Haiku-commits] r30168 - haiku/trunk/src/kits/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15837">[ date ]</a>
+              <a href="thread.html#15837">[ thread ]</a>
+              <a href="subject.html#15837">[ subject ]</a>
+              <a href="author.html#15837">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-04-15 12:29:33 +0200 (Wed, 15 Apr 2009)
+New Revision: 30167
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30167&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30167&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+Log:
+* The initial ARP entry for interfaces without an address were never removed.
+* arp_update_local() was called without holding the sCacheLock, but did not take
+  care about locking either. Now the caller has to lock.
+* Updating the local ARP entry is now done while holding the sCacheLock the
+  whole time, thus it's now atomic to the outside.
+* Fixed a potential deadlock: the arp_entry destructor must not be called with
+  the sCacheLock being held as long as there is a potential timer running.
+* Fixed a potential double delete in case the arp_entry destructor was called
+  with a pending ARP_STATE_REMOVE_FAILED or ARP_STATE_STALE. Now, we set the
+  new flag ARP_FLAG_REMOVED to check for that condition (it's now set when an
+  entry is removed from the hash).
+* arp_start_resolve() would leak non-functional ARP entries around when
+  something went wrong during the initialization. It will now remove them via
+  their timer.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp	2009-04-15 10:21:58 UTC (rev 30166)
++++ haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp	2009-04-15 10:29:33 UTC (rev 30167)
+@@ -90,9 +90,12 @@
+ 	void ClearQueue();
+ 	void MarkFailed();
+ 	void MarkValid();
++	void ScheduleRemoval();
+ };
+ 
+-// see arp_control.h for flags
++// see arp_control.h for more flags
++#define ARP_FLAG_REMOVED			0x00010000
++#define ARP_PUBLIC_FLAG_MASK		0x0000ffff
+ 
+ #define ARP_NO_STATE				0
+ #define ARP_STATE_REQUEST			1
+@@ -206,6 +209,8 @@
+ arp_entry::Add(in_addr_t protocolAddress, sockaddr_dl *hardwareAddress,
+ 	uint32 flags)
+ {
++	ASSERT_LOCKED_MUTEX(&amp;sCacheLock);
++
+ 	arp_entry *entry = new (std::nothrow) arp_entry;
+ 	if (entry == NULL)
+ 		return NULL;
+@@ -232,6 +237,8 @@
+ 	}
+ 
+ 	if (hash_insert(sCache, entry) != B_OK) {
++		// We can delete the entry here with the sCacheLock held, since it's
++		// guaranteed there are no timers pending.
+ 		delete entry;
+ 		return NULL;
+ 	}
+@@ -294,6 +301,18 @@
+ }
+ 
+ 
++void
++arp_entry::ScheduleRemoval()
++{
++	// schedule a timer to remove this entry
++	timer_state = ARP_STATE_REMOVE_FAILED;
++	sStackModule-&gt;set_timer(&amp;timer, 0);
++}
++
++
++//	#pragma mark -
++
++
+ static void
+ ipv4_to_ether_multicast(sockaddr_dl *destination, const sockaddr_in *source)
+ {
+@@ -324,8 +343,7 @@
+ //	#pragma mark -
+ 
+ 
+-/*!
+-	Updates the entry determined by \a protocolAddress with the specified
++/*!	Updates the entry determined by \a protocolAddress with the specified
+ 	\a hardwareAddress.
+ 	If such an entry does not exist yet, a new entry is added. If you try
+ 	to update a local existing entry but didn't ask for it (by setting
+@@ -338,6 +356,8 @@
+ arp_update_entry(in_addr_t protocolAddress, sockaddr_dl *hardwareAddress,
+ 	uint32 flags, arp_entry **_entry = NULL)
+ {
++	ASSERT_LOCKED_MUTEX(&amp;sCacheLock);
++
+ 	arp_entry *entry = arp_entry::Lookup(protocolAddress);
+ 	if (entry != NULL) {
+ 		// We disallow updating of entries that had been resolved before,
+@@ -385,9 +405,14 @@
+ }
+ 
+ 
++/*!	Creates a permanent local entry for the interface belonging to this protocol.
++	You need to hold the cache lock when calling this function.
++*/
+ static status_t
+ arp_update_local(arp_protocol *protocol)
+ {
++	ASSERT_LOCKED_MUTEX(&amp;sCacheLock);
++
+ 	net_interface *interface = protocol-&gt;interface;
+ 	in_addr_t inetAddress;
+ 
+@@ -566,9 +591,13 @@
+ 			// the entry has aged so much that we're going to remove it
+ 			TRACE((&quot;  remove ARP entry %p!\n&quot;, entry));
+ 
+-			// TODO: we need to make sure we aren't deleting this entry from
+-			// somewhere else right now!
+ 			mutex_lock(&amp;sCacheLock);
++			if ((entry-&gt;flags &amp; ARP_FLAG_REMOVED) != 0) {
++				// The entry has already been removed, and is about to be deleted
++				mutex_unlock(&amp;sCacheLock);
++				break;
++			}
++
+ 			hash_remove(sCache, entry);
+ 			mutex_unlock(&amp;sCacheLock);
+ 
+@@ -616,13 +645,15 @@
+ 
+ /*!	Address resolver function: prepares and triggers the ARP request necessary
+ 	to retrieve the hardware address for \a address.
+-	You need to have the sCacheLock held when calling this function - but
+-	note that the lock will be interrupted here if everything goes well.
++
++	You need to have the sCacheLock held when calling this function.
+ */
+ static status_t
+ arp_start_resolve(net_datalink_protocol *protocol, in_addr_t address,
+ 	arp_entry **_entry)
+ {
++	ASSERT_LOCKED_MUTEX(&amp;sCacheLock);
++
+ 	// create an unresolved ARP entry as a placeholder
+ 	arp_entry *entry = arp_entry::Add(address, NULL, 0);
+ 	if (entry == NULL)
+@@ -632,14 +663,14 @@
+ 
+ 	entry-&gt;request_buffer = gBufferModule-&gt;create(256);
+ 	if (entry-&gt;request_buffer == NULL) {
+-		// TODO: do something with the entry
++		entry-&gt;ScheduleRemoval();
+ 		return B_NO_MEMORY;
+ 	}
+ 
+ 	NetBufferPrepend&lt;arp_header&gt; bufferHeader(entry-&gt;request_buffer);
+ 	status_t status = bufferHeader.Status();
+ 	if (status &lt; B_OK) {
+-		// TODO: do something with the entry
++		entry-&gt;ScheduleRemoval();
+ 		return status;
+ 	}
+ 
+@@ -658,9 +689,12 @@
+ 	if (protocol-&gt;interface-&gt;address != NULL) {
+ 		header.protocol_sender
+ 			= ((sockaddr_in *)protocol-&gt;interface-&gt;address)-&gt;sin_addr.s_addr;
+-	} else
++	} else {
+ 		header.protocol_sender = 0;
+-			// TODO: test if this actually works - maybe we should use INADDR_BROADCAST instead
++			// TODO: test if this actually works - maybe we should use
++			// INADDR_BROADCAST instead
++	}
++
+ 	memset(header.hardware_target, 0, ETHER_ADDRESS_LENGTH);
+ 	header.protocol_target = address;
+ 
+@@ -734,7 +768,7 @@
+ 			} else
+ 				memset(control.ethernet_address, 0, ETHER_ADDRESS_LENGTH);
+ 
+-			control.flags = entry-&gt;flags;
++			control.flags = entry-&gt;flags &amp; ARP_PUBLIC_FLAG_MASK;
+ 			return user_memcpy(buffer, &amp;control, sizeof(struct arp_control));
+ 		}
+ 
+@@ -761,7 +795,7 @@
+ 					entry-&gt;hardware_address.sdl_data, ETHER_ADDRESS_LENGTH);
+ 			} else
+ 				memset(control.ethernet_address, 0, ETHER_ADDRESS_LENGTH);
+-			control.flags = entry-&gt;flags;
++			control.flags = entry-&gt;flags &amp; ARP_PUBLIC_FLAG_MASK;
+ 
+ 			return user_memcpy(buffer, &amp;control, sizeof(struct arp_control));
+ 		}
+@@ -774,9 +808,7 @@
+ 			if ((entry-&gt;flags &amp; ARP_FLAG_LOCAL) != 0)
+ 				return B_BAD_VALUE;
+ 
+-			// schedule a timer to remove this entry
+-			entry-&gt;timer_state = ARP_STATE_REMOVE_FAILED;
+-			sStackModule-&gt;set_timer(&amp;entry-&gt;timer, 0);
++			entry-&gt;ScheduleRemoval();
+ 			return B_OK;
+ 		}
+ 
+@@ -791,9 +823,7 @@
+ 				if ((entry-&gt;flags &amp; ARP_FLAG_LOCAL) != 0)
+ 					continue;
+ 
+-				// schedule a timer to remove this entry
+-				entry-&gt;timer_state = ARP_STATE_REMOVE_FAILED;
+-				sStackModule-&gt;set_timer(&amp;entry-&gt;timer, 0);
++				entry-&gt;ScheduleRemoval();
+ 			}
+ 			hash_close(sCache, &amp;iterator, false);
+ 			return B_OK;
+@@ -930,7 +960,10 @@
+ 
+ 	// cache this device's address for later use
+ 
++	mutex_lock(&amp;sCacheLock);
+ 	status = arp_update_local(protocol);
++	mutex_unlock(&amp;sCacheLock);
++
+ 	if (status &lt; B_OK) {
+ 		protocol-&gt;next-&gt;module-&gt;interface_down(protocol-&gt;next);
+ 		return status;
+@@ -952,6 +985,9 @@
+ 			((sockaddr_in *)protocol-&gt;interface-&gt;address)-&gt;sin_addr.s_addr);
+ 		if (entry != NULL) {
+ 			hash_remove(sCache, entry);
++			entry-&gt;flags |= ARP_FLAG_REMOVED;
++			locker.Unlock();
++
+ 			delete entry;
+ 		}
+ 	}
+@@ -969,12 +1005,10 @@
+ 	if (op == SIOCSIFADDR &amp;&amp; (protocol-&gt;interface-&gt;flags &amp; IFF_UP) != 0) {
+ 		// The interface may get a new address, so we need to update our
+ 		// local entries.
+-		bool hasOldAddress = false;
+ 		in_addr_t oldAddress = 0;
+ 		if (protocol-&gt;interface-&gt;address != NULL) {
+-			oldAddress = ((sockaddr_in *)
+-				protocol-&gt;interface-&gt;address)-&gt;sin_addr.s_addr;
+-			hasOldAddress = true;
++			oldAddress
++				= ((sockaddr_in *)protocol-&gt;interface-&gt;address)-&gt;sin_addr.s_addr;
+ 		}
+ 
+ 		status_t status = protocol-&gt;next-&gt;module-&gt;control(protocol-&gt;next,
+@@ -982,21 +1016,22 @@
+ 		if (status &lt; B_OK)
+ 			return status;
+ 
++		MutexLocker locker(sCacheLock);
++
+ 		arp_update_local(protocol);
+ 
+ 		if (oldAddress == ((sockaddr_in *)
+-				protocol-&gt;interface-&gt;address)-&gt;sin_addr.s_addr
+-			|| !hasOldAddress)
++				protocol-&gt;interface-&gt;address)-&gt;sin_addr.s_addr)
+ 			return B_OK;
+ 
+ 		// remove previous address from cache
+-		// TODO: we should be able to do this (add/remove) in one atomic operation!
+ 
+-		MutexLocker locker(sCacheLock);
+-
+ 		arp_entry *entry = arp_entry::Lookup(oldAddress);
+ 		if (entry != NULL) {
+ 			hash_remove(sCache, entry);
++			entry-&gt;flags |= ARP_FLAG_REMOVED;
++			locker.Unlock();
++
+ 			delete entry;
+ 		}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015836.html">[Haiku-commits] r30166 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+	<LI>Next message: <A HREF="015838.html">[Haiku-commits] r30168 - haiku/trunk/src/kits/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15837">[ date ]</a>
+              <a href="thread.html#15837">[ thread ]</a>
+              <a href="subject.html#15837">[ subject ]</a>
+              <a href="author.html#15837">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

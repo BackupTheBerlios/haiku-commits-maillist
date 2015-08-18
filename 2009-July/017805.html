@@ -1,0 +1,437 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31454 -	haiku/trunk/src/add-ons/media/plugins/ffmpeg
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31454%20-%0A%09haiku/trunk/src/add-ons/media/plugins/ffmpeg&In-Reply-To=%3C200907080851.n688pWmL002420%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017800.html">
+   <LINK REL="Next"  HREF="017807.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31454 -	haiku/trunk/src/add-ons/media/plugins/ffmpeg</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31454%20-%0A%09haiku/trunk/src/add-ons/media/plugins/ffmpeg&In-Reply-To=%3C200907080851.n688pWmL002420%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31454 -	haiku/trunk/src/add-ons/media/plugins/ffmpeg">stippi at mail.berlios.de
+       </A><BR>
+    <I>Wed Jul  8 10:51:32 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017800.html">[Haiku-commits] r31453 -	haiku/trunk/src/add-ons/kernel/partitioning_systems/intel
+</A></li>
+        <LI>Next message: <A HREF="017807.html">[Haiku-commits] r31454 - haiku/trunk/src/add-ons/media/plugins/ffmpeg
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17805">[ date ]</a>
+              <a href="thread.html#17805">[ thread ]</a>
+              <a href="subject.html#17805">[ subject ]</a>
+              <a href="author.html#17805">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-07-08 10:51:31 +0200 (Wed, 08 Jul 2009)
+New Revision: 31454
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31454&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31454&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp
+Log:
+* Virtualize the stream index and implement finding streams when the
+  context has AVPrograms. I gather this feature is for container streams
+  that contain multiple &quot;groups of streams&quot; like how it would work for
+  satilite mpeg-ts streams with multiple TV channels in one stream. For this
+  to be properly supported, we should extend the BMediaFile/Track API. For
+  now, the AVFormatReader uses the first program, if one is there. This
+  was also needed to get make mpegts demuxer work, but it is not yet enabled
+  for other reasons.
+* Read more probe data. 1024 bytes were not enough to detect &quot;mpegts&quot; properly
+  for example.
+* For now, I disabled the locking in the AVFormatReader hooks themselves,
+  this should not be necessary, though I hope libavformat is reentrant as
+  long as you have your own AVFormatContext for each thread. So far everything
+  hints that it is the case.
+
+
+Modified: haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp	2009-07-08 01:32:09 UTC (rev 31453)
++++ haiku/trunk/src/add-ons/media/plugins/ffmpeg/AVFormatReader.cpp	2009-07-08 08:51:31 UTC (rev 31454)
+@@ -64,6 +64,10 @@
+ 	inline	const AVFormatContext* Context() const
+ 									{ return fContext; }
+ 			int32				Index() const;
++			int32				CountStreams() const;
++			int32				StreamIndexFor(int32 virtualIndex) const;
++	inline	int32				VirtualIndex() const
++									{ return fVirtualIndex; }
+ 
+ 	inline	const media_format&amp;	Format() const
+ 									{ return fFormat; }
+@@ -105,6 +109,7 @@
+ 
+ 			AVFormatContext*	fContext;
+ 			AVStream*			fStream;
++			int32				fVirtualIndex;
+ 
+ 			ByteIOContext		fIOContext;
+ 			uint8				fIOBuffer[kIOBufferSize];
+@@ -126,6 +131,7 @@
+ 
+ 	fContext(NULL),
+ 	fStream(NULL),
++	fVirtualIndex(-1),
+ 
+ 	fReusePacket(false)
+ {
+@@ -146,7 +152,7 @@
+ AVFormatReader::StreamCookie::Open()
+ {
+ 	// Init probing data
+-	size_t probeSize = 1024;
++	size_t probeSize = kIOBufferSize / 2; //1024;
+ 	AVProbeData probeData;
+ 	probeData.filename = &quot;&quot;;
+ 	probeData.buf = fIOBuffer;
+@@ -167,18 +173,18 @@
+ 	AVInputFormat* inputFormat = av_probe_input_format(&amp;probeData, 1);
+ 
+ 	if (inputFormat == NULL) {
+-		TRACE(&quot;AVFormatReader::StreamCookie::Init() - &quot;
++		TRACE(&quot;AVFormatReader::StreamCookie::Open() - &quot;
+ 			&quot;av_probe_input_format() failed!\n&quot;);
+ 		return B_NOT_SUPPORTED;
+ 	}
+ 
+-	TRACE(&quot;AVFormatReader::StreamCookie::Init() - &quot;
++	TRACE(&quot;AVFormatReader::StreamCookie::Open() - &quot;
+ 		&quot;av_probe_input_format(): %s\n&quot;, inputFormat-&gt;name);
+ 
+ 	const DemuxerFormat* demuxerFormat = demuxer_format_for(inputFormat);
+ 	if (demuxerFormat == NULL) {
+ 		// We could support this format, but we don't want to. Bail out.
+-		ERROR(&quot;AVFormatReader::StreamCookie::Init() - &quot;
++		ERROR(&quot;AVFormatReader::StreamCookie::Open() - &quot;
+ 			&quot;support for demuxer '%s' is not enabled. &quot;
+ 			&quot;See DemuxerTable.cpp\n&quot;, inputFormat-&gt;name);
+ 		return B_NOT_SUPPORTED;
+@@ -188,7 +194,7 @@
+ 	// cookie.
+ 	if (init_put_byte(&amp;fIOContext, fIOBuffer, kIOBufferSize, 0, this,
+ 			_Read, 0, _Seek) != 0) {
+-		TRACE(&quot;AVFormatReader::StreamCookie::Init() - &quot;
++		TRACE(&quot;AVFormatReader::StreamCookie::Open() - &quot;
+ 			&quot;init_put_byte() failed!\n&quot;);
+ 		return B_ERROR;
+ 	}
+@@ -196,19 +202,19 @@
+ 	// Initialize our context.
+ 	if (av_open_input_stream(&amp;fContext, &amp;fIOContext, &quot;&quot;, inputFormat,
+ 			NULL) &lt; 0) {
+-		TRACE(&quot;AVFormatReader::StreamCookie::Init() - &quot;
++		TRACE(&quot;AVFormatReader::StreamCookie::Open() - &quot;
+ 			&quot;av_open_input_stream() failed!\n&quot;);
+ 		return B_NOT_SUPPORTED;
+ 	}
+ 
+ 	// Retrieve stream information
+ 	if (av_find_stream_info(fContext) &lt; 0) {
+-		TRACE(&quot;AVFormatReader::StreamCookie::Init() - &quot;
++		TRACE(&quot;AVFormatReader::StreamCookie::Open() - &quot;
+ 			&quot;av_find_stream_info() failed!\n&quot;);
+ 		return B_NOT_SUPPORTED;
+ 	}
+ 
+-	TRACE(&quot;AVFormatReader::StreamCookie::Init() - &quot;
++	TRACE(&quot;AVFormatReader::StreamCookie::Open() - &quot;
+ 		&quot;av_find_stream_info() success!\n&quot;);
+ 
+ 	return B_OK;
+@@ -216,15 +222,18 @@
+ 
+ 
+ status_t
+-AVFormatReader::StreamCookie::Init(int32 streamIndex)
++AVFormatReader::StreamCookie::Init(int32 virtualIndex)
+ {
+-	TRACE(&quot;AVFormatReader::StreamCookie::Init(%ld)\n&quot;, streamIndex);
++	TRACE(&quot;AVFormatReader::StreamCookie::Init(%ld)\n&quot;, virtualIndex);
+ 
+ 	if (fContext == NULL)
+ 		return B_NO_INIT;
+ 
+-	if (streamIndex &lt; 0 || streamIndex &gt;= (int32)fContext-&gt;nb_streams)
++	int32 streamIndex = StreamIndexFor(virtualIndex);
++	if (streamIndex &lt; 0) {
++		TRACE(&quot;  Bad stream index!\n&quot;);
+ 		return B_BAD_INDEX;
++	}
+ 
+ 	const DemuxerFormat* demuxerFormat = demuxer_format_for(fContext-&gt;iformat);
+ 	if (demuxerFormat == NULL) {
+@@ -232,6 +241,10 @@
+ 		return B_NOT_SUPPORTED;
+ 	}
+ 
++	// We need to remember the virtual index so that
++	// AVFormatReader::FreeCookie() can clear the correct stream entry.
++	fVirtualIndex = virtualIndex;
++
+ 	// Make us point to the AVStream at streamIndex
+ 	fStream = fContext-&gt;streams[streamIndex];
+ 
+@@ -311,23 +324,40 @@
+ 				break;
+ 		}
+ 	} else {
++		uint32 codecTag = codecContext-&gt;codec_tag;
++		if (codecTag == 0) {
++			// Ugh, no codec_tag. Let's try to fake some known codecs.
++			// Such a situation seems to occur for the &quot;mpegts&quot; demuxer for
++			// example. These are some tags I could test with.
++			switch (codecContext-&gt;codec_id) {
++				case CODEC_ID_H264:
++					codecTag = 'h264';
++					break;
++//				case CODEC_ID_AC3:
++//					codecTag = 0x2000;
++//					break;
++				default:
++					// TODO: Add more...
++					break;
++			}
++		}
+ 		switch (description.family) {
+ 			case B_AIFF_FORMAT_FAMILY:
+ 				TRACE(&quot;  B_AIFF_FORMAT_FAMILY\n&quot;);
+-				description.u.aiff.codec = codecContext-&gt;codec_tag;
++				description.u.aiff.codec = codecTag;
+ 				break;
+ 			case B_ASF_FORMAT_FAMILY:
+ 				TRACE(&quot;  B_ASF_FORMAT_FAMILY\n&quot;);
+-//				description.u.asf.guid = GUID(codecContext-&gt;codec_tag);
++//				description.u.asf.guid = GUID(codecTag);
+ 				return B_NOT_SUPPORTED;
+ 				break;
+ 			case B_AVI_FORMAT_FAMILY:
+ 				TRACE(&quot;  B_AVI_FORMAT_FAMILY\n&quot;);
+-				description.u.avi.codec = codecContext-&gt;codec_tag;
++				description.u.avi.codec = codecTag;
+ 				break;
+ 			case B_AVR_FORMAT_FAMILY:
+ 				TRACE(&quot;  B_AVR_FORMAT_FAMILY\n&quot;);
+-				description.u.avr.id = codecContext-&gt;codec_tag;
++				description.u.avr.id = codecTag;
+ 				break;
+ 			case B_MPEG_FORMAT_FAMILY:
+ 				TRACE(&quot;  B_MPEG_FORMAT_FAMILY\n&quot;);
+@@ -346,21 +376,21 @@
+ 			case B_QUICKTIME_FORMAT_FAMILY:
+ 				TRACE(&quot;  B_QUICKTIME_FORMAT_FAMILY\n&quot;);
+ 				description.u.quicktime.codec
+-					= B_HOST_TO_BENDIAN_INT32(codecContext-&gt;codec_tag);
++					= B_HOST_TO_BENDIAN_INT32(codecTag);
+ 				break;
+ 			case B_WAV_FORMAT_FAMILY:
+ 				TRACE(&quot;  B_WAV_FORMAT_FAMILY\n&quot;);
+-				description.u.wav.codec = codecContext-&gt;codec_tag;
++				description.u.wav.codec = codecTag;
+ 				break;
+ 			case B_MISC_FORMAT_FAMILY:
+ 				TRACE(&quot;  B_MISC_FORMAT_FAMILY\n&quot;);
+-				description.u.misc.codec = codecContext-&gt;codec_tag;
++				description.u.misc.codec = codecTag;
+ 				break;
+ 
+ 			default:
+ 				break;
+ 		}
+-		TRACE(&quot;  fourcc '%.4s'\n&quot;, (char*)&amp;codecContext-&gt;codec_tag);
++		TRACE(&quot;  codecTag '%.4s' or %ld\n&quot;, (char*)&amp;codecTag, codecTag);
+ 
+ 		BMediaFormats formats;
+ 		status_t status = formats.GetFormatFor(description, format);
+@@ -368,7 +398,7 @@
+ 			TRACE(&quot;  formats.GetFormatFor() error: %s\n&quot;, strerror(status));
+ 
+ 		format-&gt;user_data_type = B_CODEC_TYPE_INFO;
+-		*(uint32*)format-&gt;user_data = codecContext-&gt;codec_tag;
++		*(uint32*)format-&gt;user_data = codecTag;
+ 		format-&gt;user_data[4] = 0;
+ 	}
+ 
+@@ -485,17 +515,59 @@
+ }
+ 
+ 
++int32
++AVFormatReader::StreamCookie::CountStreams() const
++{
++	// Figure out the stream count. If the context has &quot;AVPrograms&quot;, use
++	// the first program (for now).
++	// TODO: To support &quot;programs&quot; properly, the BMediaFile/Track API should
++	// be extended accordingly. I guess programs are like TV channels in the
++	// same satilite transport stream. Maybe call them &quot;TrackGroups&quot;.
++	if (fContext-&gt;nb_programs &gt; 0) {
++		// See libavformat/utils.c:dump_format()
++		return fContext-&gt;programs[0]-&gt;nb_stream_indexes;
++	}
++	return fContext-&gt;nb_streams;
++}
++
++
++int32
++AVFormatReader::StreamCookie::StreamIndexFor(int32 virtualIndex) const
++{
++	// NOTE: See CountStreams()
++	if (fContext-&gt;nb_programs &gt; 0) {
++		const AVProgram* program = fContext-&gt;programs[0];
++		if (virtualIndex &gt;= 0
++			&amp;&amp; virtualIndex &lt; (int32)program-&gt;nb_stream_indexes) {
++			return program-&gt;stream_index[virtualIndex];
++		}
++	} else {
++		if (virtualIndex &gt;= 0 &amp;&amp; virtualIndex &lt; (int32)fContext-&gt;nb_streams)
++			return virtualIndex;
++	}
++	return -1;
++}
++
++
+ double
+ AVFormatReader::StreamCookie::FrameRate() const
+ {
++	// TODO: Find a way to always calculate a correct frame rate...
++	double frameRate;
+ 	switch (fStream-&gt;codec-&gt;codec_type) {
+ 		case CODEC_TYPE_AUDIO:
+-			return (double)fStream-&gt;codec-&gt;sample_rate;
++			frameRate = (double)fStream-&gt;codec-&gt;sample_rate;
++			break;
+ 		case CODEC_TYPE_VIDEO:
+-			return av_q2d(fStream-&gt;r_frame_rate);
++			frameRate = av_q2d(fStream-&gt;r_frame_rate);
++			break;
+ 		default:
+-			return 0.0;
++			frameRate = 1.0;
++			break;
+ 	}
++	if (frameRate &lt;= 0.0)
++		frameRate = 1.0;
++	return frameRate;
+ }
+ 
+ 
+@@ -656,8 +728,11 @@
+ 	TRACE_PACKET(&quot;AVFormatReader::StreamCookie::GetNextChunk()\n&quot;);
+ 
+ 	status_t ret = _NextPacket(false);
+-	if (ret != B_OK)
++	if (ret != B_OK) {
++		*chunkBuffer = NULL;
++		*chunkSize = 0;
+ 		return ret;
++	}
+ 
+ 	// According to libavformat documentation, fPacket is valid until the
+ 	// next call to av_read_frame(). This is what we want and we can share
+@@ -857,7 +932,7 @@
+ 	delete[] fStreams;
+ 	fStreams = NULL;
+ 
+-	int32 streamCount = stream-&gt;Context()-&gt;nb_streams;
++	int32 streamCount = stream-&gt;CountStreams();
+ 	if (streamCount == 0) {
+ 		TRACE(&quot;  failed to detect any streams: %s\n&quot;, strerror(ret));
+ 		return B_ERROR;
+@@ -964,9 +1039,7 @@
+ 	if (fStreams == NULL)
+ 		return B_NO_INIT;
+ 
+-	const AVFormatContext* context = fStreams[0]-&gt;Context();
+-
+-	if (streamIndex &lt; 0 || streamIndex &gt;= (int32)context-&gt;nb_streams)
++	if (streamIndex &lt; 0 || streamIndex &gt;= fStreams[0]-&gt;CountStreams())
+ 		return B_BAD_INDEX;
+ 
+ 	if (_cookie == NULL)
+@@ -1020,9 +1093,9 @@
+ 	StreamCookie* cookie = reinterpret_cast&lt;StreamCookie*&gt;(_cookie);
+ 
+ 	// NOTE: Never delete the first cookie!
+-	if (cookie != NULL &amp;&amp; cookie-&gt;Index() != 0) {
++	if (cookie != NULL &amp;&amp; cookie-&gt;VirtualIndex() != 0) {
+ 		if (fStreams != NULL)
+-			fStreams[cookie-&gt;Index()] = NULL;
++			fStreams[cookie-&gt;VirtualIndex()] = NULL;
+ 		delete cookie;
+ 	}
+ 
+@@ -1040,7 +1113,7 @@
+ {
+ 	TRACE(&quot;AVFormatReader::GetStreamInfo()\n&quot;);
+ 
+-	BAutolock _(fStreamLock);
++//	BAutolock _(fStreamLock);
+ 
+ 	StreamCookie* cookie = reinterpret_cast&lt;StreamCookie*&gt;(_cookie);
+ 	return cookie-&gt;GetStreamInfo(frameCount, duration, format, infoBuffer,
+@@ -1054,7 +1127,7 @@
+ {
+ 	TRACE_SEEK(&quot;AVFormatReader::Seek()\n&quot;);
+ 
+-	BAutolock _(fStreamLock);
++//	BAutolock _(fStreamLock);
+ 
+ 	StreamCookie* cookie = reinterpret_cast&lt;StreamCookie*&gt;(_cookie);
+ 	return cookie-&gt;Seek(seekTo, frame, time);
+@@ -1067,7 +1140,7 @@
+ {
+ 	TRACE_SEEK(&quot;AVFormatReader::FindKeyFrame()\n&quot;);
+ 
+-	BAutolock _(fStreamLock);
++//	BAutolock _(fStreamLock);
+ 
+ 	StreamCookie* cookie = reinterpret_cast&lt;StreamCookie*&gt;(_cookie);
+ 	return cookie-&gt;FindKeyFrame(flags, frame, time);
+@@ -1080,7 +1153,7 @@
+ {
+ 	TRACE_PACKET(&quot;AVFormatReader::GetNextChunk()\n&quot;);
+ 
+-	BAutolock _(fStreamLock);
++//	BAutolock _(fStreamLock);
+ 
+ 	StreamCookie* cookie = reinterpret_cast&lt;StreamCookie*&gt;(_cookie);
+ 	return cookie-&gt;GetNextChunk(chunkBuffer, chunkSize, mediaHeader);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017800.html">[Haiku-commits] r31453 -	haiku/trunk/src/add-ons/kernel/partitioning_systems/intel
+</A></li>
+	<LI>Next message: <A HREF="017807.html">[Haiku-commits] r31454 - haiku/trunk/src/add-ons/media/plugins/ffmpeg
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17805">[ date ]</a>
+              <a href="thread.html#17805">[ thread ]</a>
+              <a href="subject.html#17805">[ subject ]</a>
+              <a href="author.html#17805">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

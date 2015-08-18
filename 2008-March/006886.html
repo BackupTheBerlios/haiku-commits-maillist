@@ -1,0 +1,167 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24429 - haiku/trunk/src/kits/interface
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24429%20-%20haiku/trunk/src/kits/interface&In-Reply-To=%3C200803180035.m2I0Zaqp016520%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006885.html">
+   <LINK REL="Next"  HREF="006887.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24429 - haiku/trunk/src/kits/interface</H1>
+    <B>anevilyak at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24429%20-%20haiku/trunk/src/kits/interface&In-Reply-To=%3C200803180035.m2I0Zaqp016520%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24429 - haiku/trunk/src/kits/interface">anevilyak at mail.berlios.de
+       </A><BR>
+    <I>Tue Mar 18 01:35:36 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006885.html">[Haiku-commits] r24428 - haiku/trunk/src/servers/app
+</A></li>
+        <LI>Next message: <A HREF="006887.html">[Haiku-commits] r24430 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6886">[ date ]</a>
+              <a href="thread.html#6886">[ thread ]</a>
+              <a href="subject.html#6886">[ subject ]</a>
+              <a href="author.html#6886">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: anevilyak
+Date: 2008-03-18 01:35:36 +0100 (Tue, 18 Mar 2008)
+New Revision: 24429
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24429&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24429&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/kits/interface/Shelf.cpp
+Log:
+Plug various memleaks in BShelf.
+
+
+
+Modified: haiku/trunk/src/kits/interface/Shelf.cpp
+===================================================================
+--- haiku/trunk/src/kits/interface/Shelf.cpp	2008-03-18 00:04:12 UTC (rev 24428)
++++ haiku/trunk/src/kits/interface/Shelf.cpp	2008-03-18 00:35:36 UTC (rev 24429)
+@@ -6,6 +6,7 @@
+  *		Marc Flerackers (<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">mflerackers at androme.be</A>)
+  *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
+  *		J&#233;r&#244;me Duval
++ *		Ren&#233; Gollent
+  */
+ 
+ /*!	BShelf stores replicant views that are dropped onto it */
+@@ -108,6 +109,7 @@
+ 	replicant_data(BMessage *message, BView *view, BDragger *dragger,
+ 		BDragger::relation relation, unsigned long id, image_id image);
+ 	replicant_data();
++	~replicant_data();
+ 
+ 	static replicant_data* Find(BList const *list, BMessage const *msg);
+ 	static replicant_data* Find(BList const *list, BView const *view, bool allowZombie);
+@@ -230,6 +232,17 @@
+ {
+ }
+ 
++replicant_data::~replicant_data()
++{
++	delete message;
++	// we can't delete the view or image here since 
++	// 1 - the view may already have been deleted and thus our pointer is invalid
++	// and 2 - we don't know what order they will be deleted in, so we can't unload the image yet
++	// since the destructor code for the view might still be needed if it has not been destroyed yet.
++	// this does mean we technically leak add-on images on exit, but I don't see a way around that,
++	// and in theory they should be unloaded by team cleanup on exit anyways.
++}
++
+ status_t
+ replicant_data::Archive(BMessage* msg)
+ {
+@@ -489,6 +502,13 @@
+ 	Save();
+ 
+ 	delete fEntry;
++	delete fStream;
++
++	while (fReplicants.CountItems() &gt; 0) {
++		replicant_data *data = (replicant_data *)fReplicants.ItemAt(0);
++		fReplicants.RemoveItem(0L);
++		delete data;
++	}
+ }
+ 
+ 
+@@ -1104,7 +1124,7 @@
+ status_t
+ BShelf::_DeleteReplicant(replicant_data* item)
+ {
+-	bool loadedImage = item-&gt;message-&gt;FindBool(&quot;&quot;);
++	bool loadedImage = item-&gt;message-&gt;FindBool(&quot;_loaded_image_&quot;);
+ 
+ 	BView *view = item-&gt;view;
+ 	if (view == NULL)
+@@ -1122,12 +1142,20 @@
+ 	
+ 	fReplicants.RemoveItem(item);	
+ 
++	if (item-&gt;relation == BDragger::TARGET_IS_PARENT
++		|| item-&gt;relation == BDragger::TARGET_IS_SIBLING) {			
++		delete view;			
++	}
++	if (item-&gt;relation == BDragger::TARGET_IS_CHILD
++		|| item-&gt;relation == BDragger::TARGET_IS_SIBLING) {	
++		delete item-&gt;dragger;
++	}
++
+ 	if (loadedImage &amp;&amp; item-&gt;image &gt;= 0)
+ 		unload_add_on(item-&gt;image);
+ 
+ 	delete item;
+ 
+-	// TODO: Should we also delete the view ?
+ 
+ 	return B_OK;
+ }
+@@ -1206,6 +1234,9 @@
+ 	data-&gt;RemoveName(&quot;_drop_point_&quot;);
+ 	data-&gt;RemoveName(&quot;_drop_offset_&quot;);
+ 
++	if (image &gt;= 0)
++		data-&gt;AddBool(&quot;_loaded_image_&quot;, true);
++
+ 	replicant_data *item = new replicant_data(data, replicant, dragger,
+ 		relation, uniqueID, image);
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006885.html">[Haiku-commits] r24428 - haiku/trunk/src/servers/app
+</A></li>
+	<LI>Next message: <A HREF="006887.html">[Haiku-commits] r24430 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6886">[ date ]</a>
+              <a href="thread.html#6886">[ thread ]</a>
+              <a href="subject.html#6886">[ subject ]</a>
+              <a href="author.html#6886">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

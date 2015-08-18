@@ -1,0 +1,582 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26564 - haiku/trunk/src/bin/mkfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26564%20-%20haiku/trunk/src/bin/mkfs&In-Reply-To=%3C200807221411.m6MEBuiH030312%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010466.html">
+   <LINK REL="Next"  HREF="010474.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26564 - haiku/trunk/src/bin/mkfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26564%20-%20haiku/trunk/src/bin/mkfs&In-Reply-To=%3C200807221411.m6MEBuiH030312%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26564 - haiku/trunk/src/bin/mkfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Jul 22 16:11:56 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010466.html">[Haiku-commits] r26563 -	haiku/trunk/src/system/kernel/disk_device_manager
+</A></li>
+        <LI>Next message: <A HREF="010474.html">[Haiku-commits] r26565 -	haiku/trunk/src/tests/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10467">[ date ]</a>
+              <a href="thread.html#10467">[ thread ]</a>
+              <a href="subject.html#10467">[ subject ]</a>
+              <a href="author.html#10467">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-07-22 16:11:54 +0200 (Tue, 22 Jul 2008)
+New Revision: 26564
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26564&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26564&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/bin/mkfs/FsCreator.cpp
+   haiku/trunk/src/bin/mkfs/FsCreator.h
+   haiku/trunk/src/bin/mkfs/main.cpp
+Log:
+* Now supports formatting file devices as well as partitions.
+* Fixed crash when it couldn't find the device.
+* Added a &quot;-l|--list-types&quot; option that list all file systems that support
+  initializing (currently only BFS).
+* Added a &quot;-q|--dont-ask&quot; option that prevents mkfs from questioning your
+  command :-)
+* Fixed return value - would return failure to the shell when it actually
+  succeeded and vice versa.
+* Improved/clarified some output and fixed spelling errors.
+* Errors now have the command name as prefix, as that's how it is usually
+  done (and very useful for batch processing).
+* Cleanup, though I kept the FsCreator class which is kinda superfluous.
+
+
+Modified: haiku/trunk/src/bin/mkfs/FsCreator.cpp
+===================================================================
+--- haiku/trunk/src/bin/mkfs/FsCreator.cpp	2008-07-22 14:05:47 UTC (rev 26563)
++++ haiku/trunk/src/bin/mkfs/FsCreator.cpp	2008-07-22 14:11:54 UTC (rev 26564)
+@@ -4,6 +4,7 @@
+  *
+  * Authors:
+  *		Marco Minutoli, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">mminutoli at gmail.com</A>
++ *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
+  */
+ 
+ #include &quot;FsCreator.h&quot;
+@@ -13,63 +14,116 @@
+ #include &lt;DiskSystem.h&gt;
+ 
+ 
+-FsCreator::FsCreator(const char* devPath, BString&amp; type,
+-	BString&amp; volumeName, const char* fsOpt, bool verbose)
++class UnregisterFileDevice {
++public:
++	UnregisterFileDevice()
++		:
++		fID(-1)
++	{
++	}
++
++	~UnregisterFileDevice()
++	{
++		if (fID &gt;= 0) {
++			BDiskDeviceRoster roster;
++			roster.UnregisterFileDevice(fID);
++		}
++	}
++
++	void SetTo(partition_id id)
++	{
++		fID = id;
++	}
++
++	void Detach()
++	{
++		fID = -1;
++	}
++
++private:
++	partition_id	fID;
++};
++
++
++extern &quot;C&quot; const char* __progname;
++static const char* kProgramName = __progname;
++
++
++FsCreator::FsCreator(const char* path, const char* type, const char* volumeName,
++		const char* fsOptions, bool quick, bool verbose)
+ 	:
+ 	fType(type),
+-	fDevicePath(devPath),
++	fPath(path),
+ 	fVolumeName(volumeName),
+-	fFsOptions(fsOpt),
+-	fVerbose(verbose)
++	fFsOptions(fsOptions),
++	fVerbose(verbose),
++	fQuick(quick)
+ {
+-	BDiskDeviceRoster roster;
+-	status_t ret = roster.GetDeviceForPath(devPath, &amp;fDevice);
+-	if (ret != B_OK) {
+-		std::cerr &lt;&lt; &quot;Error: Failed to get disk device for path &quot;
+-				  &lt;&lt; devPath &lt;&lt; &quot;: &quot; &lt;&lt; strerror(ret);
+-	}
+ }
+ 
+ 
+ bool
+ FsCreator::Run()
+ {
++	UnregisterFileDevice unregisterFileDevice;
++
++	BDiskDeviceRoster roster;
++	BPartition* partition;
++	BDiskDevice device;
++
++	status_t status = roster.GetPartitionForPath(fPath, &amp;device,
++		&amp;partition);
++	if (status != B_OK) {
++		if (!strncmp(fPath, &quot;/dev&quot;, 4)) {
++			std::cerr &lt;&lt; kProgramName &lt;&lt; &quot;: Failed to get disk device for path &quot;
++				&lt;&lt; fPath &lt;&lt; &quot;: &quot; &lt;&lt; strerror(status) &lt;&lt; std::endl;
++			return false;
++		}
++
++		// try to register file device
++
++		partition_id id = roster.RegisterFileDevice(fPath);
++		if (id &lt; B_OK) {
++			std::cerr &lt;&lt; kProgramName &lt;&lt; &quot;: Could not register file device for &quot;
++				&quot;path &quot; &lt;&lt; fPath &lt;&lt; &quot;: &quot; &lt;&lt; strerror(status) &lt;&lt; std::endl;
++			return false;
++		}
++
++		unregisterFileDevice.SetTo(id);
++
++		status = roster.GetPartitionWithID(id, &amp;device, &amp;partition);
++		if (!strncmp(fPath, &quot;/dev&quot;, 4)) {
++			std::cerr &lt;&lt; kProgramName &lt;&lt; &quot;: Cannot find registered file device &quot;
++				&quot;for path &quot; &lt;&lt; fPath &lt;&lt; &quot;: &quot; &lt;&lt; strerror(status)
++				&lt;&lt; std::endl;
++			return false;
++		}
++	}
++
+ 	// check that the device is writable
+-	if (fDevice.IsReadOnly()) {
+-		std::cerr &lt;&lt; &quot;Error: Can't Inizialize the device. &quot;
+-			&quot;It is read only.\n&quot;;
++	if (partition-&gt;IsReadOnly()) {
++		std::cerr &lt;&lt; kProgramName &lt;&lt; &quot;: Cannot initialize read-only device.\n&quot;;
+ 		return false;
+ 	}
+ 
+ 	// check if the device is mounted
+-	if (fDevice.IsMounted()) {
+-		std::cerr &lt;&lt; &quot;Error: The device has to be unmounted before.\n&quot;;
++	if (partition-&gt;IsMounted()) {
++		std::cerr &lt;&lt; kProgramName &lt;&lt; &quot;: Cannot initialize mounted device.\n&quot;;
+ 		return false;
+ 	}
+ 
+ 	BDiskSystem diskSystem;
+-	BDiskDeviceRoster dDRoster;
+-	bool found = false;
+-	while (dDRoster.GetNextDiskSystem(&amp;diskSystem) == B_OK) {
+-		if (diskSystem.IsFileSystem() &amp;&amp; diskSystem.SupportsInitializing()) {
+-			if (diskSystem.ShortName() == fType) {
+-				found = true;
+-				break;
+-			}
+-		}
+-	}
+-
+-	if (!found) {
+-		std::cerr &lt;&lt; &quot;Error: &quot; &lt;&lt; fType.String()
+-				  &lt;&lt; &quot; is an invalid or unsupported file system type.\n&quot;;
++	if (roster.GetDiskSystem(&amp;diskSystem, fType) != B_OK) {
++		std::cerr &lt;&lt; kProgramName &lt;&lt; &quot;: &quot; &lt;&lt; fType
++			&lt;&lt; &quot; is an invalid or unsupported file system type.\n&quot;;
+ 		return false;
+ 	}
+ 
+ 	// prepare the device for modifications
+-	status_t ret = fDevice.PrepareModifications();
+-	if (ret != B_OK) {
+-		std::cerr &lt;&lt; &quot;Error: A problem occurred preparing the device for the&quot;
+-			&quot;modifications\n&quot;;
++	status = device.PrepareModifications();
++	if (status != B_OK) {
++		std::cerr &lt;&lt; kProgramName &lt;&lt; &quot;: A problem occurred preparing the &quot;
++			&quot;device for the modifications\n&quot;;
+ 		return false;
+ 	}
+ 	if (fVerbose)
+@@ -77,52 +131,64 @@
+ 
+ 	// validate parameters
+ 	BString name(fVolumeName);
+-	if (fDevice.ValidateInitialize(diskSystem.PrettyName(),
+-			&amp;fVolumeName, fFsOptions) != B_OK) {
+-		std::cerr &lt;&lt; &quot;Error: Parameters validation failed. &quot;
++	if (partition-&gt;ValidateInitialize(diskSystem.PrettyName(),
++			&amp;name, fFsOptions) != B_OK) {
++		std::cerr &lt;&lt; kProgramName &lt;&lt; &quot;: Parameters validation failed. &quot;
+ 			&quot;Check what you wrote\n&quot;;
+-		std::cerr &lt;&lt; ret;
++		std::cerr &lt;&lt; status;
+ 		return false;
+ 	}
+ 	if (fVerbose)
+ 		std::cout &lt;&lt; &quot;Parameters Validation...\n\n&quot;;
+-	if (name != fVolumeName)
++	if (name != fVolumeName) {
+ 		std::cout &lt;&lt; &quot;Volume name was adjusted to &quot;
+-				  &lt;&lt; fVolumeName.String() &lt;&lt; std::endl;
++			&lt;&lt; name.String() &lt;&lt; std::endl;
++	}
+ 
+ 	// Initialize the partition
+-	ret = fDevice.Initialize(diskSystem.PrettyName(),
+-		fVolumeName.String(), fFsOptions);
+-	if (ret != B_OK) {
+-		std::cerr &lt;&lt; &quot;Initialization failed: &quot; &lt;&lt;  strerror(ret) &lt;&lt; std::endl;
++	status = partition-&gt;Initialize(diskSystem.PrettyName(), name.String(),
++		fFsOptions);
++	if (status != B_OK) {
++		std::cerr &lt;&lt; kProgramName &lt;&lt; &quot;: Initialization failed: &quot;
++			&lt;&lt; strerror(status) &lt;&lt; std::endl;
+ 		return false;
+ 	}
+ 
+-	std::cout &lt;&lt; &quot;\nAre you sure you want to do this now?\n&quot;
+-			  &lt;&lt; &quot;\nALL YOUR DATA in &quot; &lt;&lt; fDevicePath.String()
+-			  &lt;&lt; &quot; will be lost forever.\n&quot;;
++	if (!fQuick) {
++		std::cout &lt;&lt; &quot;\nAbout to initialize &quot; &lt;&lt; fPath &lt;&lt; &quot; with &quot;
++			&lt;&lt; diskSystem.PrettyName()
++			&lt;&lt; &quot;\nAre you sure you want to do this now?\n&quot;
++			&lt;&lt; &quot;\nALL YOUR DATA in &quot; &lt;&lt; fPath &lt;&lt; &quot; will be lost forever.\n&quot;;
+ 
+-	BString reply;
+-	do {
+-		std::cout &lt;&lt; &quot;Continue? [yes|no]: &quot;;
+-		reply = _ReadLine();
+-		if (reply == &quot;&quot;)
+-			reply = &quot;no&quot;; // silence is dissence
+-	} while (reply != &quot;yes&quot; &amp;&amp; reply != &quot;no&quot;);
++		BString reply;
++		do {
++			std::cout &lt;&lt; &quot;Continue (yes|[no])? &quot;;
++			reply = _ReadLine();
++			if (reply == &quot;&quot;)
++				reply = &quot;no&quot;; // silence is dissence
++		} while (reply != &quot;yes&quot; &amp;&amp; reply != &quot;no&quot;);
+ 
+-	if (reply == &quot;yes&quot;) {
+-		ret = fDevice.CommitModifications();
+-		if (ret == B_OK) {
+-			if (fVerbose) {
+-				std::cout &lt;&lt; &quot;Volume &quot; &lt;&lt; fDevice.ContentName()
+-						  &lt;&lt; &quot; has been initialized successfully!\n&quot;;
+-			}
+-		} else {
+-			std::cout &lt;&lt; &quot;Error: Initialization of &quot; &lt;&lt; fDevice.ContentName()
+-					  &lt;&lt; &quot; failed: &quot; &lt;&lt; strerror(ret) &lt;&lt; std::endl;
+-			return false;
++		if (reply != &quot;yes&quot;)
++			return true;
++	}
++
++	status = device.CommitModifications();
++	if (status == B_OK) {
++		if (fVerbose) {
++			std::cout &lt;&lt; &quot;Volume &quot; &lt;&lt; partition-&gt;ContentName()
++				&lt;&lt; &quot; has been initialized successfully!\n&quot;;
+ 		}
++	} else {
++		std::cout &lt;&lt; kProgramName &lt;&lt; &quot;: Initialization of &quot;
++			&lt;&lt; partition-&gt;ContentName() &lt;&lt; &quot; failed: &quot; &lt;&lt; strerror(status)
++			&lt;&lt; std::endl;
++		return false;
+ 	}
++
++	// TODO: should we keep the file device around, or unregister it
++	// after we're done? This could be an option, too (for now, we'll
++	// just keep them if everything went well).
++	unregisterFileDevice.Detach();
+ 	return true;
+ }
+ 
+
+Modified: haiku/trunk/src/bin/mkfs/FsCreator.h
+===================================================================
+--- haiku/trunk/src/bin/mkfs/FsCreator.h	2008-07-22 14:05:47 UTC (rev 26563)
++++ haiku/trunk/src/bin/mkfs/FsCreator.h	2008-07-22 14:11:54 UTC (rev 26564)
+@@ -13,22 +13,24 @@
+ #include &lt;DiskDevice.h&gt;
+ #include &lt;DiskDeviceRoster.h&gt;
+ 
++
+ class FsCreator {
+ public:
+-	FsCreator(const char* devPath, BString&amp; type, BString&amp; volumeName,
+-		const char* fsOpt, bool verbose);
++							FsCreator(const char* path, const char* type,
++								const char* volumeName, const char* fsOptions,
++								bool quick, bool verbose);
+ 
+-	bool Run();
++			bool			Run();
++
+ private:
+-	inline BString _ReadLine();
++			BString			_ReadLine();
+ 
+-	BString fType;
+-	BString fDevicePath;
+-	BString&amp; fVolumeName;
+-	const char* fFsOptions;
+-	BDiskDevice fDevice;
+-	BPartition* fPartition;
+-	const bool fVerbose;
++			const char*		fType;
++			const char*		fPath;
++			const char*		fVolumeName;
++			const char*		fFsOptions;
++			bool			fVerbose;
++			bool			fQuick;
+ };
+ 
+-#endif // _FSCREATOR_H_
++#endif	// _FSCREATOR_H_
+
+Modified: haiku/trunk/src/bin/mkfs/main.cpp
+===================================================================
+--- haiku/trunk/src/bin/mkfs/main.cpp	2008-07-22 14:05:47 UTC (rev 26563)
++++ haiku/trunk/src/bin/mkfs/main.cpp	2008-07-22 14:11:54 UTC (rev 26564)
+@@ -4,43 +4,42 @@
+  *
+  * Authors:
+  *		Marco Minutoli, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">mminutoli at gmail.com</A>
++ *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
+  */
+ 
++#include &lt;getopt.h&gt;
+ #include &lt;stdio.h&gt;
+-#include &lt;iostream&gt;
+ #include &lt;stdlib.h&gt;
+-#include &lt;String.h&gt;
+-#include &lt;getopt.h&gt;
++
++#include &lt;DiskSystem.h&gt;
++
+ #include &quot;FsCreator.h&quot;
+ 
++
+ extern &quot;C&quot; const char* __progname;
+ static const char* kProgramName = __progname;
+ 
+-static const char* kUsage = 
+-&quot;Usage: %s -t &lt;fs&gt; &lt;options&gt; &lt;device&gt; &lt;volume name&gt;\n&quot;
+-&quot;\n&quot;
+-&quot;Options:\n&quot;
+-&quot;  -t, --type       &lt;fs&gt;   - set type of filesystem to create\n\n&quot;
+-&quot;  -h, --help              - print this help text\n&quot;
+-&quot;  -o, --options    &lt;opt&gt;  - set fs specific options\n&quot;
+-&quot;  -v, --verbose           - set verbose output\n&quot;
+-;
+ 
+-
+-/*
+- * Print program help on the right stream
+- */
+-inline void
++/*!	Print program help on the right stream */
++static void
+ print_help(bool out)
+ {
+-	fprintf(out ? stdout : stderr, kUsage, kProgramName, kProgramName);
++	fprintf(out ? stdout : stderr,
++		&quot;Usage: %s &lt;options&gt; &lt;device&gt; &lt;volume name&gt;\n&quot;
++		&quot;\n&quot;
++		&quot;Options:\n&quot;
++		&quot;  -t, --type       &lt;fs&gt;   - set type of file system to create\n\n&quot;
++		&quot;  -l, --list-types        - list file systems that support initializing\n&quot;
++		&quot;  -h, --help              - print this help text\n&quot;
++		&quot;  -o, --options    &lt;opt&gt;  - set fs specific options\n&quot;
++		&quot;  -q, --dont-ask          - do not ask before initializing\n&quot;
++		&quot;  -v, --verbose           - set verbose output\n&quot;,
++		kProgramName);
+ }
+ 
+ 
+-/*
+- * Print program help and exit
+- */
+-inline void
++/*!	Print program help and exit */
++static void
+ print_help_exit(bool out)
+ {
+ 	print_help(out);
+@@ -48,36 +47,57 @@
+ }
+ 
+ 
++static void
++list_types()
++{
++	const char* kFormat = &quot;%-10s  %-25s  %s\n&quot;;
++	BDiskDeviceRoster roster;
++	BDiskSystem diskSystem;
++
++	printf(&quot;Installed file systems that support initializing:\n\n&quot;);
++	printf(kFormat, &quot;Name&quot;, &quot;Pretty Name&quot;, &quot;Module&quot;);
++	printf(kFormat, &quot;--&quot;, &quot;--&quot;, &quot;--&quot;);
++
++	while (roster.GetNextDiskSystem(&amp;diskSystem) == B_OK) {
++		if (!diskSystem.SupportsInitializing()
++			|| !diskSystem.IsFileSystem())
++			continue;
++
++		printf(kFormat, diskSystem.ShortName(), diskSystem.PrettyName(),
++			diskSystem.Name());
++	}
++}
++
++
+ int
+ main(int argc, char* const* argv)
+ {
+-	const struct option longOptions[] = {
++	const struct option kLongOptions[] = {
+ 		{ &quot;help&quot;, 0, NULL, 'h' },
+ 		{ &quot;options&quot;, 0, NULL, 'o' },
+ 		{ &quot;type&quot;, 1, NULL, 't' },
++		{ &quot;list-types&quot;, 0, NULL, 'l' },
+ 		{ &quot;verbose&quot;, 0, NULL, 'v' },
++		{ &quot;dont-ask&quot;, 0, NULL, 'q' },
+ 		{ NULL, 0, NULL, 0 }
+ 	};
+-	const char *shortOptions = &quot;t:o:hv&quot;;
++	const char* kShortOptions = &quot;t:o:lhvq&quot;;
+ 
+ 	// parse argument list
+-	int32 nextOption;
+-	BString fsType;
+-	BString fsOptions;
++	const char* fsType = &quot;bfs&quot;;
++	const char* fsOptions = NULL;
+ 	bool verbose = false;
++	bool quick = false;
+ 
+-	nextOption = getopt_long(argc, argv, shortOptions, longOptions, NULL);
+-	if (nextOption == 't')
+-		fsType = optarg;
+-	else
+-		print_help_exit(nextOption == 'h' ? true : false);
++	while (true) {
++		int nextOption = getopt_long(argc, argv, kShortOptions, kLongOptions,
++			NULL);
++		if (nextOption == -1)
++			break;
+ 
+-	do {
+-		nextOption = getopt_long(argc, argv, shortOptions, longOptions, NULL);
+-
+ 		switch (nextOption) {
+-			case 't':	// -t or --type again?
+-				print_help_exit(false);
++			case 't':	// -t or --type
++				fsType = optarg;
+ 				break;
+ 			case 'h':	// -h or --help
+ 				print_help_exit(true);
+@@ -86,8 +106,14 @@
+ 				verbose = true;
+ 				break;
+ 			case 'o':	// -o or --options
+-				fsOptions &lt;&lt; optarg;
++				fsOptions = optarg;
+ 				break;
++			case 'q':	// -q or --quick
++				quick = true;
++				break;
++			case 'l':	// list types
++				list_types();
++				return 0;
+ 			case '?':	// invalid option
+ 				break;
+ 			case -1:	// done with options
+@@ -96,21 +122,24 @@
+ 				print_help(false);
+ 				abort();
+ 		}
+-	} while (nextOption != -1);
++	}
+ 
+ 	// the device name should be the first non-option element
+-	// right before the VolumeName
+-	if (optind != argc - 2)
++	// right before the volume name
++	if (optind &gt; argc - 1)
+ 		print_help_exit(false);
+-	const char* devPath = argv[optind];
+-	BString volName = argv[argc-1];
+ 
+-	FsCreator* creator = new FsCreator(devPath, fsType, volName,
+-		fsOptions.String(), verbose);
+-	if (creator == NULL) {
+-		std::cerr &lt;&lt; &quot;Error: FsCreator can't be allocated\n&quot;;
+-		abort();
++	const char* device = argv[optind];
++	const char* volumeName = NULL;
++	if (optind == argc - 2)
++		volumeName = argv[argc - 1];
++	else {
++		if (!strncmp(device, &quot;/dev&quot;, 4))
++			volumeName = &quot;Unnamed&quot;;
++		else
++			volumeName = &quot;Unnamed Image&quot;;
+ 	}
+ 
+-	return creator-&gt;Run();
++	FsCreator creator(device, fsType, volumeName, fsOptions, quick, verbose);
++	return creator.Run() ? 0 : 1;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010466.html">[Haiku-commits] r26563 -	haiku/trunk/src/system/kernel/disk_device_manager
+</A></li>
+	<LI>Next message: <A HREF="010474.html">[Haiku-commits] r26565 -	haiku/trunk/src/tests/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10467">[ date ]</a>
+              <a href="thread.html#10467">[ thread ]</a>
+              <a href="subject.html#10467">[ subject ]</a>
+              <a href="author.html#10467">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

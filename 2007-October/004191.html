@@ -1,0 +1,347 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22486 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22486%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200710081615.l98GFuEO013210%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004190.html">
+   <LINK REL="Next"  HREF="004198.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22486 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22486%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200710081615.l98GFuEO013210%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22486 - haiku/trunk/src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Oct  8 18:15:56 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004190.html">[Haiku-commits] r22485 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="004198.html">[Haiku-commits] r22487 - haiku/trunk/src/system/libroot/posix/unistd
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4191">[ date ]</a>
+              <a href="thread.html#4191">[ thread ]</a>
+              <a href="subject.html#4191">[ subject ]</a>
+              <a href="author.html#4191">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-10-08 18:15:56 +0200 (Mon, 08 Oct 2007)
+New Revision: 22486
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22486&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22486&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* Fixed the page_thief(): it never noticed it could not get a page.
+* The page_thief() will no longer steal any pages in B_LOW_MEMORY_NOTE state,
+  only in the more serious cases.
+* I've disabled stealing active pages for now again; there seem to be some
+  problems with it (either with how we do it, or with other stuff).
+* vm_page_schedule_write_page() now always releases the page writer semaphore,
+  resulting in many more written pages - this isn't optimal as long as there is
+  no I/O scheduler, but before it was much too rare when there are many dirty
+  pages.
+* Customized the thread priorities a bit to make the page scanner/thief/writer
+  experience a bit nicer with our current scheduler.
+* vm_page_reserve_pages() would return too early, it did not test if really
+  enough pages are free.
+* Under certain circumstances, the wakeup from vm_page_reserve_pages() did not
+  work - we now always notify in vm_page_unreserve_pages() to work around that
+  problem.
+* Checked if the page reservations are done when needed and are always balanced
+  for the whole kernel.
+* vm_page_allocate_page() now panics if it can't deliver a reserved page.
+* vm_page_allocate_page_run() can no longer steal reserved pages.
+* With all of those changes, I could finally copy a file in emulation, ie. the
+  Luposian bug should finally be fixed, even though the system might still not
+  be perfectly stable under low memory. Will do some more testing.
+* write_page() no longer prints something on failure.
+* Dumping a whole page queue will now also write the cache type of each page.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-10-08 16:06:32 UTC (rev 22485)
++++ haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-10-08 16:15:56 UTC (rev 22486)
+@@ -223,7 +223,7 @@
+ 
+ 	// create a kernel thread to select pages for pageout
+ 	thread_id thread = spawn_kernel_thread(&amp;page_daemon, &quot;page daemon&quot;,
+-		B_LOW_PRIORITY, NULL);
++		B_LOW_PRIORITY + 1, NULL);
+ 	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 
+ 	return B_OK;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-10-08 16:06:32 UTC (rev 22485)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-10-08 16:15:56 UTC (rev 22486)
+@@ -375,12 +375,30 @@
+ 
+ 	if (argc == 3) {
+ 		struct vm_page *page = queue-&gt;head;
++		const char *type = &quot;unknown&quot;;
+ 		int i;
+ 
+-		kprintf(&quot;page        cache          state  wired  usage\n&quot;);
++		switch (page-&gt;cache-&gt;type) {
++			case CACHE_TYPE_RAM:
++				type = &quot;RAM&quot;;
++				break;
++			case CACHE_TYPE_DEVICE:
++				type = &quot;device&quot;;
++				break;
++			case CACHE_TYPE_VNODE:
++				type = &quot;vnode&quot;;
++				break;
++			case CACHE_TYPE_NULL:
++				type = &quot;null&quot;;
++				break;
++			default:
++				break;
++		}
++
++		kprintf(&quot;page        cache       type       state  wired  usage\n&quot;);
+ 		for (i = 0; page; i++, page = page-&gt;queue_next) {
+-			kprintf(&quot;%p  %p  %8s  %5d  %5d\n&quot;, page, page-&gt;cache,
+-				page_state_to_string(page-&gt;state),
++			kprintf(&quot;%p  %p  %-7s %8s  %5d  %5d\n&quot;, page, page-&gt;cache,
++				type, page_state_to_string(page-&gt;state),
+ 				page-&gt;wired_count, page-&gt;usage_count);
+ 		}
+ 	}
+@@ -411,16 +429,16 @@
+ 	kprintf(&quot;wired: %lu\nmodified: %lu\nfree: %lu\nclear: %lu\n&quot;,
+ 		counter[PAGE_STATE_WIRED], counter[PAGE_STATE_MODIFIED],
+ 		counter[PAGE_STATE_FREE], counter[PAGE_STATE_CLEAR]);
++	kprintf(&quot;reserved pages: %lu\n&quot;, sReservedPages);
+ 
+-	kprintf(&quot;\nfree_queue: %p, count = %ld\n&quot;, &amp;sFreePageQueue,
++	kprintf(&quot;\nfree queue: %p, count = %ld\n&quot;, &amp;sFreePageQueue,
+ 		sFreePageQueue.count);
+-	kprintf(&quot;clear_queue: %p, count = %ld\n&quot;, &amp;sClearPageQueue,
++	kprintf(&quot;clear queue: %p, count = %ld\n&quot;, &amp;sClearPageQueue,
+ 		sClearPageQueue.count);
+-	kprintf(&quot;modified_queue: %p, count = %ld\n&quot;, &amp;sModifiedPageQueue,
++	kprintf(&quot;modified queue: %p, count = %ld\n&quot;, &amp;sModifiedPageQueue,
+ 		sModifiedPageQueue.count);
+-	kprintf(&quot;active_queue: %p, count = %ld\n&quot;, &amp;sActivePageQueue,
++	kprintf(&quot;active queue: %p, count = %ld\n&quot;, &amp;sActivePageQueue,
+ 		sActivePageQueue.count);
+-
+ 	return 0;
+ }
+ 
+@@ -612,12 +630,12 @@
+ 		vecs, 1, &amp;length, mayBlock, fsReenter);
+ 
+ 	vm_put_physical_page((addr_t)vecs[0].iov_base);
+-
++#if 0
+ 	if (status &lt; B_OK) {
+ 		dprintf(&quot;write_page(page = %p): offset = %lx, status = %ld\n&quot;,
+ 			page, page-&gt;cache_offset, status);
+ 	}
+-
++#endif
+ 	return status;
+ }
+ 
+@@ -751,12 +769,10 @@
+ 			default:
+ 				timeout = B_INFINITE_TIMEOUT;
+ 				continue;
+-
+ 			case B_LOW_MEMORY_NOTE:
+-				steal = 10;
+-				score = -20;
+ 				timeout = 1000000;
+-				break;
++				continue;
++
+ 			case B_LOW_MEMORY_WARNING:
+ 				steal = 50;
+ 				score = -5;
+@@ -768,7 +784,6 @@
+ 				timeout = 100000;
+ 				break;
+ 		}
+-		//dprintf(&quot;page thief running - target %ld...\n&quot;, steal);
+ 
+ 		vm_page* page = NULL;
+ 		bool stealActive = false, desperate = false;
+@@ -780,7 +795,8 @@
+ 
+ 			// find a candidate to steal from the inactive queue
+ 
+-			for (int32 i = sActivePageQueue.count; i-- &gt; 0;) {
++			int32 i = sActivePageQueue.count;
++			while (i-- &gt; 0) {
+ 				// move page to the tail of the queue so that we don't
+ 				// scan it again directly
+ 				page = dequeue_page(&amp;sActivePageQueue);
+@@ -793,7 +809,7 @@
+ 					break;
+ 			}
+ 
+-			if (page == NULL) {
++			if (i &lt; 0) {
+ 				if (score == 0) {
+ 					if (state != B_LOW_MEMORY_CRITICAL)
+ 						break;
+@@ -805,6 +821,8 @@
+ 						score = 127;
+ 						desperate = true;
+ 					} else {
++						// TODO: for now, we never steal active pages
++						break;
+ 						stealActive = true;
+ 						score = 5;
+ 						steal = 5;
+@@ -965,7 +983,7 @@
+ 
+ 
+ /*!	Schedules the page writer to write back the specified \a page.
+-	Note, however, that it doesn't do this immediately, and it might
++	Note, however, that it might not do this immediately, and it can well
+ 	take several seconds until the page is actually written out.
+ */
+ void
+@@ -975,8 +993,7 @@
+ 
+ 	vm_page_requeue(page, false);
+ 
+-	release_sem_etc(sWriterWaitSem, 1,
+-		B_RELEASE_IF_WAITING_ONLY | B_DO_NOT_RESCHEDULE);
++	release_sem_etc(sWriterWaitSem, 1, B_DO_NOT_RESCHEDULE);
+ }
+ 
+ 
+@@ -1103,7 +1120,7 @@
+ 	sThiefWaitSem = create_sem(0, &quot;page thief&quot;);
+ 
+ 	thread = spawn_kernel_thread(&amp;page_writer, &quot;page writer&quot;,
+-		B_LOW_PRIORITY, NULL);
++		B_LOW_PRIORITY + 2, NULL);
+ 	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 
+ 	thread = spawn_kernel_thread(&amp;page_thief, &quot;page thief&quot;,
+@@ -1187,7 +1204,9 @@
+ 
+ 	sReservedPages -= count;
+ 
+-	if (vm_page_num_free_pages() &lt;= sReservedPages)
++	// TODO: find out why the line below won't work correctly
++	//if (vm_page_num_free_pages() &lt;= sReservedPages + count)
++	if (!kernel_startup)
+ 		sFreePageCondition.NotifyAll();
+ }
+ 
+@@ -1207,17 +1226,23 @@
+ 
+ 	sReservedPages += count;
+ 	size_t freePages = vm_page_num_free_pages();
+-	if (sReservedPages &lt; freePages)
++	if (sReservedPages &lt;= freePages)
+ 		return;
+ 
+ 	ConditionVariableEntry&lt;page_queue&gt; freeConditionEntry;
+-	freeConditionEntry.Add(&amp;sFreePageQueue);
+ 	vm_low_memory(sReservedPages - freePages);
+ 
+-	// we need to wait until new pages become available
+-	locker.Unlock();
++	while (true) {
++		// we need to wait until new pages become available
++		freeConditionEntry.Add(&amp;sFreePageQueue);
++		locker.Unlock();
++	
++		freeConditionEntry.Wait();
+ 
+-	freeConditionEntry.Wait();
++		locker.Lock();
++		if (sReservedPages &lt;= vm_page_num_free_pages())
++			break;
++	}
+ }
+ 
+ 
+@@ -1260,6 +1285,8 @@
+ 		}
+ 
+ 		if (page == NULL) {
++			if (reserved)
++				panic(&quot;Had reserved page, but there is none!&quot;);
+ #ifdef DEBUG
+ 			if (otherQueue-&gt;count != 0) {
+ 				panic(&quot;other queue %p corrupted, count = %d\n&quot;, otherQueue,
+@@ -1329,13 +1356,16 @@
+ vm_page *
+ vm_page_allocate_page_run(int pageState, addr_t length)
+ {
+-	// TODO: make sure this one doesn't steal reserved pages!
+ 	vm_page *firstPage = NULL;
+ 	uint32 start = 0;
+ 
+-	cpu_status state = disable_interrupts();
+-	acquire_spinlock(&amp;sPageLock);
++	InterruptsSpinLocker locker(sPageLock);
+ 
++	if (sFreePageQueue.count + sClearPageQueue.count - sReservedPages &lt; length) {
++		// no free space
++		return NULL;
++	}
++
+ 	for (;;) {
+ 		bool foundRun = true;
+ 		if (start + length &gt; sNumPages)
+@@ -1364,9 +1394,9 @@
+ 			start += i;
+ 		}
+ 	}
+-	release_spinlock(&amp;sPageLock);
+-	restore_interrupts(state);
+ 
++	locker.Unlock();
++
+ 	if (firstPage != NULL &amp;&amp; pageState == PAGE_STATE_CLEAR) {
+ 		for (uint32 i = 0; i &lt; length; i++) {
+ 			if (!sPages[start + i].is_cleared) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004190.html">[Haiku-commits] r22485 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="004198.html">[Haiku-commits] r22487 - haiku/trunk/src/system/libroot/posix/unistd
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4191">[ date ]</a>
+              <a href="thread.html#4191">[ thread ]</a>
+              <a href="subject.html#4191">[ subject ]</a>
+              <a href="author.html#4191">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

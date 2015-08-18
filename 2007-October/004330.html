@@ -1,0 +1,340 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22602 - in haiku/trunk: headers/private/storage	src/kits/storage
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22602%20-%20in%20haiku/trunk%3A%20headers/private/storage%0A%09src/kits/storage&In-Reply-To=%3C200710172150.l9HLoKWU010609%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004329.html">
+   <LINK REL="Next"  HREF="004331.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22602 - in haiku/trunk: headers/private/storage	src/kits/storage</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22602%20-%20in%20haiku/trunk%3A%20headers/private/storage%0A%09src/kits/storage&In-Reply-To=%3C200710172150.l9HLoKWU010609%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22602 - in haiku/trunk: headers/private/storage	src/kits/storage">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Oct 17 23:50:20 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004329.html">[Haiku-commits] r22601 - haiku/trunk/src/preferences/time
+</A></li>
+        <LI>Next message: <A HREF="004331.html">[Haiku-commits] r22603 - haiku/trunk/src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4330">[ date ]</a>
+              <a href="thread.html#4330">[ thread ]</a>
+              <a href="subject.html#4330">[ subject ]</a>
+              <a href="author.html#4330">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-10-17 23:50:20 +0200 (Wed, 17 Oct 2007)
+New Revision: 22602
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22602&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22602&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/storage/Partition.h
+   haiku/trunk/src/kits/storage/DiskDevice.cpp
+   haiku/trunk/src/kits/storage/Partition.cpp
+Log:
+* Reimplemented BDiskDevice::IsModified()/
+  {Prepare,Commit,Cancel}Modifications() using the userland add-on
+  backend. IsModified() and CommitModifications() are little more than
+  stubs ATM.
+* Made BPartition::VisitEachChild()/VisitEachDescendant() const.
+
+
+Modified: haiku/trunk/headers/private/storage/Partition.h
+===================================================================
+--- haiku/trunk/headers/private/storage/Partition.h	2007-10-17 21:05:44 UTC (rev 22601)
++++ haiku/trunk/headers/private/storage/Partition.h	2007-10-17 21:50:20 UTC (rev 22602)
+@@ -76,9 +76,10 @@
+ 			status_t			GetPartitioningInfo(
+ 									BPartitioningInfo* info) const;
+ 	
+-			BPartition*			VisitEachChild(BDiskDeviceVisitor* visitor);
++			BPartition*			VisitEachChild(BDiskDeviceVisitor* visitor)
++									const;
+ 	virtual BPartition*			VisitEachDescendant(
+-									BDiskDeviceVisitor* visitor);
++									BDiskDeviceVisitor* visitor) const;
+ 
+ 	// Self Modification
+ 
+@@ -205,6 +206,11 @@
+ 			bool				_SupportsChildOperation(const BPartition* child,
+ 									uint32 flag) const;
+ 
++			status_t			_CreateDelegates();
++			status_t			_InitDelegates();
++			void				_DeleteDelegates();
++			bool				_IsModified() const;
++
+ 			friend class BDiskDevice;
+ 			friend class BDiskSystem;
+ 			friend class BMutablePartition;
+
+Modified: haiku/trunk/src/kits/storage/DiskDevice.cpp
+===================================================================
+--- haiku/trunk/src/kits/storage/DiskDevice.cpp	2007-10-17 21:05:44 UTC (rev 22601)
++++ haiku/trunk/src/kits/storage/DiskDevice.cpp	2007-10-17 21:50:20 UTC (rev 22602)
+@@ -188,8 +188,22 @@
+ bool
+ BDiskDevice::IsModified() const
+ {
+-	return (InitCheck() == B_OK &amp;&amp; _IsShadow()
+-		&amp;&amp; _kern_is_disk_device_modified(ID()));
++	if (InitCheck() != B_OK)
++		return false;
++
++	struct IsModifiedVisitor : public BDiskDeviceVisitor {
++		virtual bool Visit(BDiskDevice *device)
++		{
++			return Visit(device, 0);
++		}
++		
++		virtual bool Visit(BPartition *partition, int32 level)
++		{
++			return partition-&gt;_IsModified();
++		}
++	} visitor;
++
++	return (VisitEachDescendant(&amp;visitor) != NULL);
+ }
+ 
+ 
+@@ -209,21 +223,20 @@
+ 	status_t error = InitCheck();
+ 	if (error != B_OK)
+ 		return error;
+-	if (_IsShadow())
+-		return B_ERROR;
++	if (fDelegate)
++		return B_BAD_VALUE;
+ 
+-	// ask kernel to prepare for modifications
+-	error = _kern_prepare_disk_device_modifications(ID());
++	// recursively create the delegates
++	error = _CreateDelegates();
++
++	// init them
++	if (error == B_OK)
++		error = _InitDelegates();
++
++	// delete all of them, if something went wrong
+ 	if (error != B_OK)
+-		return error;
++		_DeleteDelegates();
+ 
+-	// update
+-	error = _Update(true, NULL);
+-	if (error != B_OK) {
+-		// bad -- cancelling the modifications is all we can do
+-		_kern_cancel_disk_device_modifications(ID());
+-	}
+-
+ 	return error;
+ }
+ 
+@@ -242,15 +255,14 @@
+ 	status_t error = InitCheck();
+ 	if (error != B_OK)
+ 		return error;
+-	if (!_IsShadow())
++
++	if (!fDelegate)
+ 		return B_BAD_VALUE;
+ 
+-	// TODO: Get port and token from the progressMessenger
+-	// TODO: Respect &quot;synchronously&quot;!
+-	port_id port = -1;
+-	int32 token = -1;
+-	error = _kern_commit_disk_device_modifications(ID(), port, token,
+-		receiveCompleteProgressUpdates);
++	// TODO: Implement!
++
++	_DeleteDelegates();
++
+ 	if (error == B_OK)
+ 		error = _SetTo(ID(), true, false, 0);
+ 
+@@ -269,10 +281,12 @@
+ 	status_t error = InitCheck();
+ 	if (error != B_OK)
+ 		return error;
+-	if (!_IsShadow())
++
++	if (!fDelegate)
+ 		return B_BAD_VALUE;
+ 
+-	error = _kern_cancel_disk_device_modifications(ID());
++	_DeleteDelegates();
++
+ 	if (error == B_OK)
+ 		error = _SetTo(ID(), true, false, 0);
+ 
+@@ -317,8 +331,7 @@
+ 	status_t error = B_OK;
+ 	do {
+ 		error = _kern_get_disk_device_data(id, deviceOnly, shadow,
+-										   (user_disk_device_data*)buffer,
+-										   bufferSize, &amp;neededSize);
++			(user_disk_device_data*)buffer, bufferSize, &amp;neededSize);
+ 		if (error == B_BUFFER_OVERFLOW) {
+ 			// buffer to small re-allocate it
+ 			if (buffer)
+@@ -346,7 +359,7 @@
+ // _SetTo
+ status_t
+ BDiskDevice::_SetTo(partition_id id, bool deviceOnly, bool shadow,
+-					size_t neededSize)
++	size_t neededSize)
+ {
+ 	Unset();
+ 
+
+Modified: haiku/trunk/src/kits/storage/Partition.cpp
+===================================================================
+--- haiku/trunk/src/kits/storage/Partition.cpp	2007-10-17 21:05:44 UTC (rev 22601)
++++ haiku/trunk/src/kits/storage/Partition.cpp	2007-10-17 21:50:20 UTC (rev 22602)
+@@ -641,7 +641,7 @@
+ 
+ // VisitEachChild
+ BPartition*
+-BPartition::VisitEachChild(BDiskDeviceVisitor* visitor)
++BPartition::VisitEachChild(BDiskDeviceVisitor* visitor) const
+ {
+ 	if (visitor) {
+ 		int32 level = _Level();
+@@ -656,10 +656,10 @@
+ 
+ // VisitEachDescendant
+ BPartition*
+-BPartition::VisitEachDescendant(BDiskDeviceVisitor* visitor)
++BPartition::VisitEachDescendant(BDiskDeviceVisitor* visitor) const
+ {
+ 	if (visitor)
+-		return _VisitEachDescendant(visitor);
++		return const_cast&lt;BPartition*&gt;(this)-&gt;_VisitEachDescendant(visitor);
+ 	return NULL;
+ }
+ 
+@@ -1500,3 +1500,85 @@
+ 	return supported &amp; flag;
+ }
+ 
++
++// _CreateDelegates
++status_t
++BPartition::_CreateDelegates()
++{
++	if (fDelegate || !fPartitionData)
++		return B_BAD_VALUE;
++
++	// create and init delegate
++	fDelegate = new(nothrow) Delegate(this);
++	if (!fDelegate)
++		return B_NO_MEMORY;
++
++	status_t error = fDelegate-&gt;InitHierarchy(fPartitionData,
++		fParent ? fParent-&gt;fDelegate : NULL);
++	if (error != B_OK)
++		return error;
++
++	// create child delegates
++	int32 count = fPartitionData-&gt;child_count;
++	for (int32 i = 0; i &lt; count; i++) {
++		BPartition* child = (BPartition*)fPartitionData-&gt;children[i]-&gt;user_data;
++		error = child-&gt;_CreateDelegates();
++		if (error != B_OK)
++			return error;
++	}
++
++	return B_OK;
++}
++
++
++// _InitDelegates
++status_t
++BPartition::_InitDelegates()
++{
++	// init delegate
++	status_t error = fDelegate-&gt;InitAfterHierarchy();
++	if (error != B_OK)
++		return error;
++
++	// recursively init child delegates
++	int32 count = CountChildren();
++	for (int32 i = 0; i &lt; count; i++) {
++		error = ChildAt(i)-&gt;_InitDelegates();
++		if (error != B_OK)
++			return error;
++	}
++
++	return B_OK;
++}
++
++
++// _DeleteDelegates
++void
++BPartition::_DeleteDelegates()
++{
++	// recursively delete child delegates
++	int32 count = CountChildren();
++	for (int32 i = count - 1; i &gt;= 0; i--)
++		ChildAt(i)-&gt;_DeleteDelegates();
++
++	// delete delegate
++	delete fDelegate;
++	fDelegate = NULL;
++
++	// Commit suicide, if the delegate was our only link to reality (i.e.
++	// there's no physically existing partition we represent).
++	if (fPartitionData == NULL)
++		delete this;
++}
++
++
++// _IsModified
++bool
++BPartition::_IsModified() const
++{
++	if (!fDelegate)
++		return false;
++
++	// TODO: Implement!
++	return false;
++}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004329.html">[Haiku-commits] r22601 - haiku/trunk/src/preferences/time
+</A></li>
+	<LI>Next message: <A HREF="004331.html">[Haiku-commits] r22603 - haiku/trunk/src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4330">[ date ]</a>
+              <a href="thread.html#4330">[ thread ]</a>
+              <a href="subject.html#4330">[ subject ]</a>
+              <a href="author.html#4330">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

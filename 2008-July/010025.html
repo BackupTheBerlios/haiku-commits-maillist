@@ -1,0 +1,161 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26258 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26258%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200807050112.m651Cas2020950%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010024.html">
+   <LINK REL="Next"  HREF="010027.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26258 - haiku/trunk/src/system/kernel</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26258%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200807050112.m651Cas2020950%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26258 - haiku/trunk/src/system/kernel">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sat Jul  5 03:12:36 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010024.html">[Haiku-commits] r26257 - in haiku/branches/developer/bonefish/vm:	headers/private/kernel src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="010027.html">[Haiku-commits] r26259 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10025">[ date ]</a>
+              <a href="thread.html#10025">[ thread ]</a>
+              <a href="subject.html#10025">[ subject ]</a>
+              <a href="author.html#10025">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-07-05 03:12:34 +0200 (Sat, 05 Jul 2008)
+New Revision: 26258
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26258&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26258&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/heap.cpp
+Log:
+Make the all_areas list ordered by base and take advantage of this ordering
+when looking up the target area on free(). This makes free() scale better with
+large area counts, as the lookup can abort early when it knows that no area
+below the only candidate can contain the address.
+
+Modified: haiku/trunk/src/system/kernel/heap.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/heap.cpp	2008-07-05 00:17:00 UTC (rev 26257)
++++ haiku/trunk/src/system/kernel/heap.cpp	2008-07-05 01:12:34 UTC (rev 26258)
+@@ -641,7 +641,7 @@
+ 	uint32 totalPageCount = 0;
+ 	uint32 totalFreePageCount = 0;
+ 	heap_area *area = heap-&gt;all_areas;
+-	while (area) {
++	while (area != NULL) {
+ 		// validate the free pages list
+ 		uint32 freePageCount = 0;
+ 		heap_page *lastPage = NULL;
+@@ -693,9 +693,9 @@
+ 	area = heap-&gt;areas;
+ 	heap_area *lastArea = NULL;
+ 	uint32 lastFreeCount = 0;
+-	while (area) {
++	while (area != NULL) {
+ 		if (area-&gt;free_page_count &lt; lastFreeCount)
+-			panic(&quot;ordering of area list broken\n&quot;);
++			panic(&quot;size ordering of area list broken\n&quot;);
+ 
+ 		if (area-&gt;prev != lastArea)
+ 			panic(&quot;area list entry has invalid prev link\n&quot;);
+@@ -705,6 +705,16 @@
+ 		area = area-&gt;next;
+ 	}
+ 
++	lastArea = NULL;
++	area = heap-&gt;all_areas;
++	while (area != NULL) {
++		if (lastArea != NULL &amp;&amp; lastArea-&gt;base &lt; area-&gt;base)
++			panic(&quot;base ordering of all_areas list broken\n&quot;);
++
++		lastArea = area;
++		area = area-&gt;all_next;
++	}
++
+ 	// validate the bins
+ 	for (uint32 i = 0; i &lt; heap-&gt;bin_count; i++) {
+ 		heap_bin *bin = &amp;heap-&gt;bins[i];
+@@ -845,8 +855,19 @@
+ 		area-&gt;prev = lastArea;
+ 	}
+ 
+-	area-&gt;all_next = heap-&gt;all_areas;
+-	heap-&gt;all_areas = area;
++	// insert this area in the all_areas list so it stays ordered by base
++	if (heap-&gt;all_areas == NULL || heap-&gt;all_areas-&gt;base &lt; area-&gt;base) {
++		area-&gt;all_next = heap-&gt;all_areas;
++		heap-&gt;all_areas = area;
++	} else {
++		heap_area *insert = heap-&gt;all_areas;
++		while (insert-&gt;all_next &amp;&amp; insert-&gt;all_next-&gt;base &gt; area-&gt;base)
++			insert = insert-&gt;all_next;
++
++		area-&gt;all_next = insert-&gt;all_next;
++		insert-&gt;all_next = area;
++	}
++
+ 	heap-&gt;total_pages += area-&gt;page_count;
+ 	heap-&gt;total_free_pages += area-&gt;free_page_count;
+ 
+@@ -1283,9 +1304,19 @@
+ 
+ 	heap_area *area = heap-&gt;all_areas;
+ 	while (area) {
+-		if ((addr_t)address &gt;= area-&gt;base
+-			&amp;&amp; (addr_t)address &lt; area-&gt;base + area-&gt;size)
++		// since the all_areas list is ordered by base with the biggest
++		// base at the top, we need only find the first area with a base
++		// smaller than our address to become our only candidate for freeing
++		if (area-&gt;base &lt;= (addr_t)address) {
++			if ((addr_t)address &gt;= area-&gt;base + area-&gt;size) {
++				// the only candidate area doesn't contain the address,
++				// set it to NULL so we return below (none of the other areas
++				// can contain the address as the list is ordered)
++				area = NULL;
++			}
++
+ 			break;
++		}
+ 
+ 		area = area-&gt;all_next;
+ 	}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010024.html">[Haiku-commits] r26257 - in haiku/branches/developer/bonefish/vm:	headers/private/kernel src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="010027.html">[Haiku-commits] r26259 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10025">[ date ]</a>
+              <a href="thread.html#10025">[ thread ]</a>
+              <a href="subject.html#10025">[ subject ]</a>
+              <a href="author.html#10025">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

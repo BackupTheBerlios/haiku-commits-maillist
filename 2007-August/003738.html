@@ -1,0 +1,534 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22115 - in haiku/trunk/src: kits/app servers/app	servers/registrar
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22115%20-%20in%20haiku/trunk/src%3A%20kits/app%20servers/app%0A%09servers/registrar&In-Reply-To=%3C200708300009.l7U09jAH011710%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003737.html">
+   <LINK REL="Next"  HREF="003739.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22115 - in haiku/trunk/src: kits/app servers/app	servers/registrar</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22115%20-%20in%20haiku/trunk/src%3A%20kits/app%20servers/app%0A%09servers/registrar&In-Reply-To=%3C200708300009.l7U09jAH011710%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22115 - in haiku/trunk/src: kits/app servers/app	servers/registrar">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug 30 02:09:45 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003737.html">[Haiku-commits] r22114 -	haiku/trunk/headers/private/media/experimental
+</A></li>
+        <LI>Next message: <A HREF="003739.html">[Haiku-commits] r22116 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3738">[ date ]</a>
+              <a href="thread.html#3738">[ thread ]</a>
+              <a href="subject.html#3738">[ subject ]</a>
+              <a href="author.html#3738">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-08-30 02:09:43 +0200 (Thu, 30 Aug 2007)
+New Revision: 22115
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22115&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22115&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/kits/app/LinkReceiver.cpp
+   haiku/trunk/src/servers/app/AppServer.cpp
+   haiku/trunk/src/servers/app/MessageLooper.cpp
+   haiku/trunk/src/servers/registrar/RosterAppInfo.cpp
+   haiku/trunk/src/servers/registrar/RosterAppInfo.h
+   haiku/trunk/src/servers/registrar/TRoster.cpp
+   haiku/trunk/src/servers/registrar/TRoster.h
+Log:
+The wonders of signals:
+* Since the app_server launched the input_server, it would also get notified
+  when the latter died via a signal - but LinkReceiver could return B_INTERRUPTED
+  in that case (it didn't check the return value of port_buffer_size()) which
+  the app_server misinterpreted and quit itself... this fixes the hanging part
+  of bug #1298.
+* But the input_server still wasn't restarted, because the Registrar had it
+  still listed as being running. Now, the Registrar checks not just periodically
+  for died teams, it will also check for it when a new application registers
+  itself. This fixes the rest of bug #1298.
+* Removed the old (disabled) R5 style input_server launch mechanism from the
+  app_server.
+* MessageLooper now prints a bit more information when a port is supposed to
+  have been deleted.
+* The default implementation of MessageLooper::_GetLooperName() is now
+  returning the name of the semaphore of its BLocker instead of &quot;unnamed
+  looper&quot;.
+
+
+Modified: haiku/trunk/src/kits/app/LinkReceiver.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/LinkReceiver.cpp	2007-08-29 23:49:02 UTC (rev 22114)
++++ haiku/trunk/src/kits/app/LinkReceiver.cpp	2007-08-30 00:09:43 UTC (rev 22115)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2006, Haiku.
++ * Copyright 2001-2007, Haiku.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -161,11 +161,14 @@
+ 		fRecvBufferSize = kInitialBufferSize;
+ 	} else {
+ 		STRACE((&quot;info: LinkReceiver getting port_buffer_size().\n&quot;));
++
+ 		ssize_t bufferSize;
+-		if (timeout == B_INFINITE_TIMEOUT)
+-			bufferSize = port_buffer_size(fReceivePort);
+-		else
+-			bufferSize = port_buffer_size_etc(fReceivePort, B_TIMEOUT, timeout);
++		do {
++			bufferSize = port_buffer_size_etc(fReceivePort,
++				timeout == B_INFINITE_TIMEOUT ? B_RELATIVE_TIMEOUT : 0,
++				timeout);
++		} while (bufferSize == B_INTERRUPTED);
++
+ 		STRACE((&quot;info: LinkReceiver got port_buffer_size() = %ld.\n&quot;, bufferSize));
+ 
+ 		if (bufferSize &lt; 0)
+
+Modified: haiku/trunk/src/servers/app/AppServer.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/AppServer.cpp	2007-08-29 23:49:02 UTC (rev 22114)
++++ haiku/trunk/src/servers/app/AppServer.cpp	2007-08-30 00:09:43 UTC (rev 22115)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2001-2006, Haiku, Inc.
++ * Copyright (c) 2001-2007, Haiku, Inc.
+  * Distributed under the terms of the MIT license.
+  *
+  * Authors:
+@@ -113,68 +113,7 @@
+ }
+ 
+ 
+-#if 0
+ /*!
+-	\brief Starts Input Server
+-*/
+-void
+-AppServer::_LaunchInputServer()
+-{
+-	// We are supposed to start the input_server, but it's a BApplication
+-	// that depends on the registrar running, which is started after app_server
+-	// so we wait on roster thread to launch the input server
+-
+-	fISThreadID = B_ERROR;
+-
+-	while (!BRoster::Private().IsMessengerValid(false) &amp;&amp; !fQuitting) {
+-		snooze(250000);
+-		BRoster::Private::DeleteBeRoster();
+-		BRoster::Private::InitBeRoster();
+-	}
+-
+-	if (fQuitting)
+-		return;
+-
+-	// we use an area for cursor data communication with input_server
+-	// area id and sem id are sent to the input_server
+-
+-	if (fCursorArea &lt; B_OK)	
+-		fCursorArea = create_area(&quot;isCursor&quot;, (void**) &amp;fCursorAddr, B_ANY_ADDRESS, B_PAGE_SIZE, B_FULL_LOCK, B_READ_AREA | B_WRITE_AREA);
+-	if (fCursorSem &lt; B_OK)
+-		fCursorSem = create_sem(0, &quot;isSem&quot;); 
+-
+-	int32 arg_c = 1;
+-	char **arg_v = (char **)malloc(sizeof(char *) * (arg_c + 1));
+-#if TEST_MODE
+-	arg_v[0] = strdup(&quot;/boot/home/svnhaiku/trunk/distro/x86.R1/beos/system/servers/input_server&quot;);
+-#else
+-	arg_v[0] = strdup(&quot;/system/servers/input_server&quot;);
+-#endif
+-	arg_v[1] = NULL;
+-	fISThreadID = load_image(arg_c, (const char**)arg_v, (const char **)environ);
+-	free(arg_v[0]);
+-
+-	int32 tmpbuf[2] = {fCursorSem, fCursorArea};
+-	int32 code = 0;
+-	send_data(fISThreadID, code, (void *)tmpbuf, sizeof(tmpbuf));   
+-
+-	resume_thread(fISThreadID);
+-	setpgid(fISThreadID, 0); 
+-
+-	// we receive 
+-
+-	thread_id sender;
+-	code = receive_data(&amp;sender, (void *)tmpbuf, sizeof(tmpbuf));
+-	fISASPort = tmpbuf[0];
+-	fISPort = tmpbuf[1];  
+-
+-	// if at any time, one of these ports is error prone, it might mean input_server is gone
+-	// then relaunch input_server
+-}
+-#endif
+-
+-
+-/*!
+ 	\brief Creates a desktop object for an authorized user
+ */
+ Desktop *
+@@ -299,12 +238,6 @@
+ //	#pragma mark -
+ 
+ 
+-/*!
+-	\brief Entry function to run the entire server
+-	\param argc Number of command-line arguments present
+-	\param argv String array of the command-line arguments
+-	\return -1 if the app_server is already running, 0 if everything's OK.
+-*/
+ int
+ main(int argc, char** argv)
+ {
+
+Modified: haiku/trunk/src/servers/app/MessageLooper.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/MessageLooper.cpp	2007-08-29 23:49:02 UTC (rev 22114)
++++ haiku/trunk/src/servers/app/MessageLooper.cpp	2007-08-30 00:09:43 UTC (rev 22115)
+@@ -118,7 +118,12 @@
+ void
+ MessageLooper::_GetLooperName(char* name, size_t length)
+ {
+-	strcpy(name, &quot;unnamed looper&quot;);
++	sem_id semaphore = Sem();
++	sem_info info;
++	if (get_sem_info(semaphore, &amp;info) == B_OK)
++		strlcpy(name, info.name, length);
++	else
++		strlcpy(name, &quot;unnamed looper&quot;, length);
+ }
+ 
+ 
+@@ -138,7 +143,10 @@
+ 		status_t status = receiver.GetNextMessage(code);
+ 		if (status &lt; B_OK) {
+ 			// that shouldn't happen, it's our port
+-			printf(&quot;Someone deleted our message port!\n&quot;);
++			char name[256];
++			_GetLooperName(name, 256);
++			printf(&quot;MessageLooper \&quot;%s\&quot;: Someone deleted our message port %ld, %s!\n&quot;,
++				name, receiver.Port(), strerror(status));
+ 			break;
+ 		}
+ 
+
+Modified: haiku/trunk/src/servers/registrar/RosterAppInfo.cpp
+===================================================================
+--- haiku/trunk/src/servers/registrar/RosterAppInfo.cpp	2007-08-29 23:49:02 UTC (rev 22114)
++++ haiku/trunk/src/servers/registrar/RosterAppInfo.cpp	2007-08-30 00:09:43 UTC (rev 22115)
+@@ -1,63 +1,46 @@
+-//------------------------------------------------------------------------------
+-//	Copyright (c) 2001-2002, OpenBeOS
+-//
+-//	Permission is hereby granted, free of charge, to any person obtaining a
+-//	copy of this software and associated documentation files (the &quot;Software&quot;),
+-//	to deal in the Software without restriction, including without limitation
+-//	the rights to use, copy, modify, merge, publish, distribute, sublicense,
+-//	and/or sell copies of the Software, and to permit persons to whom the
+-//	Software is furnished to do so, subject to the following conditions:
+-//
+-//	The above copyright notice and this permission notice shall be included in
+-//	all copies or substantial portions of the Software.
+-//
+-//	THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-//	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-//	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-//	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-//	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+-//	FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+-//	DEALINGS IN THE SOFTWARE.
+-//
+-//	File Name:		RosterAppInfo.cpp
+-//	Author:			Ingo Weinhold (<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at users.sf.net</A>)
+-//	Description:	An extended app_info.
+-//------------------------------------------------------------------------------
++/*
++ * Copyright 2001-2007, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at users.sf.net.</A>
++ * Distributed under the terms of the MIT License.
++ */
+ 
+-#include &lt;new&gt;
++//!	An extended app_info.
+ 
++#include &quot;RosterAppInfo.h&quot;
++
++#include &lt;new&gt;
+ #include &lt;string.h&gt;
+ 
+-#include &quot;RosterAppInfo.h&quot;
+ 
+ using std::nothrow;
+ 
++
+ // constructor
+ RosterAppInfo::RosterAppInfo()
+-			 : app_info(),
+-			   state(APP_STATE_UNREGISTERED),
+-			   token(0),
+-			   registration_time(0)
++	: app_info(),
++	state(APP_STATE_UNREGISTERED),
++	token(0),
++	registration_time(0)
+ {
+ }
+ 
++
+ // Init
+ void
+ RosterAppInfo::Init(thread_id thread, team_id team, port_id port, uint32 flags,
+-					const entry_ref *ref, const char *signature)
++	const entry_ref *ref, const char *signature)
+ {
+ 	this-&gt;thread = thread;
+ 	this-&gt;team = team;
+ 	this-&gt;port = port;
+ 	this-&gt;flags = flags;
+ 	this-&gt;ref = *ref;
+-	if (signature) {
+-		strncpy(this-&gt;signature, signature, B_MIME_TYPE_LENGTH - 1);
+-		this-&gt;signature[B_MIME_TYPE_LENGTH - 1] = '\0';
+-	} else
++	if (signature)
++		strlcpy(this-&gt;signature, signature, B_MIME_TYPE_LENGTH);
++	else
+ 		this-&gt;signature[0] = '\0';
+ }
+ 
++
+ // Clone
+ RosterAppInfo *
+ RosterAppInfo::Clone() const
+@@ -70,3 +53,13 @@
+ 	clone-&gt;registration_time = registration_time;
+ 	return clone;
+ }
++
++
++// IsRunning
++bool
++RosterAppInfo::IsRunning() const
++{
++	team_info teamInfo;
++	return get_team_info(team, &amp;teamInfo) == B_OK;
++}
++
+
+Modified: haiku/trunk/src/servers/registrar/RosterAppInfo.h
+===================================================================
+--- haiku/trunk/src/servers/registrar/RosterAppInfo.h	2007-08-29 23:49:02 UTC (rev 22114)
++++ haiku/trunk/src/servers/registrar/RosterAppInfo.h	2007-08-30 00:09:43 UTC (rev 22115)
+@@ -1,29 +1,7 @@
+-//------------------------------------------------------------------------------
+-//	Copyright (c) 2001-2002, OpenBeOS
+-//
+-//	Permission is hereby granted, free of charge, to any person obtaining a
+-//	copy of this software and associated documentation files (the &quot;Software&quot;),
+-//	to deal in the Software without restriction, including without limitation
+-//	the rights to use, copy, modify, merge, publish, distribute, sublicense,
+-//	and/or sell copies of the Software, and to permit persons to whom the
+-//	Software is furnished to do so, subject to the following conditions:
+-//
+-//	The above copyright notice and this permission notice shall be included in
+-//	all copies or substantial portions of the Software.
+-//
+-//	THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-//	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-//	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-//	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-//	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+-//	FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+-//	DEALINGS IN THE SOFTWARE.
+-//
+-//	File Name:		RosterAppInfo.h
+-//	Author:			Ingo Weinhold (<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at users.sf.net</A>)
+-//	Description:	An extended app_info.
+-//------------------------------------------------------------------------------
+-
++/*
++ * Copyright 2001-2007, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at users.sf.net.</A>
++ * Distributed under the terms of the MIT License.
++ */
+ #ifndef ROSTER_APP_INFO_H
+ #define ROSTER_APP_INFO_H
+ 
+@@ -45,9 +23,10 @@
+ 
+ 	RosterAppInfo();
+ 	void Init(thread_id thread, team_id team, port_id port, uint32 flags,
+-			  const entry_ref *ref, const char *signature);
++		const entry_ref *ref, const char *signature);
+ 
+ 	RosterAppInfo *Clone() const;
++	bool IsRunning() const;
+ };
+ 
+ #endif	// ROSTER_APP_INFO_H
+
+Modified: haiku/trunk/src/servers/registrar/TRoster.cpp
+===================================================================
+--- haiku/trunk/src/servers/registrar/TRoster.cpp	2007-08-29 23:49:02 UTC (rev 22114)
++++ haiku/trunk/src/servers/registrar/TRoster.cpp	2007-08-30 00:09:43 UTC (rev 22115)
+@@ -179,24 +179,26 @@
+ 	uint32 token = 0;
+ 	
+ 	uint32 launchFlags = flags &amp; B_LAUNCH_MASK;
++	BEntry entry(&amp;ref);
++	if (!entry.Exists())
++		SET_ERROR(error, B_ENTRY_NOT_FOUND);
+ 
++	if (error == B_OK)
++		_ValidateRunning(ref, signature);
++
+ 	// entry_ref
+ 	if (error == B_OK) {
+-		// the entry_ref must be valid
+-		if (BEntry(&amp;ref).Exists()) {
+ PRINT((&quot;flags: %lx\n&quot;, flags));
+ PRINT((&quot;ref: %ld, %lld, %s\n&quot;, ref.device, ref.directory, ref.name));
+-			// check single/exclusive launchers
+-			RosterAppInfo *info = NULL;
+-			if ((launchFlags == B_SINGLE_LAUNCH
+-				 || launchFlags ==  B_EXCLUSIVE_LAUNCH)
+-				&amp;&amp; (((info = fRegisteredApps.InfoFor(&amp;ref)))
+-					|| ((info = fEarlyPreRegisteredApps.InfoFor(&amp;ref))))) {
+-				SET_ERROR(error, B_ALREADY_RUNNING);
+-				otherTeam = info-&gt;team;
+-			}
+-		} else
+-			SET_ERROR(error, B_ENTRY_NOT_FOUND);
++		// check single/exclusive launchers
++		RosterAppInfo *info = NULL;
++		if ((launchFlags == B_SINGLE_LAUNCH
++			 || launchFlags ==  B_EXCLUSIVE_LAUNCH)
++			&amp;&amp; ((info = info = fRegisteredApps.InfoFor(&amp;ref)) != NULL
++				|| (info = fEarlyPreRegisteredApps.InfoFor(&amp;ref)) != NULL)) {
++			SET_ERROR(error, B_ALREADY_RUNNING);
++			otherTeam = info-&gt;team;
++		}
+ 	}
+ 
+ 	// signature
+@@ -1274,8 +1276,7 @@
+ 	// not early (pre-)registered applications
+ 	AppInfoList obsoleteApps;
+ 	for (AppInfoList::Iterator it = fRegisteredApps.It(); it.IsValid(); ++it) {
+-		team_info teamInfo;
+-		if (get_team_info((*it)-&gt;team, &amp;teamInfo) != B_OK)
++		if (!(*it)-&gt;IsRunning())
+ 			obsoleteApps.AddInfo(*it);
+ 	}
+ 	// remove the apps
+@@ -1750,7 +1751,30 @@
+ 	FUNCTION_END();
+ } 
+ 
+-// _IsSystemApp
++
++/*!
++	\brief Checks all registered apps for \a ref and \a signature if
++		they are still alive, and removes those that aren't.
++*/
++void
++TRoster::_ValidateRunning(const entry_ref&amp; ref, const char* signature)
++{
++	while (true) {
++		// get info via ref or signature
++		RosterAppInfo* info = fRegisteredApps.InfoFor(&amp;ref);
++		if (info == NULL &amp;&amp; signature != NULL)
++			info = fRegisteredApps.InfoFor(signature);
++
++		// if app is alive or does not exist, we can exit
++		if (info == NULL || info-&gt;IsRunning())
++			return;
++
++		RemoveApp(info);
++		delete info;
++	}
++}
++
++
+ bool
+ TRoster::_IsSystemApp(RosterAppInfo *info) const
+ {
+
+Modified: haiku/trunk/src/servers/registrar/TRoster.h
+===================================================================
+--- haiku/trunk/src/servers/registrar/TRoster.h	2007-08-29 23:49:02 UTC (rev 22114)
++++ haiku/trunk/src/servers/registrar/TRoster.h	2007-08-30 00:09:43 UTC (rev 22115)
+@@ -84,20 +84,20 @@
+ 	void _AppDeactivated(RosterAppInfo *info);
+ 
+ 	// helper functions
+-	static status_t _AddMessageAppInfo(BMessage *message,
+-									   const app_info *info);
+-	static status_t _AddMessageWatchingInfo(BMessage *message,
+-											const app_info *info);
++	static status_t _AddMessageAppInfo(BMessage* message, const app_info* info);
++	static status_t _AddMessageWatchingInfo(BMessage* message,
++		const app_info* info);
+ 	uint32 _NextToken();
+ 
+ 	void _AddIARRequest(IARRequestMap&amp; map, int32 key, BMessage* request);
+-	void _ReplyToIARRequests(BMessageQueue *requests,
+-		const RosterAppInfo *info);
+-	void _ReplyToIARRequest(BMessage *request, const RosterAppInfo *info);
++	void _ReplyToIARRequests(BMessageQueue* requests,
++		const RosterAppInfo* info);
++	void _ReplyToIARRequest(BMessage* request, const RosterAppInfo* info);
+ 
+-	void _HandleGetRecentEntries(BMessage *request);
++	void _HandleGetRecentEntries(BMessage* request);
+ 
+-	bool _IsSystemApp(RosterAppInfo *info) const;
++	void _ValidateRunning(const entry_ref&amp; ref, const char* signature);
++	bool _IsSystemApp(RosterAppInfo* info) const;
+ 	
+ 	status_t _LoadRosterSettings(const char *path = NULL);
+ 	status_t _SaveRosterSettings(const char *path = NULL);
+@@ -109,7 +109,7 @@
+ 	AppInfoList		fEarlyPreRegisteredApps;
+ 	IARRequestMap	fIARRequestsByID;
+ 	IARRequestMap	fIARRequestsByToken;
+-	RosterAppInfo	*fActiveApp;
++	RosterAppInfo*	fActiveApp;
+ 	WatchingService	fWatchingService;
+ 	RecentApps		fRecentApps;
+ 	RecentEntries	fRecentDocuments;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003737.html">[Haiku-commits] r22114 -	haiku/trunk/headers/private/media/experimental
+</A></li>
+	<LI>Next message: <A HREF="003739.html">[Haiku-commits] r22116 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3738">[ date ]</a>
+              <a href="thread.html#3738">[ thread ]</a>
+              <a href="subject.html#3738">[ subject ]</a>
+              <a href="author.html#3738">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

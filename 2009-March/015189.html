@@ -1,0 +1,190 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29732 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29732%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200903261516.n2QFGdlV019425%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015186.html">
+   <LINK REL="Next"  HREF="015191.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29732 - haiku/trunk/src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29732%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200903261516.n2QFGdlV019425%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29732 - haiku/trunk/src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Mar 26 16:16:39 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015186.html">[Haiku-commits] r29731 - haiku/trunk/src/add-ons/screen_savers
+</A></li>
+        <LI>Next message: <A HREF="015191.html">[Haiku-commits] r29733 - haiku/trunk/src/system/kernel/scheduler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15189">[ date ]</a>
+              <a href="thread.html#15189">[ thread ]</a>
+              <a href="subject.html#15189">[ subject ]</a>
+              <a href="author.html#15189">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-03-26 16:16:39 +0100 (Thu, 26 Mar 2009)
+New Revision: 29732
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29732&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29732&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/smp.cpp
+Log:
+acquire_spinlock[_nocheck]() do now panic() when they couldn't acquire the
+spinlock for a long time. That should help to analyze system &quot;freezes&quot;
+involving spinlocks. In VMware on a Core 2 Duo 2.2 GHz the panic() is
+triggered after 20-30 seconds. The time will be shorter on faster machines.
+
+
+Modified: haiku/trunk/src/system/kernel/smp.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/smp.cpp	2009-03-26 15:03:29 UTC (rev 29731)
++++ haiku/trunk/src/system/kernel/smp.cpp	2009-03-26 15:16:39 UTC (rev 29732)
+@@ -37,6 +37,13 @@
+ 
+ #define MSG_POOL_SIZE (SMP_MAX_CPUS * 4)
+ 
++// These macros define the number of unsuccessful iterations in
++// acquire_spinlock() and acquire_spinlock_nocheck() after which the functions
++// panic(), assuming a deadlock.
++#define SPINLOCK_DEADLOCK_COUNT				100000000
++#define SPINLOCK_DEADLOCK_COUNT_NO_CHECK	2000000000
++
++
+ struct smp_msg {
+ 	struct smp_msg	*next;
+ 	int32			message;
+@@ -217,16 +224,28 @@
+ void
+ acquire_spinlock(spinlock *lock)
+ {
++#if DEBUG_SPINLOCKS
++	if (are_interrupts_enabled()) {
++		panic(&quot;acquire_spinlock: attempt to acquire lock %p with interrupts &quot;
++			&quot;enabled&quot;, lock);
++	}
++#endif
++
+ 	if (sNumCPUs &gt; 1) {
+ 		int currentCPU = smp_get_current_cpu();
+-		if (are_interrupts_enabled())
+-			panic(&quot;acquire_spinlock: attempt to acquire lock %p with interrupts enabled\n&quot;, lock);
+ #if B_DEBUG_SPINLOCK_CONTENTION
+ 		while (atomic_add(&amp;lock-&gt;lock, 1) != 0)
+ 			process_all_pending_ici(currentCPU);
+ #else
+ 		while (1) {
++			uint32 count = 0;
+ 			while (*lock != 0) {
++				if (++count == SPINLOCK_DEADLOCK_COUNT) {
++					panic(&quot;acquire_spinlock(): Failed to acquire spinlock %p &quot;
++						&quot;for a long time!&quot;, lock);
++					count = 0;
++				}
++
+ 				process_all_pending_ici(currentCPU);
+ 				PAUSE();
+ 			}
+@@ -241,12 +260,11 @@
+ 	} else {
+ #if DEBUG_SPINLOCKS
+ 		int32 oldValue;
+-		if (are_interrupts_enabled())
+-			panic(&quot;acquire_spinlock: attempt to acquire lock %p with interrupts enabled\n&quot;, lock);
+ 		oldValue = atomic_set((int32 *)lock, 1);
+ 		if (oldValue != 0) {
+-			panic(&quot;acquire_spinlock: attempt to acquire lock %p twice on non-SMP system (last caller: %p, value %ld)\n&quot;,
+-				lock, find_lock_caller(lock), oldValue);
++			panic(&quot;acquire_spinlock: attempt to acquire lock %p twice on &quot;
++				&quot;non-SMP system (last caller: %p, value %ld)&quot;, lock,
++				find_lock_caller(lock), oldValue);
+ 		}
+ 
+ 		push_lock_caller(arch_debug_get_caller(), lock);
+@@ -258,28 +276,40 @@
+ static void
+ acquire_spinlock_nocheck(spinlock *lock)
+ {
+-	if (sNumCPUs &gt; 1) {
+ #if DEBUG_SPINLOCKS
+-		if (are_interrupts_enabled())
+-			panic(&quot;acquire_spinlock_nocheck: attempt to acquire lock %p with interrupts enabled\n&quot;, lock);
++	if (are_interrupts_enabled()) {
++		panic(&quot;acquire_spinlock_nocheck: attempt to acquire lock %p with &quot;
++			&quot;interrupts enabled&quot;, lock);
++	}
+ #endif
++
++	if (sNumCPUs &gt; 1) {
+ #if B_DEBUG_SPINLOCK_CONTENTION
+ 		while (atomic_add(&amp;lock-&gt;lock, 1) != 0) {
+ 		}
+ #else
+ 		while (1) {
+-			while (*lock != 0)
++			uint32 count = 0;
++			while (*lock != 0) {
++				if (++count == SPINLOCK_DEADLOCK_COUNT_NO_CHECK) {
++					panic(&quot;acquire_spinlock(): Failed to acquire spinlock %p &quot;
++						&quot;for a long time!&quot;, lock);
++					count = 0;
++				}
++
+ 				PAUSE();
++			}
++
+ 			if (atomic_set((int32 *)lock, 1) == 0)
+ 				break;
+ 		}
+ #endif
+ 	} else {
+ #if DEBUG_SPINLOCKS
+-		if (are_interrupts_enabled())
+-			panic(&quot;acquire_spinlock_nocheck: attempt to acquire lock %p with interrupts enabled\n&quot;, lock);
+-		if (atomic_set((int32 *)lock, 1) != 0)
+-			panic(&quot;acquire_spinlock_nocheck: attempt to acquire lock %p twice on non-SMP system\n&quot;, lock);
++		if (atomic_set((int32 *)lock, 1) != 0) {
++			panic(&quot;acquire_spinlock_nocheck: attempt to acquire lock %p twice &quot;
++				&quot;on non-SMP system\n&quot;, lock);
++		}
+ #endif
+ 	}
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015186.html">[Haiku-commits] r29731 - haiku/trunk/src/add-ons/screen_savers
+</A></li>
+	<LI>Next message: <A HREF="015191.html">[Haiku-commits] r29733 - haiku/trunk/src/system/kernel/scheduler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15189">[ date ]</a>
+              <a href="thread.html#15189">[ thread ]</a>
+              <a href="subject.html#15189">[ subject ]</a>
+              <a href="author.html#15189">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

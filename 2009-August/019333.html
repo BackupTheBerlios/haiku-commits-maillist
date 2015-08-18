@@ -1,0 +1,299 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32418 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32418%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200908151642.n7FGgKLu028251%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019332.html">
+   <LINK REL="Next"  HREF="019338.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32418 - haiku/trunk/src/system/kernel</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32418%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200908151642.n7FGgKLu028251%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32418 - haiku/trunk/src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Aug 15 18:42:20 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019332.html">[Haiku-commits] r32417 - haiku/trunk/src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="019338.html">[Haiku-commits] r32418 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19333">[ date ]</a>
+              <a href="thread.html#19333">[ thread ]</a>
+              <a href="subject.html#19333">[ subject ]</a>
+              <a href="author.html#19333">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-08-15 18:42:18 +0200 (Sat, 15 Aug 2009)
+New Revision: 32418
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32418&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32418&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/wait_for_objects.cpp
+Log:
+common_poll():
+* Always select POLLNVAL. We wouldn't get notified, if the FD was closed while
+  waiting.
+* Skip negative FDs (as per POSIX standard).
+* When encountering an invalid FD, we must not wait. Previously we did that as
+  long as any FD was valid.
+* The return count must consider all FDs with non-null revents, including
+  invalid ones (revents is POLLNVAL then).
+
+common_poll()/common_wait_for_objects():
+* Don't bail out early, when no FDs/objects have been selected. We always want
+  to wait.
+
+_user_poll()/_user_wait_for_objects():
+* Copy the array back to userland even if common_*() returned an error. The
+  functions do now always fill in the resulting events.
+
+
+Modified: haiku/trunk/src/system/kernel/wait_for_objects.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/wait_for_objects.cpp	2009-08-15 16:28:15 UTC (rev 32417)
++++ haiku/trunk/src/system/kernel/wait_for_objects.cpp	2009-08-15 16:42:18 UTC (rev 32418)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2007-2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at cs.tu-berlin.de.</A>
++ * Copyright 2007-2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
+  * Copyright 2002-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  */
+@@ -495,7 +495,7 @@
+ 
+ 	PRINT((&quot;common_select(): events deselected\n&quot;));
+ 
+-	// collect the events that happened in the meantime
++	// collect the events that have happened in the meantime
+ 
+ 	int count = 0;
+ 
+@@ -546,13 +546,9 @@
+ static int
+ common_poll(struct pollfd *fds, nfds_t numFDs, bigtime_t timeout, bool kernel)
+ {
+-	status_t status = B_OK;
+-	int count = 0;
+-	uint32 i;
+-
+ 	// allocate sync object
+ 	select_sync* sync;
+-	status = create_select_sync(numFDs, sync);
++	status_t status = create_select_sync(numFDs, sync);
+ 	if (status != B_OK)
+ 		return status;
+ 
+@@ -560,41 +556,43 @@
+ 
+ 	// start polling file descriptors (by selecting them)
+ 
+-	for (i = 0; i &lt; numFDs; i++) {
++	bool invalid = false;
++	for (uint32 i = 0; i &lt; numFDs; i++) {
+ 		int fd = fds[i].fd;
+ 
+ 		// initialize events masks
+-		sync-&gt;set[i].selected_events = (fds[i].events &amp; ~POLLNVAL)
+-			| POLLERR | POLLHUP;
++		sync-&gt;set[i].selected_events = fds[i].events
++			| POLLNVAL | POLLERR | POLLHUP;
+ 		sync-&gt;set[i].events = 0;
++		fds[i].revents = 0;
+ 
+-		if (select_fd(fd, sync-&gt;set + i, kernel) == B_OK) {
+-			fds[i].revents = 0;
+-			if (sync-&gt;set[i].selected_events != 0)
+-				count++;
+-		} else
++		if (fd &gt;= 0 &amp;&amp; select_fd(fd, sync-&gt;set + i, kernel) != B_OK) {
++			sync-&gt;set[i].events = POLLNVAL;
+ 			fds[i].revents = POLLNVAL;
++				// indicates that the FD doesn't need to be deselected
++			invalid = true;
++		}
+ 	}
+ 
+-	if (numFDs &gt; 0 &amp;&amp; count &lt; 1) {
+-		count = B_BAD_VALUE;
+-		goto err;
++	if (!invalid) {
++		status = acquire_sem_etc(sync-&gt;sem, 1,
++			B_CAN_INTERRUPT | (timeout &gt;= 0 ? B_ABSOLUTE_TIMEOUT : 0), timeout);
+ 	}
+ 
+-	status = acquire_sem_etc(sync-&gt;sem, 1,
+-		B_CAN_INTERRUPT | (timeout &gt;= 0 ? B_ABSOLUTE_TIMEOUT : 0), timeout);
+-
+ 	// deselect file descriptors
+ 
+-	for (i = 0; i &lt; numFDs; i++)
+-		deselect_fd(fds[i].fd, sync-&gt;set + i, kernel);
++	for (uint32 i = 0; i &lt; numFDs; i++) {
++		if (fds[i].fd &gt;= 0 &amp;&amp; (fds[i].revents &amp; POLLNVAL) == 0)
++			deselect_fd(fds[i].fd, sync-&gt;set + i, kernel);
++	}
+ 
+-	// collect the events that are happened in the meantime
++	// collect the events that have happened in the meantime
+ 
++	int count = 0;
+ 	switch (status) {
+ 		case B_OK:
+-			for (count = 0, i = 0; i &lt; numFDs; i++) {
+-				if (fds[i].revents == POLLNVAL)
++			for (uint32 i = 0; i &lt; numFDs; i++) {
++				if (fds[i].fd &lt; 0)
+ 					continue;
+ 
+ 				// POLLxxx flags and B_SELECT_xxx flags are compatible
+@@ -609,10 +607,9 @@
+ 			break;
+ 		default:
+ 			// B_TIMED_OUT, and B_WOULD_BLOCK
+-			count = 0;
++			break;
+ 	}
+ 
+-err:
+ 	put_select_sync(sync);
+ 
+ 	T(PollDone(fds, numFDs, count));
+@@ -635,7 +632,6 @@
+ 
+ 	// start selecting objects
+ 
+-	ssize_t count = 0;
+ 	bool invalid = false;
+ 	for (int i = 0; i &lt; numInfos; i++) {
+ 		uint16 type = infos[i].type;
+@@ -645,24 +641,17 @@
+ 		sync-&gt;set[i].selected_events = infos[i].events
+ 			| B_EVENT_INVALID | B_EVENT_ERROR | B_EVENT_DISCONNECTED;
+ 		sync-&gt;set[i].events = 0;
++		infos[i].events = 0;
+ 
+-		if (type &lt; kSelectOpsCount
+-			&amp;&amp; kSelectOps[type].select(object, sync-&gt;set + i, kernel) == B_OK) {
+-			infos[i].events = 0;
+-			if (sync-&gt;set[i].selected_events != 0)
+-				count++;
+-		} else {
+-			sync-&gt;set[i].selected_events = B_EVENT_INVALID;
++		if (type &gt;= kSelectOpsCount
++			|| kSelectOps[type].select(object, sync-&gt;set + i, kernel) != B_OK) {
++			sync-&gt;set[i].events = B_EVENT_INVALID;
+ 			infos[i].events = B_EVENT_INVALID;
++				// indicates that the object doesn't need to be deselected
+ 			invalid = true;
+ 		}
+ 	}
+ 
+-	if (numInfos &gt; 0 &amp;&amp; count &lt; 1) {
+-		put_select_sync(sync);
+-		return B_BAD_VALUE;
+-	}
+-
+ 	if (!invalid) {
+ 		status = acquire_sem_etc(sync-&gt;sem, 1, B_CAN_INTERRUPT | flags,
+ 			timeout);
+@@ -677,22 +666,19 @@
+ 			kSelectOps[type].deselect(infos[i].object, sync-&gt;set + i, kernel);
+ 	}
+ 
+-	// collect the events that are happened in the meantime
++	// collect the events that have happened in the meantime
+ 
+-	switch (status) {
+-		case B_OK:
+-			count = 0;
+-			for (int i = 0; i &lt; numInfos; i++) {
+-				infos[i].events = sync-&gt;set[i].events
+-					&amp; sync-&gt;set[i].selected_events;
+-				if (infos[i].events != 0)
+-					count++;
+-			}
+-			break;
+-		default:
+-			// B_INTERRUPTED, B_TIMED_OUT, and B_WOULD_BLOCK
+-			count = status;
+-			break;
++	ssize_t count = 0;
++	if (status == B_OK) {
++		for (int i = 0; i &lt; numInfos; i++) {
++			infos[i].events = sync-&gt;set[i].events
++				&amp; sync-&gt;set[i].selected_events;
++			if (infos[i].events != 0)
++				count++;
++		}
++	} else {
++		// B_INTERRUPTED, B_TIMED_OUT, and B_WOULD_BLOCK
++		count = status;
+ 	}
+ 
+ 	put_select_sync(sync);
+@@ -1040,9 +1026,10 @@
+ 	result = common_poll(fds, numFDs, timeout, false);
+ 
+ 	// copy back results
+-	if (result &gt;= 0 &amp;&amp; numFDs &gt; 0 &amp;&amp; user_memcpy(userfds, fds, bytes) &lt; B_OK)
+-		result = B_BAD_ADDRESS;
+-	else
++	if (numFDs &gt; 0 &amp;&amp; user_memcpy(userfds, fds, bytes) != 0) {
++		if (result &gt;= 0)
++			result = B_BAD_ADDRESS;
++	} else
+ 		syscall_restart_handle_timeout_post(result, timeout);
+ 
+ err:
+@@ -1084,9 +1071,10 @@
+ 		result = common_wait_for_objects(infos, numInfos, flags, timeout,
+ 			false);
+ 
+-		if (result &gt;= 0 &amp;&amp; user_memcpy(userInfos, infos, bytes) != B_OK)
+-			result = B_BAD_ADDRESS;
+-		else
++		if (user_memcpy(userInfos, infos, bytes) != B_OK) {
++			if (result &gt;= 0)
++				result = B_BAD_ADDRESS;
++		} else
+ 			syscall_restart_handle_timeout_post(result, timeout);
+ 	} else
+ 		result = B_BAD_ADDRESS;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019332.html">[Haiku-commits] r32417 - haiku/trunk/src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="019338.html">[Haiku-commits] r32418 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19333">[ date ]</a>
+              <a href="thread.html#19333">[ thread ]</a>
+              <a href="subject.html#19333">[ subject ]</a>
+              <a href="author.html#19333">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

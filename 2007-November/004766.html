@@ -1,0 +1,205 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22934 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22934%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200711161011.lAGAB2sA005427%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004764.html">
+   <LINK REL="Next"  HREF="004767.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22934 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>sbenedetto at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22934%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200711161011.lAGAB2sA005427%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22934 - haiku/trunk/src/add-ons/kernel/busses/usb">sbenedetto at mail.berlios.de
+       </A><BR>
+    <I>Fri Nov 16 11:11:02 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004764.html">[Haiku-commits] r22933 - haiku/trunk/src/system/libroot/os/arch/m68k
+</A></li>
+        <LI>Next message: <A HREF="004767.html">[Haiku-commits] r22934 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4766">[ date ]</a>
+              <a href="thread.html#4766">[ thread ]</a>
+              <a href="subject.html#4766">[ subject ]</a>
+              <a href="author.html#4766">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: sbenedetto
+Date: 2007-11-16 11:11:02 +0100 (Fri, 16 Nov 2007)
+New Revision: 22934
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22934&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22934&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+Log:
+* Moved disable_interrupt right before resetting the controller
+* Reworked on NotifyPipeChange
+* Added _RemoveEndpointForPipe (not implemented)
+
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2007-11-15 22:59:35 UTC (rev 22933)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2007-11-16 10:11:02 UTC (rev 22934)
+@@ -249,8 +249,10 @@
+ 	// We now own the host controller and the bus has been reset
+ 	uint32 frameInterval = _ReadReg(OHCI_FRAME_INTERVAL);
+ 	uint32 intervalValue = OHCI_GET_INTERVAL_VALUE(frameInterval);
++
++	// Disable interrupts right before we reset
++	cpu_status former = disable_interrupts();
+ 	_WriteReg(OHCI_COMMAND_STATUS, OHCI_HOST_CONTROLLER_RESET);
+-
+ 	for (uint32 i = 0; i &lt; 10; i++) {
+ 		snooze(10);
+ 		if (!(_ReadReg(OHCI_COMMAND_STATUS) &amp; OHCI_HOST_CONTROLLER_RESET))
+@@ -259,14 +261,13 @@
+ 
+ 	if (_ReadReg(OHCI_COMMAND_STATUS) &amp; OHCI_HOST_CONTROLLER_RESET) {
+ 		TRACE_ERROR((&quot;usb_ohci: Error resetting the host controller (timeout)\n&quot;));
++		restore_interrupts(former);
+ 		return;
+ 	}
+ 
+ 	// The controller is now in SUSPEND state, we have 2ms to go OPERATIONAL.
+-	// In order to do so we need to disable interrupts.
++	// Interrupts are disabled.
+ 
+-	cpu_status former = disable_interrupts();
+-
+ 	// Set up host controller register
+ 	_WriteReg(OHCI_HCCA, (uint32)hccaPhysicalAddress);
+ 	_WriteReg(OHCI_CONTROL_HEAD_ED, (uint32)fDummyControl-&gt;physical_address);
+@@ -437,7 +438,7 @@
+ 		return _SubmitPeriodicTransfer(transfer);
+ 	}
+ 
+-	TRACE_ERROR((&quot;usb_ohci: tried to submit transfer for unknow pipe&quot;
++	TRACE_ERROR((&quot;usb_ohci: tried to submit transfer for unknown pipe&quot;
+ 		&quot; type %lu\n&quot;, type));
+ 	return B_ERROR;
+ }
+@@ -460,21 +461,26 @@
+ status_t
+ OHCI::NotifyPipeChange(Pipe *pipe, usb_change change)
+ {
+-	TRACE((&quot;usb_ohci::%s(%p, %d)\n&quot;, __FUNCTION__, pipe, (int)change));
+-	if (InitCheck())
+-		return B_ERROR;
+-
++	TRACE((&quot;usb_ohci: pipe change %d for pipe 0x%08lx\n&quot;, change, (uint32)pipe));
+ 	switch (change) {
+-	case USB_CHANGE_CREATED:
+-		return _InsertEndpointForPipe(pipe);
+-	case USB_CHANGE_DESTROYED:
+-		// Do something
+-		return B_ERROR;
+-	case USB_CHANGE_PIPE_POLICY_CHANGED:
+-	default:
+-		break;
++		case USB_CHANGE_CREATED: {
++			TRACE((&quot;usb_ohci: inserting endpoint\n&quot;));
++			return _InsertEndpointForPipe(pipe);
++		}
++		case USB_CHANGE_DESTROYED: {
++			TRACE((&quot;usb_ohci: removing endpoint\n&quot;));
++			return _RemoveEndpointForPipe(pipe);
++		}
++		case USB_CHANGE_PIPE_POLICY_CHANGED: {
++			TRACE((&quot;usb_ohci: pipe policy changing unhandled!\n&quot;));
++			break;
++		}
++		default: {
++			TRACE_ERROR((&quot;usb_ohci: unknown pipe change!\n&quot;));
++			return B_ERROR;
++		}
+ 	}
+-	return B_ERROR; //We should never go here
++	return B_OK;
+ }
+ 
+ 
+@@ -706,7 +712,7 @@
+ 
+ 
+ status_t
+-OHCI::_InsertEndpointForPipe(Pipe *p)
++OHCI::_InsertEndpointForPipe(Pipe *pipe)
+ {
+ #if 0
+ 	TRACE((&quot;OHCI: Inserting Endpoint for device %u function %u\n&quot;, p-&gt;DeviceAddress(), p-&gt;EndpointAddress()));
+@@ -800,6 +806,13 @@
+ }
+ 
+ 
++status_t
++OHCI::_RemoveEndpointForPipe(Pipe *pipe)
++{
++	return B_ERROR;
++}
++
++
+ inline void
+ OHCI::_WriteReg(uint32 reg, uint32 value)
+ {
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2007-11-15 22:59:35 UTC (rev 22933)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2007-11-16 10:11:02 UTC (rev 22934)
+@@ -85,14 +85,15 @@
+ 
+ 		status_t					_SubmitAsyncTransfer(Transfer *transfer);
+ 		status_t					_SubmitPeriodicTransfer(Transfer *transfer);
+-		
++
+ 		// Endpoint related methods
++		status_t					_InsertEndpointForPipe(Pipe *pipe);
++		status_t					_RemoveEndpointForPipe(Pipe *pipe);
+ 		status_t					_CreateEndpoint(Pipe *pipe,
+ 										bool isIsochronous);
+ 		ohci_endpoint_descriptor	*_AllocateEndpoint();
+ 		void						_FreeEndpoint(
+ 										ohci_endpoint_descriptor *endpoint);
+-		status_t					_InsertEndpointForPipe(Pipe *pipe);
+ 
+ 		// Transfer descriptor related methods
+ 		ohci_general_descriptor		*_CreateGeneralDescriptor();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004764.html">[Haiku-commits] r22933 - haiku/trunk/src/system/libroot/os/arch/m68k
+</A></li>
+	<LI>Next message: <A HREF="004767.html">[Haiku-commits] r22934 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4766">[ date ]</a>
+              <a href="thread.html#4766">[ thread ]</a>
+              <a href="subject.html#4766">[ subject ]</a>
+              <a href="author.html#4766">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

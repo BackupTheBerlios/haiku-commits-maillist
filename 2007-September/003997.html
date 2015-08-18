@@ -1,0 +1,953 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22315 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/fs src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22315%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/cache%20src/system/kernel/fs%20src/system/kernel/vm&In-Reply-To=%3C200709260020.l8Q0KQlE024609%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003996.html">
+   <LINK REL="Next"  HREF="003998.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22315 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/fs src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22315%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/cache%20src/system/kernel/fs%20src/system/kernel/vm&In-Reply-To=%3C200709260020.l8Q0KQlE024609%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22315 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/fs src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Sep 26 02:20:26 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003996.html">[Haiku-commits] r22314 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="003998.html">[Haiku-commits] r22316 - in haiku/trunk: build/jam	src/add-ons/kernel/file_systems src/add-ons/kernel/file_systems/fat
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3997">[ date ]</a>
+              <a href="thread.html#3997">[ thread ]</a>
+              <a href="subject.html#3997">[ subject ]</a>
+              <a href="author.html#3997">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-09-26 02:20:23 +0200 (Wed, 26 Sep 2007)
+New Revision: 22315
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22315&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22315&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/file_cache.h
+   haiku/trunk/headers/private/kernel/vfs.h
+   haiku/trunk/headers/private/kernel/vm.h
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+   haiku/trunk/src/system/kernel/cache/vnode_store.cpp
+   haiku/trunk/src/system/kernel/cache/vnode_store.h
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+bonefish+axeld:
+* Removed the vm_cache/vm_store ref_count duality that besides being a bit ugly
+  also created the page dameon cache retrieval problem: now, only areas (and
+  cache consumers) retrieve a reference to the store (and therefore, the vnode).
+  The page daemon doesn't need to care about this at all anymore, and the pseudo
+  references of the vm_cache could be removed again.
+* Rearranged deletion of vnodes such that its ID can be reused directly after
+  fs_remove_vnode() has been called.
+* vm_page_allocate_page() no longer panics when it runs out of pages, but just
+  waits for new pages to become available using the new sFreeCondition condition
+  variable - to make sure this happens in an acceptable time frame, it'll
+  trigger a run of the low memory handlers.
+* Implemented a page_thief() that steals inactive pages from caches and puts
+  them into the free queue. It runs as a low memory handler.
+* The file cache now sets the usage count on the pages it inserts into the
+  cache (needs some rework though, cache_io() doesn't do it yet).
+* Instead of panicking, the kernel will currently dead lock in low memory
+  situations, since BFS does a bit too much in bfs_release_vnode().
+* Some minor cleanup.
+
+
+Modified: haiku/trunk/headers/private/kernel/file_cache.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/file_cache.h	2007-09-26 00:06:18 UTC (rev 22314)
++++ haiku/trunk/headers/private/kernel/file_cache.h	2007-09-26 00:20:23 UTC (rev 22315)
+@@ -47,7 +47,7 @@
+ extern status_t file_cache_init_post_boot_device(void);
+ extern status_t file_cache_init(void);
+ 
+-extern vm_store *vm_create_vnode_store(void *vnode);
++extern vm_store *vm_create_vnode_store(struct vnode *vnode);
+ 
+ #ifdef __cplusplus
+ }
+
+Modified: haiku/trunk/headers/private/kernel/vfs.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vfs.h	2007-09-26 00:06:18 UTC (rev 22314)
++++ haiku/trunk/headers/private/kernel/vfs.h	2007-09-26 00:20:23 UTC (rev 22315)
+@@ -31,6 +31,7 @@
+ struct file_descriptor;
+ struct selectsync;
+ struct pollfd;
++struct vnode;
+ 
+ 
+ /** The I/O context of a process/team, holds the fd array among others */
+
+Modified: haiku/trunk/headers/private/kernel/vm.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm.h	2007-09-26 00:06:18 UTC (rev 22314)
++++ haiku/trunk/headers/private/kernel/vm.h	2007-09-26 00:20:23 UTC (rev 22315)
+@@ -15,6 +15,7 @@
+ 
+ struct kernel_args;
+ struct team;
++struct vnode;
+ 
+ 
+ #ifdef __cplusplus
+@@ -65,7 +66,7 @@
+ 			uint32 addressSpec, uint32 protection, uint32 mapping, 
+ 			area_id sourceArea);
+ status_t vm_delete_area(team_id aid, area_id id);
+-status_t vm_create_vnode_cache(void *vnode, vm_cache **_cache);
++status_t vm_create_vnode_cache(struct vnode *vnode, vm_cache **_cache);
+ vm_area *vm_area_lookup(vm_address_space *addressSpace, addr_t address);
+ status_t vm_set_area_memory_type(area_id id, addr_t physicalBase, uint32 type);
+ status_t vm_get_page_mapping(team_id team, addr_t vaddr, addr_t *paddr);
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-09-26 00:06:18 UTC (rev 22314)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-09-26 00:20:23 UTC (rev 22315)
+@@ -612,6 +612,11 @@
+ 	// make the pages accessible in the cache
+ 	for (int32 i = pageIndex; i-- &gt; 0;) {
+ 		pages[i]-&gt;state = PAGE_STATE_ACTIVE;
++		if (pages[i]-&gt;usage_count &lt; 0)
++			pages[i]-&gt;usage_count = 1;
++		else
++			pages[i]-&gt;usage_count++;
++
+ 		busyConditions[i].Unpublish();
+ 	}
+ 
+@@ -792,6 +797,11 @@
+ 	for (int32 i = pageIndex; i-- &gt; 0;) {
+ 		busyConditions[i].Unpublish();
+ 
++		if (pages[i]-&gt;usage_count &lt; 0)
++			pages[i]-&gt;usage_count = 1;
++		else
++			pages[i]-&gt;usage_count++;
++
+ 		if (writeThrough)
+ 			pages[i]-&gt;state = PAGE_STATE_ACTIVE;
+ 		else
+@@ -1248,17 +1258,10 @@
+ 	if (vfs_lookup_vnode(mountID, vnodeID, &amp;ref-&gt;vnode) != B_OK)
+ 		goto err2;
+ 
+-	// Gets (usually creates) the cache for the node - note, this does grab a
+-	// reference to the node...
++	// Gets (usually creates) the cache for the node
+ 	if (vfs_get_vnode_cache(ref-&gt;vnode, &amp;ref-&gt;cache, true) != B_OK)
+ 		goto err2;
+ 
+-	// ... that we don't need, and therefore release it again.
+-	// Our caller already holds a reference to the vnode; it will destroy us
+-	// when the last one goes away (which, of course, can only ever happen if
+-	// we don't grab an extra reference).
+-	vfs_put_vnode(ref-&gt;vnode);
+-
+ 	ref-&gt;cache-&gt;virtual_size = size;
+ 	((vnode_store *)ref-&gt;cache-&gt;store)-&gt;file_cache_ref = ref;
+ 	return ref;
+
+Modified: haiku/trunk/src/system/kernel/cache/vnode_store.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/vnode_store.cpp	2007-09-26 00:06:18 UTC (rev 22314)
++++ haiku/trunk/src/system/kernel/cache/vnode_store.cpp	2007-09-26 00:20:23 UTC (rev 22315)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2006, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2004-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  */
+ 
+@@ -112,7 +112,7 @@
+ 
+ 
+ extern &quot;C&quot; vm_store *
+-vm_create_vnode_store(void *vnode)
++vm_create_vnode_store(struct vnode *vnode)
+ {
+ 	vnode_store *store = (vnode_store *)malloc(sizeof(struct vnode_store));
+ 	if (store == NULL)
+
+Modified: haiku/trunk/src/system/kernel/cache/vnode_store.h
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/vnode_store.h	2007-09-26 00:06:18 UTC (rev 22314)
++++ haiku/trunk/src/system/kernel/cache/vnode_store.h	2007-09-26 00:20:23 UTC (rev 22315)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2004-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  */
+ #ifndef VNODE_STORE_H
+@@ -10,9 +10,9 @@
+ 
+ 
+ struct vnode_store {
+-	vm_store	vm;
+-	void		*vnode;
+-	void		*file_cache_ref;
++	vm_store		vm;
++	struct vnode*	vnode;
++	void*			file_cache_ref;
+ };
+ 
+ #endif	/* VNODE_STORE_H */
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2007-09-26 00:06:18 UTC (rev 22314)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2007-09-26 00:20:23 UTC (rev 22315)
+@@ -685,6 +685,12 @@
+ 	// count, so that it will neither become negative nor 0.
+ 	vnode-&gt;ref_count = 2;
+ 
++	// The file system has removed the resources of the vnode now, so we can
++	// make it available again (and remove the busy vnode from the hash)
++	mutex_lock(&amp;sVnodeMutex);
++	hash_remove(sVnodeTable, vnode);
++	mutex_unlock(&amp;sVnodeMutex);
++
+ 	// TODO: Usually, when the vnode is unreferenced, no one can get hold of the
+ 	// cache either (i.e. no one can get a cache reference while we're deleting
+ 	// the vnode).. This is, however, not the case for the page daemon. It gets
+@@ -692,18 +698,15 @@
+ 	// vnode reference while we're deleting the vnode.
+ 
+ 	if (!vnode-&gt;unpublished) {
+-		if (vnode-&gt;remove)
+-			FS_CALL(vnode, remove_vnode)(vnode-&gt;mount-&gt;cookie, vnode-&gt;private_node, reenter);
+-		else
+-			FS_CALL(vnode, put_vnode)(vnode-&gt;mount-&gt;cookie, vnode-&gt;private_node, reenter);
++		if (vnode-&gt;remove) {
++			FS_CALL(vnode, remove_vnode)(vnode-&gt;mount-&gt;cookie,
++				vnode-&gt;private_node, reenter);
++		} else {
++			FS_CALL(vnode, put_vnode)(vnode-&gt;mount-&gt;cookie, vnode-&gt;private_node,
++				reenter);
++		}
+ 	}
+ 
+-	// The file system has removed the resources of the vnode now, so we can
+-	// make it available again (and remove the busy vnode from the hash)
+-	mutex_lock(&amp;sVnodeMutex);
+-	hash_remove(sVnodeTable, vnode);
+-	mutex_unlock(&amp;sVnodeMutex);
+-
+ 	// if we have a vm_cache attached, remove it
+ 	if (vnode-&gt;cache)
+ 		vm_cache_release_ref(vnode-&gt;cache);
+@@ -3116,12 +3119,11 @@
+ }
+ 
+ 
+-/** Gets the vnode's vm_cache object. If it didn't have one, it will be
+- *	created if \a allocate is \c true.
+- *	In case it's successful, it will also grab a reference to the cache
+- *	it returns (and therefore, one from the \a vnode in question as well).
+- */
+-
++/*!	Gets the vnode's vm_cache object. If it didn't have one, it will be
++	created if \a allocate is \c true.
++	In case it's successful, it will also grab a reference to the cache
++	it returns.
++*/
+ extern &quot;C&quot; status_t
+ vfs_get_vnode_cache(void *_vnode, vm_cache **_cache, bool allocate)
+ {
+@@ -4222,9 +4224,9 @@
+ 
+ 			// O_CLOEXEC is the only flag available at this time
+ 			mutex_lock(&amp;context-&gt;io_mutex);
+-			fd_set_close_on_exec(context, fd, argument &amp; FD_CLOEXEC);
++			fd_set_close_on_exec(context, fd, (argument &amp; FD_CLOEXEC) != 0);
+ 			mutex_unlock(&amp;context-&gt;io_mutex);
+-			
++
+ 			status = B_OK;
+ 			break;
+ 		}
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-09-26 00:06:18 UTC (rev 22314)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-09-26 00:20:23 UTC (rev 22315)
+@@ -1761,7 +1761,7 @@
+ 	The vnode has to be marked busy when calling this function.
+ */
+ status_t
+-vm_create_vnode_cache(void *vnode, struct vm_cache **_cache)
++vm_create_vnode_cache(struct vnode *vnode, struct vm_cache **_cache)
+ {
+ 	status_t status;
+ 
+@@ -1787,11 +1787,10 @@
+ }
+ 
+ 
+-/** Will map the file at the path specified by \a name to an area in memory.
+- *	The file will be mirrored beginning at the specified \a offset. The \a offset
+- *	and \a size arguments have to be page aligned.
+- */
+-
++/*!	Will map the file at the path specified by \a name to an area in memory.
++	The file will be mirrored beginning at the specified \a offset. The \a offset
++	and \a size arguments have to be page aligned.
++*/
+ static area_id
+ _vm_map_file(team_id team, const char *name, void **_address, uint32 addressSpec,
+ 	size_t size, uint32 protection, uint32 mapping, const char *path,
+@@ -1827,13 +1826,10 @@
+ 
+ 	// ToDo: this only works for file systems that use the file cache
+ 	status = vfs_get_vnode_cache(vnode, &amp;cache, false);
+-
+-	vfs_put_vnode(vnode);
+-		// we don't need this vnode anymore - if the above call was
+-		// successful, the store already has a ref to it
+-
+-	if (status &lt; B_OK)
++	if (status &lt; B_OK) {
++		vfs_put_vnode(vnode);
+ 		return status;
++	}
+ 
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 
+@@ -1842,6 +1838,10 @@
+ 
+ 	mutex_unlock(&amp;cache-&gt;lock);
+ 
++	vfs_put_vnode(vnode);
++		// we don't need this vnode anymore - if the above call was
++		// successful, the store already has a ref to it
++
+ 	if (status &lt; B_OK || mapping == REGION_PRIVATE_MAP) {
+ 		// map_backing_store() cannot know we no longer need the ref
+ 		vm_cache_release_ref(cache);
+@@ -2539,6 +2539,9 @@
+ 		area-&gt;mappings.Add(mapping);
+ 	}
+ 
++	if (page-&gt;usage_count &lt; 0)
++		page-&gt;usage_count = 1;
++
+ 	if (page-&gt;state != PAGE_STATE_MODIFIED)
+ 		vm_page_set_state(page, PAGE_STATE_ACTIVE);
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-09-26 00:06:18 UTC (rev 22314)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-09-26 00:20:23 UTC (rev 22315)
+@@ -80,16 +80,14 @@
+ }
+ 
+ 
+-/*!	Acquires a pseudo reference to a cache yet unreferenced by the caller. The
++/*!	Acquires a reference to a cache yet unreferenced by the caller. The
+ 	caller must make sure, that the cache is not deleted, e.g. by holding the
+ 	cache's source cache lock or by holding the page cache table lock while the
+-	cache is still referred to by a page. To get a real reference, the caller
+-	must subsequently call vm_cache_acquire_ref() and decrement the cache's ref
+-	count manually afterwards.
+-	Returns \c true, if the pseudo reference could be acquired.
++	cache is still referred to by a page.
++	Returns \c true, if the reference could be acquired.
+ */
+ static inline bool
+-acquire_unreferenced_cache_pseudo_ref(vm_cache* cache)
++acquire_unreferenced_cache_ref(vm_cache* cache)
+ {
+ 	while (true) {
+ 		int32 count = cache-&gt;ref_count;
+@@ -102,6 +100,73 @@
+ }
+ 
+ 
++static void
++delete_cache(vm_cache *cache)
++{
++	if (cache-&gt;areas != NULL)
++		panic(&quot;cache %p to be deleted still has areas&quot;, cache);
++	if (!list_is_empty(&amp;cache-&gt;consumers))
++		panic(&quot;cache %p to be deleted still has consumers&quot;, cache);
++
++#if DEBUG_CACHE_LIST
++	int state = disable_interrupts();
++	acquire_spinlock(&amp;sDebugCacheListLock);
++
++	if (cache-&gt;debug_previous)
++		cache-&gt;debug_previous-&gt;debug_next = cache-&gt;debug_next;
++	if (cache-&gt;debug_next)
++		cache-&gt;debug_next-&gt;debug_previous = cache-&gt;debug_previous;
++	if (cache == gDebugCacheList)
++		gDebugCacheList = cache-&gt;debug_next;
++
++	release_spinlock(&amp;sDebugCacheListLock);
++	restore_interrupts(state);
++#endif
++
++	// delete the cache's backing store
++	cache-&gt;store-&gt;ops-&gt;destroy(cache-&gt;store);
++
++	// free all of the pages in the cache
++	vm_page *page = cache-&gt;page_list;
++	while (page) {
++		vm_page *oldPage = page;
++		int state;
++
++		page = page-&gt;cache_next;
++
++		if (!oldPage-&gt;mappings.IsEmpty() || oldPage-&gt;wired_count != 0) {
++			panic(&quot;remove page %p from cache %p: page still has mappings!\n&quot;,
++				oldPage, cache);
++		}
++
++		// remove it from the hash table
++		state = disable_interrupts();
++		acquire_spinlock(&amp;sPageCacheTableLock);
++
++		hash_remove(sPageCacheTable, oldPage);
++		oldPage-&gt;cache = NULL;
++		// TODO: we also need to remove all of the page's mappings!
++
++		release_spinlock(&amp;sPageCacheTableLock);
++		restore_interrupts(state);
++
++		TRACE((&quot;vm_cache_release_ref: freeing page 0x%lx\n&quot;,
++			oldPage-&gt;physical_page_number));
++		vm_page_set_state(oldPage, PAGE_STATE_FREE);
++	}
++
++	// remove the ref to the source
++	if (cache-&gt;source)
++		vm_cache_remove_consumer(cache-&gt;source, cache);
++
++	mutex_destroy(&amp;cache-&gt;lock);
++	free(cache);
++}
++
++
++//	#pragma mark -
++
++
+ status_t
+ vm_cache_init(kernel_args *args)
+ {
+@@ -181,9 +246,6 @@
+ 	if (cache == NULL)
+ 		panic(&quot;vm_cache_acquire_ref: passed NULL\n&quot;);
+ 
+-	if (cache-&gt;store-&gt;ops-&gt;acquire_ref != NULL)
+-		cache-&gt;store-&gt;ops-&gt;acquire_ref(cache-&gt;store);
+-
+ 	atomic_add(&amp;cache-&gt;ref_count, 1);
+ }
+ 
+@@ -191,8 +253,6 @@
+ void
+ vm_cache_release_ref(vm_cache *cache)
+ {
+-	vm_page *page;
+-
+ 	TRACE((&quot;vm_cache_release_ref: cacheRef %p, ref will be %ld\n&quot;,
+ 		cache, cache-&gt;ref_count - 1));
+ 
+@@ -200,10 +260,6 @@
+ 		panic(&quot;vm_cache_release_ref: passed NULL\n&quot;);
+ 
+ 	if (atomic_add(&amp;cache-&gt;ref_count, -1) != 1) {
+-		// the store ref is only released on the &quot;working&quot; refs, not
+-		// on the initial one (this is vnode specific)
+-		if (cache-&gt;store-&gt;ops-&gt;release_ref)
+-			cache-&gt;store-&gt;ops-&gt;release_ref(cache-&gt;store);
+ #if 0
+ {
+ 	// count min references to see if everything is okay
+@@ -237,64 +293,7 @@
+ 
+ 	// delete this cache
+ 
+-	if (cache-&gt;areas != NULL)
+-		panic(&quot;cache %p to be deleted still has areas&quot;, cache);
+-	if (!list_is_empty(&amp;cache-&gt;consumers))
+-		panic(&quot;cache %p to be deleted still has consumers&quot;, cache);
+-
+-#if DEBUG_CACHE_LIST
+-	int state = disable_interrupts();
+-	acquire_spinlock(&amp;sDebugCacheListLock);
+-
+-	if (cache-&gt;debug_previous)
+-		cache-&gt;debug_previous-&gt;debug_next = cache-&gt;debug_next;
+-	if (cache-&gt;debug_next)
+-		cache-&gt;debug_next-&gt;debug_previous = cache-&gt;debug_previous;
+-	if (cache == gDebugCacheList)
+-		gDebugCacheList = cache-&gt;debug_next;
+-
+-	release_spinlock(&amp;sDebugCacheListLock);
+-	restore_interrupts(state);
+-#endif
+-
+-	// delete the cache's backing store
+-	cache-&gt;store-&gt;ops-&gt;destroy(cache-&gt;store);
+-
+-	// free all of the pages in the cache
+-	page = cache-&gt;page_list;
+-	while (page) {
+-		vm_page *oldPage = page;
+-		int state;
+-
+-		page = page-&gt;cache_next;
+-
+-		if (!oldPage-&gt;mappings.IsEmpty() || oldPage-&gt;wired_count != 0) {
+-			panic(&quot;remove page %p from cache %p: page still has mappings!\n&quot;,
+-				oldPage, cache);
+-		}
+-
+-		// remove it from the hash table
+-		state = disable_interrupts();
+-		acquire_spinlock(&amp;sPageCacheTableLock);
+-
+-		hash_remove(sPageCacheTable, oldPage);
+-		oldPage-&gt;cache = NULL;
+-		// TODO: we also need to remove all of the page's mappings!
+-
+-		release_spinlock(&amp;sPageCacheTableLock);
+-		restore_interrupts(state);
+-
+-		TRACE((&quot;vm_cache_release_ref: freeing page 0x%lx\n&quot;,
+-			oldPage-&gt;physical_page_number));
+-		vm_page_set_state(oldPage, PAGE_STATE_FREE);
+-	}
+-
+-	// remove the ref to the source
+-	if (cache-&gt;source)
+-		vm_cache_remove_consumer(cache-&gt;source, cache);
+-
+-	mutex_destroy(&amp;cache-&gt;lock);
+-	free(cache);
++	delete_cache(cache);
+ }
+ 
+ 
+@@ -307,16 +306,10 @@
+ 	if (cache == NULL)
+ 		return NULL;
+ 
+-	// get a pseudo reference
+-	if (!acquire_unreferenced_cache_pseudo_ref(cache))
++	// get a reference
++	if (!acquire_unreferenced_cache_ref(cache))
+ 		return NULL;
+ 
+-	locker.Unlock();
+-
+-	// turn it into a real reference
+-	vm_cache_acquire_ref(cache);
+-	atomic_add(&amp;cache-&gt;ref_count, -1);
+-
+ 	return cache;
+ }
+ 
+@@ -541,6 +534,9 @@
+ 	list_remove_item(&amp;cache-&gt;consumers, consumer);
+ 	consumer-&gt;source = NULL;
+ 
++	if (cache-&gt;store-&gt;ops-&gt;release_ref)
++		cache-&gt;store-&gt;ops-&gt;release_ref(cache-&gt;store);
++
+ 	if (cache-&gt;areas == NULL &amp;&amp; cache-&gt;source != NULL
+ 		&amp;&amp; !list_is_empty(&amp;cache-&gt;consumers)
+ 		&amp;&amp; cache-&gt;consumers.link.next == cache-&gt;consumers.link.prev) {
+@@ -549,14 +545,7 @@
+ 
+ 		consumer = (vm_cache *)list_get_first_item(&amp;cache-&gt;consumers);
+ 
+-		bool merge = acquire_unreferenced_cache_pseudo_ref(consumer);
+-		if (merge) {
+-			// We managed to increment the reference count, but that's not a
+-			// full reference. We get a real one now and decrement the ref count
+-			// again.
+-			vm_cache_acquire_ref(consumer);
+-			atomic_add(&amp;consumer-&gt;ref_count, -1);
+-		}
++		bool merge = acquire_unreferenced_cache_ref(consumer);
+ 
+ 		// In case we managed to grab a reference to the consumerRef,
+ 		// this doesn't guarantee that we get the cache we wanted
+@@ -696,6 +685,9 @@
+ 	list_add_item(&amp;cache-&gt;consumers, consumer);
+ 
+ 	vm_cache_acquire_ref(cache);
++
++	if (cache-&gt;store-&gt;ops-&gt;acquire_ref != NULL)
++		cache-&gt;store-&gt;ops-&gt;acquire_ref(cache-&gt;store);
+ }
+ 
+ 
+@@ -714,6 +706,9 @@
+ 	area-&gt;cache_prev = NULL;
+ 	cache-&gt;areas = area;
+ 
++	if (cache-&gt;store-&gt;ops-&gt;acquire_ref != NULL)
++		cache-&gt;store-&gt;ops-&gt;acquire_ref(cache-&gt;store);
++
+ 	return B_OK;
+ }
+ 
+@@ -730,6 +725,9 @@
+ 	if (cache-&gt;areas == area)
+ 		cache-&gt;areas = area-&gt;cache_next;
+ 
++	if (cache-&gt;store-&gt;ops-&gt;release_ref)
++		cache-&gt;store-&gt;ops-&gt;release_ref(cache-&gt;store);
++
+ 	mutex_unlock(&amp;cache-&gt;lock);
+ 	return B_OK;
+ }
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-09-26 00:06:18 UTC (rev 22314)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-09-26 00:20:23 UTC (rev 22315)
+@@ -6,6 +6,9 @@
+  * Distributed under the terms of the NewOS License.
+  */
+ 
++#include &lt;signal.h&gt;
++#include &lt;string.h&gt;
++#include &lt;stdlib.h&gt;
+ 
+ #include &lt;KernelExport.h&gt;
+ #include &lt;OS.h&gt;
+@@ -16,15 +19,14 @@
+ #include &lt;condition_variable.h&gt;
+ #include &lt;kernel.h&gt;
+ #include &lt;thread.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ #include &lt;vm.h&gt;
+ #include &lt;vm_address_space.h&gt;
++#include &lt;vm_low_memory.h&gt;
+ #include &lt;vm_priv.h&gt;
+ #include &lt;vm_page.h&gt;
+ #include &lt;vm_cache.h&gt;
+ 
+-#include &lt;signal.h&gt;
+-#include &lt;string.h&gt;
+-#include &lt;stdlib.h&gt;
+ 
+ //#define TRACE_VM_PAGE
+ #ifdef TRACE_VM_PAGE
+@@ -53,6 +55,7 @@
+ static addr_t sPhysicalPageOffset;
+ static size_t sNumPages;
+ 
++static ConditionVariable&lt;page_queue&gt; sFreePageCondition;
+ static spinlock sPageLock;
+ 
+ static sem_id modified_pages_available;
+@@ -414,8 +417,8 @@
+ static status_t
+ set_page_state_nolock(vm_page *page, int pageState)
+ {
+-	page_queue *from_q = NULL;
+-	page_queue *to_q = NULL;
++	page_queue *fromQueue = NULL;
++	page_queue *toQueue = NULL;
+ 
+ 	switch (page-&gt;state) {
+ 		case PAGE_STATE_BUSY:
+@@ -423,16 +426,16 @@
+ 		case PAGE_STATE_INACTIVE:
+ 		case PAGE_STATE_WIRED:
+ 		case PAGE_STATE_UNUSED:
+-			from_q = &sActivePageQueue;
++			fromQueue = &sActivePageQueue;
+ 			break;
+ 		case PAGE_STATE_MODIFIED:
+-			from_q = &sModifiedPageQueue;
++			fromQueue = &sModifiedPageQueue;
+ 			break;
+ 		case PAGE_STATE_FREE:
+-			from_q = &sFreePageQueue;
++			fromQueue = &sFreePageQueue;
+ 			break;
+ 		case PAGE_STATE_CLEAR:
+-			from_q = &sClearPageQueue;
++			fromQueue = &sClearPageQueue;
+ 			break;
+ 		default:
+ 			panic(&quot;vm_page_set_state: vm_page %p in invalid state %d\n&quot;, page, page-&gt;state);
+@@ -442,10 +445,6 @@
+ 		if (page-&gt;cache != NULL)
+ 			panic(&quot;free page %p has cache&quot;, page);
+ 	}
+-	if (pageState == PAGE_STATE_CLEAR || pageState == PAGE_STATE_FREE) {
+-		if (page-&gt;cache != NULL)
+-			panic(&quot;to be freed page %p has cache&quot;, page);
+-	}
+ 
+ 	switch (pageState) {
+ 		case PAGE_STATE_BUSY:
+@@ -453,22 +452,31 @@
+ 		case PAGE_STATE_INACTIVE:
+ 		case PAGE_STATE_WIRED:
+ 		case PAGE_STATE_UNUSED:
+-			to_q = &sActivePageQueue;
++			toQueue = &sActivePageQueue;
+ 			break;
+ 		case PAGE_STATE_MODIFIED:
+-			to_q = &sModifiedPageQueue;
++			toQueue = &sModifiedPageQueue;
+ 			break;
+ 		case PAGE_STATE_FREE:
+-			to_q = &sFreePageQueue;
++			toQueue = &sFreePageQueue;
+ 			break;
+ 		case PAGE_STATE_CLEAR:
+-			to_q = &sClearPageQueue;
++			toQueue = &sClearPageQueue;
+ 			break;
+ 		default:
+ 			panic(&quot;vm_page_set_state: invalid target state %d\n&quot;, pageState);
+ 	}
++
++	if (pageState == PAGE_STATE_CLEAR || pageState == PAGE_STATE_FREE) {
++		if (sFreePageQueue.count + sClearPageQueue.count == 0)
++			sFreePageCondition.NotifyAll();
++
++		if (page-&gt;cache != NULL)
++			panic(&quot;to be freed page %p has cache&quot;, page);
++	}
++
+ 	page-&gt;state = pageState;
+-	move_page_to_queue(from_q, to_q, page);
++	move_page_to_queue(fromQueue, toQueue, page);
+ 
+ 	return B_OK;
+ }
+@@ -661,6 +669,82 @@
+ }
+ 
+ 
++static void
++page_thief(void* /*unused*/, int32 level)
++{
++	uint32 steal;
++	int32 score;
++
++	switch (level) {
++		default:
++		case B_LOW_MEMORY_NOTE:
++			steal = 10;
++			score = -20;
++			break;
++		case B_LOW_MEMORY_WARNING:
++			steal = 50;
++			score = -5;
++			break;
++		case B_LOW_MEMORY_CRITICAL:
++			steal = 500;
++			score = -1;
++			break;
++	}
++
++	vm_page* page = NULL;
++	InterruptsSpinLocker locker(sPageLock);
++
++	while (steal &gt; 0) {
++		if (!locker.IsLocked())
++			locker.Lock();
++
++		// find a candidate to steal from the inactive queue
++
++		for (int32 i = sActivePageQueue.count; i-- &gt; 0;) {
++			// move page to the head of the queue so that we don't
++			// scan it again directly
++			page = dequeue_page(&amp;sActivePageQueue);
++			enqueue_page(&amp;sActivePageQueue, page);
++
++			if (page-&gt;state == PAGE_STATE_INACTIVE
++				&amp;&amp; page-&gt;usage_count &lt;= score)
++				break;
++		}
++
++		if (page == NULL) {
++			if (score == 0)
++				break;
++
++			score = 0;
++			continue;
++		}
++
++		locker.Unlock();
++
++		// try to lock the page's cache
++
++		vm_cache* cache = vm_cache_acquire_page_cache_ref(page);
++		if (cache == NULL)
++			continue;
++
++		if (mutex_trylock(&amp;cache-&gt;lock) != B_OK
++			|| page-&gt;state != PAGE_STATE_INACTIVE) {
++			vm_cache_release_ref(cache);
++			continue;
++		}
++
++		// we can now steal this page
++
++		vm_cache_remove_page(cache, page);
++		vm_page_set_state(page, PAGE_STATE_FREE);
++		steal--;
++
++		mutex_unlock(&amp;cache-&gt;lock);
++		vm_cache_release_ref(cache);
++	}
++}
++
++
+ //	#pragma mark - private kernel API
+ 
+ 
+@@ -904,6 +988,11 @@
+ 	tid = thread_create_kernel_thread(&quot;pageout daemon&quot;, &amp;pageout_daemon, B_FIRST_REAL_TIME_PRIORITY + 1);
+ 	thread_resume_thread(tid);
+ #endif
++
++	new (&amp;sFreePageCondition) ConditionVariable&lt;page_queue&gt;;
++	sFreePageCondition.Publish(&amp;sFreePageQueue, &quot;free page&quot;);
++
++	register_low_memory_handler(page_thief, NULL, 0);
+ 	return B_OK;
+ }
+ 
+@@ -967,6 +1056,9 @@
+ vm_page *
+ vm_page_allocate_page(int pageState)
+ {
++	// TODO: we may want to have a &quot;canWait&quot; argument
++
++	ConditionVariableEntry&lt;page_queue&gt; freeConditionEntry;
+ 	page_queue *queue;
+ 	page_queue *otherQueue;
+ 
+@@ -983,33 +1075,43 @@
+ 			return NULL; // invalid
+ 	}
+ 
+-	cpu_status state = disable_interrupts();
+-	acquire_spinlock(&amp;sPageLock);
++	InterruptsSpinLocker locker(sPageLock);
+ 
+-	vm_page *page = dequeue_page(queue);
+-	if (page == NULL) {
++	vm_page *page = NULL;
++	while (true) {
++		page = dequeue_page(queue);
++		if (page == NULL) {
+ #ifdef DEBUG
+-		if (queue-&gt;count != 0)
+-			panic(&quot;queue %p corrupted, count = %d\n&quot;, queue, queue-&gt;count);
++			if (queue-&gt;count != 0)
++				panic(&quot;queue %p corrupted, count = %d\n&quot;, queue, queue-&gt;count);
+ #endif
+ 
+-		// if the primary queue was empty, grap the page from the
+-		// secondary queue
+-		page = dequeue_page(otherQueue);
+-		if (page == NULL) {
++			// if the primary queue was empty, grap the page from the
++			// secondary queue
++			page = dequeue_page(otherQueue);
++			if (page == NULL) {
+ #ifdef DEBUG
+-			if (otherQueue-&gt;count != 0) {
+-				panic(&quot;other queue %p corrupted, count = %d\n&quot;, otherQueue,
+-					otherQueue-&gt;count);
+-			}
++				if (otherQueue-&gt;count != 0) {
++					panic(&quot;other queue %p corrupted, count = %d\n&quot;, otherQueue,
++						otherQueue-&gt;count);
++				}
+ #endif
+ 
+-			// ToDo: issue &quot;someone&quot; to free up some pages for us, and go into
+-			// wait state until that's done
+-			panic(&quot;vm_allocate_page: out of memory! page state = %d\n&quot;,
+-				pageState);
++				freeConditionEntry.Add(&amp;sFreePageQueue);
++				vm_low_memory(1);
++			}
+ 		}
++		if (page != NULL)
++			break;
++
++		// we need to wait until new pages become available
++		locker.Unlock();
++
++		freeConditionEntry.Wait();
++
++		locker.Lock();
+ 	}
++
+ 	if (page-&gt;cache != NULL)
+ 		panic(&quot;supposed to be free page %p has cache\n&quot;, page);
+ 
+@@ -1018,8 +1120,7 @@
+ 
+ 	enqueue_page(&amp;sActivePageQueue, page);
+ 
+-	release_spinlock(&amp;sPageLock);
+-	restore_interrupts(state);
++	locker.Unlock();
+ 
+ 	// if needed take the page from the free queue and zero it out
+ 	if (pageState == PAGE_STATE_CLEAR &amp;&amp; oldPageState != PAGE_STATE_CLEAR)
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003996.html">[Haiku-commits] r22314 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="003998.html">[Haiku-commits] r22316 - in haiku/trunk: build/jam	src/add-ons/kernel/file_systems src/add-ons/kernel/file_systems/fat
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3997">[ date ]</a>
+              <a href="thread.html#3997">[ thread ]</a>
+              <a href="subject.html#3997">[ subject ]</a>
+              <a href="author.html#3997">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

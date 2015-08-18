@@ -1,0 +1,425 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22897 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22897%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200711111307.lABD7uSD022289%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004714.html">
+   <LINK REL="Next"  HREF="004717.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22897 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22897%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200711111307.lABD7uSD022289%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22897 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sun Nov 11 14:07:56 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004714.html">[Haiku-commits] r22896 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+        <LI>Next message: <A HREF="004717.html">[Haiku-commits] r22898 - haiku/trunk/src/add-ons/translators/stxt
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4715">[ date ]</a>
+              <a href="thread.html#4715">[ thread ]</a>
+              <a href="subject.html#4715">[ subject ]</a>
+              <a href="author.html#4715">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-11-11 14:07:56 +0100 (Sun, 11 Nov 2007)
+New Revision: 22897
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22897&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22897&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Lock.h
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/bfs.h
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
+Log:
+* The previous locking order &quot;inode write&quot; -&gt; &quot;journal&quot; was not only not
+  honoured (in the Inode attribute code), it also couldn't be honoured there.
+  Therefore, the locking order is now reversed, that is &quot;journal&quot; comes first,
+  then the Inode write lock. This should also help with the lock ups that
+  appeared after r22886.
+* Got rid of INODE_NO_TRANSACTION; it doesn't make any sense to use.
+* When Inode::WriteAttribute() changed the type, the type field was actually
+  never written back within the current transaction.
+* If the attribute data fit into the inode again, the attribute's write lock
+  was never released.
+* Since r22886, Inode::ReadAt() does its own locking, so we must no longer lock
+  the inode before calling it.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2007-11-11 13:00:59 UTC (rev 22896)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2007-11-11 13:07:56 UTC (rev 22897)
+@@ -55,11 +55,13 @@
+ 
+ 
+ status_t 
+-InodeAllocator::New(block_run *parentRun, mode_t mode, block_run &amp;run, Inode **_inode)
++InodeAllocator::New(block_run *parentRun, mode_t mode, block_run &amp;run,
++	Inode **_inode)
+ {
+ 	Volume *volume = fTransaction-&gt;GetVolume();
+ 
+-	status_t status = volume-&gt;AllocateForInode(*fTransaction, parentRun, mode, fRun);
++	status_t status = volume-&gt;AllocateForInode(*fTransaction, parentRun, mode,
++		fRun);
+ 	if (status &lt; B_OK) {
+ 		// don't free the space in the destructor, because
+ 		// the allocation failed
+@@ -101,7 +103,8 @@
+ 
+ 	if (fInode-&gt;IsRegularNode()) {
+ 		if (tree-&gt;Insert(*fTransaction, &quot;.&quot;, fInode-&gt;ID()) &lt; B_OK
+-			|| tree-&gt;Insert(*fTransaction, &quot;..&quot;, volume-&gt;ToVnode(fInode-&gt;Parent())) &lt; B_OK)
++			|| tree-&gt;Insert(*fTransaction, &quot;..&quot;,
++					volume-&gt;ToVnode(fInode-&gt;Parent())) &lt; B_OK)
+ 			return B_ERROR;
+ 	}
+ 	return B_OK;
+@@ -833,11 +836,7 @@
+ 	Inode *attribute;
+ 	status_t status = GetAttribute(name, &amp;attribute);
+ 	if (status == B_OK) {
+-		if (attribute-&gt;Lock().Lock() == B_OK) {
+-			status = attribute-&gt;ReadAt(pos, (uint8 *)buffer, _length);
+-			attribute-&gt;Lock().Unlock();
+-		} else
+-			status = B_ERROR;
++		status = attribute-&gt;ReadAt(pos, (uint8 *)buffer, _length);
+ 
+ 		ReleaseAttribute(attribute);
+ 	}
+@@ -862,6 +861,8 @@
+ 	// TODO: we actually depend on that the contents of &quot;buffer&quot; are constant.
+ 	// If they get changed during the write (hey, user programs), we may mess
+ 	// up our index trees!
++	// TODO: for attribute files, we need to log the first BPLUSTREE_MAX_KEY_LENGTH
++	// bytes of the data stream, or the same as above might happen.
+ 
+ 	Index index(fVolume);
+ 	index.SetTo(name);
+@@ -916,19 +917,24 @@
+ 
+ 			// check if the data fits into the small_data section again
+ 			NodeGetter node(fVolume, transaction, this);
+-			status = _AddSmallData(transaction, node, name, type, buffer, *_length);
++			status = _AddSmallData(transaction, node, name, type, buffer,
++				*_length);
++
+ 			if (status == B_OK) {
+ 				// it does - remove its file
++				attribute-&gt;Lock().UnlockWrite();
+ 				status = _RemoveAttribute(transaction, name, false, NULL);
+ 			} else {
+-				status = attribute-&gt;WriteAt(transaction, pos, buffer, _length);
++				// The attribute type might have been changed - we need to
++				// adopt the new one
++				attribute-&gt;Node().type = HOST_ENDIAN_TO_BFS_INT32(type);
++				status = attribute-&gt;WriteBack(transaction);
++				attribute-&gt;Lock().UnlockWrite();
++
+ 				if (status == B_OK) {
+-					// The attribute type might have been changed - we need to adopt
+-					// the new one - the attribute's inode will be written back on close
+-					attribute-&gt;Node().type = HOST_ENDIAN_TO_BFS_INT32(type);
++					status = attribute-&gt;WriteAt(transaction, pos, buffer,
++						_length);
+ 				}
+-
+-				attribute-&gt;Lock().UnlockWrite();
+ 			}
+ 		} else
+ 			status = B_ERROR;
+@@ -976,8 +982,8 @@
+ 			uint32 length = smallData-&gt;DataSize();
+ 			if (length &gt; BPLUSTREE_MAX_KEY_LENGTH)
+ 				length = BPLUSTREE_MAX_KEY_LENGTH;
+-			index.Update(transaction, name, smallData-&gt;Type(), smallData-&gt;Data(),
+-				length, NULL, 0, this);
++			index.Update(transaction, name, smallData-&gt;Type(),
++				smallData-&gt;Data(), length, NULL, 0, this);
+ 		}
+ 		fSmallDataLock.Unlock();
+ 	}
+@@ -1224,14 +1230,6 @@
+ status_t
+ Inode::ReadAt(off_t pos, uint8 *buffer, size_t *_length)
+ {
+-#if 0
+-	// call the right ReadAt() method, depending on the inode flags
+-
+-	if (Flags() &amp; INODE_LOGGED)
+-		return ((Stream&lt;Access::Logged&gt; *)this)-&gt;ReadAt(pos, buffer, _length);
+-
+-	return ((Stream&lt;Access::Cached&gt; *)this)-&gt;ReadAt(pos, buffer, _length);
+-#endif
+ 	size_t length = *_length;
+ 
+ 	// set/check boundaries for pos/length
+@@ -1266,27 +1264,28 @@
+ 		&lt;&lt; INODE_TIME_SHIFT);
+ 
+ 	// TODO: support INODE_LOGGED!
+-#if 0
+-	if (Flags() &amp; INODE_LOGGED)
+-		return ((Stream&lt;Access::Logged&gt; *)this)-&gt;WriteAt(transaction, pos, buffer, _length);
+ 
+-	return ((Stream&lt;Access::Cached&gt; *)this)-&gt;WriteAt(transaction, pos, buffer, _length);
+-#endif
+ 	size_t length = *_length;
++	bool changeSize = false;
+ 
+ 	// set/check boundaries for pos/length
+ 	if (pos &lt; 0)
+ 		return B_BAD_VALUE;
+ 
++	if (pos + length &gt; Size())
++		changeSize = true;
++
++	locker.Unlock();
++
++	// the transaction doesn't have to be started already
++	if (changeSize &amp;&amp; !transaction.IsStarted())
++		transaction.Start(fVolume, BlockNumber());
++
++	locker.Lock();
++
+ 	if (pos + length &gt; Size()) {
+ 		off_t oldSize = Size();
+ 
+-		// the transaction doesn't have to be started already
+-		// ToDo: what's that INODE_NO_TRANSACTION flag good for again?
+-		if ((Flags() &amp; INODE_NO_TRANSACTION) == 0
+-			&amp;&amp; !transaction.IsStarted())
+-			transaction.Start(fVolume, BlockNumber());
+-
+ 		// let's grow the data stream to the size needed
+ 		status_t status = SetFileSize(transaction, pos + length);
+ 		if (status &lt; B_OK) {
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Lock.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Lock.h	2007-11-11 13:00:59 UTC (rev 22896)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Lock.h	2007-11-11 13:07:56 UTC (rev 22897)
+@@ -479,7 +479,7 @@
+ 			:
+ 			fLock(lock)
+ 		{
+-			fStatus = lock != NULL ? lock-&gt;LockWrite() : B_ERROR;
++			fStatus = lock != NULL ? lock-&gt;LockWrite() : B_NO_INIT;
+ 		}
+ 
+ 		~WriteLocked()
+@@ -489,6 +489,14 @@
+ 		}
+ 
+ 		status_t
++		Lock()
++		{
++			if (fStatus == B_OK)
++				return B_ERROR;
++			return fStatus = fLock-&gt;LockWrite();
++		}
++
++		status_t
+ 		IsLocked()
+ 		{
+ 			return fStatus;
+@@ -497,8 +505,9 @@
+ 		void
+ 		Unlock()
+ 		{
+-			fLock-&gt;UnlockWrite();
+-			fStatus = B_NO_INIT;
++			if (fStatus == B_OK)
++				fLock-&gt;UnlockWrite();
++			fStatus = B_ERROR;
+ 		}
+ 
+ 	private:
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/bfs.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/bfs.h	2007-11-11 13:00:59 UTC (rev 22896)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/bfs.h	2007-11-11 13:07:56 UTC (rev 22897)
+@@ -217,7 +217,6 @@
+ 	INODE_PERMANENT_FLAGS	= 0x0000ffff,
+ 
+ 	INODE_WAS_WRITTEN		= 0x00020000,
+-	INODE_NO_TRANSACTION	= 0x00040000,
+ 	INODE_DONT_FREE_SPACE	= 0x00080000,	// only used by the &quot;chkbfs&quot; functionality
+ 	INODE_CHKBFS_RUNNING	= 0x00200000,
+ };
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp	2007-11-11 13:00:59 UTC (rev 22896)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp	2007-11-11 13:07:56 UTC (rev 22897)
+@@ -694,20 +694,19 @@
+ 	Volume *volume = (Volume *)_ns;
+ 	Inode *inode = (Inode *)_node;
+ 
+-	// that may be incorrect here - I don't think we need write access to
+-	// change most of the stat...
+-	// we should definitely check a bit more if the new stats are correct and valid...
++	// TODO: we should definitely check a bit more if the new stats are
++	//	valid - or even better, the VFS should check this before calling us
+ 	
+ 	status_t status = inode-&gt;CheckPermissions(W_OK);
+ 	if (status &lt; B_OK)
+ 		RETURN_ERROR(status);
+ 
++	Transaction transaction(volume, inode-&gt;BlockNumber());
++
+ 	WriteLocked locked(inode-&gt;Lock());
+ 	if (locked.IsLocked() &lt; B_OK)
+ 		RETURN_ERROR(B_ERROR);
+ 
+-	Transaction transaction(volume, inode-&gt;BlockNumber());
+-
+ 	bfs_inode &amp;node = inode-&gt;Node();
+ 
+ 	if (mask &amp; B_STAT_SIZE) {
+@@ -737,7 +736,8 @@
+ 
+ 	if (mask &amp; B_STAT_MODE) {
+ 		PRINT((&quot;original mode = %ld, stat-&gt;st_mode = %d\n&quot;, node.Mode(), stat-&gt;st_mode));
+-		node.mode = HOST_ENDIAN_TO_BFS_INT32(node.Mode() &amp; ~S_IUMSK | stat-&gt;st_mode &amp; S_IUMSK);
++		node.mode = HOST_ENDIAN_TO_BFS_INT32(node.Mode() &amp; ~S_IUMSK
++			| stat-&gt;st_mode &amp; S_IUMSK);
+ 	}
+ 
+ 	if (mask &amp; B_STAT_UID)
+@@ -762,7 +762,8 @@
+ 			(bigtime_t)stat-&gt;st_crtime &lt;&lt; INODE_TIME_SHIFT);
+ 	}
+ 
+-	if ((status = inode-&gt;WriteBack(transaction)) == B_OK)
++	status = inode-&gt;WriteBack(transaction);
++	if (status == B_OK)
+ 		transaction.Done();
+ 
+ 	notify_stat_changed(volume-&gt;ID(), inode-&gt;ID(), mask);
+@@ -772,8 +773,8 @@
+ 
+ 
+ status_t 
+-bfs_create(void *_ns, void *_directory, const char *name, int openMode, int mode,
+-	void **_cookie, ino_t *_vnodeID)
++bfs_create(void *_ns, void *_directory, const char *name, int openMode,
++	int mode, void **_cookie, ino_t *_vnodeID)
+ {
+ 	FUNCTION_START((&quot;name = \&quot;%s\&quot;, perms = %d, openMode = %d\n&quot;, name, mode, openMode));
+ 
+@@ -1147,8 +1148,8 @@
+ 
+ 	// Should we truncate the file?
+ 	if (openMode &amp; O_TRUNC) {
++		Transaction transaction(volume, inode-&gt;BlockNumber());
+ 		WriteLocked locked(inode-&gt;Lock());
+-		Transaction transaction(volume, inode-&gt;BlockNumber());
+ 
+ 		status_t status = inode-&gt;SetFileSize(transaction, 0);
+ 		if (status &gt;= B_OK)
+@@ -1255,25 +1256,32 @@
+ 		return B_BAD_VALUE;
+ 
+ 	file_cookie *cookie = (file_cookie *)_cookie;
+-
+ 	Volume *volume = (Volume *)_ns;
+ 	Inode *inode = (Inode *)_node;
+ 
+-	WriteLocked locked(inode-&gt;Lock());
++	Transaction transaction;
++	bool needsTrimming;
+ 
+-	bool needsTrimming = inode-&gt;NeedsTrimming();
++	{
++		ReadLocked locker(inode-&gt;Lock());
++		needsTrimming = inode-&gt;NeedsTrimming();
+ 
+-	if ((cookie-&gt;open_mode &amp; O_RWMASK) != 0
+-		&amp;&amp; !inode-&gt;IsDeleted()
+-		&amp;&amp; (needsTrimming
+-			|| inode-&gt;OldLastModified() != inode-&gt;LastModified()
+-			|| inode-&gt;OldSize() != inode-&gt;Size())) {
++		if ((cookie-&gt;open_mode &amp; O_RWMASK) != 0
++			&amp;&amp; !inode-&gt;IsDeleted()
++			&amp;&amp; (needsTrimming
++				|| inode-&gt;OldLastModified() != inode-&gt;LastModified()
++				|| inode-&gt;OldSize() != inode-&gt;Size())) {
++			locker.Unlock();
++			transaction.Start(volume, inode-&gt;BlockNumber());
++		}
++	}
+ 
++	WriteLocked locker(inode-&gt;Lock());
++	status_t status = B_ERROR;
++
++	if (transaction.IsStarted()) {
+ 		// trim the preallocated blocks and update the size,
+ 		// and last_modified indices if needed
+-
+-		Transaction transaction(volume, inode-&gt;BlockNumber());
+-		status_t status = B_OK;
+ 		bool changedSize = false, changedTime = false;
+ 		Index index(volume);
+ 
+@@ -1299,14 +1307,14 @@
+ 			inode-&gt;WriteBack(transaction);
+ 		}
+ 
+-		if (status == B_OK)
+-			transaction.Done();
+-
+ 		if (changedSize || changedTime) {
+ 			notify_stat_changed(volume-&gt;ID(), inode-&gt;ID(),
+-				(changedTime ? B_STAT_MODIFICATION_TIME : 0) | (changedSize ? B_STAT_SIZE : 0));
++				(changedTime ? B_STAT_MODIFICATION_TIME : 0)
++				| (changedSize ? B_STAT_SIZE : 0));
+ 		}
+ 	}
++	if (status == B_OK)
++		transaction.Done();
+ 
+ 	if (inode-&gt;Flags() &amp; INODE_CHKBFS_RUNNING) {
+ 		// &quot;chkbfs&quot; exited abnormally, so we have to stop it here...
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004714.html">[Haiku-commits] r22896 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+	<LI>Next message: <A HREF="004717.html">[Haiku-commits] r22898 - haiku/trunk/src/add-ons/translators/stxt
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4715">[ date ]</a>
+              <a href="thread.html#4715">[ thread ]</a>
+              <a href="subject.html#4715">[ subject ]</a>
+              <a href="author.html#4715">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

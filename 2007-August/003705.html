@@ -1,0 +1,361 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22084 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22084%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200708272030.l7RKUYeE027348%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003704.html">
+   <LINK REL="Next"  HREF="003715.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22084 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22084%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200708272030.l7RKUYeE027348%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22084 - in haiku/trunk: headers/private/kernel	src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Aug 27 22:30:34 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003704.html">[Haiku-commits] r22083 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="003715.html">[Haiku-commits] r22084 - in haiku/trunk: headers/private/kernel src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3705">[ date ]</a>
+              <a href="thread.html#3705">[ thread ]</a>
+              <a href="subject.html#3705">[ subject ]</a>
+              <a href="author.html#3705">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-08-27 22:30:34 +0200 (Mon, 27 Aug 2007)
+New Revision: 22084
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22084&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22084&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/thread_types.h
+   haiku/trunk/src/system/kernel/team.cpp
+   haiku/trunk/src/system/kernel/thread.cpp
+Log:
+* Replaced the team::dead_children::sem semaphore by a condition
+  variable. Due to C code including the header I had to turn it from and
+  aggregated member to a pointer. I'm very close to starting to convert
+  all remaining .c to .cpp files. :-/
+* Got rid of the &quot;waiters&quot; field. It was only written, never read.
+
+
+Modified: haiku/trunk/headers/private/kernel/thread_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/thread_types.h	2007-08-27 20:17:31 UTC (rev 22083)
++++ haiku/trunk/headers/private/kernel/thread_types.h	2007-08-27 20:30:34 UTC (rev 22084)
+@@ -82,6 +82,27 @@
+ #define MAX_DEAD_CHILDREN	32
+ 	// this is a soft limit for the number of dead entries in a team
+ 
++typedef struct team_dead_children team_dead_children;
++
++
++#ifdef __cplusplus
++
++#include &lt;condition_variable.h&gt;
++
++struct team_dead_children {
++	ConditionVariable&lt;team_dead_children&gt; condition_variable;
++									// wait for dead child entries
++	struct list	list;
++	uint32		count;
++	vint32		wait_for_any;	// count of wait_for_child() that wait for any
++								// child
++	bigtime_t	kernel_time;
++	bigtime_t	user_time;
++};
++
++#endif	// __cplusplus
++
++
+ struct team {
+ 	struct team		*next;			// next in hash
+ 	struct team		*siblings_next;
+@@ -99,15 +120,7 @@
+ 	int				pending_signals;
+ 	void			*io_context;
+ 	sem_id			death_sem;		// semaphore to wait on for dying threads
+-	struct {
+-		sem_id		sem;			// wait for dead child entries
+-		struct list	list;
+-		uint32		count;
+-		vint32		wait_for_any;	// count of wait_for_child() that wait for any child
+-		int32		waiters;		// count of all threads waiting for dead children sem
+-		bigtime_t	kernel_time;
+-		bigtime_t	user_time;
+-	} dead_children;
++	team_dead_children *dead_children;
+ 	struct vm_address_space *address_space;
+ 	struct thread	*main_thread;
+ 	struct thread	*thread_list;
+
+Modified: haiku/trunk/src/system/kernel/team.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/team.cpp	2007-08-27 20:17:31 UTC (rev 22083)
++++ haiku/trunk/src/system/kernel/team.cpp	2007-08-27 20:30:34 UTC (rev 22084)
+@@ -8,8 +8,15 @@
+ 
+ /* Team functions */
+ 
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/wait.h&gt;
++
+ #include &lt;OS.h&gt;
+ 
++#include &lt;AutoDeleter.h&gt;
++
+ #include &lt;elf.h&gt;
+ #include &lt;file_cache.h&gt;
+ #include &lt;int.h&gt;
+@@ -28,11 +35,6 @@
+ #include &lt;vm_address_space.h&gt;
+ #include &lt;util/khash.h&gt;
+ 
+-#include &lt;sys/wait.h&gt;
+-#include &lt;string.h&gt;
+-#include &lt;stdio.h&gt;
+-#include &lt;stdlib.h&gt;
+-
+ //#define TRACE_TEAM
+ #ifdef TRACE_TEAM
+ #	define TRACE(x) dprintf x
+@@ -543,6 +545,7 @@
+ 	struct team *team = (struct team *)malloc(sizeof(struct team));
+ 	if (team == NULL)
+ 		return NULL;
++	MemoryDeleter teamDeleter(team);
+ 
+ 	team-&gt;next = team-&gt;siblings_next = team-&gt;children = team-&gt;parent = NULL;
+ 	team-&gt;id = allocate_thread_id();
+@@ -561,31 +564,33 @@
+ 	team-&gt;dead_threads_kernel_time = 0;
+ 	team-&gt;dead_threads_user_time = 0;
+ 
+-	list_init(&amp;team-&gt;dead_children.list);
+-	team-&gt;dead_children.count = 0;
+-	team-&gt;dead_children.wait_for_any = 0;
+-	team-&gt;dead_children.waiters = 0;
+-	team-&gt;dead_children.kernel_time = 0;
+-	team-&gt;dead_children.user_time = 0;
+-	team-&gt;dead_children.sem = create_sem(0, &quot;dead children&quot;);
+-	if (team-&gt;dead_children.sem &lt; B_OK)
+-		goto error1;
++	team-&gt;dead_children
++		= (team_dead_children*)malloc(sizeof(team_dead_children));
++	if (team-&gt;dead_children == NULL)
++		return NULL;
++	MemoryDeleter deadChildrenDeleter(team-&gt;dead_children);
+ 
++	list_init(&amp;team-&gt;dead_children-&gt;list);
++	team-&gt;dead_children-&gt;count = 0;
++	team-&gt;dead_children-&gt;wait_for_any = 0;
++	team-&gt;dead_children-&gt;kernel_time = 0;
++	team-&gt;dead_children-&gt;user_time = 0;
++	team-&gt;dead_children-&gt;condition_variable.Publish(team-&gt;dead_children,
++		&quot;dead children&quot;);
++
+ 	list_init(&amp;team-&gt;image_list);
+ 	list_init(&amp;team-&gt;watcher_list);
+ 
+ 	clear_team_debug_info(&amp;team-&gt;debug_info, true);
+ 
+-	if (arch_team_init_team_struct(team, kernel) &lt; 0)
+-		goto error2;
++	if (arch_team_init_team_struct(team, kernel) &lt; 0) {
++		team-&gt;dead_children-&gt;condition_variable.Unpublish();
++		return NULL;
++	}
+ 
++	deadChildrenDeleter.Detach();
++	teamDeleter.Detach();
+ 	return team;
+-
+-error2:
+-	delete_sem(team-&gt;dead_children.sem);
+-error1:
+-	free(team);
+-	return NULL;
+ }
+ 
+ 
+@@ -594,13 +599,14 @@
+ {
+ 	struct death_entry *death;
+ 
+-	delete_sem(team-&gt;dead_children.sem);
++	team-&gt;dead_children-&gt;condition_variable.Unpublish();
+ 
+ 	while ((death = (struct death_entry*)list_remove_head_item(
+-			&amp;team-&gt;dead_children.list)) != NULL) {
++			&amp;team-&gt;dead_children-&gt;list)) != NULL) {
+ 		free(death);
+ 	}
+ 
++	free(team-&gt;dead_children);
+ 	free(team);
+ }
+ 
+@@ -1276,11 +1282,11 @@
+ 	}
+ 	if (child &lt; 0) {
+ 		// we need to make sure the death entries won't get deleted too soon
+-		atomic_add(&amp;team-&gt;dead_children.wait_for_any, 1);
++		atomic_add(&amp;team-&gt;dead_children-&gt;wait_for_any, 1);
+ 	}
+ 
+ 	while (true) {
+-		sem_id waitSem = -1;
++		ConditionVariableEntry&lt;team_dead_children&gt; waitEntry;
+ 
+ 		cpu_status state = disable_interrupts();
+ 		GRAB_THREAD_LOCK();
+@@ -1332,8 +1338,7 @@
+ 		if (status == B_WOULD_BLOCK &amp;&amp; (flags &amp; WNOHANG) == 0) {
+ 			// We need to hold the team lock when changing this counter,
+ 			// but of course only if we really will wait later
+-			waitSem = team-&gt;dead_children.sem;
+-			team-&gt;dead_children.waiters++;
++			waitEntry.Add(team-&gt;dead_children);
+ 		}
+ 
+ 		RELEASE_TEAM_LOCK();
+@@ -1345,7 +1350,7 @@
+ 		if (status != B_WOULD_BLOCK || (flags &amp; WNOHANG) != 0)
+ 			goto err;
+ 
+-		status = acquire_sem_etc(waitSem, 1, B_CAN_INTERRUPT, 0);
++		status = waitEntry.Wait(B_CAN_INTERRUPT);
+ 		if (status == B_INTERRUPTED)
+ 			goto err;
+ 	}
+@@ -1361,7 +1366,7 @@
+ 
+ err:
+ 	if (child &lt; 0)
+-		atomic_add(&amp;team-&gt;dead_children.wait_for_any, -1);
++		atomic_add(&amp;team-&gt;dead_children-&gt;wait_for_any, -1);
+ 
+ 	return status;
+ }
+@@ -1480,7 +1485,7 @@
+ 	}
+ 
+ 	while ((entry = (struct death_entry*)list_get_next_item(
+-			&amp;team-&gt;dead_children.list, entry)) != NULL) {
++			&amp;team-&gt;dead_children-&gt;list, entry)) != NULL) {
+ 		if (child != -1 &amp;&amp; entry-&gt;thread != child &amp;&amp; entry-&gt;group_id != -child)
+ 			continue;
+ 
+@@ -1489,10 +1494,10 @@
+ 		*death = *entry;
+ 
+ 		// only remove the death entry if there aren't any other interested parties
+-		if ((child &lt; 0 &amp;&amp; atomic_add(&amp;team-&gt;dead_children.wait_for_any, -1) == 1)
+-			|| (child &gt; 0 &amp;&amp; team-&gt;dead_children.wait_for_any == 0)) {
++		if ((child &lt; 0 &amp;&amp; atomic_add(&amp;team-&gt;dead_children-&gt;wait_for_any, -1) == 1)
++			|| (child &gt; 0 &amp;&amp; team-&gt;dead_children-&gt;wait_for_any == 0)) {
+ 			list_remove_link(entry);
+-			team-&gt;dead_children.count--;
++			team-&gt;dead_children-&gt;count--;
+ 			*_freeDeath = entry;
+ 		}
+ 
+@@ -1588,10 +1593,10 @@
+ 	struct team *parent = team-&gt;parent;
+ 
+ 	// remember how long this team lasted
+-	parent-&gt;dead_children.kernel_time += team-&gt;dead_threads_kernel_time
+-		+ team-&gt;dead_children.kernel_time;
+-	parent-&gt;dead_children.user_time += team-&gt;dead_threads_user_time
+-		+ team-&gt;dead_children.user_time;
++	parent-&gt;dead_children-&gt;kernel_time += team-&gt;dead_threads_kernel_time
++		+ team-&gt;dead_children-&gt;kernel_time;
++	parent-&gt;dead_children-&gt;user_time += team-&gt;dead_threads_user_time
++		+ team-&gt;dead_children-&gt;user_time;
+ 
+ 	hash_remove(sTeamHash, team);
+ 	sUsedTeams--;
+@@ -2064,8 +2069,8 @@
+ 				userTime += child-&gt;dead_threads_user_time;
+ 			}
+ 
+-			kernelTime += team-&gt;dead_children.kernel_time;
+-			userTime += team-&gt;dead_children.user_time;
++			kernelTime += team-&gt;dead_children-&gt;kernel_time;
++			userTime += team-&gt;dead_children-&gt;user_time;
+ 			break;
+ 		}
+ 	}
+
+Modified: haiku/trunk/src/system/kernel/thread.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/thread.cpp	2007-08-27 20:17:31 UTC (rev 22083)
++++ haiku/trunk/src/system/kernel/thread.cpp	2007-08-27 20:30:34 UTC (rev 22084)
+@@ -1164,11 +1164,11 @@
+ 			if (death != NULL) {
+ 				// insert death entry into the parent's list
+ 
+-				list_add_link_to_tail(&amp;parent-&gt;dead_children.list, death);
+-				if (++parent-&gt;dead_children.count &gt; MAX_DEAD_CHILDREN) {
++				list_add_link_to_tail(&amp;parent-&gt;dead_children-&gt;list, death);
++				if (++parent-&gt;dead_children-&gt;count &gt; MAX_DEAD_CHILDREN) {
+ 					death = (struct death_entry*)list_remove_head_item(
+-						&amp;parent-&gt;dead_children.list);
+-					parent-&gt;dead_children.count--;
++						&amp;parent-&gt;dead_children-&gt;list);
++					parent-&gt;dead_children-&gt;count--;
+ 				} else
+ 					death = NULL;
+ 
+@@ -1176,10 +1176,7 @@
+ 
+ 				// notify listeners that a new death entry is available
+ 				// TODO: should that be moved to handle_signal() (for SIGCHLD)?
+-				release_sem_etc(parent-&gt;dead_children.sem,
+-					parent-&gt;dead_children.waiters, B_DO_NOT_RESCHEDULE);
+-
+-				parent-&gt;dead_children.waiters = 0;
++				parent-&gt;dead_children-&gt;condition_variable.NotifyOne();
+ 			} else
+ 				RELEASE_THREAD_LOCK();
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003704.html">[Haiku-commits] r22083 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="003715.html">[Haiku-commits] r22084 - in haiku/trunk: headers/private/kernel src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3705">[ date ]</a>
+              <a href="thread.html#3705">[ thread ]</a>
+              <a href="subject.html#3705">[ subject ]</a>
+              <a href="author.html#3705">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

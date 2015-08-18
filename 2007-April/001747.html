@@ -1,0 +1,186 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20778 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20778%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704210311.l3L3BGVB021177%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001746.html">
+   <LINK REL="Next"  HREF="001752.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20778 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20778%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704210311.l3L3BGVB021177%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20778 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Sat Apr 21 05:11:16 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001746.html">[Haiku-commits] r20777 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+        <LI>Next message: <A HREF="001752.html">[Haiku-commits] r20764 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/protocols/icmp	src/add-ons/kernel/network/protocols/ipv4	src/add-ons/kernel/network/protocols/tcp	src/add-ons/kernel/network/protocols/udp src/add-ons/kernel/
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1747">[ date ]</a>
+              <a href="thread.html#1747">[ thread ]</a>
+              <a href="subject.html#1747">[ subject ]</a>
+              <a href="author.html#1747">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-21 05:11:05 +0200 (Sat, 21 Apr 2007)
+New Revision: 20778
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20778&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20778&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+Log:
+when sending pure ACKs, use an artificial window of 0.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-21 02:37:17 UTC (rev 20777)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-21 03:11:05 UTC (rev 20778)
+@@ -672,10 +672,9 @@
+ 
+ 	TRACE(&quot;  ReadData(): %lu bytes kept.&quot;, fReceiveQueue.Available());
+ 
+-	if (!clone) {
+-		// we are opening the window, check if we should send an ACK
+-		_SendQueued();
+-	}
++	// if we are opening the window, check if we should send an ACK
++	if (!clone)
++		SendAcknowledge(false);
+ 
+ 	return receivedBytes;
+ }
+@@ -740,7 +739,7 @@
+ 	if (gStackModule-&gt;cancel_timer(&amp;fDelayedAcknowledgeTimer)) {
+ 		// timer was active, send an ACK now (with the exception above,
+ 		// we send every other ACK)
+-		return SendAcknowledge();
++		return SendAcknowledge(true);
+ 	}
+ 
+ 	gStackModule-&gt;set_timer(&amp;fDelayedAcknowledgeTimer, TCP_DELAYED_ACKNOWLEDGE_TIMEOUT);
+@@ -749,9 +748,9 @@
+ 
+ 
+ status_t
+-TCPEndpoint::SendAcknowledge()
++TCPEndpoint::SendAcknowledge(bool force)
+ {
+-	return _SendQueued(true);
++	return _SendQueued(force, 0);
+ }
+ 
+ 
+@@ -916,7 +915,7 @@
+ 
+ 	// process acknowledge action as asked for by the *Receive() method
+ 	if (segmentAction &amp; IMMEDIATE_ACKNOWLEDGE)
+-		SendAcknowledge();
++		SendAcknowledge(true);
+ 	else if (segmentAction &amp; ACKNOWLEDGE)
+ 		DelayedAcknowledge();
+ 
+@@ -1049,12 +1048,19 @@
+ }
+ 
+ 
++status_t
++TCPEndpoint::_SendQueued(bool force)
++{
++	return _SendQueued(force, fSendWindow);
++}
++
++
+ /*!
+ 	Sends one or more TCP segments with the data waiting in the queue, or some
+ 	specific flags that need to be sent.
+ */
+ status_t
+-TCPEndpoint::_SendQueued(bool force)
++TCPEndpoint::_SendQueued(bool force, uint32 sendWindow)
+ {
+ 	if (fRoute == NULL)
+ 		return B_ERROR;
+@@ -1092,9 +1098,8 @@
+ 	segment.acknowledge = fReceiveNext;
+ 	segment.urgent_offset = 0;
+ 
+-	uint32 sendWindow = fSendWindow;
+-	if (fCongestionWindow &gt; 0)
+-		sendWindow = min_c(sendWindow, fCongestionWindow);
++	if (fCongestionWindow &gt; 0 &amp;&amp; fCongestionWindow &lt; sendWindow)
++		sendWindow = fCongestionWindow;
+ 
+ 	// SND.UNA  SND.NXT        SND.MAX
+ 	//  |        |              |
+@@ -1793,7 +1798,7 @@
+ 	if (!locker.IsLocked())
+ 		return;
+ 
+-	endpoint-&gt;SendAcknowledge();
++	endpoint-&gt;SendAcknowledge(true);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-21 02:37:17 UTC (rev 20777)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-21 03:11:05 UTC (rev 20778)
+@@ -68,7 +68,7 @@
+ 		void DeleteSocket();
+ 
+ 		status_t DelayedAcknowledge();
+-		status_t SendAcknowledge();
++		status_t SendAcknowledge(bool force);
+ 		status_t UpdateTimeWait();
+ 
+ 		int32 SegmentReceived(tcp_segment_header&amp; segment, net_buffer *buffer);
+@@ -90,6 +90,7 @@
+ 		bool _ShouldSendSegment(tcp_segment_header &amp;segment, uint32 length,
+ 			uint32 segmentMaxSize, uint32 flightSize);
+ 		status_t _SendQueued(bool force = false);
++		status_t _SendQueued(bool force, uint32 sendWindow);
+ 		int _GetMSS(const struct sockaddr *) const;
+ 		status_t _ShutdownEgress(bool closing);
+ 		ssize_t _AvailableData() const;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001746.html">[Haiku-commits] r20777 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+	<LI>Next message: <A HREF="001752.html">[Haiku-commits] r20764 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/protocols/icmp	src/add-ons/kernel/network/protocols/ipv4	src/add-ons/kernel/network/protocols/tcp	src/add-ons/kernel/network/protocols/udp src/add-ons/kernel/
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1747">[ date ]</a>
+              <a href="thread.html#1747">[ thread ]</a>
+              <a href="subject.html#1747">[ subject ]</a>
+              <a href="author.html#1747">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,514 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31912 - haiku/trunk/src/apps/installer
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31912%20-%20haiku/trunk/src/apps/installer&In-Reply-To=%3C200907291504.n6TF46wt001707%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018451.html">
+   <LINK REL="Next"  HREF="018453.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31912 - haiku/trunk/src/apps/installer</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31912%20-%20haiku/trunk/src/apps/installer&In-Reply-To=%3C200907291504.n6TF46wt001707%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31912 - haiku/trunk/src/apps/installer">stippi at mail.berlios.de
+       </A><BR>
+    <I>Wed Jul 29 17:04:06 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018451.html">[Haiku-commits] r31911 - haiku/trunk/src/bin/coreutils/src
+</A></li>
+        <LI>Next message: <A HREF="018453.html">[Haiku-commits] r31913 -	haiku/trunk/src/add-ons/kernel/file_systems/fat
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18452">[ date ]</a>
+              <a href="thread.html#18452">[ thread ]</a>
+              <a href="subject.html#18452">[ subject ]</a>
+              <a href="author.html#18452">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-07-29 17:04:02 +0200 (Wed, 29 Jul 2009)
+New Revision: 31912
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31912&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31912&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/installer/CopyEngine.cpp
+   haiku/trunk/src/apps/installer/CopyEngine.h
+   haiku/trunk/src/apps/installer/InstallerWindow.cpp
+   haiku/trunk/src/apps/installer/InstallerWindow.h
+   haiku/trunk/src/apps/installer/WorkerThread.cpp
+   haiku/trunk/src/apps/installer/WorkerThread.h
+Log:
+Changed the somewhat bold BLocker usage to a more straight forward semaphore
+based mechanism to pause and eventually cancel the WorkerThread. This also works
+now when the CopyEngine is still collecting file informartion (ticket #4153).
+
+
+Modified: haiku/trunk/src/apps/installer/CopyEngine.cpp
+===================================================================
+--- haiku/trunk/src/apps/installer/CopyEngine.cpp	2009-07-29 14:53:42 UTC (rev 31911)
++++ haiku/trunk/src/apps/installer/CopyEngine.cpp	2009-07-29 15:04:02 UTC (rev 31912)
+@@ -26,6 +26,39 @@
+ using std::nothrow;
+ 
+ 
++// SemaphoreLocking
++class SemaphoreLocking {
++public:
++	inline bool Lock(sem_id* lockable)
++	{
++		return acquire_sem(*lockable) == B_OK;
++	}
++
++	inline void Unlock(sem_id* lockable)
++	{
++		release_sem(*lockable);
++	}
++};
++
++// SemaphoreLocker
++class SemaphoreLocker : public AutoLocker&lt;sem_id, SemaphoreLocking&gt; {
++public:
++	inline SemaphoreLocker(sem_id semaphore, bool alreadyLocked = false,
++			bool lockIfNotLocked = true)
++		:
++		AutoLocker&lt;sem_id, SemaphoreLocking&gt;(),
++		fSem(semaphore)
++	{
++		SetTo(&amp;fSem, alreadyLocked, lockIfNotLocked);
++	}
++
++private:
++	sem_id	fSem;
++};
++
++
++
++
+ CopyEngine::CopyEngine(const BMessenger&amp; messenger, BMessage* message)
+ 	:
+ 	fBufferQueue(),
+@@ -102,16 +135,16 @@
+ 
+ 
+ status_t
+-CopyEngine::CollectTargets(const char* source)
++CopyEngine::CollectTargets(const char* source, sem_id cancelSemaphore)
+ {
+ 	int32 level = 0;
+-	return _CollectCopyInfo(source, level);
++	return _CollectCopyInfo(source, level, cancelSemaphore);
+ }
+ 
+ 
+ status_t
+ CopyEngine::CopyFolder(const char* source, const char* destination,
+-	BLocker* locker)
++	sem_id cancelSemaphore)
+ {
+ 	printf(&quot;%lld bytes to read in %lld files\n&quot;, fBytesToCopy, fItemsToCopy);
+ 
+@@ -122,16 +155,16 @@
+ 	}
+ 
+ 	int32 level = 0;
+-	return _CopyFolder(source, destination, level, locker);
++	return _CopyFolder(source, destination, level, cancelSemaphore);
+ }
+ 
+ 
+ status_t
+ CopyEngine::CopyFile(const BEntry&amp; _source, const BEntry&amp; _destination,
+-	BLocker* locker)
++	sem_id cancelSemaphore)
+ {
+-	AutoLocker&lt;BLocker&gt; lock(locker);
+-	if (locker != NULL &amp;&amp; !lock.IsLocked()) {
++	SemaphoreLocker lock(cancelSemaphore);
++	if (cancelSemaphore &gt;= 0 &amp;&amp; !lock.IsLocked()) {
+ 		// We are supposed to quit
+ printf(&quot;CopyFile - cancled\n&quot;);
+ 		return B_CANCELED;
+@@ -210,7 +243,8 @@
+ 
+ 
+ status_t
+-CopyEngine::_CollectCopyInfo(const char* _source, int32&amp; level)
++CopyEngine::_CollectCopyInfo(const char* _source, int32&amp; level,
++	sem_id cancelSemaphore)
+ {
+ 	level++;
+ 
+@@ -221,6 +255,12 @@
+ 
+ 	BEntry entry;
+ 	while (source.GetNextEntry(&amp;entry) == B_OK) {
++		SemaphoreLocker lock(cancelSemaphore);
++		if (cancelSemaphore &gt;= 0 &amp;&amp; !lock.IsLocked()) {
++			// We are supposed to quit
++			return B_CANCELED;
++		}
++
+ 		struct stat statInfo;
+ 		entry.GetStat(&amp;statInfo);
+ 
+@@ -239,7 +279,10 @@
+ 			if (ret &lt; B_OK)
+ 				return ret;
+ 
+-			ret = _CollectCopyInfo(srcFolder.Path(), level);
++			if (cancelSemaphore &gt;= 0)
++				lock.Unlock();
++
++			ret = _CollectCopyInfo(srcFolder.Path(), level, cancelSemaphore);
+ 			if (ret &lt; B_OK)
+ 				return ret;
+ 		} else if (S_ISLNK(statInfo.st_mode)) {
+@@ -259,7 +302,7 @@
+ 
+ status_t
+ CopyEngine::_CopyFolder(const char* _source, const char* _destination,
+-	int32&amp; level, BLocker* locker)
++	int32&amp; level, sem_id cancelSemaphore)
+ {
+ 	level++;
+ 	fCurrentTargetFolder = _destination;
+@@ -283,8 +326,8 @@
+ 
+ 	BEntry entry;
+ 	while (source.GetNextEntry(&amp;entry) == B_OK) {
+-		AutoLocker&lt;BLocker&gt; lock(locker);
+-		if (locker != NULL &amp;&amp; !lock.IsLocked()) {
++		SemaphoreLocker lock(cancelSemaphore);
++		if (cancelSemaphore &gt;= 0 &amp;&amp; !lock.IsLocked()) {
+ 			// We are supposed to quit
+ 			return B_CANCELED;
+ 		}
+@@ -341,15 +384,15 @@
+ 			if (ret &lt; B_OK)
+ 				return ret;
+ 
+-			if (locker != NULL)
++			if (cancelSemaphore &gt;= 0)
+ 				lock.Unlock();
+ 
+ 			ret = _CopyFolder(srcFolder.Path(), dstFolder.Path(), level,
+-				locker);
++				cancelSemaphore);
+ 			if (ret &lt; B_OK)
+ 				return ret;
+ 
+-			if (locker != NULL &amp;&amp; !lock.Lock()) {
++			if (cancelSemaphore &gt;= 0 &amp;&amp; !lock.Lock()) {
+ 				// We are supposed to quit
+ 				return B_CANCELED;
+ 			}
+
+Modified: haiku/trunk/src/apps/installer/CopyEngine.h
+===================================================================
+--- haiku/trunk/src/apps/installer/CopyEngine.h	2009-07-29 14:53:42 UTC (rev 31911)
++++ haiku/trunk/src/apps/installer/CopyEngine.h	2009-07-29 15:04:02 UTC (rev 31912)
+@@ -15,7 +15,6 @@
+ #include &quot;BlockingQueue.h&quot;
+ 
+ class BFile;
+-class BLocker;
+ class BMessage;
+ class BMessenger;
+ 
+@@ -26,23 +25,23 @@
+ 	virtual						~CopyEngine();
+ 
+ 			void				ResetTargets();
+-			status_t			CollectTargets(const char* source);
++			status_t			CollectTargets(const char* source,
++									sem_id cancelSemaphore = -1);
+ 
+ 			status_t			CopyFolder(const char* source,
+ 									const char* destination,
+-									BLocker* locker = NULL);
++									sem_id cancelSemaphore = -1);
+ 
+ 			status_t			CopyFile(const BEntry&amp; entry,
+ 									const BEntry&amp; destination,
+-									BLocker* locker = NULL);
++									sem_id cancelSemaphore = -1);
+ 
+ private:
+ 			status_t			_CollectCopyInfo(const char* source,
+-									int32&amp; level);
++									int32&amp; level, sem_id cancelSemaphore);
+ 			status_t			_CopyFolder(const char* source,
+ 									const char* destination,
+-									int32&amp; level,
+-									BLocker* locker = NULL);
++									int32&amp; level, sem_id cancelSemaphore);
+ 
+ 			bool				_ShouldCopyEntry(const char* name,
+ 									const struct stat&amp; statInfo,
+
+Modified: haiku/trunk/src/apps/installer/InstallerWindow.cpp
+===================================================================
+--- haiku/trunk/src/apps/installer/InstallerWindow.cpp	2009-07-29 14:53:42 UTC (rev 31911)
++++ haiku/trunk/src/apps/installer/InstallerWindow.cpp	2009-07-29 15:04:02 UTC (rev 31912)
+@@ -149,7 +149,7 @@
+ 	fDriveSetupLaunched(false),
+ 	fInstallStatus(kReadyForInstall),
+ 	fWorkerThread(new WorkerThread(this)),
+-	fCopyEngineLock(NULL)
++	fCopyEngineCancelSemaphore(-1)
+ {
+ 	LogoView* logoView = new LogoView();
+ 
+@@ -271,6 +271,7 @@
+ 
+ InstallerWindow::~InstallerWindow()
+ {
++	_SetCopyEngineCancelSemaphore(-1);
+ 	be_roster-&gt;StopWatching(this);
+ }
+ 
+@@ -299,8 +300,7 @@
+ 	switch (msg-&gt;what) {
+ 		case MSG_RESET:
+ 		{
+-			delete fCopyEngineLock;
+-			fCopyEngineLock = NULL;
++			_SetCopyEngineCancelSemaphore(-1);
+ 
+ 			status_t error;
+ 			if (msg-&gt;FindInt32(&quot;error&quot;, &amp;error) == B_OK) {
+@@ -326,12 +326,13 @@
+ 			switch (fInstallStatus) {
+ 				case kReadyForInstall:
+ 				{
+-					delete fCopyEngineLock;
+-					fCopyEngineLock = new BLocker(&quot;copy engine lock&quot;);
++					_SetCopyEngineCancelSemaphore(create_sem(1,
++						&quot;copy engine cancel&quot;));
++
+ 					BList* list = new BList();
+ 					int32 size = 0;
+ 					fPackagesView-&gt;GetPackagesToInstall(list, &amp;size);
+-					fWorkerThread-&gt;SetLock(fCopyEngineLock);
++					fWorkerThread-&gt;SetLock(fCopyEngineCancelSemaphore);
+ 					fWorkerThread-&gt;SetPackagesList(list);
+ 					fWorkerThread-&gt;SetSpaceRequired(size);
+ 					fInstallStatus = kInstalling;
+@@ -415,8 +416,8 @@
+ 		}
+ 		case MSG_INSTALL_FINISHED:
+ 		{
+-			delete fCopyEngineLock;
+-			fCopyEngineLock = NULL;
++			
++			_SetCopyEngineCancelSemaphore(-1);
+ 
+ 			fBeginButton-&gt;SetLabel(&quot;Quit&quot;);
+ 
+@@ -689,13 +690,26 @@
+ 
+ 
+ void
++InstallerWindow::_SetCopyEngineCancelSemaphore(sem_id id, bool alreadyLocked)
++{
++	if (fCopyEngineCancelSemaphore &gt;= 0) {
++		if (!alreadyLocked)
++			acquire_sem(fCopyEngineCancelSemaphore);
++		delete_sem(fCopyEngineCancelSemaphore);
++	}
++	fCopyEngineCancelSemaphore = id;
++}
++
++
++void
+ InstallerWindow::_QuitCopyEngine(bool askUser)
+ {
+-	if (fCopyEngineLock == NULL)
++	if (fCopyEngineCancelSemaphore &lt; 0)
+ 		return;
+ 
+-	// first of all block the copy engine
+-	fCopyEngineLock-&gt;Lock();
++	// First of all block the copy engine, so that it doesn't continue
++	// while the alert is showing, which would be irritating.
++	acquire_sem(fCopyEngineCancelSemaphore);
+ 	
+ 	bool quit = true;
+ 	if (askUser) {
+@@ -706,23 +720,10 @@
+ 	}
+ 
+ 	if (quit) {
+-		int32 tries = 0;
+-		// wait until the engine blocks
+-		while (fCopyEngineLock-&gt;CountLockRequests() &lt; 2) {
+-			// TODO: There is a race here, the copy engine
+-			// may have finished before we locked the engine
+-			// lock. That's why we limit the number of tries
+-			// here.
+-			tries++;
+-			if (tries &gt; 100)
+-				break;
+-			snooze(3000);
+-		}
+-		// make it quit by having it's lock fail
+-		delete fCopyEngineLock;
+-		fCopyEngineLock = NULL;
++		// Make it quit by having it's lock fail...
++		_SetCopyEngineCancelSemaphore(-1, true);
+ 	} else
+-		fCopyEngineLock-&gt;Unlock();
++		release_sem(fCopyEngineCancelSemaphore);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/apps/installer/InstallerWindow.h
+===================================================================
+--- haiku/trunk/src/apps/installer/InstallerWindow.h	2009-07-29 14:53:42 UTC (rev 31911)
++++ haiku/trunk/src/apps/installer/InstallerWindow.h	2009-07-29 15:04:02 UTC (rev 31912)
+@@ -16,7 +16,6 @@
+ 
+ class BButton;
+ class BLayoutItem;
+-class BLocker;
+ class BMenu;
+ class BMenuField;
+ class BStatusBar;
+@@ -61,6 +60,8 @@
+ 			void				_PublishPackages();
+ 			void				_SetStatusMessage(const char* text);
+ 
++			void				_SetCopyEngineCancelSemaphore(sem_id id,
++									bool alreadyLocked = false);
+ 			void				_QuitCopyEngine(bool askUser);
+ 
+ 	static	int					_ComparePackages(const void* firstArg,
+@@ -95,7 +96,7 @@
+ 
+ 			WorkerThread*		fWorkerThread;
+ 			BString				fLastStatus;
+-			BLocker*			fCopyEngineLock;
++			sem_id				fCopyEngineCancelSemaphore;
+ };
+ 
+ #endif // INSTALLER_WINDOW_H
+
+Modified: haiku/trunk/src/apps/installer/WorkerThread.cpp
+===================================================================
+--- haiku/trunk/src/apps/installer/WorkerThread.cpp	2009-07-29 14:53:42 UTC (rev 31911)
++++ haiku/trunk/src/apps/installer/WorkerThread.cpp	2009-07-29 15:04:02 UTC (rev 31912)
+@@ -77,7 +77,8 @@
+ 	: BLooper(&quot;copy_engine&quot;),
+ 	fWindow(window),
+ 	fPackages(NULL),
+-	fSpaceRequired(0)
++	fSpaceRequired(0),
++	fCancelSemaphore(-1)
+ {
+ 	Run();
+ }
+@@ -398,7 +399,7 @@
+ 
+ 	// let the engine collect information for the progress bar later on
+ 	engine.ResetTargets();
+-	err = engine.CollectTargets(srcDirectory.Path());
++	err = engine.CollectTargets(srcDirectory.Path(), fCancelSemaphore);
+ 	if (err != B_OK)
+ 		goto error;
+ 
+@@ -409,7 +410,7 @@
+ 		for (int32 i = 0; i &lt; count; i++) {
+ 			Package *p = static_cast&lt;Package*&gt;(fPackages-&gt;ItemAt(i));
+ 			BPath packageDir(pkgRootDir.Path(), p-&gt;Folder());
+-			err = engine.CollectTargets(packageDir.Path());
++			err = engine.CollectTargets(packageDir.Path(), fCancelSemaphore);
+ 			if (err != B_OK)
+ 				goto error;
+ 		}
+@@ -417,7 +418,7 @@
+ 
+ 	// copy source volume
+ 	err = engine.CopyFolder(srcDirectory.Path(), targetDirectory.Path(),
+-		fCancelLock);
++		fCancelSemaphore);
+ 	if (err != B_OK)
+ 		goto error;
+ 
+@@ -429,7 +430,7 @@
+ 			Package *p = static_cast&lt;Package*&gt;(fPackages-&gt;ItemAt(i));
+ 			BPath packageDir(pkgRootDir.Path(), p-&gt;Folder());
+ 			err = engine.CopyFolder(packageDir.Path(), targetDirectory.Path(),
+-				fCancelLock);
++				fCancelSemaphore);
+ 			if (err != B_OK)
+ 				goto error;
+ 		}
+
+Modified: haiku/trunk/src/apps/installer/WorkerThread.h
+===================================================================
+--- haiku/trunk/src/apps/installer/WorkerThread.h	2009-07-29 14:53:42 UTC (rev 31911)
++++ haiku/trunk/src/apps/installer/WorkerThread.h	2009-07-29 15:04:02 UTC (rev 31912)
+@@ -14,7 +14,6 @@
+ #include &lt;Volume.h&gt;
+ 
+ class BList;
+-class BLocker;
+ class BMenu;
+ class InstallerWindow;
+ 
+@@ -32,8 +31,8 @@
+ 									{ fSpaceRequired = bytes; };
+ 
+ 			bool				Cancel();
+-			void				SetLock(BLocker* lock)
+-									{ fCancelLock = lock; }
++			void				SetLock(sem_id cancelSemaphore)
++									{ fCancelSemaphore = cancelSemaphore; }
+ 
+ 			void				StartInstall();
+ 			void				WriteBootSector(BMenu* dstMenu);
+@@ -50,7 +49,7 @@
+ 			BDiskDeviceRoster	fDDRoster;
+ 			BList*				fPackages;
+ 			off_t				fSpaceRequired;
+-			BLocker*			fCancelLock;
++			sem_id				fCancelSemaphore;
+ };
+ 
+ #endif // WORKER_THREAD_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018451.html">[Haiku-commits] r31911 - haiku/trunk/src/bin/coreutils/src
+</A></li>
+	<LI>Next message: <A HREF="018453.html">[Haiku-commits] r31913 -	haiku/trunk/src/add-ons/kernel/file_systems/fat
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18452">[ date ]</a>
+              <a href="thread.html#18452">[ thread ]</a>
+              <a href="subject.html#18452">[ subject ]</a>
+              <a href="author.html#18452">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

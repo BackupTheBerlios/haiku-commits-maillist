@@ -1,0 +1,1085 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30142 - haiku/trunk/src/kits/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30142%20-%20haiku/trunk/src/kits/debug&In-Reply-To=%3C200904122357.n3CNvcAf015302%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015788.html">
+   <LINK REL="Next"  HREF="015790.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30142 - haiku/trunk/src/kits/debug</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30142%20-%20haiku/trunk/src/kits/debug&In-Reply-To=%3C200904122357.n3CNvcAf015302%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30142 - haiku/trunk/src/kits/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Apr 13 01:57:38 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015788.html">[Haiku-commits] r30141 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+        <LI>Next message: <A HREF="015790.html">[Haiku-commits] r30143 -	haiku/trunk/src/add-ons/media/plugins/ape_reader
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15789">[ date ]</a>
+              <a href="thread.html#15789">[ thread ]</a>
+              <a href="subject.html#15789">[ subject ]</a>
+              <a href="author.html#15789">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-04-13 01:57:35 +0200 (Mon, 13 Apr 2009)
+New Revision: 30142
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30142&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30142&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/kits/debug/Image.cpp
+   haiku/trunk/src/kits/debug/Image.h
+Modified:
+   haiku/trunk/src/kits/debug/Jamfile
+   haiku/trunk/src/kits/debug/SymbolLookup.cpp
+   haiku/trunk/src/kits/debug/SymbolLookup.h
+   haiku/trunk/src/kits/debug/debug_support.cpp
+Log:
+* Some refactoring: There are three ways to access the symbols of an image.
+  Formerly two were implemented in ImageFile (from file, via syscalls) and one
+  in SymbolLookup (via the debugger interface). Now there's a base class Image
+  and respective derived classes implementing those methods.
+* Simplified SymbolIterator.
+* Moved the classes into sub-namespace BPrivate::Debug.
+
+
+Added: haiku/trunk/src/kits/debug/Image.cpp
+===================================================================
+--- haiku/trunk/src/kits/debug/Image.cpp	2009-04-12 22:48:39 UTC (rev 30141)
++++ haiku/trunk/src/kits/debug/Image.cpp	2009-04-12 23:57:35 UTC (rev 30142)
+@@ -0,0 +1,333 @@
++/*
++ * Copyright 2005-2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++
++#include &quot;Image.h&quot;
++
++#include &lt;errno.h&gt;
++#include &lt;fcntl.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/mman.h&gt;
++#include &lt;unistd.h&gt;
++
++#include &lt;new&gt;
++
++#include &lt;runtime_loader.h&gt;
++#include &lt;syscalls.h&gt;
++
++
++using namespace BPrivate::Debug;
++
++
++// #pragma mark - Image
++
++
++Image::Image()
++{
++}
++
++
++Image::~Image()
++{
++}
++
++
++// #pragma mark - SymbolTableBasedImage
++
++
++SymbolTableBasedImage::SymbolTableBasedImage()
++	:
++	fInfo(),
++	fLoadDelta(0),
++	fSymbolTable(NULL),
++	fStringTable(NULL),
++	fSymbolCount(0),
++	fStringTableSize(0)
++{
++}
++
++
++SymbolTableBasedImage::~SymbolTableBasedImage()
++{
++}
++
++
++image_id
++SymbolTableBasedImage::ID() const
++{
++	return fInfo.id;
++}
++
++
++const char*
++SymbolTableBasedImage::Name() const
++{
++	return fInfo.name;
++}
++
++
++addr_t
++SymbolTableBasedImage::TextAddress() const
++{
++	return (addr_t)fInfo.text;
++}
++
++
++size_t
++SymbolTableBasedImage::TextSize() const
++{
++	return fInfo.text_size;
++}
++
++
++const Elf32_Sym*
++SymbolTableBasedImage::LookupSymbol(addr_t address, addr_t* _baseAddress,
++	const char** _symbolName, size_t *_symbolNameLen, bool *_exactMatch) const
++{
++	const Elf32_Sym* symbolFound = NULL;
++	const char* symbolName = NULL;
++	bool exactMatch = false;
++	addr_t deltaFound = ~(addr_t)0;
++
++	for (int32 i = 0; i &lt; fSymbolCount; i++) {
++		const Elf32_Sym* symbol = &amp;fSymbolTable[i];
++
++		if (symbol-&gt;st_value == 0
++			|| symbol-&gt;st_size &gt;= (size_t)fInfo.text_size + fInfo.data_size) {
++			continue;
++		}
++
++		addr_t symbolAddress = symbol-&gt;st_value + fLoadDelta;
++		if (symbolAddress &gt; address)
++			continue;
++
++		addr_t symbolDelta = address - symbolAddress;
++		if (symbolDelta &gt;= 0 &amp;&amp; symbolDelta &lt; symbol-&gt;st_size)
++			exactMatch = true;
++
++		if (exactMatch || symbolDelta &lt; deltaFound) {
++			deltaFound = symbolDelta;
++			symbolFound = symbol;
++			symbolName = fStringTable + symbol-&gt;st_name;
++
++			if (exactMatch)
++				break;
++		}
++	}
++
++	if (symbolFound != NULL) {
++		if (_baseAddress != NULL)
++			*_baseAddress = symbolFound-&gt;st_value + fLoadDelta;
++		if (_symbolName != NULL)
++			*_symbolName = symbolName;
++		if (_exactMatch != NULL)
++			*_exactMatch = exactMatch;
++		if (_symbolNameLen != NULL)
++			*_symbolNameLen = _SymbolNameLen(symbolName);
++	}
++
++	return symbolFound;
++}
++
++
++status_t
++SymbolTableBasedImage::NextSymbol(int32&amp; iterator, const char** _symbolName,
++	size_t* _symbolNameLen, addr_t* _symbolAddress, size_t* _symbolSize,
++	int32* _symbolType) const
++{
++	while (true) {
++		if (++iterator &gt;= fSymbolCount)
++			return B_ENTRY_NOT_FOUND;
++
++		const Elf32_Sym* symbol = &amp;fSymbolTable[iterator];
++
++		if ((ELF32_ST_TYPE(symbol-&gt;st_info) != STT_FUNC
++				&amp;&amp; ELF32_ST_TYPE(symbol-&gt;st_info) != STT_OBJECT)
++			|| symbol-&gt;st_value == 0) {
++			continue;
++		}
++
++		*_symbolName = fStringTable + symbol-&gt;st_name;
++		*_symbolNameLen = _SymbolNameLen(*_symbolName);
++		*_symbolAddress = symbol-&gt;st_value + fLoadDelta;
++		*_symbolSize = symbol-&gt;st_size;
++		*_symbolType = ELF32_ST_TYPE(symbol-&gt;st_info) == STT_FUNC
++			? B_SYMBOL_TYPE_TEXT : B_SYMBOL_TYPE_DATA;
++
++		return B_OK;
++	}
++}
++
++
++size_t
++SymbolTableBasedImage::_SymbolNameLen(const char* symbolName) const
++{
++	if (symbolName == NULL || (addr_t)symbolName &lt; (addr_t)fStringTable
++		|| (addr_t)symbolName &gt;= (addr_t)fStringTable + fStringTableSize) {
++		return 0;
++	}
++
++	return strnlen(symbolName,
++		(addr_t)fStringTable + fStringTableSize - (addr_t)symbolName);
++}
++
++
++// #pragma mark - ImageFile
++
++
++ImageFile::ImageFile()
++	:
++	fFD(-1),
++	fFileSize(0),
++	fMappedFile((uint8*)MAP_FAILED)
++{
++}
++
++
++ImageFile::~ImageFile()
++{
++	if (fMappedFile != MAP_FAILED)
++		munmap(fMappedFile, fFileSize);
++
++	if (fFD &gt;= 0)
++		close(fFD);
++}
++
++
++status_t
++ImageFile::Init(const image_info&amp; info)
++{
++	fInfo = info;
++
++	// open and stat() the file
++	fFD = open(fInfo.name, O_RDONLY);
++	if (fFD &lt; 0)
++		return errno;
++
++	struct stat st;
++	if (fstat(fFD, &amp;st) &lt; 0)
++		return errno;
++
++	fFileSize = st.st_size;
++	if (fFileSize &lt; sizeof(Elf32_Ehdr))
++		return B_NOT_AN_EXECUTABLE;
++
++	// map it
++	fMappedFile = (uint8*)mmap(NULL, fFileSize, PROT_READ, MAP_PRIVATE, fFD, 0);
++	if (fMappedFile == MAP_FAILED)
++		return errno;
++
++	// examine the elf header
++	Elf32_Ehdr* elfHeader = (Elf32_Ehdr*)fMappedFile;
++	if (memcmp(elfHeader-&gt;e_ident, ELF_MAGIC, 4) != 0)
++		return B_NOT_AN_EXECUTABLE;
++
++	if (elfHeader-&gt;e_ident[4] != ELFCLASS32)
++		return B_NOT_AN_EXECUTABLE;
++
++	// verify the location of the program headers
++	int32 programHeaderCount = elfHeader-&gt;e_phnum;
++	if (elfHeader-&gt;e_phoff &lt; sizeof(Elf32_Ehdr)
++		|| elfHeader-&gt;e_phentsize &lt; sizeof(Elf32_Phdr)
++		|| elfHeader-&gt;e_phoff + programHeaderCount * elfHeader-&gt;e_phentsize
++			&gt; fFileSize) {
++		return B_NOT_AN_EXECUTABLE;
++	}
++
++	Elf32_Phdr* programHeaders
++		= (Elf32_Phdr*)(fMappedFile + elfHeader-&gt;e_phoff);
++
++	// verify the location of the section headers
++	int32 sectionCount = elfHeader-&gt;e_shnum;
++	if (elfHeader-&gt;e_shoff &lt; sizeof(Elf32_Ehdr)
++		|| elfHeader-&gt;e_shentsize &lt; sizeof(Elf32_Shdr)
++		|| elfHeader-&gt;e_shoff + sectionCount * elfHeader-&gt;e_shentsize
++			&gt; fFileSize) {
++		return B_NOT_AN_EXECUTABLE;
++	}
++
++	Elf32_Shdr* sectionHeaders
++		= (Elf32_Shdr*)(fMappedFile + elfHeader-&gt;e_shoff);
++
++	// find the first segment -- we need its relative offset
++	for (int32 i = 0; i &lt; programHeaderCount; i++) {
++		Elf32_Phdr* header = (Elf32_Phdr*)
++			((uint8*)programHeaders + i * elfHeader-&gt;e_phentsize);
++		if (header-&gt;p_type == PT_LOAD) {
++			fLoadDelta = (addr_t)fInfo.text - header-&gt;p_vaddr;
++			break;
++		}
++	}
++
++	// find the symbol table
++	for (int32 i = 0; i &lt; elfHeader-&gt;e_shnum; i++) {
++		Elf32_Shdr* sectionHeader = (Elf32_Shdr*)
++			((uint8*)sectionHeaders + i * elfHeader-&gt;e_shentsize);
++
++		if (sectionHeader-&gt;sh_type == SHT_SYMTAB) {
++			Elf32_Shdr&amp; stringHeader = *(Elf32_Shdr*)
++				((uint8*)sectionHeaders
++					+ sectionHeader-&gt;sh_link * elfHeader-&gt;e_shentsize);
++
++			if (stringHeader.sh_type != SHT_STRTAB)
++				return B_BAD_DATA;
++
++			if (sectionHeader-&gt;sh_offset + sectionHeader-&gt;sh_size &gt; fFileSize
++				|| stringHeader.sh_offset + stringHeader.sh_size &gt; fFileSize) {
++				return B_BAD_DATA;
++			}
++
++			fSymbolTable = (Elf32_Sym*)(fMappedFile + sectionHeader-&gt;sh_offset);
++			fStringTable = (char*)(fMappedFile + stringHeader.sh_offset);
++			fSymbolCount = sectionHeader-&gt;sh_size / sizeof(Elf32_Sym);
++			fStringTableSize = stringHeader.sh_size;
++
++			return B_OK;
++		}
++	}
++
++	return B_BAD_DATA;
++}
++
++
++// #pragma mark - KernelImage
++
++
++KernelImage::KernelImage()
++{
++}
++
++
++KernelImage::~KernelImage()
++{
++	delete[] fSymbolTable;
++	delete[] fStringTable;
++}
++
++
++status_t
++KernelImage::Init(const image_info&amp; info)
++{
++	fInfo = info;
++
++	// get the table sizes
++	fSymbolCount = 0;
++	fStringTableSize = 0;
++	status_t error = _kern_read_kernel_image_symbols(fInfo.id,
++		NULL, &amp;fSymbolCount, NULL, &amp;fStringTableSize, NULL);
++	if (error != B_OK)
++		return error;
++
++	// allocate the tables
++	fSymbolTable = new(std::nothrow) Elf32_Sym[fSymbolCount];
++	fStringTable = new(std::nothrow) char[fStringTableSize];
++	if (fSymbolTable == NULL || fStringTable == NULL)
++		return B_NO_MEMORY;
++
++	// get the info
++	return _kern_read_kernel_image_symbols(fInfo.id,
++		fSymbolTable, &amp;fSymbolCount, fStringTable, &amp;fStringTableSize,
++		&amp;fLoadDelta);
++}
+
+Added: haiku/trunk/src/kits/debug/Image.h
+===================================================================
+--- haiku/trunk/src/kits/debug/Image.h	2009-04-12 22:48:39 UTC (rev 30141)
++++ haiku/trunk/src/kits/debug/Image.h	2009-04-12 23:57:35 UTC (rev 30142)
+@@ -0,0 +1,112 @@
++/*
++ * Copyright 2005-2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++
++#ifndef IMAGE_H
++#define IMAGE_H
++
++#include &lt;stdio.h&gt;
++
++#include &lt;image.h&gt;
++#include &lt;OS.h&gt;
++
++#include &lt;util/DoublyLinkedList.h&gt;
++
++
++struct image_t;
++struct runtime_loader_debug_area;
++struct Elf32_Sym;
++
++
++namespace BPrivate {
++namespace Debug {
++
++
++class Image : public DoublyLinkedListLinkImpl&lt;Image&gt; {
++public:
++								Image();
++	virtual						~Image();
++
++	virtual	image_id			ID() const = 0;
++	virtual	const char*			Name() const = 0;
++	virtual	addr_t				TextAddress() const = 0;
++	virtual	size_t				TextSize() const = 0;
++
++	virtual	const Elf32_Sym*	LookupSymbol(addr_t address,
++									addr_t* _baseAddress,
++									const char** _symbolName,
++									size_t *_symbolNameLen,
++									bool *_exactMatch) const = 0;
++	virtual	status_t			NextSymbol(int32&amp; iterator,
++									const char** _symbolName,
++									size_t* _symbolNameLen,
++									addr_t* _symbolAddress, size_t* _symbolSize,
++									int32* _symbolType) const = 0;
++};
++
++
++class SymbolTableBasedImage : public Image {
++public:
++								SymbolTableBasedImage();
++	virtual						~SymbolTableBasedImage();
++
++	virtual	image_id			ID() const ;
++	virtual	const char*			Name() const;
++	virtual	addr_t				TextAddress() const;
++	virtual	size_t				TextSize() const;
++
++	virtual	const Elf32_Sym*	LookupSymbol(addr_t address,
++									addr_t* _baseAddress,
++									const char** _symbolName,
++									size_t *_symbolNameLen,
++									bool *_exactMatch) const;
++	virtual	status_t			NextSymbol(int32&amp; iterator,
++									const char** _symbolName,
++									size_t* _symbolNameLen,
++									addr_t* _symbolAddress, size_t* _symbolSize,
++									int32* _symbolType) const;
++
++protected:
++			size_t				_SymbolNameLen(const char* symbolName) const;
++
++protected:
++			image_info			fInfo;
++			addr_t				fLoadDelta;
++			Elf32_Sym*			fSymbolTable;
++			char*				fStringTable;
++			int32				fSymbolCount;
++			size_t				fStringTableSize;
++};
++
++
++class ImageFile : public SymbolTableBasedImage {
++public:
++								ImageFile();
++	virtual						~ImageFile();
++
++			status_t			Init(const image_info&amp; info);
++
++private:
++			int					fFD;
++			off_t				fFileSize;
++			uint8*				fMappedFile;
++};
++
++
++class KernelImage : public SymbolTableBasedImage {
++public:
++								KernelImage();
++	virtual						~KernelImage();
++
++			status_t			Init(const image_info&amp; info);
++};
++
++}	// namespace Debug
++}	// namespace BPrivate
++
++
++using BPrivate::Debug::ImageFile;
++
++
++#endif	// IMAGE_H
+
+Modified: haiku/trunk/src/kits/debug/Jamfile
+===================================================================
+--- haiku/trunk/src/kits/debug/Jamfile	2009-04-12 22:48:39 UTC (rev 30141)
++++ haiku/trunk/src/kits/debug/Jamfile	2009-04-12 23:57:35 UTC (rev 30142)
+@@ -12,6 +12,7 @@
+ 
+ SharedLibrary libdebug.so :
+ 	debug_support.cpp
++	Image.cpp
+ 	SymbolLookup.cpp
+ 
+ 	# architecture specific
+
+Modified: haiku/trunk/src/kits/debug/SymbolLookup.cpp
+===================================================================
+--- haiku/trunk/src/kits/debug/SymbolLookup.cpp	2009-04-12 22:48:39 UTC (rev 30141)
++++ haiku/trunk/src/kits/debug/SymbolLookup.cpp	2009-04-12 23:57:35 UTC (rev 30142)
+@@ -1,15 +1,12 @@
+ /*
+- * Copyright 2005-2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Copyright 2005-2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
+  * Distributed under the terms of the MIT License.
+  */
+ 
+ #include &quot;SymbolLookup.h&quot;
+ 
+-#include &lt;errno.h&gt;
+-#include &lt;fcntl.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+-#include &lt;sys/mman.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+ #include &lt;new&gt;
+@@ -17,7 +14,9 @@
+ #include &lt;runtime_loader.h&gt;
+ #include &lt;syscalls.h&gt;
+ 
++#include &quot;Image.h&quot;
+ 
++
+ #undef TRACE
+ //#define TRACE_DEBUG_SYMBOL_LOOKUP
+ #ifdef TRACE_DEBUG_SYMBOL_LOOKUP
+@@ -27,8 +26,7 @@
+ #endif
+ 
+ 
+-using std::nothrow;
+-using namespace BPrivate;
++using namespace BPrivate::Debug;
+ 
+ 
+ // PrepareAddress
+@@ -94,7 +92,7 @@
+ 		TRACE((&quot;area %ld: address: %p, size: %ld, name: %s\n&quot;, areaInfo.area,
+ 			areaInfo.address, areaInfo.size, areaInfo.name));
+ 
+-		Area *area = new(nothrow) Area(areaInfo.area, areaInfo.address,
++		Area *area = new(std::nothrow) Area(areaInfo.area, areaInfo.address,
+ 			areaInfo.size);
+ 		if (!area)
+ 			return B_NO_MEMORY;
+@@ -192,245 +190,36 @@
+ // #pragma mark -
+ 
+ 
+-ImageFile::ImageFile(const image_info&amp; info)
+-	:
+-	fInfo(info),
+-	fFD(-1),
+-	fFileSize(0),
+-	fMappedFile((uint8*)MAP_FAILED),
+-	fLoadDelta(0),
+-	fSymbolTable(NULL),
+-	fStringTable(NULL),
+-	fSymbolCount(0),
+-	fStringTableSize(0)
+-{
+-}
++class SymbolLookup::LoadedImage : public Image {
++public:
++								LoadedImage(SymbolLookup* symbolLookup,
++									const image_t* image, int32 symbolCount);
++	virtual						~LoadedImage();
+ 
++	virtual	image_id			ID() const;
++	virtual	const char*			Name() const;
++	virtual	addr_t				TextAddress() const;
++	virtual	size_t				TextSize() const;
+ 
+-ImageFile::~ImageFile()
+-{
+-	if (fMappedFile != MAP_FAILED) {
+-		munmap(fMappedFile, fFileSize);
+-	} else {
+-		delete[] fSymbolTable;
+-		delete[] fStringTable;
+-	}
++	virtual	const Elf32_Sym*	LookupSymbol(addr_t address,
++									addr_t* _baseAddress,
++									const char** _symbolName,
++									size_t *_symbolNameLen,
++									bool *_exactMatch) const;
++	virtual	status_t			NextSymbol(int32&amp; iterator,
++									const char** _symbolName,
++									size_t* _symbolNameLen,
++									addr_t* _symbolAddress, size_t* _symbolSize,
++									int32* _symbolType) const;
+ 
+-	if (fFD &gt;= 0)
+-		close(fFD);
+-}
++private:
++			SymbolLookup*			fSymbolLookup;
++			const image_t*			fImage;
++			int32					fSymbolCount;
++			size_t					fTextDelta;
++};
+ 
+ 
+-status_t
+-ImageFile::Load()
+-{
+-	// open and stat() the file
+-	fFD = open(fInfo.name, O_RDONLY);
+-	if (fFD &lt; 0)
+-		return errno;
+-
+-	struct stat st;
+-	if (fstat(fFD, &amp;st) &lt; 0)
+-		return errno;
+-
+-	fFileSize = st.st_size;
+-	if (fFileSize &lt; sizeof(Elf32_Ehdr))
+-		return B_NOT_AN_EXECUTABLE;
+-
+-	// map it
+-	fMappedFile = (uint8*)mmap(NULL, fFileSize, PROT_READ, MAP_PRIVATE, fFD, 0);
+-	if (fMappedFile == MAP_FAILED)
+-		return errno;
+-
+-	// examine the elf header
+-	Elf32_Ehdr* elfHeader = (Elf32_Ehdr*)fMappedFile;
+-	if (memcmp(elfHeader-&gt;e_ident, ELF_MAGIC, 4) != 0)
+-		return B_NOT_AN_EXECUTABLE;
+-
+-	if (elfHeader-&gt;e_ident[4] != ELFCLASS32)
+-		return B_NOT_AN_EXECUTABLE;
+-
+-	// verify the location of the program headers
+-	int32 programHeaderCount = elfHeader-&gt;e_phnum;
+-	if (elfHeader-&gt;e_phoff &lt; sizeof(Elf32_Ehdr)
+-		|| elfHeader-&gt;e_phentsize &lt; sizeof(Elf32_Phdr)
+-		|| elfHeader-&gt;e_phoff + programHeaderCount * elfHeader-&gt;e_phentsize
+-			&gt; fFileSize) {
+-		return B_NOT_AN_EXECUTABLE;
+-	}
+-
+-	Elf32_Phdr* programHeaders
+-		= (Elf32_Phdr*)(fMappedFile + elfHeader-&gt;e_phoff);
+-
+-	// verify the location of the section headers
+-	int32 sectionCount = elfHeader-&gt;e_shnum;
+-	if (elfHeader-&gt;e_shoff &lt; sizeof(Elf32_Ehdr)
+-		|| elfHeader-&gt;e_shentsize &lt; sizeof(Elf32_Shdr)
+-		|| elfHeader-&gt;e_shoff + sectionCount * elfHeader-&gt;e_shentsize
+-			&gt; fFileSize) {
+-		return B_NOT_AN_EXECUTABLE;
+-	}
+-
+-	Elf32_Shdr* sectionHeaders
+-		= (Elf32_Shdr*)(fMappedFile + elfHeader-&gt;e_shoff);
+-
+-	// find the first segment -- we need its relative offset
+-	for (int32 i = 0; i &lt; programHeaderCount; i++) {
+-		Elf32_Phdr* header = (Elf32_Phdr*)
+-			((uint8*)programHeaders + i * elfHeader-&gt;e_phentsize);
+-		if (header-&gt;p_type == PT_LOAD) {
+-			fLoadDelta = (addr_t)fInfo.text - header-&gt;p_vaddr;
+-			break;
+-		}
+-	}
+-
+-	// find the symbol table
+-	for (int32 i = 0; i &lt; elfHeader-&gt;e_shnum; i++) {
+-		Elf32_Shdr* sectionHeader = (Elf32_Shdr*)
+-			((uint8*)sectionHeaders + i * elfHeader-&gt;e_shentsize);
+-
+-		if (sectionHeader-&gt;sh_type == SHT_SYMTAB) {
+-			Elf32_Shdr&amp; stringHeader = *(Elf32_Shdr*)
+-				((uint8*)sectionHeaders
+-					+ sectionHeader-&gt;sh_link * elfHeader-&gt;e_shentsize);
+-
+-			if (stringHeader.sh_type != SHT_STRTAB)
+-				return B_BAD_DATA;
+-
+-			if (sectionHeader-&gt;sh_offset + sectionHeader-&gt;sh_size &gt; fFileSize
+-				|| stringHeader.sh_offset + stringHeader.sh_size &gt; fFileSize) {
+-				return B_BAD_DATA;
+-			}
+-
+-			fSymbolTable = (Elf32_Sym*)(fMappedFile + sectionHeader-&gt;sh_offset);
+-			fStringTable = (char*)(fMappedFile + stringHeader.sh_offset);
+-			fSymbolCount = sectionHeader-&gt;sh_size / sizeof(Elf32_Sym);
+-			fStringTableSize = stringHeader.sh_size;
+-
+-			return B_OK;
+-		}
+-	}
+-
+-	return B_BAD_DATA;
+-}
+-
+-
+-status_t
+-ImageFile::LoadKernel()
+-{
+-	// get the table sizes
+-	fSymbolCount = 0;
+-	fStringTableSize = 0;
+-	status_t error = _kern_read_kernel_image_symbols(fInfo.id,
+-		NULL, &amp;fSymbolCount, NULL, &amp;fStringTableSize, NULL);
+-	if (error != B_OK)
+-		return error;
+-
+-	// allocate the tables
+-	fSymbolTable = new(std::nothrow) Elf32_Sym[fSymbolCount];
+-	fStringTable = new(std::nothrow) char[fStringTableSize];
+-	if (fSymbolTable == NULL || fStringTable == NULL)
+-		return B_NO_MEMORY;
+-
+-	// get the info
+-	return _kern_read_kernel_image_symbols(fInfo.id,
+-		fSymbolTable, &amp;fSymbolCount, fStringTable, &amp;fStringTableSize,
+-		&amp;fLoadDelta);
+-}
+-
+-
+-const Elf32_Sym*
+-ImageFile::LookupSymbol(addr_t address, addr_t* _baseAddress,
+-	const char** _symbolName, size_t *_symbolNameLen, bool *_exactMatch) const
+-{
+-	const Elf32_Sym* symbolFound = NULL;
+-	const char* symbolName = NULL;
+-	bool exactMatch = false;
+-	addr_t deltaFound = ~(addr_t)0;
+-
+-	for (int32 i = 0; i &lt; fSymbolCount; i++) {
+-		const Elf32_Sym* symbol = &amp;fSymbolTable[i];
+-
+-		if (symbol-&gt;st_value == 0
+-			|| symbol-&gt;st_size &gt;= (size_t)fInfo.text_size + fInfo.data_size) {
+-			continue;
+-		}
+-
+-		addr_t symbolAddress = symbol-&gt;st_value + fLoadDelta;
+-		if (symbolAddress &gt; address)
+-			continue;
+-
+-		addr_t symbolDelta = address - symbolAddress;
+-		if (symbolDelta &gt;= 0 &amp;&amp; symbolDelta &lt; symbol-&gt;st_size)
+-			exactMatch = true;
+-
+-		if (exactMatch || symbolDelta &lt; deltaFound) {
+-			deltaFound = symbolDelta;
+-			symbolFound = symbol;
+-			symbolName = fStringTable + symbol-&gt;st_name;
+-
+-			if (exactMatch)
+-				break;
+-		}
+-	}
+-
+-	if (symbolFound != NULL) {
+-		if (_baseAddress != NULL)
+-			*_baseAddress = symbolFound-&gt;st_value + fLoadDelta;
+-		if (_symbolName != NULL)
+-			*_symbolName = symbolName;
+-		if (_exactMatch != NULL)
+-			*_exactMatch = exactMatch;
+-		if (_symbolNameLen != NULL)
+-			*_symbolNameLen = _SymbolNameLen(symbolName);
+-	}
+-
+-	return symbolFound;
+-}
+-
+-
+-status_t
+-ImageFile::NextSymbol(int32&amp; iterator, const char** _symbolName,
+-	size_t* _symbolNameLen, addr_t* _symbolAddress, size_t* _symbolSize,
+-	int32* _symbolType) const
+-{
+-	while (true) {
+-		if (++iterator &gt;= fSymbolCount)
+-			return B_ENTRY_NOT_FOUND;
+-
+-		const Elf32_Sym* symbol = &amp;fSymbolTable[iterator];
+-
+-		if ((ELF32_ST_TYPE(symbol-&gt;st_info) != STT_FUNC
+-				&amp;&amp; ELF32_ST_TYPE(symbol-&gt;st_info) != STT_OBJECT)
+-			|| symbol-&gt;st_value == 0) {
+-			continue;
+-		}
+-
+-		*_symbolName = fStringTable + symbol-&gt;st_name;
+-		*_symbolNameLen = _SymbolNameLen(*_symbolName);
+-		*_symbolAddress = symbol-&gt;st_value + fLoadDelta;
+-		*_symbolSize = symbol-&gt;st_size;
+-		*_symbolType = ELF32_ST_TYPE(symbol-&gt;st_info) == STT_FUNC
+-			? B_SYMBOL_TYPE_TEXT : B_SYMBOL_TYPE_DATA;
+-
+-		return B_OK;
+-	}
+-}
+-
+-
+-size_t
+-ImageFile::_SymbolNameLen(const char* symbolName) const
+-{
+-	if (symbolName == NULL || (addr_t)symbolName &lt; (addr_t)fStringTable
+-		|| (addr_t)symbolName &gt;= (addr_t)fStringTable + fStringTableSize) {
+-		return 0;
+-	}
+-
+-	return strnlen(symbolName,
+-		(addr_t)fStringTable + fStringTableSize - (addr_t)symbolName);
+-}
+-
+-
+ // #pragma mark -
+ 
+ 
+@@ -439,7 +228,7 @@
+ 	:
+ 	RemoteMemoryAccessor(team),
+ 	fDebugArea(NULL),
+-	fImageFiles()
++	fImages()
+ {
+ }
+ 
+@@ -447,8 +236,8 @@
+ // destructor
+ SymbolLookup::~SymbolLookup()
+ {
+-	while (ImageFile* imageFile = fImageFiles.RemoveHead())
+-		delete imageFile;
++	while (Image* image = fImages.RemoveHead())
++		delete image;
+ }
+ 
+ 
+@@ -500,18 +289,41 @@
+ 	image_info imageInfo;
+ 	int32 cookie = 0;
+ 	while (get_next_image_info(fTeam, &amp;cookie, &amp;imageInfo) == B_OK) {
+-		ImageFile* imageFile = new(std::nothrow) ImageFile(imageInfo);
+-		if (imageFile == NULL)
+-			break;
++		Image* image;
+ 
+-		error = fTeam == B_SYSTEM_TEAM
+-			? imageFile-&gt;LoadKernel() : imageFile-&gt;Load();
++		if (fTeam == B_SYSTEM_TEAM) {
++			// kernel image
++			KernelImage* kernelImage = new(std::nothrow) KernelImage;
++			if (kernelImage == NULL)
++				return B_NO_MEMORY;
++
++			error = kernelImage-&gt;Init(imageInfo);
++			image = kernelImage;
++		} else {
++			// userland image -- try to load an image file
++			ImageFile* imageFile = new(std::nothrow) ImageFile;
++			if (imageFile == NULL)
++				return B_NO_MEMORY;
++
++			error = imageFile-&gt;Init(imageInfo);
++			image = imageFile;
++		}
++
+ 		if (error != B_OK) {
+-			delete imageFile;
+-			continue;
++			// initialization error -- fall back to the loaded image
++			delete image;
++
++			const image_t* loadedImage = _FindLoadedImageByID(imageInfo.id);
++			if (loadedImage == NULL)
++				continue;
++
++			image = new(std::nothrow) LoadedImage(this, loadedImage,
++				Read(loadedImage-&gt;symhash[1]));
++			if (image == NULL)
++				return B_NO_MEMORY;
+ 		}
+ 
+-		fImageFiles.Add(imageFile);
++		fImages.Add(image);
+ 	}
+ 
+ 	return B_OK;
+@@ -526,98 +338,38 @@
+ {
+ 	TRACE((&quot;SymbolLookup::LookupSymbolAddress(%p)\n&quot;, (void*)address));
+ 
+-	// Try the loaded image file first -- it also contains static symbols.
+-	ImageFile* imageFile = _FindImageFileAtAddress(address);
+-	if (imageFile != NULL) {
+-		if (_imageName != NULL)
+-			*_imageName = imageFile-&gt;Info().name;
+-		const Elf32_Sym* symbol = imageFile-&gt;LookupSymbol(address, _baseAddress,
+-			_symbolName, _symbolNameLen, _exactMatch);
+-		if (symbol != NULL)
+-			return B_OK;
+-	}
+-
+-	// get the image for the address
+-	const image_t *image = _FindImageAtAddress(address);
++	Image* image = _FindImageAtAddress(address);
+ 	if (!image)
+ 		return B_ENTRY_NOT_FOUND;
+ 
+-	TRACE((&quot;SymbolLookup::LookupSymbolAddress(): found image: ID: %ld, text: &quot;
+-		&quot;address: %p, size: %ld\n&quot;,
+-		image-&gt;id, (void*)image-&gt;regions[0].vmstart, image-&gt;regions[0].size));
++	if (_imageName != NULL)
++		*_imageName = image-&gt;Name();
+ 
+-	// search the image for the symbol
+-	const struct Elf32_Sym *symbolFound = NULL;
+-	addr_t deltaFound = INT_MAX;
+-	bool exactMatch = false;
+-	const char *symbolName = NULL;
++	const Elf32_Sym* symbolFound = image-&gt;LookupSymbol(address, _baseAddress,
++		_symbolName, _symbolNameLen, _exactMatch);
+ 
+-	int32 symbolCount = Read(image-&gt;symhash[1]);
+-	const elf_region_t *textRegion = image-&gt;regions;				// local
+-
+-	for (int32 i = 0; i &lt; symbolCount; i++) {
+-		const struct Elf32_Sym *symbol = &amp;Read(image-&gt;syms[i]);
+-
+-		// The symbol table contains not only symbols referring to functions
+-		// and data symbols within the shared object, but also referenced
+-		// symbols of other shared objects, as well as section and file
+-		// references. We ignore everything but function and data symbols
+-		// that have an st_value != 0 (0 seems to be an indication for a
+-		// symbol defined elsewhere -- couldn't verify that in the specs
+-		// though).
+-		if ((ELF32_ST_TYPE(symbol-&gt;st_info) != STT_FUNC
+-				&amp;&amp; ELF32_ST_TYPE(symbol-&gt;st_info) != STT_OBJECT)
+-			|| symbol-&gt;st_value == 0
+-			|| symbol-&gt;st_value + symbol-&gt;st_size + textRegion-&gt;delta
+-				&gt; textRegion-&gt;vmstart + textRegion-&gt;size) {
+-			continue;
+-		}
+-
+-		// skip symbols starting after the given address
+-		addr_t symbolAddress = symbol-&gt;st_value + textRegion-&gt;delta;
+-
+-		if (symbolAddress &gt; address)
+-			continue;
+-		addr_t symbolDelta = address - symbolAddress;
+-
+-		if (!symbolFound || symbolDelta &lt; deltaFound) {
+-			symbolName = (const char*)PrepareAddressNoThrow(SYMNAME(image,
+-				symbol), 1);
+-			if (symbolName == NULL)
+-				continue;
+-
+-			deltaFound = symbolDelta;
+-			symbolFound = symbol;
+-
+-			if (symbolDelta &gt;= 0 &amp;&amp; symbolDelta &lt; symbol-&gt;st_size) {
+-				// exact match
+-				exactMatch = true;
+-				break;
+-			}
+-		}
+-	}
+-
+ 	TRACE((&quot;SymbolLookup::LookupSymbolAddress(): done: symbol: %p, image name: &quot;
+ 		&quot;%s, exact match: %d\n&quot;, symbolFound, image-&gt;name, exactMatch));
+ 
+-	if (_baseAddress) {
+-		if (symbolFound)
+-			*_baseAddress = symbolFound-&gt;st_value + textRegion-&gt;delta;
+-		else
+-			*_baseAddress = textRegion-&gt;vmstart;
+-	}
++	if (symbolFound != NULL)
++		return B_OK;
+ 
++	// symbol not found -- return the image itself
++
++	if (_baseAddress)
++		*_baseAddress = image-&gt;TextAddress();
++
+ 	if (_imageName)
+-		*_imageName = image-&gt;name;
++		*_imageName = image-&gt;Name();
+ 
+ 	if (_symbolName)
+-		*_symbolName = symbolName;	// remote address
++		*_symbolName = NULL;
+ 
+ 	if (_exactMatch)
+-		*_exactMatch = exactMatch;
++		*_exactMatch = false;
+ 
+ 	if (_symbolNameLen != NULL)
+-		*_symbolNameLen = _SymbolNameLen(symbolName);
++		*_symbolNameLen = 0;
+ 
+ 	return B_OK;
+ }
+@@ -630,21 +382,14 @@
+ {
+ 	TRACE((&quot;SymbolLookup::InitSymbolIterator(): image ID: %ld\n&quot;, imageID));
+ 
+-	// find the image file
+-	iterator.imageFile = _FindImageFileByID(imageID);
++	// find the image
++	iterator.image = _FindImageByID(imageID);
+ 
+-	// If that didn't work, find the image.
+-	if (iterator.imageFile == NULL) {
+-		const image_t* image = _FindImageByID(imageID);
+-		if (image == NULL) {
+-			TRACE((&quot;SymbolLookup::InitSymbolIterator() done: image not &quot;
+-				&quot;found\n&quot;));
+-			return B_ENTRY_NOT_FOUND;
+-		}
+-
+-		iterator.image = image;
+-		iterator.symbolCount = Read(image-&gt;symhash[1]);
+-		iterator.textDelta = image-&gt;regions-&gt;delta;
++	// If that didn't work, find the loaded image.
++	if (iterator.image == NULL) {
++		TRACE((&quot;SymbolLookup::InitSymbolIterator() done: image not &quot;
+
+[... truncated: 470 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015788.html">[Haiku-commits] r30141 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+	<LI>Next message: <A HREF="015790.html">[Haiku-commits] r30143 -	haiku/trunk/src/add-ons/media/plugins/ape_reader
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15789">[ date ]</a>
+              <a href="thread.html#15789">[ thread ]</a>
+              <a href="subject.html#15789">[ subject ]</a>
+              <a href="author.html#15789">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

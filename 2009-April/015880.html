@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30199 -	haiku/trunk/src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30199%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200904161111.n3GBBdeI031036%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015881.html">
+   <LINK REL="Next"  HREF="015885.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30199 -	haiku/trunk/src/add-ons/kernel/network/stack</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30199%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200904161111.n3GBBdeI031036%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30199 -	haiku/trunk/src/add-ons/kernel/network/stack">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 16 13:11:39 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015881.html">[Haiku-commits] r30198 - haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+        <LI>Next message: <A HREF="015885.html">[Haiku-commits] r30200 - haiku/trunk/src/bin
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15880">[ date ]</a>
+              <a href="thread.html#15880">[ thread ]</a>
+              <a href="subject.html#15880">[ subject ]</a>
+              <a href="author.html#15880">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-04-16 13:11:37 +0200 (Thu, 16 Apr 2009)
+New Revision: 30199
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30199&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30199&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/stack/stack.cpp
+Log:
+* struct family now uses a DoublyLinkedList instead of a struct list.
+* Added but commented out adding/removing chains to its family: this would allow
+  the stack to unload protocol modules as soon as they are no longer needed.
+  However, it currently does not work yet (double lock, we need a recursive lock
+  here to allow this).
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/stack.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/stack.cpp	2009-04-16 10:54:07 UTC (rev 30198)
++++ haiku/trunk/src/add-ons/kernel/network/stack/stack.cpp	2009-04-16 11:11:37 UTC (rev 30199)
+@@ -41,6 +41,9 @@
+ 
+ #define MAX_CHAIN_MODULES 5
+ 
++struct chain;
++typedef DoublyLinkedList&lt;chain&gt; ChainList;
++
+ struct chain_key {
+ 	int		family;
+ 	int		type;
+@@ -61,10 +64,10 @@
+ 	struct family*	next;
+ 	int				type;
+ 	int32			ref_count;
+-	struct list		chains;
++	ChainList		chains;
+ };
+ 
+-struct chain {
++struct chain : DoublyLinkedListLinkImpl&lt;chain&gt; {
+ 	chain(int family, int type, int protocol);
+ 	~chain();
+ 
+@@ -83,7 +86,6 @@
+ 	static void DeleteChains(hash_table* chains);
+ 
+ 	chain*			next;
+-	struct list_link family_link;
+ 	struct family*	parent;
+ 
+ 	int 			family;
+@@ -113,7 +115,6 @@
+ 	type(_type),
+ 	ref_count(0)
+ {
+-	list_init_etc(&amp;chains, offsetof(struct chain, family_link));
+ }
+ 
+ 
+@@ -131,14 +132,10 @@
+ 		return;
+ 
+ 	TRACE((&quot;family %d unused, uninit chains\n&quot;, type));
+-	MutexLocker locker(&amp;sChainLock);
++	MutexLocker _(sChainLock);
+ 
+-	struct chain* chain = NULL;
+-	while (true) {
+-		chain = (struct chain*)list_get_next_item(&amp;chains, chain);
+-		if (chain == NULL)
+-			break;
+-
++	ChainList::Iterator iterator = chains.GetIterator();
++	while (struct chain* chain = iterator.Next()) {
+ 		chain-&gt;Uninitialize();
+ 	}
+ }
+@@ -208,6 +205,8 @@
+ 	if (parent == NULL)
+ 		parent = ::family::Add(family);
+ 
++	//parent-&gt;chains.Add(this);
++
+ 	for (int32 i = 0; i &lt; MAX_CHAIN_MODULES; i++) {
+ 		modules[i] = NULL;
+ 		infos[i] = NULL;
+@@ -220,6 +219,8 @@
+ 	for (int32 i = 0; i &lt; MAX_CHAIN_MODULES; i++) {
+ 		free((char*)modules[i]);
+ 	}
++
++	//parent-&gt;chains.Remove(this);
+ }
+ 
+ 
+@@ -227,7 +228,7 @@
+ chain::Acquire()
+ {
+ 	if (atomic_add(&amp;ref_count, 1) &gt; 0) {
+-		if (flags &amp; CHAIN_MISSING_MODULE) {
++		if ((flags &amp; CHAIN_MISSING_MODULE) != 0) {
+ 			atomic_add(&amp;ref_count, -1);
+ 			return EAFNOSUPPORT;
+ 		}
+@@ -282,7 +283,7 @@
+ 		return;
+ 
+ 	TRACE((&quot;uninit chain %d.%d.%d\n&quot;, family, type, protocol));
+-	MutexLocker locker(sInitializeChainLock);
++	MutexLocker _(sInitializeChainLock);
+ 
+ 	for (int32 i = 0; modules[i] != NULL; i++) {
+ 		put_module(modules[i]);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015881.html">[Haiku-commits] r30198 - haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+	<LI>Next message: <A HREF="015885.html">[Haiku-commits] r30200 - haiku/trunk/src/bin
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15880">[ date ]</a>
+              <a href="thread.html#15880">[ thread ]</a>
+              <a href="subject.html#15880">[ subject ]</a>
+              <a href="author.html#15880">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

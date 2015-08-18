@@ -1,0 +1,177 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26373 - in haiku/branches/developer/bonefish/vm:	headers/private/kernel src/system/kernel src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26373%20-%20in%20haiku/branches/developer/bonefish/vm%3A%0A%09headers/private/kernel%20src/system/kernel%20src/system/kernel/vm&In-Reply-To=%3C200807101856.m6AIuc0o015066%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010188.html">
+   <LINK REL="Next"  HREF="010190.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26373 - in haiku/branches/developer/bonefish/vm:	headers/private/kernel src/system/kernel src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26373%20-%20in%20haiku/branches/developer/bonefish/vm%3A%0A%09headers/private/kernel%20src/system/kernel%20src/system/kernel/vm&In-Reply-To=%3C200807101856.m6AIuc0o015066%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26373 - in haiku/branches/developer/bonefish/vm:	headers/private/kernel src/system/kernel src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Jul 10 20:56:38 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010188.html">[Haiku-commits] r26372 - in haiku/branches/developer/bonefish/vm:	headers/private/kernel src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="010190.html">[Haiku-commits] r26374 -	haiku/branches/developer/bonefish/vm/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10189">[ date ]</a>
+              <a href="thread.html#10189">[ thread ]</a>
+              <a href="subject.html#10189">[ subject ]</a>
+              <a href="author.html#10189">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-07-10 20:56:35 +0200 (Thu, 10 Jul 2008)
+New Revision: 26373
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26373&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26373&amp;view=rev</A>
+
+Modified:
+   haiku/branches/developer/bonefish/vm/headers/private/kernel/low_resource_manager.h
+   haiku/branches/developer/bonefish/vm/src/system/kernel/low_resource_manager.cpp
+   haiku/branches/developer/bonefish/vm/src/system/kernel/vm/vm_page.cpp
+Log:
+Added &quot;bool wait&quot; parameter to low_resource(). When true the function
+will wait until the low resource manager thread has finished its next
+iteration of calling low resource handlers.
+
+
+Modified: haiku/branches/developer/bonefish/vm/headers/private/kernel/low_resource_manager.h
+===================================================================
+--- haiku/branches/developer/bonefish/vm/headers/private/kernel/low_resource_manager.h	2008-07-10 18:53:49 UTC (rev 26372)
++++ haiku/branches/developer/bonefish/vm/headers/private/kernel/low_resource_manager.h	2008-07-10 18:56:35 UTC (rev 26373)
+@@ -37,7 +37,7 @@
+ status_t low_resource_manager_init(void);
+ status_t low_resource_manager_init_post_thread(void);
+ int32 low_resource_state(uint32 resources);
+-void low_resource(uint32 resource, uint64 requirements);
++void low_resource(uint32 resource, uint64 requirements, bool wait);
+ 
+ // these calls might get public some day
+ status_t register_low_resource_handler(low_resource_func function, void *data,
+
+Modified: haiku/branches/developer/bonefish/vm/src/system/kernel/low_resource_manager.cpp
+===================================================================
+--- haiku/branches/developer/bonefish/vm/src/system/kernel/low_resource_manager.cpp	2008-07-10 18:53:49 UTC (rev 26372)
++++ haiku/branches/developer/bonefish/vm/src/system/kernel/low_resource_manager.cpp	2008-07-10 18:56:35 UTC (rev 26373)
+@@ -14,6 +14,7 @@
+ 
+ #include &lt;KernelExport.h&gt;
+ 
++#include &lt;condition_variable.h&gt;
+ #include &lt;elf.h&gt;
+ #include &lt;lock.h&gt;
+ #include &lt;sem.h&gt;
+@@ -70,7 +71,9 @@
+ static sem_id sLowResourceWaitSem;
+ static HandlerList sLowResourceHandlers;
+ 
++static ConditionVariable sLowResourceWaiterCondition;
+ 
++
+ static int32
+ low_resource_state_no_update(uint32 resources)
+ {
+@@ -202,6 +205,8 @@
+ 			timeout = kWarnResourceInterval;
+ 		else
+ 			timeout = kLowResourceInterval;
++
++		sLowResourceWaiterCondition.NotifyAll();
+ 	}
+ 	return 0;
+ }
+@@ -237,8 +242,12 @@
+ //	#pragma mark - private kernel API
+ 
+ 
++/*!	Notifies the low resource manager that a resource is lacking. If \a wait
++	is \c true, the function will wait until the low resource manager has
++	finished its next iteration of calling low resource handlers.
++*/
+ void
+-low_resource(uint32 resource, uint64 requirements)
++low_resource(uint32 resource, uint64 requirements, bool wait)
+ {
+ 	// TODO: take requirements into account
+ 
+@@ -247,14 +256,15 @@
+ 			vm_schedule_page_scanner(requirements);
+ 			break;
+ 		case B_KERNEL_RESOURCE_MEMORY:
+-// TODO:...
+ 			break;
+ 		case B_KERNEL_RESOURCE_SEMAPHORES:
+-// TODO:...
+ 			break;
+ 	}
+ 
+ 	release_sem(sLowResourceWaitSem);
++
++	if (wait)
++		sLowResourceWaiterCondition.Wait();
+ }
+ 
+ 
+@@ -281,6 +291,8 @@
+ 		// static initializers do not work in the kernel,
+ 		// so we have to do it here, manually
+ 
++	sLowResourceWaiterCondition.Init(NULL, &quot;low resource waiters&quot;);
++
+ 	// compute the free memory limits
+ 	off_t totalMemory = (off_t)vm_page_num_pages() * B_PAGE_SIZE;
+ 	sNoteMemoryLimit = totalMemory / 16;
+
+Modified: haiku/branches/developer/bonefish/vm/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/branches/developer/bonefish/vm/src/system/kernel/vm/vm_page.cpp	2008-07-10 18:53:49 UTC (rev 26372)
++++ haiku/branches/developer/bonefish/vm/src/system/kernel/vm/vm_page.cpp	2008-07-10 18:56:35 UTC (rev 26373)
+@@ -1252,7 +1252,7 @@
+ 		freeConditionEntry.Add(&amp;sFreePageQueue);
+ 		locker.Unlock();
+ 
+-		low_resource(B_KERNEL_RESOURCE_PAGES, count);
++		low_resource(B_KERNEL_RESOURCE_PAGES, count, false);
+ 		//snooze(50000);
+ 			// sleep for 50ms
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010188.html">[Haiku-commits] r26372 - in haiku/branches/developer/bonefish/vm:	headers/private/kernel src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="010190.html">[Haiku-commits] r26374 -	haiku/branches/developer/bonefish/vm/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10189">[ date ]</a>
+              <a href="thread.html#10189">[ thread ]</a>
+              <a href="subject.html#10189">[ subject ]</a>
+              <a href="author.html#10189">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

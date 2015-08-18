@@ -1,0 +1,357 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23532 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23532%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200801151504.m0FF4VVI008965%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005507.html">
+   <LINK REL="Next"  HREF="005509.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23532 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23532%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200801151504.m0FF4VVI008965%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23532 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Jan 15 16:04:31 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005507.html">[Haiku-commits] r23531 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+        <LI>Next message: <A HREF="005509.html">[Haiku-commits] r23533 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5508">[ date ]</a>
+              <a href="thread.html#5508">[ thread ]</a>
+              <a href="subject.html#5508">[ subject ]</a>
+              <a href="author.html#5508">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-01-15 16:04:31 +0100 (Tue, 15 Jan 2008)
+New Revision: 23532
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23532&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23532&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/block_cache.cpp
+Log:
+* Added tracing support for transactions.
+* improved the &quot;block_cache&quot; KDL command: it can now also dump blocks,
+  added support for the &quot;--help&quot; argument.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-01-15 15:02:26 UTC (rev 23531)
++++ haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-01-15 15:04:31 UTC (rev 23532)
+@@ -48,43 +48,137 @@
+ // system, like out of memory situations - should only panic for debugging.
+ #define FATAL(x) panic x
+ 
++
++struct cache_hook : DoublyLinkedListLinkImpl&lt;cache_hook&gt; {
++	transaction_notification_hook	hook;
++	void							*data;
++};
++
++typedef DoublyLinkedList&lt;cache_hook&gt; HookList; 
++
++struct cache_transaction {
++	cache_transaction();
++
++	cache_transaction *next;
++	int32			id;
++	int32			num_blocks;
++	int32			sub_num_blocks;
++	cached_block	*first_block;
++	block_list		blocks;
++	transaction_notification_hook notification_hook;
++	void			*notification_data;
++	HookList		listeners;
++	bool			open;
++	bool			has_sub_transaction;
++};
++
+ #ifdef TRANSACTION_TRACING
+ namespace TransactionTracing {
+ 
+ class Start : public AbstractTraceEntry {
+ 	public:
+-		Start(cache_transaction *transaction)
++		Start(block_cache *cache, cache_transaction *transaction)
+ 			:
+-			fTransaction(transaction)
++			fCache(cache),
++			fTransaction(transaction),
++			fID(transaction-&gt;id),
++			fSub(transaction-&gt;has_sub_transaction),
++			fNumBlocks(transaction-&gt;num_blocks),
++			fSubNumBlocks(transaction-&gt;sub_num_blocks)
+ 		{
+ 			Initialized();
+ 		}
+ 
+ 		virtual void AddDump(char *buffer, size_t size)
+ 		{
++			snprintf(buffer, size, &quot;cache %p, start transaction %p (id %ld)%s&quot;
++				&quot;, %ld/%ld blocks&quot;, fCache, fTransaction, fID,
++				fSub ? &quot; sub&quot; : &quot;&quot;, fNumBlocks, fSubNumBlocks);
+ 		}
+ 
+ 	private:
++		block_cache			*fCache;
+ 		cache_transaction	*fTransaction;
++		int32				fID;
++		bool				fSub;
++		int32				fNumBlocks;
++		int32				fSubNumBlocks;
+ };
+ 
+-class Cancel : public AbstractTraceEntry {
++class Detach : public AbstractTraceEntry {
+ 	public:
+-		Cancel(cache_transaction *transaction)
++		Detach(block_cache *cache, cache_transaction *transaction,
++				cache_transaction *newTransaction)
+ 			:
+-			fTransaction(transaction)
++			fCache(cache),
++			fTransaction(transaction),
++			fID(transaction-&gt;id),
++			fSub(transaction-&gt;has_sub_transaction),
++			fNewTransaction(newTransaction),
++			fNewID(newTransaction-&gt;id)
+ 		{
+ 			Initialized();
+ 		}
+ 
+ 		virtual void AddDump(char *buffer, size_t size)
+ 		{
++			snprintf(buffer, size, &quot;cache %p, detach transaction %p (id %ld)&quot;
++				&quot;from transaction %p (id %ld)%s&quot;,
++				fCache, fNewTransaction, fNewID, fTransaction, fID,
++				fSub ? &quot; sub&quot; : &quot;&quot;);
+ 		}
+ 
+ 	private:
++		block_cache			*fCache;
+ 		cache_transaction	*fTransaction;
++		int32				fID;
++		bool				fSub;
++		cache_transaction	*fNewTransaction;
++		int32				fNewID;
+ };
+ 
++class Abort : public AbstractTraceEntry {
++	public:
++		Abort(block_cache *cache, cache_transaction *transaction)
++			:
++			fCache(cache),
++			fTransaction(transaction),
++			fID(transaction-&gt;id),
++			fNumBlocks(0)
++		{
++			bool isSub = transaction-&gt;has_sub_transaction;
++			fNumBlocks = isSub ? transaction-&gt;sub_num_blocks
++				: transaction-&gt;num_blocks;
++			fBlocks = (off_t *)alloc_tracing_buffer(fNumBlocks * sizeof(off_t));
++			if (fBlocks != NULL) {
++				cached_block *block = transaction-&gt;first_block;
++				for (int32 i = 0; block != NULL &amp;&amp; i &lt; fNumBlocks;
++						block = block-&gt;transaction_next) {
++					fBlocks[i++] = block-&gt;block_number;
++				}
++			} else
++				fNumBlocks = 0;
++			Initialized();
++		}
++
++		virtual void AddDump(char *buffer, size_t size)
++		{
++			int length = snprintf(buffer, size, &quot;cache %p, abort transaction &quot;
++				&quot;%p (id %ld), blocks&quot;, fCache, fTransaction, fID);
++			for (int32 i = 0; i &lt; fNumBlocks &amp;&amp; (size_t)length &lt; size; i++) {
++				length += snprintf(buffer + length, size - length, &quot; %Ld&quot;,
++					fBlocks[i]);
++			}
++		}
++
++	private:
++		block_cache			*fCache;
++		cache_transaction	*fTransaction;
++		int32				fID;
++		off_t				*fBlocks;
++		int32				fNumBlocks;
++};
++
+ }	// namespace TransactionTracing
+ 
+ #	define T(x) new(std::nothrow) TransactionTracing::x;
+@@ -93,29 +187,6 @@
+ #endif
+ 
+ 
+-struct cache_hook : DoublyLinkedListLinkImpl&lt;cache_hook&gt; {
+-	transaction_notification_hook	hook;
+-	void							*data;
+-};
+-
+-typedef DoublyLinkedList&lt;cache_hook&gt; HookList; 
+-
+-struct cache_transaction {
+-	cache_transaction();
+-
+-	cache_transaction *next;
+-	int32			id;
+-	int32			num_blocks;
+-	int32			sub_num_blocks;
+-	cached_block	*first_block;
+-	block_list		blocks;
+-	transaction_notification_hook notification_hook;
+-	void			*notification_data;
+-	HookList		listeners;
+-	bool			open;
+-	bool			has_sub_transaction;
+-};
+-
+ static status_t write_cached_block(block_cache *cache, cached_block *block,
+ 	bool deleteTransaction = true);
+ 
+@@ -804,8 +875,8 @@
+ static int
+ dump_cache(int argc, char **argv)
+ {
+-	if (argc &lt; 2) {
+-		kprintf(&quot;usage: %s [-b] &lt;address&gt;\n&quot;, argv[0]);
++	if (argc &lt; 2 || !strcmp(argv[1], &quot;--help&quot;)) {
++		kprintf(&quot;usage: %s [-b] &lt;address&gt; [block-number]\n&quot;, argv[0]);
+ 		return 0;
+ 	}
+ 
+@@ -816,12 +887,52 @@
+ 		i++;
+ 	}
+ 
+-	block_cache *cache = (struct block_cache *)strtoul(argv[i], NULL, 0);
++	block_cache *cache = (struct block_cache *)parse_expression(argv[i]);
+ 	if (cache == NULL) {
+ 		kprintf(&quot;invalid cache address\n&quot;);
+ 		return 0;
+ 	}
+ 
++	off_t blockNumber = -1;
++	if (i + 1 &lt; argc) {
++		blockNumber = strtoll(argv[i + 1], NULL, 0);
++		cached_block *block = (cached_block *)hash_lookup(cache-&gt;hash,
++			&amp;blockNumber);
++		if (cache != NULL) {
++			kprintf(&quot;BLOCK %p\n&quot;, block);
++			kprintf(&quot; current data:  %p\n&quot;, block-&gt;current_data);
++			kprintf(&quot; original data: %p\n&quot;, block-&gt;original_data);
++			kprintf(&quot; parent data:   %p\n&quot;, block-&gt;parent_data);
++			kprintf(&quot; ref_count:     %ld\n&quot;, block-&gt;ref_count);
++			kprintf(&quot; accessed:      %ld\n&quot;, block-&gt;accessed);
++			kprintf(&quot; flags:        &quot;);
++			if (block-&gt;is_writing)
++				kprintf(&quot; is-writing&quot;);
++			if (block-&gt;is_dirty)
++				kprintf(&quot; is-dirty&quot;);
++			if (block-&gt;unused)
++				kprintf(&quot; unused&quot;);
++			if (block-&gt;unmapped)
++				kprintf(&quot; unmapped&quot;);
++			kprintf(&quot;\n&quot;);
++			if (block-&gt;transaction != NULL) {
++				kprintf(&quot; transaction:   %p (%ld)\n&quot;, block-&gt;transaction,
++					block-&gt;transaction-&gt;id);
++				if (block-&gt;transaction_next != NULL) {
++					kprintf(&quot; next in transaction: %Ld\n&quot;,
++						block-&gt;transaction_next-&gt;block_number);
++				}
++			}
++			if (block-&gt;previous_transaction != NULL) {
++				kprintf(&quot; previous transaction: %p (%ld)\n&quot;,
++					block-&gt;previous_transaction,
++					block-&gt;previous_transaction-&gt;id);
++			}
++		} else
++			kprintf(&quot;block %Ld not found\n&quot;, blockNumber);
++		return 0;
++	}
++
+ 	kprintf(&quot;BLOCK CACHE: %p\n&quot;, cache);
+ 
+ 	kprintf(&quot; fd:         %d\n&quot;, cache-&gt;fd);
+@@ -914,6 +1025,7 @@
+ 	cache-&gt;last_transaction = transaction;
+ 
+ 	TRACE((&quot;cache_start_transaction(): id %ld started\n&quot;, transaction-&gt;id));
++	T(Start(cache, transaction));
+ 
+ 	hash_insert(cache-&gt;transaction_hash, transaction);
+ 
+@@ -1024,6 +1136,7 @@
+ 		return B_BAD_VALUE;
+ 	}
+ 
++	T(Abort(cache, transaction));
+ 	notify_transaction_listeners(transaction, TRANSACTION_ABORTED);
+ 
+ 	// iterate through all blocks and restore their original contents
+@@ -1083,6 +1196,7 @@
+ 		return B_NO_MEMORY;
+ 
+ 	newTransaction-&gt;id = atomic_add(&amp;cache-&gt;next_transaction_id, 1);
++	T(Detach(cache, transaction, newTransaction));
+ 
+ 	transaction-&gt;notification_hook = hook;
+ 	transaction-&gt;notification_data = data;
+@@ -1153,6 +1267,7 @@
+ 	if (!transaction-&gt;has_sub_transaction)
+ 		return B_BAD_VALUE;
+ 
++	T(Abort(cache, transaction));
+ 	notify_transaction_listeners(transaction, TRANSACTION_ABORTED);
+ 
+ 	// revert all changes back to the version of the parent
+@@ -1223,6 +1338,7 @@
+ 	// all subsequent changes will go into the sub transaction
+ 	transaction-&gt;has_sub_transaction = true;
+ 	transaction-&gt;sub_num_blocks = 0;
++	T(Start(cache, transaction));
+ 
+ 	return B_OK;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005507.html">[Haiku-commits] r23531 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+	<LI>Next message: <A HREF="005509.html">[Haiku-commits] r23533 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5508">[ date ]</a>
+              <a href="thread.html#5508">[ thread ]</a>
+              <a href="subject.html#5508">[ subject ]</a>
+              <a href="author.html#5508">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

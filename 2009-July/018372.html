@@ -1,0 +1,307 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31850 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31850%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200907281555.n6SFtmx0032529%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018369.html">
+   <LINK REL="Next"  HREF="018375.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31850 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31850%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200907281555.n6SFtmx0032529%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31850 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Jul 28 17:55:48 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018369.html">[Haiku-commits] r31849 - haiku/trunk/src/apps/installer
+</A></li>
+        <LI>Next message: <A HREF="018375.html">[Haiku-commits] r31851 - haiku/trunk/docs/userguide/en/installation
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18372">[ date ]</a>
+              <a href="thread.html#18372">[ thread ]</a>
+              <a href="subject.html#18372">[ subject ]</a>
+              <a href="author.html#18372">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-07-28 17:55:48 +0200 (Tue, 28 Jul 2009)
+New Revision: 31850
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31850&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31850&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
+Log:
+* Journal::_WriteTransactionToLog()'s return value was ignored previously,
+  leading BFS to report success on actually failed transactions. Those
+  transactions were even kept open, leading to a panic when starting the next
+  transaction.
+* Transaction::Done() now returns a status - currently, this is only handled
+  correctly where this is likely to happen without a disk fault, ie. if the
+  transaction was too large to be written back safely.
+* Improved &quot;bfs_journal&quot; command output.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2009-07-28 15:49:22 UTC (rev 31849)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2009-07-28 15:55:48 UTC (rev 31850)
+@@ -690,10 +690,9 @@
+ 				fVolume-&gt;BlockCache(), fTransactionID) &lt; (int32)fLogSize) {
+ 			detached = true;
+ 		} else {
+-			// TODO: what are our options here?
+-			// a) abort the transaction - bad, because all changes are lost
+-			// b) carry out the changes, but don't use the log - even worse,
+-			//    as it potentially creates a corrupted disk.
++			// We created a transaction larger than one we can write back to
++			// disk - the only option we have (besides risking disk corruption
++			// by writing it back anyway), is to let it fail.
+ 			dprintf(&quot;transaction too large (%d blocks, %d main, log size %d)!\n&quot;,
+ 				(int)_TransactionSize(), (int)cache_blocks_in_main_transaction(
+ 				fVolume-&gt;BlockCache(), fTransactionID), (int)fLogSize);
+@@ -959,15 +958,18 @@
+ }
+ 
+ 
+-void
++status_t
+ Journal::Unlock(Transaction* owner, bool success)
+ {
+ 	if (fSeparateSubTransactions || recursive_lock_get_recursion(&amp;fLock) == 1) {
+ 		// we only end the transaction if we would really unlock it
+ 		// TODO: what about failing transactions that do not unlock?
+ 		// (they must make the parent fail, too)
+-		if (fOwner != NULL)
+-			_TransactionDone(success);
++		if (fOwner != NULL) {
++			status_t status = _TransactionDone(success);
++			if (status != B_OK)
++				return status;
++		}
+ 
+ 		fTimestamp = system_time();
+ 		fOwner = NULL;
+@@ -978,6 +980,7 @@
+ 	}
+ 
+ 	recursive_lock_unlock(&amp;fLock);
++	return B_OK;
+ }
+ 
+ 
+@@ -1021,7 +1024,11 @@
+ 		return B_OK;
+ 	}
+ 
+-	return _WriteTransactionToLog();
++	status_t status = _WriteTransactionToLog();
++	if (status != B_OK)
++		fUnwrittenTransactions++;
++
++	return status;
+ }
+ 
+ 
+@@ -1033,8 +1040,18 @@
+ void
+ Journal::Dump()
+ {
+-	kprintf(&quot;log start: %ld\n&quot;, fVolume-&gt;LogStart());
+-	kprintf(&quot;log end:   %ld\n&quot;, fVolume-&gt;LogEnd());
++	kprintf(&quot;Journal %p\n&quot;, this);
++	kprintf(&quot;  log start:            %ld\n&quot;, fVolume-&gt;LogStart());
++	kprintf(&quot;  log end:              %ld\n&quot;, fVolume-&gt;LogEnd());
++	kprintf(&quot;  owner:                %p\n&quot;, fOwner);
++	kprintf(&quot;  log size:             %lu\n&quot;, fLogSize);
++	kprintf(&quot;  max transaction size: %lu\n&quot;, fMaxTransactionSize);
++	kprintf(&quot;  used:                 %lu\n&quot;, fUsed);
++	kprintf(&quot;  unwritten:            %ld\n&quot;, fUnwrittenTransactions);
++	kprintf(&quot;  timestamp:            %lld\n&quot;, fTimestamp);
++	kprintf(&quot;  transaction ID:       %ld\n&quot;, fTransactionID);
++	kprintf(&quot;  has subtransaction:   %d\n&quot;, fHasSubtransaction);
++	kprintf(&quot;  separate sub-trans.:  %d\n&quot;, fSeparateSubTransactions);
+ 	kprintf(&quot;entries:\n&quot;);
+ 	kprintf(&quot;  address        id  start length\n&quot;);
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h	2009-07-28 15:49:22 UTC (rev 31849)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h	2009-07-28 15:55:48 UTC (rev 31850)
+@@ -27,7 +27,7 @@
+ 
+ 			status_t		Lock(Transaction* owner,
+ 								bool separateSubTransactions);
+-			void			Unlock(Transaction* owner, bool success);
++			status_t		Unlock(Transaction* owner, bool success);
+ 
+ 			status_t		ReplayLog();
+ 
+@@ -115,13 +115,16 @@
+ 	status_t Start(Volume* volume, off_t refBlock);
+ 	bool IsStarted() const { return fJournal != NULL; }
+ 
+-	void Done()
++	status_t Done()
+ 	{
++		status_t status = B_OK;
+ 		if (fJournal != NULL) {
+ 			_UnlockInodes();
+-			fJournal-&gt;Unlock(this, true);
++			status = fJournal-&gt;Unlock(this, true);
++			if (status == B_OK)
++				fJournal = NULL;
+ 		}
+-		fJournal = NULL;
++		return status;
+ 	}
+ 
+ 	bool HasParent()
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp	2009-07-28 15:49:22 UTC (rev 31849)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp	2009-07-28 15:55:48 UTC (rev 31850)
+@@ -359,10 +359,10 @@
+ 	// transaction which has already deleted the inode.
+ 	Transaction transaction(volume, volume-&gt;ToBlock(inode-&gt;Parent()));
+ 
+-	// The &quot;chkbfs&quot; functionality uses this flag to prevent the space used
+-	// up by the inode from being freed - this flag is set only in situations
+-	// where this is a good idea... (the block bitmap will get fixed anyway
+-	// in this case).
++	// The file system check functionality uses this flag to prevent the space
++	// used up by the inode from being freed - this flag is set only in
++	// situations where this does not cause any harm as the block bitmap will
++	// get fixed anyway in this case).
+ 	if ((inode-&gt;Flags() &amp; INODE_DONT_FREE_SPACE) != 0) {
+ 		delete inode;
+ 		return B_OK;
+@@ -370,14 +370,15 @@
+ 
+ 	status_t status = inode-&gt;Free(transaction);
+ 	if (status == B_OK) {
+-		transaction.Done();
+-
+-		delete inode;
++		status = transaction.Done();
+ 	} else if (transaction.HasParent()) {
+ 		// TODO: for now, we don't let sub-transactions fail
+-		transaction.Done();
++		status = transaction.Done();
+ 	}
+ 
++	// TODO: the VFS currently does not allow this to fail
++	delete inode;
++
+ 	return status;
+ }
+ 
+@@ -777,7 +778,7 @@
+ 			off_t oldSize = inode-&gt;Size();
+ 
+ 			status = inode-&gt;SetFileSize(transaction, stat-&gt;st_size);
+-			if (status &lt; B_OK)
++			if (status != B_OK)
+ 				return status;
+ 
+ 			// fill the new blocks (if any) with zeros
+@@ -843,10 +844,10 @@
+ 
+ 	status = inode-&gt;WriteBack(transaction);
+ 	if (status == B_OK)
+-		transaction.Done();
++		status = transaction.Done();
++	if (status == B_OK)
++		notify_stat_changed(volume-&gt;ID(), inode-&gt;ID(), mask);
+ 
+-	notify_stat_changed(volume-&gt;ID(), inode-&gt;ID(), mask);
+-
+ 	return status;
+ }
+ 
+@@ -891,11 +892,12 @@
+ 		status = file_cache_disable(inode-&gt;FileCache());
+ 	}
+ 
+-	if (status &gt;= B_OK) {
++	if (status == B_OK)
++		status = transaction.Done();
++
++	if (status == B_OK) {
+ 		entry_cache_add(volume-&gt;ID(), directory-&gt;ID(), name, *_vnodeID);
+ 
+-		transaction.Done();
+-
+ 		// register the cookie
+ 		*_cookie = cookie;
+ 
+@@ -1017,7 +1019,8 @@
+ bfs_rename(fs_volume* _volume, fs_vnode* _oldDir, const char* oldName,
+ 	fs_vnode* _newDir, const char* newName)
+ {
+-	FUNCTION_START((&quot;oldDir = %p, oldName = \&quot;%s\&quot;, newDir = %p, newName = \&quot;%s\&quot;\n&quot;, _oldDir, oldName, _newDir, newName));
++	FUNCTION_START((&quot;oldDir = %p, oldName = \&quot;%s\&quot;, newDir = %p, newName = &quot;
++		&quot;\&quot;%s\&quot;\n&quot;, _oldDir, oldName, _newDir, newName));
+ 
+ 	// there might be some more tests needed?!
+ 	if (!strcmp(oldName, &quot;.&quot;) || !strcmp(oldName, &quot;..&quot;)
+@@ -1236,14 +1239,12 @@
+ 		inode-&gt;WriteLockInTransaction(transaction);
+ 
+ 		status_t status = inode-&gt;SetFileSize(transaction, 0);
+-		if (status &lt; B_OK)
++		if (status == B_OK)
++			status = inode-&gt;WriteBack(transaction);
++		if (status == B_OK)
++			status = transaction.Done();
++		if (status != B_OK)
+ 			return status;
+-
+-		status = inode-&gt;WriteBack(transaction);
+-		if (status &lt; B_OK)
+-			return status;
+-
+-		transaction.Done();
+ 	}
+ 
+ 	fileCacheEnabler.Detach();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018369.html">[Haiku-commits] r31849 - haiku/trunk/src/apps/installer
+</A></li>
+	<LI>Next message: <A HREF="018375.html">[Haiku-commits] r31851 - haiku/trunk/docs/userguide/en/installation
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18372">[ date ]</a>
+              <a href="thread.html#18372">[ thread ]</a>
+              <a href="subject.html#18372">[ subject ]</a>
+              <a href="author.html#18372">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,393 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20836 - in haiku/trunk:	headers/private/kernel/slab src/add-ons/kernel/network/stack	src/system/kernel/slab
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20836%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/slab%20src/add-ons/kernel/network/stack%0A%09src/system/kernel/slab&In-Reply-To=%3C200704260731.l3Q7VdqK016788%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001826.html">
+   <LINK REL="Next"  HREF="001828.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20836 - in haiku/trunk:	headers/private/kernel/slab src/add-ons/kernel/network/stack	src/system/kernel/slab</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20836%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/slab%20src/add-ons/kernel/network/stack%0A%09src/system/kernel/slab&In-Reply-To=%3C200704260731.l3Q7VdqK016788%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20836 - in haiku/trunk:	headers/private/kernel/slab src/add-ons/kernel/network/stack	src/system/kernel/slab">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 26 09:31:39 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001826.html">[Haiku-commits] r20835 - haiku/trunk/headers/private/kernel/slab
+</A></li>
+        <LI>Next message: <A HREF="001828.html">[Haiku-commits] r20837 - haiku/trunk/build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1827">[ date ]</a>
+              <a href="thread.html#1827">[ thread ]</a>
+              <a href="subject.html#1827">[ subject ]</a>
+              <a href="author.html#1827">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-26 09:31:19 +0200 (Thu, 26 Apr 2007)
+New Revision: 20836
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20836&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20836&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/slab/Base.h
+   haiku/trunk/headers/private/kernel/slab/MergedStrategy.h
+   haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp
+   haiku/trunk/src/system/kernel/slab/Slab.cpp
+Log:
+added locking to slab's Cache&lt;&gt;. Now we react to system's low memory conditions freeing up empty slabs.
+
+
+Modified: haiku/trunk/headers/private/kernel/slab/Base.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/slab/Base.h	2007-04-26 06:32:25 UTC (rev 20835)
++++ haiku/trunk/headers/private/kernel/slab/Base.h	2007-04-26 07:31:19 UTC (rev 20836)
+@@ -11,7 +11,12 @@
+ 
+ #include &lt;stdint.h&gt;
+ 
++#include &lt;KernelExport.h&gt;
+ #include &lt;OS.h&gt;
++
++#include &lt;lock.h&gt;
++#include &lt;vm_low_memory.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ #include &lt;util/list.h&gt;
+ 
+ #ifdef __cplusplus
+@@ -32,14 +37,15 @@
+ 
+ /* base Slab implementation, opaque to the backend used.
+  *
+- * NOTE: the caller is responsible for the Cache's locking. */
++ * NOTE: the caller is responsible for the Cache's locking.
++ *       Cache&lt;&gt; below handles it as well. */
+ 
+ typedef struct base_cache {
+ 	char name[32];
+ 	size_t object_size;
+ 	size_t cache_color_cycle;
+ 	struct list empty, partial, full;
+-	size_t empty_count;
++	size_t empty_count, pressure;
+ 	base_cache_constructor constructor;
+ 	base_cache_destructor destructor;
+ 	void *cookie;
+@@ -56,11 +62,16 @@
+ 	struct list_link link;
+ } cache_slab;
+ 
++// TODO add reclaim method to base_cache to be called under severe memory
++//		pressure so the slab owner can free as much buffers as possible.
++
+ void base_cache_init(base_cache *cache, const char *name, size_t object_size,
+ 	size_t alignment, base_cache_constructor constructor,
+ 	base_cache_destructor destructor, void *cookie);
+ void base_cache_destroy(base_cache *cache,
+ 	void (*return_slab)(base_cache *, cache_slab *));
++void base_cache_low_memory(base_cache *cache, int32 level,
++	void (*return_slab)(base_cache *, cache_slab *));
+ 
+ cache_object_link *base_cache_allocate_object(base_cache *cache);
+ cache_object_link *base_cache_allocate_object_with_new_slab(base_cache *cache,
+@@ -83,6 +94,7 @@
+ template&lt;typename Strategy&gt;
+ class Cache : protected base_cache {
+ public:
++	typedef Cache&lt;Strategy&gt;			ThisCache;
+ 	typedef base_cache_constructor	Constructor;
+ 	typedef base_cache_destructor	Destructor;
+ 
+@@ -90,17 +102,29 @@
+ 		Constructor constructor, Destructor destructor, void *cookie)
+ 		: fStrategy(this)
+ 	{
+-		base_cache_init(this, name, objectSize, alignment, constructor,
+-			destructor, cookie);
++		if (benaphore_init(&amp;fLock, name) &gt;= B_OK) {
++			base_cache_init(this, name, objectSize, alignment, constructor,
++				destructor, cookie);
++			register_low_memory_handler(_LowMemory, this, 0);
++		}
+ 	}
+ 
+ 	~Cache()
+ 	{
+-		base_cache_destroy(this, _ReturnSlab);
++		if (fLock.sem &gt;= B_OK) {
++			benaphore_lock(&amp;fLock);
++			unregister_low_memory_handler(_LowMemory, this);
++			base_cache_destroy(this, _ReturnSlab);
++			benaphore_destroy(&amp;fLock);
++		}
+ 	}
+ 
++	status_t InitCheck() const { return fLock.sem; }
++
+ 	void *AllocateObject(uint32_t flags)
+ 	{
++		BenaphoreLocker _(fLock);
++
+ 		cache_object_link *link = base_cache_allocate_object(this);
+ 
+ 		// if the cache is returning NULL it is because it ran out of slabs
+@@ -118,6 +142,8 @@
+ 
+ 	void ReturnObject(void *object)
+ 	{
++		BenaphoreLocker _(fLock);
++
+ 		CacheObjectInfo location = fStrategy.ObjectInformation(object);
+ 
+ 		if (base_cache_return_object(this, location.first, location.second))
+@@ -127,9 +153,22 @@
+ private:
+ 	static void _ReturnSlab(base_cache *self, cache_slab *slab)
+ 	{
+-		((Cache&lt;Strategy&gt; *)self)-&gt;fStrategy.ReturnSlab(slab);
++		// Already locked, ~Cache() -&gt; base_cache_destroy -&gt; _ReturnSlab
++		((ThisCache *)self)-&gt;fStrategy.ReturnSlab(slab);
+ 	}
+ 
++	static void _LowMemory(void *_self, int32 level)
++	{
++		if (level == B_NO_LOW_MEMORY)
++			return;
++
++		ThisCache *self = (ThisCache *)_self;
++
++		BenaphoreLocker _(self-&gt;fLock);
++		base_cache_low_memory(self, level, _ReturnSlab);
++	}
++
++	benaphore fLock;
+ 	Strategy fStrategy;
+ };
+ 
+
+Modified: haiku/trunk/headers/private/kernel/slab/MergedStrategy.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/slab/MergedStrategy.h	2007-04-26 06:32:25 UTC (rev 20835)
++++ haiku/trunk/headers/private/kernel/slab/MergedStrategy.h	2007-04-26 07:31:19 UTC (rev 20836)
+@@ -9,7 +9,6 @@
+ #ifndef _SLAB_MERGED_STRATEGY_H_
+ #define _SLAB_MERGED_STRATEGY_H_
+ 
+-#include &lt;slab/Base.h&gt;
+ #include &lt;slab/Strategy.h&gt;
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp	2007-04-26 06:32:25 UTC (rev 20835)
++++ haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp	2007-04-26 07:31:19 UTC (rev 20836)
+@@ -73,7 +73,6 @@
+ 
+ static NetBufferCache *sNetBufferCache;
+ static DataNodeCache *sDataNodeCache;
+-static benaphore sCachesLock;
+ 
+ 
+ static status_t append_data(net_buffer *buffer, const void *data, size_t size);
+@@ -103,7 +102,6 @@
+ static inline data_header *
+ allocate_data_header()
+ {
+-	BenaphoreLocker _(sCachesLock);
+ 	return (data_header *)sDataNodeCache-&gt;AllocateObject(CACHE_DONT_SLEEP);
+ }
+ 
+@@ -111,7 +109,6 @@
+ static inline net_buffer_private *
+ allocate_net_buffer()
+ {
+-	BenaphoreLocker _(sCachesLock);
+ 	return (net_buffer_private *)sNetBufferCache-&gt;AllocateObject(
+ 		CACHE_DONT_SLEEP);
+ }
+@@ -120,7 +117,6 @@
+ static inline void
+ free_data_header(data_header *header)
+ {
+-	BenaphoreLocker _(sCachesLock);
+ 	sDataNodeCache-&gt;ReturnObject(header);
+ }
+ 
+@@ -128,7 +124,6 @@
+ static inline void
+ free_net_buffer(net_buffer_private *buffer)
+ {
+-	BenaphoreLocker _(sCachesLock);
+ 	sNetBufferCache-&gt;ReturnObject(buffer);
+ }
+ 
+@@ -1185,25 +1180,31 @@
+ 	// TODO improve our code a bit so we can add constructors
+ 	//		and keep around half-constructed buffers in the slab
+ 
+-	status_t status = benaphore_init(&amp;sCachesLock, &quot;net buffer cache lock&quot;);
+-	if (status &lt; B_OK)
+-		return status;
+-
+ 	sNetBufferCache = new (std::nothrow) NetBufferCache(&quot;net buffer cache&quot;,
+ 		sizeof(net_buffer_private), 8, NULL, NULL, NULL);
+-	if (sNetBufferCache == NULL) {
+-		benaphore_destroy(&amp;sCachesLock);
++	if (sNetBufferCache == NULL)
+ 		return B_NO_MEMORY;
++
++	status_t status = sNetBufferCache-&gt;InitCheck();
++	if (status &lt; B_OK) {
++		delete sNetBufferCache;
++		return status;
+ 	}
+ 
+ 	sDataNodeCache = new (std::nothrow) DataNodeCache(&quot;data node cache&quot;,
+ 		BUFFER_SIZE, 0, NULL, NULL, NULL);
+ 	if (sDataNodeCache == NULL) {
+-		benaphore_destroy(&amp;sCachesLock);
+ 		delete sNetBufferCache;
+ 		return B_NO_MEMORY;
+ 	}
+ 
++	status = sDataNodeCache-&gt;InitCheck();
++	if (status &lt; B_OK) {
++		delete sDataNodeCache;
++		delete sNetBufferCache;
++		return status;
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -1211,13 +1212,9 @@
+ status_t
+ uninit_net_buffers()
+ {
+-	benaphore_lock(&amp;sCachesLock);
+-
+ 	delete sNetBufferCache;
+ 	delete sDataNodeCache;
+ 
+-	benaphore_destroy(&amp;sCachesLock);
+-
+ 	return B_OK;
+ }
+ 
+
+Modified: haiku/trunk/src/system/kernel/slab/Slab.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/slab/Slab.cpp	2007-04-26 06:32:25 UTC (rev 20835)
++++ haiku/trunk/src/system/kernel/slab/Slab.cpp	2007-04-26 07:31:19 UTC (rev 20836)
+@@ -107,6 +107,9 @@
+ 
+ 	cache-&gt;empty_count = 0;
+ 
++	// pressure is increased whenever we need a slab and don't have one
++	cache-&gt;pressure = 0;
++
+ 	cache-&gt;constructor = constructor;
+ 	cache-&gt;destructor = destructor;
+ 	cache-&gt;cookie = cookie;
+@@ -132,14 +135,54 @@
+ }
+ 
+ 
++void
++base_cache_low_memory(base_cache *cache, int32 level,
++	void (*return_slab)(base_cache *, cache_slab *))
++{
++	size_t minimumAllowed;
++
++	// only thing we can do right now is free up empty slabs
++
++	switch (level) {
++	case B_LOW_MEMORY_NOTE:
++		minimumAllowed = cache-&gt;pressure / 2 + 1;
++		break;
++
++	case B_LOW_MEMORY_WARNING:
++		cache-&gt;pressure /= 2;
++		minimumAllowed = 0;
++		break;
++
++	default:
++		cache-&gt;pressure = 0;
++		minimumAllowed = 0;
++		break;
++	}
++
++	if (cache-&gt;empty_count &lt;= minimumAllowed)
++		return;
++
++	TRACE_CACHE(cache, &quot;cache: memory pressure, will release down to %lu.&quot;,
++		minimumAllowed);
++
++	while (cache-&gt;empty_count &gt; minimumAllowed) {
++		cache_slab *slab = (cache_slab *)list_remove_head_item(&amp;cache-&gt;empty);
++		return_slab(cache, slab);
++		cache-&gt;empty_count--;
++	}
++}
++
++
+ cache_object_link *
+ base_cache_allocate_object(base_cache *cache)
+ {
+ 	cache_slab *slab;
+ 
+ 	if (list_is_empty(&amp;cache-&gt;partial)) {
+-		if (list_is_empty(&amp;cache-&gt;empty))
++		if (list_is_empty(&amp;cache-&gt;empty)) {
++			cache-&gt;pressure++;
+ 			return NULL;
++		}
+ 
+ 		cache-&gt;empty_count--;
+ 		slab = (cache_slab *)list_remove_head_item(&amp;cache-&gt;empty);
+@@ -184,7 +227,7 @@
+ 	if (slab-&gt;count == slab-&gt;size) {
+ 		list_remove_item(&amp;cache-&gt;partial, slab);
+ 
+-		if (cache-&gt;empty_count &gt; 2)
++		if (cache-&gt;empty_count &gt;= cache-&gt;pressure)
+ 			return 1;
+ 
+ 		cache-&gt;empty_count++;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001826.html">[Haiku-commits] r20835 - haiku/trunk/headers/private/kernel/slab
+</A></li>
+	<LI>Next message: <A HREF="001828.html">[Haiku-commits] r20837 - haiku/trunk/build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1827">[ date ]</a>
+              <a href="thread.html#1827">[ thread ]</a>
+              <a href="subject.html#1827">[ subject ]</a>
+              <a href="author.html#1827">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

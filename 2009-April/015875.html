@@ -1,0 +1,267 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30196 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30196%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200904161049.n3GAnMpW008433%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015874.html">
+   <LINK REL="Next"  HREF="015876.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30196 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30196%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200904161049.n3GAnMpW008433%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30196 - haiku/trunk/src/system/kernel/fs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 16 12:49:22 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015874.html">[Haiku-commits] r30195 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+        <LI>Next message: <A HREF="015876.html">[Haiku-commits] r30197 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15875">[ date ]</a>
+              <a href="thread.html#15875">[ thread ]</a>
+              <a href="subject.html#15875">[ subject ]</a>
+              <a href="author.html#15875">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-04-16 12:49:21 +0200 (Thu, 16 Apr 2009)
+New Revision: 30196
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30196&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30196&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/socket.cpp
+Log:
+* Since we moved the socket stuff into the kernel, we lost the ability to
+  unload the network stack. This now works again, although I didn't manage to
+  do it without another lock.
+* Cleanup.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/socket.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/socket.cpp	2009-04-16 10:31:48 UTC (rev 30195)
++++ haiku/trunk/src/system/kernel/fs/socket.cpp	2009-04-16 10:49:21 UTC (rev 30196)
+@@ -1,5 +1,7 @@
+ /*
++ * Copyright 2009, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ *
+  * Distributed under the terms of the MIT License.
+  */
+ 
+@@ -16,7 +18,9 @@
+ 
+ #include &lt;fd.h&gt;
+ #include &lt;kernel.h&gt;
++#include &lt;lock.h&gt;
+ #include &lt;syscall_restart.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ #include &lt;vfs.h&gt;
+ 
+ #include &lt;net_stack_interface.h&gt;
+@@ -27,9 +31,17 @@
+ #define MAX_SOCKET_OPTION_LEN	128
+ #define MAX_ANCILLARY_DATA_LEN	1024
+ 
++#define GET_SOCKET_FD_OR_RETURN(fd, kernel, descriptor)	\
++	do {												\
++		status_t getError = get_socket_descriptor(fd, kernel, descriptor); \
++		if (getError != B_OK)							\
++			return getError;							\
++	} while (false)
+ 
++
+ static net_stack_interface_module_info* sStackInterface = NULL;
+ static vint32 sStackInterfaceInitialized = 0;
++static mutex sLock = MUTEX_INITIALIZER(&quot;stack interface&quot;);
+ 
+ 
+ struct FDPutter {
+@@ -44,40 +56,38 @@
+ 			put_fd(descriptor);
+ 	}
+ 
+-
+ 	file_descriptor*	descriptor;
+ };
+ 
+ 
+ static net_stack_interface_module_info*
+-init_stack_interface_module()
++get_stack_interface_module()
+ {
+-	// TODO: Add driver settings option to load the userland net stack.
++	MutexLocker _(sLock);
+ 
+-	// load module
+-	net_stack_interface_module_info* module;
+-	status_t error = get_module(NET_STACK_INTERFACE_MODULE_NAME,
+-		(module_info**)&amp;module);
+-	if (error != B_OK)
+-		return NULL;
++	if (sStackInterfaceInitialized++ == 0) {
++		// load module
++		net_stack_interface_module_info* module;
++		// TODO: Add driver settings option to load the userland net stack.
++		status_t error = get_module(NET_STACK_INTERFACE_MODULE_NAME,
++			(module_info**)&amp;module);
++		if (error == B_OK)
++			sStackInterface = module;
++		else
++			sStackInterface = NULL;
++	}
+ 
+-	sStackInterface = module;	// assumed to be atomic
+-
+-	// If someone else was faster getting the module, we put our reference.
+-	if (atomic_test_and_set(&amp;sStackInterfaceInitialized, 1, 0) != 0)
+-		put_module(module-&gt;info.name);
+-
+-	return module;
++	return sStackInterface;
+ }
+ 
+ 
+-static inline net_stack_interface_module_info*
+-get_stack_interface_module()
++static void
++put_stack_interface_module()
+ {
+-	if (sStackInterface)
+-		return sStackInterface;
++	MutexLocker _(sLock);
+ 
+-	return init_stack_interface_module();
++	if (sStackInterfaceInitialized-- == 1)
++		put_module(NET_STACK_INTERFACE_MODULE_NAME);
+ }
+ 
+ 
+@@ -206,14 +216,6 @@
+ }
+ 
+ 
+-#define GET_SOCKET_FD_OR_RETURN(fd, kernel, descriptor)	\
+-	do {												\
+-		status_t gsfdorError = get_socket_descriptor(fd, kernel, descriptor); \
+-		if (gsfdorError != B_OK)						\
+-			return gsfdorError;							\
+-	} while (false)
+-
+-
+ // #pragma mark - socket file descriptor
+ 
+ 
+@@ -308,6 +310,7 @@
+ socket_free(struct file_descriptor *descriptor)
+ {
+ 	sStackInterface-&gt;free(descriptor-&gt;u.socket);
++	put_stack_interface_module();
+ }
+ 
+ 
+@@ -372,14 +375,17 @@
+ 	// create the socket
+ 	net_socket* socket;
+ 	status_t error = sStackInterface-&gt;open(family, type, protocol, &amp;socket);
+-	if (error != B_OK)
++	if (error != B_OK) {
++		put_stack_interface_module();
+ 		return error;
++	}
+ 
+ 	// allocate the FD
+ 	int fd = create_socket_fd(socket, kernel);
+ 	if (fd &lt; 0) {
+ 		sStackInterface-&gt;close(socket);
+ 		sStackInterface-&gt;free(socket);
++		put_stack_interface_module();
+ 	}
+ 
+ 	return fd;
+@@ -452,6 +458,9 @@
+ 	if (acceptedFD &lt; 0) {
+ 		sStackInterface-&gt;close(acceptedSocket);
+ 		sStackInterface-&gt;free(acceptedSocket);
++	} else {
++		// we need a reference for the new FD
++		get_stack_interface_module();
+ 	}
+ 
+ 	return acceptedFD;
+@@ -600,8 +609,10 @@
+ 	net_socket* sockets[2];
+ 	status_t error = sStackInterface-&gt;socketpair(family, type, protocol,
+ 		sockets);
+-	if (error != B_OK)
++	if (error != B_OK) {
++		put_stack_interface_module();
+ 		return error;
++	}
+ 
+ 	// allocate the FDs
+ 	for (int i = 0; i &lt; 2; i++) {
+@@ -609,10 +620,13 @@
+ 		if (fds[i] &lt; 0) {
+ 			sStackInterface-&gt;close(sockets[i]);
+ 			sStackInterface-&gt;free(sockets[i]);
++			put_stack_interface_module();
+ 			return fds[i];
+ 		}
+ 	}
+ 
++	// We need another reference for the second socket
++	get_stack_interface_module();
+ 	return B_OK;
+ }
+ 
+@@ -623,7 +637,11 @@
+ 	if (!get_stack_interface_module())
+ 		return B_UNSUPPORTED;
+ 
+-	return sStackInterface-&gt;get_next_socket_stat(family, cookie, stat);
++	status_t status = sStackInterface-&gt;get_next_socket_stat(family, cookie,
++		stat);
++
++	put_stack_interface_module();
++	return status;
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015874.html">[Haiku-commits] r30195 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+	<LI>Next message: <A HREF="015876.html">[Haiku-commits] r30197 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15875">[ date ]</a>
+              <a href="thread.html#15875">[ thread ]</a>
+              <a href="subject.html#15875">[ subject ]</a>
+              <a href="author.html#15875">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

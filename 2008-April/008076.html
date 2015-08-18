@@ -1,0 +1,264 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25117 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25117%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/unix&In-Reply-To=%3C200804231710.m3NHAVka016072%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008075.html">
+   <LINK REL="Next"  HREF="008077.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25117 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25117%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/unix&In-Reply-To=%3C200804231710.m3NHAVka016072%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25117 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Apr 23 19:10:31 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008075.html">[Haiku-commits] r25116 - in haiku/trunk/src/tests/add-ons/kernel/file_systems: . fragmenter
+</A></li>
+        <LI>Next message: <A HREF="008077.html">[Haiku-commits] r25118 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8076">[ date ]</a>
+              <a href="thread.html#8076">[ thread ]</a>
+              <a href="subject.html#8076">[ subject ]</a>
+              <a href="author.html#8076">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-04-23 19:10:30 +0200 (Wed, 23 Apr 2008)
+New Revision: 25117
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25117&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25117&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.h
+Log:
+Replaced the reader/writer blocking semaphores by condition variables.
+This fixes race conditions. The OpenSSH tests don't hang anymore --
+instead they run the system out of memory, apparently due to a net
+buffer/data node leak.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp	2008-04-23 12:44:00 UTC (rev 25116)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp	2008-04-23 17:10:30 UTC (rev 25117)
+@@ -286,23 +286,17 @@
+ 	fWriters(),
+ 	fReadRequested(0),
+ 	fWriteRequested(0),
+-	fReaderSem(-1),
+-	fWriterSem(-1),
+ 	fShutdown(0)
+ 
+ {
++	fReadCondition.Init(this, &quot;unix fifo read&quot;);
++	fWriteCondition.Init(this, &quot;unix fifo write&quot;);
+ 	fLock.sem = -1;
+ }
+ 
+ 
+ UnixFifo::~UnixFifo()
+ {
+-	if (fReaderSem &gt;= 0)
+-		delete_sem(fReaderSem);
+-
+-	if (fWriterSem &gt;= 0)
+-		delete_sem(fWriterSem);
+-
+ 	if (fLock.sem &gt;= 0)
+ 		benaphore_destroy(&amp;fLock);
+ }
+@@ -311,15 +305,7 @@
+ status_t
+ UnixFifo::Init()
+ {
+-	status_t error = benaphore_init(&amp;fLock, &quot;unix fifo&quot;);
+-
+-	fReaderSem = create_sem(0, &quot;unix fifo readers&quot;);
+-	fWriterSem = create_sem(0, &quot;unix fifo writers&quot;);
+-
+-	if (error != B_OK || fReaderSem &lt; 0 || fWriterSem &lt; 0)
+-		return ENOBUFS;
+-
+-	return B_OK;
++	return benaphore_init(&amp;fLock, &quot;unix fifo&quot;);
+ }
+ 
+ 
+@@ -330,8 +316,8 @@
+ 
+ 	if (shutdown != 0) {
+ 		// Shutting down either end also effects the other, so notify both.
+-		release_sem_etc(fWriterSem, 1, B_RELEASE_ALL);
+-		release_sem_etc(fReaderSem, 1, B_RELEASE_ALL);
++		fReadCondition.NotifyAll();
++		fWriteCondition.NotifyAll();
+ 	}
+ }
+ 
+@@ -359,13 +345,13 @@
+ 			&amp;&amp; !IsReadShutdown()) {
+ 		// There's more to read, other readers, and we were first in the queue.
+ 		// So we need to notify the others.
+-		release_sem_etc(fReaderSem, 1, B_RELEASE_ALL);
++		fReadCondition.NotifyAll();
+ 	}
+ 
+ 	if (error == B_OK &amp;&amp; *_buffer != NULL &amp;&amp; (*_buffer)-&gt;size &gt; 0
+ 			&amp;&amp; !fWriters.IsEmpty() &amp;&amp; !IsWriteShutdown()) {
+ 		// We read something and there are writers. Notify them
+-		release_sem_etc(fWriterSem, 1, B_RELEASE_ALL);
++		fWriteCondition.NotifyAll();
+ 	}
+ 
+ 	RETURN_ERROR(error);
+@@ -392,13 +378,13 @@
+ 			&amp;&amp; !IsWriteShutdown()) {
+ 		// There's more space for writing, other writers, and we were first in
+ 		// the queue. So we need to notify the others.
+-		release_sem_etc(fWriterSem, 1, B_RELEASE_ALL);
++		fWriteCondition.NotifyAll();
+ 	}
+ 
+ 	if (error == B_OK &amp;&amp; request.size &gt; 0 &amp;&amp; !fReaders.IsEmpty()
+ 			&amp;&amp; !IsReadShutdown()) {
+ 		// We've written something and there are readers. Notify them
+-		release_sem_etc(fReaderSem, 1, B_RELEASE_ALL);
++		fReadCondition.NotifyAll();
+ 	}
+ 
+ 	RETURN_ERROR(error);
+@@ -439,7 +425,7 @@
+ 
+ 	// wake up waiting writers, if the capacity increased
+ 	if (!fWriters.IsEmpty() &amp;&amp; !IsWriteShutdown())
+-		release_sem_etc(fWriterSem, 1, B_RELEASE_ALL);
++		fWriteCondition.NotifyAll();
+ }
+ 
+ 
+@@ -452,11 +438,11 @@
+ 		RETURN_ERROR(B_WOULD_BLOCK);
+ 
+ 	while (fReaders.Head() != &amp;request &amp;&amp; !IsReadShutdown()) {
+-		benaphore_unlock(&amp;fLock);
++		ConditionVariableEntry entry;
++		fReadCondition.Add(&amp;entry, B_CAN_INTERRUPT);
+ 
+-		status_t error = acquire_sem_etc(fReaderSem, 1,
+-			B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, timeout);
+-
++		benaphore_unlock(&amp;fLock);
++		status_t error = entry.Wait(B_ABSOLUTE_TIMEOUT, timeout);
+ 		benaphore_lock(&amp;fLock);
+ 
+ 		if (error != B_OK)
+@@ -480,11 +466,11 @@
+ // TODO: Support low water marks!
+ 	while (fBuffer.Readable() == 0
+ 			&amp;&amp; !IsReadShutdown() &amp;&amp; !IsWriteShutdown()) {
+-		benaphore_unlock(&amp;fLock);
++		ConditionVariableEntry entry;
++		fReadCondition.Add(&amp;entry, B_CAN_INTERRUPT);
+ 
+-		status_t error = acquire_sem_etc(fReaderSem, 1,
+-			B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, timeout);
+-
++		benaphore_unlock(&amp;fLock);
++		status_t error = entry.Wait(B_ABSOLUTE_TIMEOUT, timeout);
+ 		benaphore_lock(&amp;fLock);
+ 
+ 		if (error != B_OK)
+@@ -511,11 +497,11 @@
+ 		RETURN_ERROR(B_WOULD_BLOCK);
+ 
+ 	while (fWriters.Head() != &amp;request &amp;&amp; !IsWriteShutdown()) {
+-		benaphore_unlock(&amp;fLock);
++		ConditionVariableEntry entry;
++		fWriteCondition.Add(&amp;entry, B_CAN_INTERRUPT);
+ 
+-		status_t error = acquire_sem_etc(fWriterSem, 1,
+-			B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, timeout);
+-
++		benaphore_unlock(&amp;fLock);
++		status_t error = entry.Wait(B_ABSOLUTE_TIMEOUT, timeout);
+ 		benaphore_lock(&amp;fLock);
+ 
+ 		if (error != B_OK)
+@@ -534,11 +520,11 @@
+ 
+ 	while (fBuffer.Writable() &lt; request.size &amp;&amp; !IsWriteShutdown()
+ 			&amp;&amp; !IsReadShutdown()) {
+-		benaphore_unlock(&amp;fLock);
++		ConditionVariableEntry entry;
++		fWriteCondition.Add(&amp;entry, B_CAN_INTERRUPT);
+ 
+-		status_t error = acquire_sem_etc(fWriterSem, 1,
+-			B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, timeout);
+-
++		benaphore_unlock(&amp;fLock);
++		status_t error = entry.Wait(B_ABSOLUTE_TIMEOUT, timeout);
+ 		benaphore_lock(&amp;fLock);
+ 
+ 		if (error != B_OK)
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.h	2008-04-23 12:44:00 UTC (rev 25116)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.h	2008-04-23 17:10:30 UTC (rev 25117)
+@@ -7,6 +7,7 @@
+ 
+ #include &lt;Referenceable.h&gt;
+ 
++#include &lt;condition_variable.h&gt;
+ #include &lt;lock.h&gt;
+ #include &lt;util/AutoLock.h&gt;
+ #include &lt;util/DoublyLinkedList.h&gt;
+@@ -126,8 +127,8 @@
+ 	RequestList			fWriters;
+ 	size_t				fReadRequested;
+ 	size_t				fWriteRequested;
+-	sem_id				fReaderSem;
+-	sem_id				fWriterSem;
++	ConditionVariable	fReadCondition;
++	ConditionVariable	fWriteCondition;
+ 	uint32				fShutdown;
+ };
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008075.html">[Haiku-commits] r25116 - in haiku/trunk/src/tests/add-ons/kernel/file_systems: . fragmenter
+</A></li>
+	<LI>Next message: <A HREF="008077.html">[Haiku-commits] r25118 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8076">[ date ]</a>
+              <a href="thread.html#8076">[ thread ]</a>
+              <a href="subject.html#8076">[ subject ]</a>
+              <a href="author.html#8076">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

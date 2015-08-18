@@ -1,0 +1,265 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30339 - haiku/trunk/src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30339%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200904222215.n3MMFSwN016566%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016094.html">
+   <LINK REL="Next"  HREF="016096.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30339 - haiku/trunk/src/system/kernel/debug</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30339%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200904222215.n3MMFSwN016566%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30339 - haiku/trunk/src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 23 00:15:28 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016094.html">[Haiku-commits] r30338 - haiku/trunk/src/system/kernel/scheduler
+</A></li>
+        <LI>Next message: <A HREF="016096.html">[Haiku-commits] r30340 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16095">[ date ]</a>
+              <a href="thread.html#16095">[ thread ]</a>
+              <a href="subject.html#16095">[ subject ]</a>
+              <a href="author.html#16095">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-04-23 00:15:27 +0200 (Thu, 23 Apr 2009)
+New Revision: 30339
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30339&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30339&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/debug/system_profiler.cpp
+Log:
+Fixed issues with the scheduling events. In the listener callbacks we
+potentially want to notify the profiler thread (i.e. wake it up), which can
+cause another scheduling event notification. That is we have to make sure that
+event buffer is in a consistent state at that point (i.e. wake up the thread
+at the very end of the callbacks). Furthermore the ThreadEnqueuedInRunQueue()
+callback can be called with spinlocks besides the thread spinlock being held. In
+particular waking up threads also happens in the condition variable code with
+a static spinlock being held. Trying to notify the condition variable the
+profiler thread is waiting on in such a case would be a guaranteed deadlock.
+Hence we avoid doing that, now.
+
+
+Modified: haiku/trunk/src/system/kernel/debug/system_profiler.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/system_profiler.cpp	2009-04-22 22:03:56 UTC (rev 30338)
++++ haiku/trunk/src/system/kernel/debug/system_profiler.cpp	2009-04-22 22:15:27 UTC (rev 30339)
+@@ -78,7 +78,8 @@
+ 									void* cookie);
+ 
+ 			void*				_AllocateBuffer(size_t size, int event, int cpu,
+-									int count, bool threadsLocked = false);
++									int count, bool threadsLocked = false,
++									bool* _unlockProfiler = NULL);
+ 
+ 	static	void				_InitTimers(void* cookie, int cpu);
+ 	static	void				_UninitTimers(void* cookie, int cpu);
+@@ -120,6 +121,7 @@
+ 			ConditionVariable	fProfilerWaitCondition;
+ 			bool				fProfilerWaiting;
+ 			bool				fProfilingActive;
++			bool				fReentered[B_MAX_CPU_COUNT];
+ 			CPUProfileData		fCPUData[B_MAX_CPU_COUNT];
+ };
+ 
+@@ -155,6 +157,8 @@
+ {
+ 	B_INITIALIZE_SPINLOCK(&amp;fLock);
+ 	fProfilerWaitCondition.Init(this, &quot;system profiler&quot;);
++
++	memset(fReentered, 0, sizeof(fReentered));
+ }
+ 
+ 
+@@ -457,14 +461,19 @@
+ void
+ SystemProfiler::ThreadEnqueuedInRunQueue(struct thread* thread)
+ {
+-	InterruptsSpinLocker locker(fLock);
++	int cpu = smp_get_current_cpu();
+ 
++	InterruptsSpinLocker locker(fLock, false, !fReentered[cpu]);
++		// When re-entering, we already hold the lock.
++
++	bool unlockProfiler = false;
++
+ 	system_profiler_thread_enqueued_in_run_queue* event
+ 		= (system_profiler_thread_enqueued_in_run_queue*)
+ 			_AllocateBuffer(
+ 				sizeof(system_profiler_thread_enqueued_in_run_queue),
+ 				B_SYSTEM_PROFILER_THREAD_ENQUEUED_IN_RUN_QUEUE,
+-				smp_get_current_cpu(), 0, true);
++				cpu, 0, true, &amp;unlockProfiler);
+ 	if (event == NULL)
+ 		return;
+ 
+@@ -473,20 +482,40 @@
+ 	event-&gt;priority = thread-&gt;priority;
+ 
+ 	fHeader-&gt;size = fBufferSize;
++
++	// Unblock the profiler thread, if necessary, but don't unblock the thread,
++	// if it had been waiting on a condition variable, since then we'd likely
++	// deadlock in ConditionVariable::NotifyOne(), as it acquires a static
++	// spinlock.
++	if (unlockProfiler
++		&amp;&amp; thread-&gt;wait.type != THREAD_BLOCK_TYPE_CONDITION_VARIABLE) {
++		// NotifyOne() will probably re-enqueue the profiler thread to the
++		// run queue, thus causing our ThreadEnqueuedInRunQueue() to be invoked.
++		// Hence we need the re-entering detection.
++		fProfilerWaiting = false;
++		fReentered[cpu] = true;
++		fProfilerWaitCondition.NotifyOne(true);
++		fReentered[cpu] = false;
++	}
+ }
+ 
+ 
+ void
+ SystemProfiler::ThreadRemovedFromRunQueue(struct thread* thread)
+ {
+-	InterruptsSpinLocker locker(fLock);
++	int cpu = smp_get_current_cpu();
+ 
++	InterruptsSpinLocker locker(fLock, false, !fReentered[cpu]);
++		// When re-entering, we already hold the lock.
++
++	bool unlockProfiler = false;
++
+ 	system_profiler_thread_removed_from_run_queue* event
+ 		= (system_profiler_thread_removed_from_run_queue*)
+ 			_AllocateBuffer(
+ 				sizeof(system_profiler_thread_removed_from_run_queue),
+ 				B_SYSTEM_PROFILER_THREAD_REMOVED_FROM_RUN_QUEUE,
+-				smp_get_current_cpu(), 0, true);
++				smp_get_current_cpu(), 0, true, &amp;unlockProfiler);
+ 	if (event == NULL)
+ 		return;
+ 
+@@ -494,6 +523,17 @@
+ 	event-&gt;thread = thread-&gt;id;
+ 
+ 	fHeader-&gt;size = fBufferSize;
++
++	// unblock the profiler thread, if necessary
++	if (unlockProfiler) {
++		// NotifyOne() will probably re-enqueue the profiler thread to the
++		// run queue, thus causing our ThreadEnqueuedInRunQueue() to be invoked.
++		// Hence we need the re-entering detection.
++		fProfilerWaiting = false;
++		fReentered[cpu] = true;
++		fProfilerWaitCondition.NotifyOne(true);
++		fReentered[cpu] = false;
++	}
+ }
+ 
+ 
+@@ -501,15 +541,20 @@
+ SystemProfiler::ThreadScheduled(struct thread* oldThread,
+ 	struct thread* newThread)
+ {
+-	InterruptsSpinLocker locker(fLock);
++	int cpu = smp_get_current_cpu();
+ 
++	InterruptsSpinLocker locker(fLock, false, !fReentered[cpu]);
++		// When re-entering, we already hold the lock.
++
+ 	// TODO: Deal with the wait object!
+ 
++	bool unlockProfiler = false;
++
+ 	system_profiler_thread_scheduled* event
+ 		= (system_profiler_thread_scheduled*)
+ 			_AllocateBuffer(sizeof(system_profiler_thread_scheduled),
+ 				B_SYSTEM_PROFILER_THREAD_SCHEDULED, smp_get_current_cpu(), 0,
+-				true);
++				true, &amp;unlockProfiler);
+ 	if (event == NULL)
+ 		return;
+ 
+@@ -521,6 +566,17 @@
+ 	event-&gt;previous_thread_wait_object = (addr_t)oldThread-&gt;wait.object;
+ 
+ 	fHeader-&gt;size = fBufferSize;
++
++	// unblock the profiler thread, if necessary
++	if (unlockProfiler) {
++		// NotifyOne() will probably re-enqueue the profiler thread to the
++		// run queue, thus causing our ThreadEnqueuedInRunQueue() to be invoked.
++		// Hence we need the re-entering detection.
++		fProfilerWaiting = false;
++		fReentered[cpu] = true;
++		fProfilerWaitCondition.NotifyOne(true);
++		fReentered[cpu] = false;
++	}
+ }
+ 
+ 
+@@ -699,7 +755,7 @@
+ 
+ void*
+ SystemProfiler::_AllocateBuffer(size_t size, int event, int cpu, int count,
+-	bool threadsLocked)
++	bool threadsLocked, bool* _unlockProfiler)
+ {
+ 	size = (size + 3) / 4 * 4;
+ 	size += sizeof(system_profiler_event_header);
+@@ -731,8 +787,16 @@
+ 
+ 	// If the buffer is full enough notify the profiler.
+ 	if (fProfilerWaiting &amp;&amp; fBufferSize &gt; fBufferCapacity / 2) {
+-		fProfilerWaiting = false;
+-		fProfilerWaitCondition.NotifyOne(threadsLocked);
++		if (threadsLocked) {
++			// We're obviously recording scheduler events. NotifyOne() will
++			// likely requeue the profiler thread in the run queue, thus causing
++			// recursion. We can't really handle the problem here, so just
++			// notify our caller.
++			*_unlockProfiler = true;
++		} else {
++			fProfilerWaiting = false;
++			fProfilerWaitCondition.NotifyOne();
++		}
+ 	}
+ 
+ 	return header + 1;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016094.html">[Haiku-commits] r30338 - haiku/trunk/src/system/kernel/scheduler
+</A></li>
+	<LI>Next message: <A HREF="016096.html">[Haiku-commits] r30340 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16095">[ date ]</a>
+              <a href="thread.html#16095">[ thread ]</a>
+              <a href="subject.html#16095">[ subject ]</a>
+              <a href="author.html#16095">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

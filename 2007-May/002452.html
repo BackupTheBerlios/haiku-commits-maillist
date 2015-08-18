@@ -1,0 +1,159 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21248 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21248%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200705270338.l4R3cUn8014817%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002448.html">
+   <LINK REL="Next"  HREF="002453.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21248 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21248%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200705270338.l4R3cUn8014817%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21248 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Sun May 27 05:38:30 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002448.html">[Haiku-commits] r21247 - haiku/trunk/src/tools/fs_shell
+</A></li>
+        <LI>Next message: <A HREF="002453.html">[Haiku-commits] r21249 - haiku/trunk/src/preferences/print
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2452">[ date ]</a>
+              <a href="thread.html#2452">[ thread ]</a>
+              <a href="subject.html#2452">[ subject ]</a>
+              <a href="author.html#2452">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-05-27 05:38:22 +0200 (Sun, 27 May 2007)
+New Revision: 21248
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21248&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21248&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+Log:
+tcp: fixed an issue where the socket could be waken from ReadData() even when no new data was added to the queue (due to lost packets). Also make sure we only break from the receive loop where there is at least a byte of data to be consumed.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-05-26 14:32:40 UTC (rev 21247)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-05-27 03:38:22 UTC (rev 21248)
+@@ -648,18 +648,18 @@
+ 			return B_OK;
+ 		}
+ 
+-		if (fReceiveQueue.Available() &gt;= dataNeeded ||
++		if (fReceiveQueue.Available() &gt; 0) {
++			if (fReceiveQueue.Available() &gt;= dataNeeded ||
+ 				((fReceiveQueue.PushedData() &gt; 0)
+ 					&amp;&amp; (fReceiveQueue.PushedData() &gt;= fReceiveQueue.Available())))
+-			break;
+-
+-		if (fState == FINISH_RECEIVED) {
++				break;
++		} else if (fState == FINISH_RECEIVED) {
+ 			// ``If no text is awaiting delivery, the RECEIVE will
+ 			//   get a Connection closing''.
+ 			return B_OK;
+ 		}
+ 
+-		if (flags &amp; MSG_DONTWAIT)
++		if ((flags &amp; MSG_DONTWAIT) || (socket-&gt;receive.timeout == 0))
+ 			return B_WOULD_BLOCK;
+ 
+ 		status_t status = fReceiveList.Wait(locker, timeout, false);
+@@ -1024,8 +1024,8 @@
+ 			&amp;&amp; fReceiveQueue.IsContiguous()
+ 			&amp;&amp; fReceiveQueue.Free() &gt;= buffer-&gt;size
+ 			&amp;&amp; !(fFlags &amp; FLAG_NO_RECEIVE)) {
+-			_AddData(segment, buffer);
+-			_NotifyReader();
++			if (_AddData(segment, buffer))
++				_NotifyReader();
+ 			return KEEP | ((segment.flags &amp; TCP_FLAG_PUSH) ?
+ 				IMMEDIATE_ACKNOWLEDGE : ACKNOWLEDGE);
+ 		}
+@@ -1544,10 +1544,9 @@
+ 
+ 	bool notify = false;
+ 
+-	if (buffer-&gt;size &gt; 0 &amp;&amp;	_ShouldReceive()) {
+-		_AddData(segment, buffer);
+-		notify = true;
+-	} else
++	if (buffer-&gt;size &gt; 0 &amp;&amp;	_ShouldReceive())
++		notify = _AddData(segment, buffer);
++	else
+ 		action = (action &amp; ~KEEP) | DROP;
+ 
+ 	if (segment.flags &amp; TCP_FLAG_FINISH) {
+@@ -1639,7 +1638,7 @@
+ }
+ 
+ 
+-void
++bool
+ TCPEndpoint::_AddData(tcp_segment_header &amp;segment, net_buffer *buffer)
+ {
+ 	fReceiveQueue.Add(buffer, segment.sequence);
+@@ -1650,6 +1649,8 @@
+ 
+ 	if (segment.flags &amp; TCP_FLAG_PUSH)
+ 		fReceiveQueue.SetPushPointer();
++
++	return fReceiveQueue.Available() &gt; 0;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-05-26 14:32:40 UTC (rev 21247)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-05-27 03:38:22 UTC (rev 21248)
+@@ -108,7 +108,7 @@
+ 			size_t segmentLength);
+ 		void _MarkEstablished();
+ 		status_t _WaitForEstablished(MutexLocker &amp;lock, bigtime_t timeout);
+-		void _AddData(tcp_segment_header &amp;segment, net_buffer *buffer);
++		bool _AddData(tcp_segment_header &amp;segment, net_buffer *buffer);
+ 		void _PrepareReceivePath(tcp_segment_header &amp;segment);
+ 		status_t _PrepareSendPath(const sockaddr *peer);
+ 		void _Acknowledged(tcp_segment_header &amp;segment);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002448.html">[Haiku-commits] r21247 - haiku/trunk/src/tools/fs_shell
+</A></li>
+	<LI>Next message: <A HREF="002453.html">[Haiku-commits] r21249 - haiku/trunk/src/preferences/print
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2452">[ date ]</a>
+              <a href="thread.html#2452">[ thread ]</a>
+              <a href="subject.html#2452">[ subject ]</a>
+              <a href="author.html#2452">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

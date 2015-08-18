@@ -1,0 +1,297 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21906 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21906%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200708121254.l7CCsG9a027873%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003472.html">
+   <LINK REL="Next"  HREF="003474.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21906 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21906%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200708121254.l7CCsG9a027873%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21906 - haiku/trunk/src/add-ons/kernel/busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun Aug 12 14:54:16 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003472.html">[Haiku-commits] r21905 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+        <LI>Next message: <A HREF="003474.html">[Haiku-commits] r21907 -	haiku/trunk/src/tests/kits/interface/flatten_picture
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3473">[ date ]</a>
+              <a href="thread.html#3473">[ thread ]</a>
+              <a href="subject.html#3473">[ subject ]</a>
+              <a href="author.html#3473">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2007-08-12 14:54:16 +0200 (Sun, 12 Aug 2007)
+New Revision: 21906
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21906&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21906&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h
+Log:
+* Apply more sane canceling logic to EHCI too
+* Remove the leftover user_area - this is handeled inside the Transfer class by now
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp	2007-08-12 12:04:41 UTC (rev 21905)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp	2007-08-12 12:54:16 UTC (rev 21906)
+@@ -831,7 +831,7 @@
+ EHCI::AddPendingTransfer(Transfer *transfer, ehci_qh *queueHead,
+ 	ehci_qtd *dataDescriptor, bool directionIn)
+ {
+-	transfer_data *data = new(std::nothrow) transfer_data();
++	transfer_data *data = new(std::nothrow) transfer_data;
+ 	if (!data)
+ 		return B_NO_MEMORY;
+ 
+@@ -842,8 +842,8 @@
+ 	data-&gt;transfer = transfer;
+ 	data-&gt;queue_head = queueHead;
+ 	data-&gt;data_descriptor = dataDescriptor;
+-	data-&gt;user_area = -1;
+ 	data-&gt;incoming = directionIn;
++	data-&gt;canceled = false;
+ 	data-&gt;link = NULL;
+ 
+ 	if (!Lock()) {
+@@ -869,29 +869,21 @@
+ 	if (!Lock())
+ 		return B_ERROR;
+ 
+-	transfer_data *last = NULL;
+ 	transfer_data *current = fFirstTransfer;
+ 	while (current) {
+ 		if (current-&gt;transfer-&gt;TransferPipe() == pipe) {
+-			UnlinkQueueHead(current-&gt;queue_head, &amp;fFreeListHead);
++			// clear the active bit so the descriptors are canceled
++			ehci_qtd *descriptor = (ehci_qtd *)current-&gt;queue_head-&gt;element_log;
++			while (descriptor) {
++				descriptor-&gt;token &amp;= ~EHCI_QTD_STATUS_ACTIVE;
++				descriptor = (ehci_qtd *)descriptor-&gt;next_log;
++			}
++
+ 			current-&gt;transfer-&gt;Finished(B_CANCELED, 0);
+-			delete current-&gt;transfer;
++			current-&gt;canceled = true;
++		}
+ 
+-			transfer_data *next = current-&gt;link;
+-			if (last)
+-				last-&gt;link = next;
+-			else
+-				fFirstTransfer = next;
+-
+-			if (fLastTransfer == current)
+-				fLastTransfer = last;
+-
+-			delete current;
+-			current = next;
+-		} else {
+-			last = current;
+-			current = current-&gt;link;
+-		}
++		current = current-&gt;link;
+ 	}
+ 
+ 	Unlock();
+@@ -954,11 +946,8 @@
+ 		while (transfer) {
+ 			bool transferDone = false;
+ 			ehci_qtd *descriptor = (ehci_qtd *)transfer-&gt;queue_head-&gt;element_log;
++			status_t callbackStatus = B_OK;
+ 
+-#ifdef TRACE_USB
+-			print_queue(transfer-&gt;queue_head);
+-#endif
+-
+ 			while (descriptor) {
+ 				uint32 status = descriptor-&gt;token;
+ 				if (status &amp; EHCI_QTD_STATUS_ACTIVE) {
+@@ -998,8 +987,6 @@
+ 						callbackStatus = B_DEV_STALLED;
+ 					}
+ 
+-					UnlinkQueueHead(transfer-&gt;queue_head, &amp;fFreeListHead);
+-					transfer-&gt;transfer-&gt;Finished(callbackStatus, 0);
+ 					transferDone = true;
+ 					break;
+ 				}
+@@ -1007,8 +994,41 @@
+ 				if (descriptor-&gt;next_phy &amp; EHCI_QTD_TERMINATE) {
+ 					// we arrived at the last (stray) descriptor, we're done
+ 					TRACE((&quot;usb_ehci: qtd (0x%08lx) done\n&quot;, descriptor-&gt;this_phy));
++					callbackStatus = B_OK;
++					transferDone = true;
++					break;
++				}
+ 
+-					size_t actualLength = 0;
++				descriptor = (ehci_qtd *)descriptor-&gt;next_log;
++			}
++
++			if (!transferDone) {
++				lastTransfer = transfer;
++				transfer = transfer-&gt;link;
++				continue;
++			}
++
++			// remove the transfer from the list first so we are sure
++			// it doesn't get canceled while we still process it
++			transfer_data *next = transfer-&gt;link;
++			if (Lock()) {
++				if (lastTransfer)
++					lastTransfer-&gt;link = transfer-&gt;link;
++
++				if (transfer == fFirstTransfer)
++					fFirstTransfer = transfer-&gt;link;
++				if (transfer == fLastTransfer)
++					fLastTransfer = lastTransfer;
++
++				transfer-&gt;link = NULL;
++				Unlock();
++			}
++
++			// if canceled the callback has already been called
++			if (!transfer-&gt;canceled) {
++				size_t actualLength = 0;
++
++				if (callbackStatus == B_OK) {
+ 					bool nextDataToggle = false;
+ 					if (transfer-&gt;data_descriptor &amp;&amp; transfer-&gt;incoming) {
+ 						// data to read out
+@@ -1027,56 +1047,47 @@
+ 					}
+ 
+ 					transfer-&gt;transfer-&gt;TransferPipe()-&gt;SetDataToggle(nextDataToggle);
++
+ 					if (transfer-&gt;transfer-&gt;IsFragmented()) {
+ 						// this transfer may still have data left
+ 						transfer-&gt;transfer-&gt;AdvanceByFragment(actualLength);
+ 						if (transfer-&gt;transfer-&gt;VectorLength() &gt; 0) {
+ 							FreeDescriptorChain(transfer-&gt;data_descriptor);
+ 							transfer-&gt;transfer-&gt;PrepareKernelAccess();
+-							FillQueueWithData(transfer-&gt;transfer,
++							status_t result = FillQueueWithData(
++								transfer-&gt;transfer,
+ 								transfer-&gt;queue_head,
+ 								&amp;transfer-&gt;data_descriptor, NULL);
+-							break;
++
++							if (result == B_OK &amp;&amp; Lock()) {
++								// reappend the transfer
++								if (fLastTransfer)
++									fLastTransfer-&gt;link = transfer;
++								if (!fFirstTransfer)
++									fFirstTransfer = transfer;
++
++								fLastTransfer = transfer;
++								Unlock();
++
++								transfer = next;
++								continue;
++							}
+ 						}
+ 
+ 						// the transfer is done, but we already set the
+ 						// actualLength with AdvanceByFragment()
+ 						actualLength = 0;
+ 					}
+-
+-					UnlinkQueueHead(transfer-&gt;queue_head, &amp;fFreeListHead);
+-					transfer-&gt;transfer-&gt;Finished(B_OK, actualLength);
+-					transferDone = true;
+-					break;
+ 				}
+ 
+-				descriptor = (ehci_qtd *)descriptor-&gt;next_log;
++				transfer-&gt;transfer-&gt;Finished(callbackStatus, actualLength);
+ 			}
+ 
+-			if (transferDone) {
+-				if (Lock()) {
+-					if (lastTransfer)
+-						lastTransfer-&gt;link = transfer-&gt;link;
+-
+-					if (transfer == fFirstTransfer)
+-						fFirstTransfer = transfer-&gt;link;
+-					if (transfer == fLastTransfer)
+-						fLastTransfer = lastTransfer;
+-
+-					transfer_data *next = transfer-&gt;link;
+-					delete transfer-&gt;transfer;
+-					delete transfer;
+-					transfer = next;
+-					Unlock();
+-				}
+-			} else {
+-				if (Lock()) {
+-					lastTransfer = transfer;
+-					transfer = transfer-&gt;link;
+-					Unlock();
+-				}
+-			}
+-
++			// unlink hardware queue and delete the transfer
++			UnlinkQueueHead(transfer-&gt;queue_head, &amp;fFreeListHead);
++			delete transfer-&gt;transfer;
++			delete transfer;
++			transfer = next;
+ 			release_sem(fCleanupSem);
+ 		}
+ 	}
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h	2007-08-12 12:04:41 UTC (rev 21905)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h	2007-08-12 12:54:16 UTC (rev 21906)
+@@ -22,8 +22,8 @@
+ 	Transfer		*transfer;
+ 	ehci_qh			*queue_head;
+ 	ehci_qtd		*data_descriptor;
+-	area_id			user_area;
+ 	bool			incoming;
++	bool			canceled;
+ 	transfer_data_s	*link;
+ } transfer_data;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003472.html">[Haiku-commits] r21905 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+	<LI>Next message: <A HREF="003474.html">[Haiku-commits] r21907 -	haiku/trunk/src/tests/kits/interface/flatten_picture
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3473">[ date ]</a>
+              <a href="thread.html#3473">[ thread ]</a>
+              <a href="subject.html#3473">[ subject ]</a>
+              <a href="author.html#3473">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

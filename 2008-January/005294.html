@@ -1,0 +1,228 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23334 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23334%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200801092225.m09MPLmh028425%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005293.html">
+   <LINK REL="Next"  HREF="005295.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23334 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23334%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200801092225.m09MPLmh028425%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23334 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Jan  9 23:25:21 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005293.html">[Haiku-commits] r23333 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+</A></li>
+        <LI>Next message: <A HREF="005295.html">[Haiku-commits] r23335 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5294">[ date ]</a>
+              <a href="thread.html#5294">[ thread ]</a>
+              <a href="subject.html#5294">[ subject ]</a>
+              <a href="author.html#5294">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-01-09 23:25:21 +0100 (Wed, 09 Jan 2008)
+New Revision: 23334
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23334&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23334&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* Fixed (or rather, worked around) a deadlock in the VM: when a file was
+  resized but still had dirty pages to be written back, 
+  vm_cache_resize() (which is called with the inode lock being held)
+  deadlocked with the page writer.
+* Now, I reintroduced busy_writing: it'll be set by everything that
+  writes back pages (vm_page_write_modified(), and the page writer),
+  and will be checked for in vm_cache_resize() - other functions are not
+  affected for now, AFAICT.
+* vm_cache_resize() will clear that flag, and the writer will check it
+  again after it wrote back the page (which will fail when it's outside
+  the file bounds), and if it's cleared, it will get rid of the page
+  (if the file has been resized again in the mean time, writing it will
+  succeed then, and we'll keep the page around).
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2008-01-09 22:05:26 UTC (rev 23333)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2008-01-09 22:25:21 UTC (rev 23334)
+@@ -100,6 +100,7 @@
+ 
+ 	uint8				is_cleared : 1;
+ 		// is currently only used in vm_page_allocate_page_run()
++	uint8				busy_writing : 1;
+ 
+ 	uint16				wired_count;
+ 	int8				usage_count;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-01-09 22:05:26 UTC (rev 23333)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-01-09 22:25:21 UTC (rev 23334)
+@@ -500,15 +500,23 @@
+ 
+ 			if (page-&gt;cache_offset &gt;= newPageCount) {
+ 				if (page-&gt;state == PAGE_STATE_BUSY) {
+-					// wait for page to become unbusy
+-					ConditionVariableEntry&lt;vm_page&gt; entry;
+-					entry.Add(page);
+-					mutex_unlock(&amp;cache-&gt;lock);
+-					entry.Wait();
+-					mutex_lock(&amp;cache-&gt;lock);
++					if (page-&gt;busy_writing) {
++						// We cannot wait for the page to become available
++						// as we might cause a deadlock this way
++						page-&gt;busy_writing = false;
++							// this will notify the writer to free the page
++						page = next;
++					} else {
++						// wait for page to become unbusy
++						ConditionVariableEntry&lt;vm_page&gt; entry;
++						entry.Add(page);
++						mutex_unlock(&amp;cache-&gt;lock);
++						entry.Wait();
++						mutex_lock(&amp;cache-&gt;lock);
+ 
+-					// restart from the start of the list
+-					page = cache-&gt;page_list;
++						// restart from the start of the list
++						page = cache-&gt;page_list;
++					}
+ 					continue;
+ 				}
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2008-01-09 22:05:26 UTC (rev 23333)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2008-01-09 22:25:21 UTC (rev 23334)
+@@ -835,6 +835,9 @@
+ 			page, page-&gt;cache_offset, status);
+ 	}
+ #endif
++	if (status == B_OK &amp;&amp; length == 0)
++		status = B_ERROR;
++
+ 	return status;
+ }
+ 
+@@ -960,6 +963,7 @@
+ 			InterruptsSpinLocker locker(sPageLock);
+ 			remove_page_from_queue(&amp;sModifiedPageQueue, page);
+ 			page-&gt;state = PAGE_STATE_BUSY;
++			page-&gt;busy_writing = true;
+ 
+ 			busyConditions[numPages].Publish(page, &quot;page&quot;);
+ 
+@@ -992,12 +996,21 @@
+ 				// put it into the active queue
+ 				InterruptsSpinLocker locker(sPageLock);
+ 				move_page_to_active_or_inactive_queue(pages[i], true);
++				pages[i]-&gt;busy_writing = false;
+ 			} else {
+ 				// We don't have to put the PAGE_MODIFIED bit back, as it's
+ 				// still in the modified pages list.
+-				InterruptsSpinLocker locker(sPageLock);
+-				pages[i]-&gt;state = PAGE_STATE_MODIFIED;
+-				enqueue_page(&amp;sModifiedPageQueue, pages[i]);
++				{
++					InterruptsSpinLocker locker(sPageLock);
++					pages[i]-&gt;state = PAGE_STATE_MODIFIED;
++					enqueue_page(&amp;sModifiedPageQueue, pages[i]);
++				}
++				if (!pages[i]-&gt;busy_writing) {
++					// someone has cleared the busy_writing flag which tells
++					// us our page has gone invalid
++					vm_cache_remove_page(cache, pages[i]);
++				} else
++					pages[i]-&gt;busy_writing = false;
+ 			}
+ 
+ 			busyConditions[i].Unpublish();
+@@ -1246,6 +1259,7 @@
+ 		}
+ 
+ 		page-&gt;state = PAGE_STATE_BUSY;
++		page-&gt;busy_writing = true;
+ 
+ 		ConditionVariable&lt;vm_page&gt; busyCondition;
+ 		busyCondition.Publish(page, &quot;page&quot;);
+@@ -1272,14 +1286,25 @@
+ 		if (status == B_OK) {
+ 			// put it into the active/inactive queue
+ 			move_page_to_active_or_inactive_queue(page, dequeuedPage);
++			page-&gt;busy_writing = false;
+ 		} else {
+ 			// We don't have to put the PAGE_MODIFIED bit back, as it's still
+ 			// in the modified pages list.
+ 			if (dequeuedPage) {
+ 				page-&gt;state = PAGE_STATE_MODIFIED;
+ 				enqueue_page(&amp;sModifiedPageQueue, page);
+-			} else
+-				set_page_state_nolock(page, PAGE_STATE_MODIFIED);
++			}
++
++			if (!page-&gt;busy_writing) {
++				// someone has cleared the busy_writing flag which tells
++				// us our page has gone invalid
++				vm_cache_remove_page(cache, page);
++			} else {
++				if (!dequeuedPage)
++					set_page_state_nolock(page, PAGE_STATE_MODIFIED);
++
++				page-&gt;busy_writing = false;
++			}
+ 		}
+ 
+ 		busyCondition.Unpublish();
+@@ -1345,6 +1370,7 @@
+ 		new(&amp;sPages[i].mappings) vm_page_mappings();
+ 		sPages[i].wired_count = 0;
+ 		sPages[i].usage_count = 0;
++		sPages[i].busy_writing = false;
+ 		sPages[i].cache = NULL;
+ 		#ifdef DEBUG_PAGE_QUEUE
+ 			sPages[i].queue = NULL;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005293.html">[Haiku-commits] r23333 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+</A></li>
+	<LI>Next message: <A HREF="005295.html">[Haiku-commits] r23335 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5294">[ date ]</a>
+              <a href="thread.html#5294">[ thread ]</a>
+              <a href="subject.html#5294">[ subject ]</a>
+              <a href="author.html#5294">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

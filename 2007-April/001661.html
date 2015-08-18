@@ -1,0 +1,441 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20731 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20731%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704170339.l3H3dYOe011021%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001660.html">
+   <LINK REL="Next"  HREF="001662.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20731 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20731%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704170339.l3H3dYOe011021%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20731 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Tue Apr 17 05:39:34 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001660.html">[Haiku-commits] r20730 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+        <LI>Next message: <A HREF="001662.html">[Haiku-commits] r20732 -	haiku/trunk/src/system/libroot/posix/string/arch/x86
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1661">[ date ]</a>
+              <a href="thread.html#1661">[ thread ]</a>
+              <a href="subject.html#1661">[ subject ]</a>
+              <a href="author.html#1661">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-17 05:39:24 +0200 (Tue, 17 Apr 2007)
+New Revision: 20731
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20731&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20731&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+Log:
+reorganized some of the TCP logic so we have common init paths for receive and send.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-17 01:25:08 UTC (rev 20730)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-17 03:39:24 UTC (rev 20731)
+@@ -314,7 +314,7 @@
+ 	until the connection has been established or refused.
+ */
+ status_t
+-TCPEndpoint::Connect(const struct sockaddr *address)
++TCPEndpoint::Connect(const sockaddr *address)
+ {
+ 	TRACE(&quot;Connect() on address %s&quot;,
+ 		AddressString(Domain(), address, true).Data());
+@@ -329,41 +329,13 @@
+ 	} else if (fState != CLOSED)
+ 		return EISCONN;
+ 
+-	// get a net_route if there isn't one
+-	// TODO: get a net_route_info instead!
+-	if (fRoute == NULL) {
+-		fRoute = gDatalinkModule-&gt;get_route(Domain(), (sockaddr *)address);
+-		TRACE(&quot;  Connect(): Using Route %p&quot;, fRoute);
+-		if (fRoute == NULL)
+-			return ENETUNREACH;
+-	}
+-
+-	// make sure connection does not already exist
+-	status_t status = fManager-&gt;SetConnection(this,
+-		(sockaddr *)&amp;socket-&gt;address, address, fRoute-&gt;interface-&gt;address);
+-	if (status &lt; B_OK) {
+-		TRACE(&quot;  Connect(): could not add connection: %s!&quot;, strerror(status));
++	status_t status = _PrepareSendPath(address);
++	if (status &lt; B_OK)
+ 		return status;
+-	}
+ 
+-	fReceiveMaxSegmentSize = _GetMSS(address);
+-
+-	// Compute the window shift we advertise to our peer - if it doesn't support
+-	// this option, this will be reset to 0 (when its SYN is received)
+-	fReceiveWindowShift = 0;
+-	while (fReceiveWindowShift &lt; TCP_MAX_WINDOW_SHIFT
+-		&amp;&amp; (0xffffUL &lt;&lt; fReceiveWindowShift) &lt; socket-&gt;receive.buffer_size) {
+-		fReceiveWindowShift++;
+-	}
+-
+ 	TRACE(&quot;  Connect(): starting 3-way handshake...&quot;);
+ 
+ 	fState = SYNCHRONIZE_SENT;
+-	fInitialSendSequence = system_time() &gt;&gt; 4;
+-	fSendNext = fInitialSendSequence;
+-	fSendUnacknowledged = fInitialSendSequence;
+-	fSendMax = fInitialSendSequence;
+-	fSendQueue.SetInitialSequence(fSendNext + 1);
+ 
+ 	// send SYN
+ 	status = _SendQueued();
+@@ -515,8 +487,7 @@
+ 	if (fState == CLOSED)
+ 		return ENOTCONN;
+ 	else if (fState == LISTEN) {
+-		// TODO change socket from passive to active.
+-		return EOPNOTSUPP;
++		return EDESTADDRREQ;
+ 	} else if (fState == FINISH_SENT || fState == FINISH_ACKNOWLEDGED
+ 				|| fState == CLOSING || fState == WAIT_FOR_FINISH_ACKNOWLEDGE
+ 				|| fState == TIME_WAIT) {
+@@ -753,7 +724,8 @@
+ 	AddressModule()-&gt;set_to((sockaddr *)&amp;newSocket-&gt;peer,
+ 		(sockaddr *)&amp;buffer-&gt;source);
+ 
+-	return ((TCPEndpoint *)newSocket-&gt;first_protocol)-&gt;Spawn(this, segment, buffer);
++	return ((TCPEndpoint *)newSocket-&gt;first_protocol)-&gt;Spawn(this,
++		segment, buffer);
+ }
+ 
+ 
+@@ -765,55 +737,18 @@
+ 
+ 	fState = SYNCHRONIZE_RECEIVED;
+ 	fManager = parent-&gt;fManager;
++	fSpawned = true;
+ 
+ 	TRACE(&quot;Spawn()&quot;);
+ 
+-	fSpawned = true;
+-
+-	sockaddr *local = (sockaddr *)&amp;socket-&gt;address;
+-	sockaddr *peer = (sockaddr *)&amp;socket-&gt;peer;
+-
+ 	// TODO: proper error handling!
+-
+-	fRoute = gDatalinkModule-&gt;get_route(Domain(), peer);
+-	if (fRoute == NULL)
++	if (_PrepareSendPath((sockaddr *)&amp;socket-&gt;peer) &lt; B_OK)
+ 		return DROP;
+ 
+-	if (fManager-&gt;SetConnection(this, local, peer, NULL) &lt; B_OK)
+-		return DROP;
++	_PrepareReceivePath(parent, segment);
+ 
+-	fInitialReceiveSequence = segment.sequence;
+-	fReceiveQueue.SetInitialSequence(segment.sequence + 1);
+-	fAcceptSemaphore = parent-&gt;fAcceptSemaphore;
+-	fReceiveMaxSegmentSize = _GetMSS(peer);
+-		// 40 bytes for IP and TCP header without any options
+-		// TODO: make this depending on the RTF_LOCAL flag?
+-	fReceiveNext = segment.sequence + 1;
+-		// account for the extra sequence number for the synchronization
+-
+-	fInitialSendSequence = system_time() &gt;&gt; 4;
+-	fSendNext = fInitialSendSequence;
+-	fSendUnacknowledged = fSendNext;
+-	fSendMax = fSendNext;
+-
+-	// set options
+-	if ((parent-&gt;fOptions &amp; TCP_NOOPT) == 0) {
+-		if (segment.max_segment_size &gt; 0)
+-			fSendMaxSegmentSize = segment.max_segment_size;
+-		else
+-			fReceiveMaxSegmentSize = TCP_DEFAULT_MAX_SEGMENT_SIZE;
+-		_CheckWindowScale(segment);
+-	}
+-
+-	_UpdateTimestamps(segment, 0, false);
+-
+ 	// send SYN+ACK
+-	status_t status = _SendQueued();
+-
+-	fInitialSendSequence = fSendNext;
+-	fSendQueue.SetInitialSequence(fSendNext);
+-
+-	if (status &lt; B_OK)
++	if (_SendQueued() &lt; B_OK)
+ 		return DROP;
+ 
+ 	segment.flags &amp;= ~TCP_FLAG_SYNCHRONIZE;
+@@ -842,20 +777,8 @@
+ 	if ((segment.flags &amp; TCP_FLAG_SYNCHRONIZE) == 0)
+ 		return DROP;
+ 
+-	fInitialReceiveSequence = segment.sequence;
+-	segment.sequence++;
++	_PrepareReceivePath(NULL, segment);
+ 
+-	fSendUnacknowledged = segment.acknowledge;
+-	fReceiveNext = segment.sequence;
+-	fReceiveQueue.SetInitialSequence(fReceiveNext);
+-
+-	if (segment.max_segment_size &gt; 0)
+-		fSendMaxSegmentSize = segment.max_segment_size;
+-	else
+-		fReceiveMaxSegmentSize = TCP_DEFAULT_MAX_SEGMENT_SIZE;
+-
+-	_CheckWindowScale(segment);
+-
+ 	if (segment.flags &amp; TCP_FLAG_ACKNOWLEDGE) {
+ 		_MarkEstablished();
+ 	} else {
+@@ -863,8 +786,6 @@
+ 		fState = SYNCHRONIZE_RECEIVED;
+ 	}
+ 
+-	_UpdateTimestamps(segment, 0, false);
+-
+ 	segment.flags &amp;= ~TCP_FLAG_SYNCHRONIZE;
+ 		// we handled this flag now, it must not be set for further processing
+ 
+@@ -929,7 +850,7 @@
+ 		&amp;&amp; advertisedWindow &gt; 0 &amp;&amp; advertisedWindow == fSendWindow
+ 		&amp;&amp; fSendNext == fSendMax) {
+ 
+-		_UpdateTimestamps(segment, buffer-&gt;size, true);
++		_UpdateTimestamps(segment, buffer-&gt;size);
+ 
+ 		if (buffer-&gt;size == 0) {
+ 			// this is a pure acknowledge segment - we're on the sending end
+@@ -1079,7 +1000,7 @@
+ 	segment.flags = _CurrentFlags();
+ 	segment.urgent_offset = 0;
+ 
+-	if (fOptions &amp; FLAG_OPTION_TIMESTAMP) {
++	if (fFlags &amp; FLAG_OPTION_TIMESTAMP) {
+ 		segment.has_timestamps = true;
+ 		segment.TSecr = fReceivedTSval;
+ 		segment.TSval = 0;
+@@ -1115,7 +1036,7 @@
+ 
+ 	size_t availableBytes = fReceiveQueue.Free();
+ 
+-	if (fOptions &amp; FLAG_OPTION_WINDOW_SCALE)
++	if (fFlags &amp; FLAG_OPTION_WINDOW_SCALE)
+ 		segment.advertised_window = availableBytes &gt;&gt; fReceiveWindowShift;
+ 	else
+ 		segment.advertised_window = min_c(TCP_MAX_WINDOW, availableBytes);
+@@ -1166,10 +1087,13 @@
+ 			}
+ 		}
+ 
+-		TRACE(&quot;SendQueued() flags %x, buffer %p, size %lu, from address %s to %s&quot;,
+-			segment.flags, buffer, buffer-&gt;size,
+-			AddressString(Domain(), (sockaddr *)&amp;buffer-&gt;source, true).Data(),
+-			AddressString(Domain(), (sockaddr *)&amp;buffer-&gt;destination, true).Data());
++		TRACE(&quot;SendQueued() buffer %p (%lu bytes) address %s to %s&quot;,
++			buffer, buffer-&gt;size, AddressString(Domain(),
++			(sockaddr *)&amp;buffer-&gt;source, true).Data(), AddressString(Domain(),
++			(sockaddr *)&amp;buffer-&gt;destination, true).Data());
++		TRACE(&quot;             flags 0x%x, seq %lu, ack %lu, rwnd %hu&quot;,
++			  segment.flags, segment.sequence, segment.acknowledge,
++			  segment.advertised_window);
+ 
+ 		status = add_tcp_header(AddressModule(), segment, buffer);
+ 		if (status != B_OK) {
+@@ -1382,10 +1306,8 @@
+ 
+ 	if ((segment.flags &amp; TCP_FLAG_ACKNOWLEDGE) != 0) {
+ 		// process acknowledged data
+-		if (fState == SYNCHRONIZE_RECEIVED) {
++		if (fState == SYNCHRONIZE_RECEIVED)
+ 			_MarkEstablished();
+-			_CheckWindowScale(segment);
+-		}
+ 
+ 		if (fSendMax &lt; segment.acknowledge || fState == TIME_WAIT)
+ 			return DROP | IMMEDIATE_ACKNOWLEDGE;
+@@ -1510,7 +1432,7 @@
+ 	if (buffer-&gt;size &gt; 0 || (segment.flags &amp; TCP_FLAG_SYNCHRONIZE) != 0)
+ 		action |= ACKNOWLEDGE;
+ 
+-	_UpdateTimestamps(segment, segmentLength, true);
++	_UpdateTimestamps(segment, segmentLength);
+ 
+ 	TRACE(&quot;Receive() Action %ld&quot;, action);
+ 
+@@ -1519,18 +1441,13 @@
+ 
+ 
+ void
+-TCPEndpoint::_UpdateTimestamps(tcp_segment_header &amp;segment, size_t segmentLength,
+-	bool checkSequence)
++TCPEndpoint::_UpdateTimestamps(tcp_segment_header &amp;segment,
++	size_t segmentLength)
+ {
+-	if (segment.has_timestamps)
+-		fOptions |= FLAG_OPTION_TIMESTAMP;
+-	else
+-		fOptions &amp;= ~FLAG_OPTION_TIMESTAMP;
+-
+-	if (fOptions &amp; FLAG_OPTION_TIMESTAMP) {
++	if (fFlags &amp; FLAG_OPTION_TIMESTAMP) {
+ 		tcp_sequence sequence(segment.sequence);
+ 
+-		if (!checkSequence || (fLastAcknowledgeSent &gt;= sequence
++		if ((fLastAcknowledgeSent &gt;= sequence
+ 				&amp;&amp; fLastAcknowledgeSent &lt; (sequence + segmentLength)))
+ 			fReceivedTSval = segment.TSval;
+ 	}
+@@ -1579,18 +1496,81 @@
+ 
+ 
+ void
+-TCPEndpoint::_CheckWindowScale(tcp_segment_header &amp;segment)
++TCPEndpoint::_PrepareReceivePath(TCPEndpoint *parent,
++	tcp_segment_header &amp;segment)
+ {
+-	if (segment.has_window_shift) {
+-		fFlags |= FLAG_OPTION_WINDOW_SCALE;
+-		fSendWindowShift = segment.window_shift;
+-	} else {
+-		fFlags &amp;= ~FLAG_OPTION_WINDOW_SCALE;
+-		fReceiveWindowShift = 0;
++	fInitialReceiveSequence = segment.sequence;
++
++	// count the received SYN
++	segment.sequence++;
++
++	if (parent == NULL)
++		fSendUnacknowledged = segment.acknowledge;
++	fReceiveNext = segment.sequence;
++	fReceiveQueue.SetInitialSequence(segment.sequence);
++
++	if (parent) {
++		fOptions = parent-&gt;fOptions;
++		fAcceptSemaphore = parent-&gt;fAcceptSemaphore;
+ 	}
++
++	if ((fOptions &amp; TCP_NOOPT) == 0) {
++		if (segment.max_segment_size &gt; 0)
++			fSendMaxSegmentSize = segment.max_segment_size;
++
++		if (segment.has_window_shift) {
++			fFlags |= FLAG_OPTION_WINDOW_SCALE;
++			fSendWindowShift = segment.window_shift;
++		} else {
++			fFlags &amp;= ~FLAG_OPTION_WINDOW_SCALE;
++			fReceiveWindowShift = 0;
++		}
++
++		if (segment.has_timestamps)
++			fFlags |= FLAG_OPTION_TIMESTAMP;
++		else
++			fFlags &amp;= ~FLAG_OPTION_TIMESTAMP;
++	}
+ }
+ 
+ 
++status_t
++TCPEndpoint::_PrepareSendPath(const sockaddr *peer)
++{
++	if (fRoute == NULL) {
++		fRoute = gDatalinkModule-&gt;get_route(Domain(), peer);
++		if (fRoute == NULL)
++			return ENETUNREACH;
++	}
++
++	// make sure connection does not already exist
++	status_t status = fManager-&gt;SetConnection(this,
++		(sockaddr *)&amp;socket-&gt;address, peer, fRoute-&gt;interface-&gt;address);
++	if (status &lt; B_OK)
++		return status;
++
++	fInitialSendSequence = system_time() &gt;&gt; 4;
++	fSendNext = fInitialSendSequence;
++	fSendUnacknowledged = fInitialSendSequence;
++	fSendMax = fInitialSendSequence;
++
++	// we are counting the SYN here
++	fSendQueue.SetInitialSequence(fSendNext + 1);
++
++	fReceiveMaxSegmentSize = _GetMSS(peer);
++
++	// Compute the window shift we advertise to our peer - if it doesn't support
++	// this option, this will be reset to 0 (when its SYN is received)
++	fReceiveWindowShift = 0;
++	while (fReceiveWindowShift &lt; TCP_MAX_WINDOW_SHIFT
++		&amp;&amp; (0xffffUL &lt;&lt; fReceiveWindowShift) &lt; socket-&gt;receive.buffer_size) {
++		fReceiveWindowShift++;
++	}
++
++	return B_OK;
++}
++
++
+ //	#pragma mark - timer
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-17 01:25:08 UTC (rev 20730)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-17 03:39:24 UTC (rev 20731)
+@@ -98,11 +98,13 @@
+ 		int32 _SegmentReceived(tcp_segment_header&amp; segment, net_buffer *buffer);
+ 		int32 _Receive(tcp_segment_header&amp; segment, net_buffer *buffer);
+ 		void _UpdateTimestamps(tcp_segment_header&amp; segment,
+-			size_t segmentLength, bool checkSequence);
++			size_t segmentLength);
+ 		void _MarkEstablished();
+ 		status_t _WaitForEstablished(RecursiveLocker &amp;lock, bigtime_t timeout);
+ 		void _AddData(tcp_segment_header &amp;segment, net_buffer *buffer);
+-		void _CheckWindowScale(tcp_segment_header &amp;segment);
++		void _PrepareReceivePath(TCPEndpoint *parent,
++			tcp_segment_header &amp;segment);
++		status_t _PrepareSendPath(const sockaddr *peer);
+ 
+ 		static void _TimeWaitTimer(net_timer *timer, void *data);
+ 		static void _RetransmitTimer(net_timer *timer, void *data);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001660.html">[Haiku-commits] r20730 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+	<LI>Next message: <A HREF="001662.html">[Haiku-commits] r20732 -	haiku/trunk/src/system/libroot/posix/string/arch/x86
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1661">[ date ]</a>
+              <a href="thread.html#1661">[ thread ]</a>
+              <a href="subject.html#1661">[ subject ]</a>
+              <a href="author.html#1661">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,181 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21042 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21042%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/usb&In-Reply-To=%3C200705061517.l46FH0Mv001694%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002143.html">
+   <LINK REL="Next"  HREF="002146.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21042 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21042%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/usb&In-Reply-To=%3C200705061517.l46FH0Mv001694%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21042 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun May  6 17:17:00 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002143.html">[Haiku-commits] r21041 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat/net compat/sys
+</A></li>
+        <LI>Next message: <A HREF="002146.html">[Haiku-commits] r21043 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2145">[ date ]</a>
+              <a href="thread.html#2145">[ thread ]</a>
+              <a href="subject.html#2145">[ subject ]</a>
+              <a href="author.html#2145">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2007-05-06 17:17:00 +0200 (Sun, 06 May 2007)
+New Revision: 21042
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21042&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21042&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp
+Log:
+* Moved around some initialization to avoid problems when deleting incompletely created objects
+* Also move waiting for the first explore to run through out of the constructor to reduce delays
+* Remove the old device when a new one is connected to the same port - this could happen when you very quickly un- and replug a device
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp	2007-05-06 15:08:08 UTC (rev 21041)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp	2007-05-06 15:17:00 UTC (rev 21042)
+@@ -13,10 +13,15 @@
+ 
+ Hub::Hub(Object *parent, usb_device_descriptor &amp;desc, int8 deviceAddress,
+ 	usb_speed speed)
+-	:	Device(parent, desc, deviceAddress, speed)
++	:	Device(parent, desc, deviceAddress, speed),
++		fInterruptPipe(NULL)
+ {
+ 	TRACE((&quot;USB Hub %d: creating hub\n&quot;, DeviceAddress()));
+ 
++	memset(&amp;fHubDescriptor, 0, sizeof(fHubDescriptor));
++	for (int32 i = 0; i &lt; 8; i++)
++		fChildren[i] = NULL;
++
+ 	if (!fInitOK) {
+ 		TRACE_ERROR((&quot;USB Hub %d: device failed to initialize\n&quot;, DeviceAddress()));
+ 		return;
+@@ -30,9 +35,6 @@
+ 		return;
+ 	}
+ 
+-	for (int32 i = 0; i &lt; 8; i++)
+-		fChildren[i] = NULL;
+-
+ 	if (fDeviceDescriptor.device_class != 9) {
+ 		TRACE_ERROR((&quot;USB Hub %d: wrong class! bailing out\n&quot;, DeviceAddress()));
+ 		return;
+@@ -58,6 +60,11 @@
+ 	TRACE((&quot;\tdevice_removeable:...0x%02x\n&quot;, fHubDescriptor.device_removeable));
+ 	TRACE((&quot;\tpower_control_mask:..0x%02x\n&quot;, fHubDescriptor.power_control_mask));
+ 
++	if (fHubDescriptor.num_ports &gt; 8) {
++		TRACE((&quot;USB Hub %d: hub supports more ports than we do (%d vs. 8)\n&quot;, DeviceAddress(), fHubDescriptor.num_ports));
++		fHubDescriptor.num_ports = 8;
++	}
++
+ 	Object *object = GetStack()-&gt;GetObject(Configuration()-&gt;interface-&gt;active-&gt;endpoint[0].handle);
+ 	if (!object || (object-&gt;Type() &amp; USB_OBJECT_INTERRUPT_PIPE) == 0) {
+ 		TRACE_ERROR((&quot;USB Hub %d: no interrupt pipe found\n&quot;, DeviceAddress()));
+@@ -183,12 +190,6 @@
+ Hub::Explore()
+ {
+ 	for (int32 i = 0; i &lt; fHubDescriptor.num_ports; i++) {
+-		if (i &gt;= 8) {
+-			TRACE((&quot;USB Hub %d: hub supports more ports than we do (%d)\n&quot;, DeviceAddress(), fHubDescriptor.num_ports));
+-			fHubDescriptor.num_ports = 8;
+-			continue;
+-		}
+-
+ 		status_t result = UpdatePortStatus(i);
+ 		if (result &lt; B_OK)
+ 			continue;
+@@ -228,6 +229,20 @@
+ 					continue;
+ 				}
+ 
++				if (fChildren[i]) {
++					TRACE_ERROR((&quot;USB Hub %d: new device on a port that is already in use\n&quot;, DeviceAddress()));
++
++					// Remove previous device first
++					TRACE((&quot;USB Hub %d: removing device 0x%08lx\n&quot;, DeviceAddress(), fChildren[i]));
++					GetStack()-&gt;NotifyDeviceChange(fChildren[i], false);
++
++					if (Lock()) {
++						GetBusManager()-&gt;FreeDevice(fChildren[i]);
++						fChildren[i] = NULL;
++						Unlock();
++					}
++				}
++
+ 				usb_speed speed = USB_SPEED_FULLSPEED;
+ 				if (fPortStatus[i].status &amp; PORT_STATUS_LOW_SPEED)
+ 					speed = USB_SPEED_LOWSPEED;
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp	2007-05-06 15:08:08 UTC (rev 21041)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp	2007-05-06 15:17:00 UTC (rev 21042)
+@@ -75,11 +75,6 @@
+ 	fExploreThread = spawn_kernel_thread(ExploreThread, &quot;usb explore&quot;,
+ 		B_LOW_PRIORITY, this);
+ 	resume_thread(fExploreThread);
+-
+-	// wait for the first explore to complete
+-	// this ensures that we get all initial devices under InstallNotify
+-	while (!fFirstExploreDone)
+-		snooze(1000);
+ }
+ 
+ 
+@@ -380,6 +375,11 @@
+ {
+ 	TRACE((&quot;USB Stack: installing notify hooks for driver \&quot;%s\&quot;\n&quot;, driverName));
+ 
++	// wait for the first explore to complete
++	// this ensures that we get all initial devices
++	while (!fFirstExploreDone)
++		snooze(1000);
++
+ 	usb_driver_info *element = fDriverList;
+ 	while (element) {
+ 		if (strcmp(element-&gt;driver_name, driverName) == 0) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002143.html">[Haiku-commits] r21041 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat/net compat/sys
+</A></li>
+	<LI>Next message: <A HREF="002146.html">[Haiku-commits] r21043 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2145">[ date ]</a>
+              <a href="thread.html#2145">[ thread ]</a>
+              <a href="subject.html#2145">[ subject ]</a>
+              <a href="author.html#2145">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

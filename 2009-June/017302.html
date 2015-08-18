@@ -1,0 +1,376 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31108 -	haiku/trunk/src/apps/debugger/debugger_interface
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31108%20-%0A%09haiku/trunk/src/apps/debugger/debugger_interface&In-Reply-To=%3C200906182237.n5IMbHLf018374%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017301.html">
+   <LINK REL="Next"  HREF="017303.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31108 -	haiku/trunk/src/apps/debugger/debugger_interface</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31108%20-%0A%09haiku/trunk/src/apps/debugger/debugger_interface&In-Reply-To=%3C200906182237.n5IMbHLf018374%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31108 -	haiku/trunk/src/apps/debugger/debugger_interface">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Jun 19 00:37:17 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017301.html">[Haiku-commits] r31107 - in haiku/trunk/src/apps/debugger: .	debugger_interface gui/team_window
+</A></li>
+        <LI>Next message: <A HREF="017303.html">[Haiku-commits] r31109 - in haiku/trunk/src/apps/debugger: . arch	arch/x86 debugger_interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17302">[ date ]</a>
+              <a href="thread.html#17302">[ thread ]</a>
+              <a href="subject.html#17302">[ subject ]</a>
+              <a href="author.html#17302">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-06-19 00:37:16 +0200 (Fri, 19 Jun 2009)
+New Revision: 31108
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31108&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31108&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/debugger/debugger_interface/DebuggerInterface.cpp
+   haiku/trunk/src/apps/debugger/debugger_interface/DebuggerInterface.h
+Log:
+We can't only use a single debug context, if we want to allow multiple threads
+to play with us without blocking. Implemented a pool of debug contexts instead.
+
+
+Modified: haiku/trunk/src/apps/debugger/debugger_interface/DebuggerInterface.cpp
+===================================================================
+--- haiku/trunk/src/apps/debugger/debugger_interface/DebuggerInterface.cpp	2009-06-18 21:45:14 UTC (rev 31107)
++++ haiku/trunk/src/apps/debugger/debugger_interface/DebuggerInterface.cpp	2009-06-18 22:37:16 UTC (rev 31108)
+@@ -9,6 +9,11 @@
+ 
+ #include &lt;stdio.h&gt;
+ 
++#include &lt;Locker.h&gt;
++
++#include &lt;AutoLocker.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
++
+ #include &quot;debug_utils.h&quot;
+ 
+ #include &quot;ArchitectureX86.h&quot;
+@@ -18,14 +23,211 @@
+ #include &quot;ThreadInfo.h&quot;
+ 
+ 
++// number of debug contexts the pool does initially create
++static const int kInitialDebugContextCount = 3;
++
++// maximum number of debug contexts in the pool
++static const int kMaxDebugContextCount = 10;
++
++
++struct DebuggerInterface::DebugContext : debug_context,
++		DoublyLinkedListLinkImpl&lt;DebugContext&gt; {
++	DebugContext()
++	{
++		team = -1;
++		nub_port = -1;
++		reply_port = -1;
++	}
++
++	~DebugContext()
++	{
++		if (reply_port &gt;= 0)
++			destroy_debug_context(this);
++	}
++
++	status_t Init(team_id team, port_id nubPort)
++	{
++		return init_debug_context(this, team, nubPort);
++	}
++
++	void Close()
++	{
++		if (reply_port &gt;= 0) {
++			destroy_debug_context(this);
++			team = -1;
++			nub_port = -1;
++			reply_port = -1;
++		}
++	}
++};
++
++
++struct DebuggerInterface::DebugContextPool {
++	DebugContextPool(team_id team, port_id nubPort)
++		:
++		fLock(&quot;debug context pool&quot;),
++		fTeam(team),
++		fNubPort(nubPort),
++		fBlockSem(-1),
++		fContextCount(0),
++		fWaiterCount(0),
++		fClosed(false)
++	{
++	}
++
++	~DebugContextPool()
++	{
++		AutoLocker&lt;BLocker&gt; locker(fLock);
++
++		while (DebugContext* context = fFreeContexts.RemoveHead())
++			delete context;
++
++		if (fBlockSem &gt;= 0)
++			delete_sem(fBlockSem);
++	}
++
++	status_t Init()
++	{
++		status_t error = fLock.InitCheck();
++		if (error != B_OK)
++			return error;
++
++		fBlockSem = create_sem(0, &quot;debug context pool block&quot;);
++		if (fBlockSem &lt; 0)
++			return fBlockSem;
++
++		for (int i = 0; i &lt; kInitialDebugContextCount; i++) {
++			DebugContext* context;
++			error = _CreateDebugContext(context);
++			if (error != B_OK)
++				return error;
++
++			fFreeContexts.Add(context);
++		}
++
++		return B_OK;
++	}
++
++	void Close()
++	{
++		AutoLocker&lt;BLocker&gt; locker(fLock);
++		fClosed = true;
++
++		for (DebugContextList::Iterator it = fFreeContexts.GetIterator();
++				DebugContext* context = it.Next();) {
++			context-&gt;Close();
++		}
++
++		for (DebugContextList::Iterator it = fUsedContexts.GetIterator();
++				DebugContext* context = it.Next();) {
++			context-&gt;Close();
++		}
++	}
++
++	DebugContext* GetContext()
++	{
++		AutoLocker&lt;BLocker&gt; locker(fLock);
++		DebugContext* context = fFreeContexts.RemoveHead();
++
++		if (context == NULL) {
++			if (fContextCount &gt;= kMaxDebugContextCount
++				|| _CreateDebugContext(context) != B_OK) {
++				// wait for a free context
++				while (context == NULL) {
++					fWaiterCount++;
++					locker.Unlock();
++					while (acquire_sem(fBlockSem) != B_OK);
++					locker.Lock();
++					context = fFreeContexts.RemoveHead();
++				}
++			}
++		}
++
++		fUsedContexts.Add(context);
++
++		return context;
++	}
++
++	void PutContext(DebugContext* context)
++	{
++		AutoLocker&lt;BLocker&gt; locker(fLock);
++		fUsedContexts.Remove(context);
++		fFreeContexts.Add(context);
++
++		if (fWaiterCount &gt; 0)
++			release_sem(fBlockSem);
++	}
++
++private:
++	typedef DoublyLinkedList&lt;DebugContext&gt; DebugContextList;
++
++private:
++	status_t _CreateDebugContext(DebugContext*&amp; _context)
++	{
++		DebugContext* context = new(std::nothrow) DebugContext;
++		if (context == NULL)
++			return B_NO_MEMORY;
++
++		if (!fClosed) {
++			status_t error = context-&gt;Init(fTeam, fNubPort);
++			if (error != B_OK) {
++				delete context;
++				return error;
++			}
++		}
++
++		fContextCount++;
++
++		_context = context;
++		return B_OK;
++	}
++
++private:
++	BLocker				fLock;
++	team_id				fTeam;
++	port_id				fNubPort;
++	sem_id				fBlockSem;
++	int32				fContextCount;
++	int32				fWaiterCount;
++	DebugContextList	fFreeContexts;
++	DebugContextList	fUsedContexts;
++	bool				fClosed;
++};
++
++
++struct DebuggerInterface::DebugContextGetter {
++	DebugContextGetter(DebugContextPool* pool)
++		:
++		fPool(pool),
++		fContext(pool-&gt;GetContext())
++	{
++	}
++
++	~DebugContextGetter()
++	{
++		fPool-&gt;PutContext(fContext);
++	}
++
++	DebugContext* Context() const
++	{
++		return fContext;
++	}
++
++private:
++	DebugContextPool*	fPool;
++	DebugContext*		fContext;
++};
++
++// #pragma mark - DebuggerInterface
++
+ DebuggerInterface::DebuggerInterface(team_id teamID)
+ 	:
+ 	fTeamID(teamID),
+ 	fDebuggerPort(-1),
+ 	fNubPort(-1),
++	fDebugContextPool(NULL),
+ 	fArchitecture(NULL)
+ {
+-	fDebugContext.reply_port = -1;
+ }
+ 
+ 
+@@ -33,9 +235,9 @@
+ {
+ 	fArchitecture-&gt;RemoveReference();
+ 
+-	destroy_debug_context(&amp;fDebugContext);
++	Close();
+ 
+-	Close();
++	delete fDebugContextPool;
+ }
+ 
+ 
+@@ -64,8 +266,12 @@
+ 	if (fNubPort &lt; 0)
+ 		return fNubPort;
+ 
+-	// init debug context
+-	status_t error = init_debug_context(&amp;fDebugContext, fTeamID, fNubPort);
++	// create debug context pool
++	fDebugContextPool = new(std::nothrow) DebugContextPool(fTeamID, fNubPort);
++	if (fDebugContextPool == NULL)
++		return B_NO_MEMORY;
++
++	status_t error = fDebugContextPool-&gt;Init();
+ 	if (error != B_OK)
+ 		return error;
+ 
+@@ -203,13 +409,15 @@
+ status_t
+ DebuggerInterface::GetCpuState(thread_id thread, CpuState*&amp; _state)
+ {
++	DebugContextGetter contextGetter(fDebugContextPool);
++
+ 	debug_nub_get_cpu_state message;
+-	message.reply_port = fDebugContext.reply_port;
++	message.reply_port = contextGetter.Context()-&gt;reply_port;
+ 	message.thread = thread;
+ 
+ 	debug_nub_get_cpu_state_reply reply;
+ 
+-	status_t error = send_debug_message(&amp;fDebugContext,
++	status_t error = send_debug_message(contextGetter.Context(),
+ 		B_DEBUG_MESSAGE_GET_CPU_STATE, &amp;message, sizeof(message), &amp;reply,
+ 		sizeof(reply));
+ 	if (error != B_OK)
+
+Modified: haiku/trunk/src/apps/debugger/debugger_interface/DebuggerInterface.h
+===================================================================
+--- haiku/trunk/src/apps/debugger/debugger_interface/DebuggerInterface.h	2009-06-18 21:45:14 UTC (rev 31107)
++++ haiku/trunk/src/apps/debugger/debugger_interface/DebuggerInterface.h	2009-06-18 22:37:16 UTC (rev 31108)
+@@ -47,6 +47,11 @@
+ 										// returns a reference to the caller
+ 
+ private:
++	struct DebugContext;
++	struct DebugContextPool;
++	struct DebugContextGetter;
++
++private:
+ 			status_t			_CreateDebugEvent(int32 messageCode,
+ 									const debug_debugger_message_data&amp; message,
+ 									bool&amp; _ignore, DebugEvent*&amp; _event);
+@@ -55,8 +60,7 @@
+ 			team_id				fTeamID;
+ 			port_id				fDebuggerPort;
+ 			port_id				fNubPort;
+-			debug_context		fDebugContext;
+-				// TODO: Use a debug context pool!
++			DebugContextPool*	fDebugContextPool;
+ 			Architecture*		fArchitecture;
+ };
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017301.html">[Haiku-commits] r31107 - in haiku/trunk/src/apps/debugger: .	debugger_interface gui/team_window
+</A></li>
+	<LI>Next message: <A HREF="017303.html">[Haiku-commits] r31109 - in haiku/trunk/src/apps/debugger: . arch	arch/x86 debugger_interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17302">[ date ]</a>
+              <a href="thread.html#17302">[ thread ]</a>
+              <a href="subject.html#17302">[ subject ]</a>
+              <a href="author.html#17302">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,371 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22354 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22354%20-%0A%09haiku/trunk/src/add-ons/kernel/busses/scsi/ahci&In-Reply-To=%3C200709282122.l8SLMQSX022390%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004040.html">
+   <LINK REL="Next"  HREF="004042.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22354 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci</H1>
+    <B>marcusoverhagen at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22354%20-%0A%09haiku/trunk/src/add-ons/kernel/busses/scsi/ahci&In-Reply-To=%3C200709282122.l8SLMQSX022390%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22354 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci">marcusoverhagen at mail.berlios.de
+       </A><BR>
+    <I>Fri Sep 28 23:22:26 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004040.html">[Haiku-commits] r22353 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="004042.html">[Haiku-commits] r22355 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4041">[ date ]</a>
+              <a href="thread.html#4041">[ thread ]</a>
+              <a href="subject.html#4041">[ subject ]</a>
+              <a href="author.html#4041">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: marcusoverhagen
+Date: 2007-09-28 23:22:25 +0200 (Fri, 28 Sep 2007)
+New Revision: 22354
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22354&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22354&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_defs.h
+   haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp
+   haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h
+Log:
+added scatter gather prd table setup, implement scsi inquiry command and emulate test unit ready
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_defs.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_defs.h	2007-09-28 21:20:57 UTC (rev 22353)
++++ haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_defs.h	2007-09-28 21:22:25 UTC (rev 22354)
+@@ -208,6 +208,7 @@
+ } _PACKED prd;
+ 
+ #define PRD_TABLE_ENTRY_COUNT 168
++#define PRD_MAX_DATA_LENGTH 0x400000 /* 4 MB */
+ 
+ 
+ extern scsi_sim_interface gAHCISimInterface;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp	2007-09-28 21:20:57 UTC (rev 22353)
++++ haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp	2007-09-28 21:22:25 UTC (rev 22354)
+@@ -6,6 +6,8 @@
+ #include &quot;ahci_port.h&quot;
+ #include &quot;ahci_controller.h&quot;
+ #include &quot;util.h&quot;
++#include &quot;ata_cmds.h&quot;
++#include &quot;scsi_cmds.h&quot;
+ 
+ #include &lt;KernelExport.h&gt;
+ #include &lt;stdio.h&gt;
+@@ -104,9 +106,7 @@
+ 
+ 	FlushPostedWrites();
+ 
+-	if (1 /* fRegs-&gt;sig == 0xffffffff */)
+-		ResetDevice();
+-
++	ResetDevice();
+ 	PostResetDevice();
+ 
+ 	TRACE(&quot;ie   0x%08lx\n&quot;, fRegs-&gt;ie);
+@@ -260,15 +260,61 @@
+ 	fRegs-&gt;is = is;
+ }
+ 
+-char c(int i)
++
++status_t
++AHCIPort::FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const void *data, size_t dataSize, bool ioc)
+ {
+-	if (i == '\n' || i == '\r' || i == '\b')
+-		return '?';
+-	return i;
++	int peMax = prdMax + 1;
++	physical_entry pe[peMax];
++	if (get_memory_map(data, dataSize, pe, peMax ) &lt; B_OK) {
++		TRACE(&quot;AHCIPort::FillPrdTable get_memory_map failed\n&quot;);
++		return B_ERROR;
++	}
++	int peUsed;
++	for (peUsed = 0; pe[peUsed].size; peUsed++)
++		;
++	return FillPrdTable(prdTable, prdCount, prdMax, pe, peUsed, ioc);
+ }
+ 
++
++status_t
++AHCIPort::FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const physical_entry *sgTable, int sgCount, bool ioc)
++{
++	*prdCount = 0;
++	while (sgCount &gt; 0) {
++		size_t size = sgTable-&gt;size;
++		void *address = sgTable-&gt;address;
++		if ((uint32)address &amp; 1) {
++			TRACE(&quot;AHCIPort::FillPrdTable: data alignment error\n&quot;);
++			return B_ERROR;
++		}
++		while (size &gt; 0) {
++			size_t bytes = min_c(size, PRD_MAX_DATA_LENGTH);
++			if (*prdCount == prdMax) {
++				TRACE(&quot;AHCIPort::FillPrdTable: prd table exhausted\n&quot;);
++				return B_ERROR;
++			}
++			prdTable-&gt;dba  = LO32(address);
++			prdTable-&gt;dbau = HI32(address);
++			prdTable-&gt;res  = 0;
++			prdTable-&gt;dbc  = bytes - 1;
++			*prdCount += 1;
++			prdTable++;
++			address = (char *)address + bytes;
++			size -= bytes;
++		}
++		sgTable++;
++		sgCount--;
++	}
++	if (ioc)
++		prdTable-&gt;dbc |= DBC_I;
++	return B_OK;
++}
++
++
++/*
+ void
+-AHCIPort::IdentifyDevice()
++AHCIPort::IdentifyDevice(scsi_ccb *request)
+ {
+ 	TRACE(&quot;AHCIPort::IdentifyDevice port %d\n&quot;, fIndex);
+ 
+@@ -341,29 +387,153 @@
+ 	}
+ 
+ 	delete_area(id);
++
++	request-&gt;subsys_status = SCSI_REQ_CMP;
++	gSCSI-&gt;finished(request, 1);
++
+ }
++*/
+ 
++void
++AHCIPort::ScsiTestUnitReady(scsi_ccb *request)
++{
++	TRACE(&quot;AHCIPort::ScsiTestUnitReady port %d\n&quot;, fIndex);
++	if ((fRegs-&gt;ssts &amp; 0xf) == 0x3)
++		request-&gt;subsys_status = SCSI_REQ_CMP;
++	else
++		request-&gt;subsys_status = SCSI_DEV_NOT_THERE;
++	gSCSI-&gt;finished(request, 1);
++}
+ 
++
+ void
++AHCIPort::ScsiInquiry(scsi_ccb *request)
++{
++	TRACE(&quot;AHCIPort::ScsiInquiry port %d\n&quot;, fIndex);
++
++	scsi_cmd_inquiry *cmd = (scsi_cmd_inquiry *)request-&gt;cdb;
++	scsi_res_inquiry scsiData;
++	ata_res_identify_device	ataData;
++
++	if (cmd-&gt;evpd || cmd-&gt;page_code) {
++		TRACE(&quot;invalid request\n&quot;);
++		return;
++	}
++
++	memset(&amp;ataData, 0, sizeof(ataData));
++
++	int prdEntrys;
++	FillPrdTable(fPRDTable, &amp;prdEntrys, PRD_TABLE_ENTRY_COUNT, &amp;ataData, sizeof(ataData), true);
++
++
++	TRACE(&quot;prdEntrys %d\n&quot;, prdEntrys);
++	
++	memset((void *)fCommandTable-&gt;cfis, 0, 5 * 4);
++	fCommandTable-&gt;cfis[0] = 0x27;
++	fCommandTable-&gt;cfis[1] = 0x80;
++	fCommandTable-&gt;cfis[2] = 0xec;
++
++
++	fCommandList-&gt;prdtl_flags_cfl = 0;
++	fCommandList-&gt;prdtl = prdEntrys;
++//	fCommandList-&gt;c = 1;
++	fCommandList-&gt;cfl = 5;
++	fCommandList-&gt;prdbc = 0;
++
++	fRegs-&gt;ci |= 1;
++	FlushPostedWrites();
++
++	snooze(500000);
++
++	TRACE(&quot;prdbc %ld\n&quot;, fCommandList-&gt;prdbc);
++
++	TRACE(&quot;ci   0x%08lx\n&quot;, fRegs-&gt;ci);
++	TRACE(&quot;ie   0x%08lx\n&quot;, fRegs-&gt;ie);
++	TRACE(&quot;is   0x%08lx\n&quot;, fRegs-&gt;is);
++	TRACE(&quot;cmd  0x%08lx\n&quot;, fRegs-&gt;cmd);
++	TRACE(&quot;ssts 0x%08lx\n&quot;, fRegs-&gt;ssts);
++	TRACE(&quot;sctl 0x%08lx\n&quot;, fRegs-&gt;sctl);
++	TRACE(&quot;serr 0x%08lx\n&quot;, fRegs-&gt;serr);
++	TRACE(&quot;sact 0x%08lx\n&quot;, fRegs-&gt;sact);
++	TRACE(&quot;tfd  0x%08lx\n&quot;, fRegs-&gt;tfd);
++
++	uint8 *data = (uint8*) &ataData;
++	for (int i = 0; i &lt; 512; i += 8) {
++		TRACE(&quot;  %02x %02x %02x %02x %02x %02x %02x %02x\n&quot;, data[i], data[i+1], data[i+2], data[i+3], data[i+4], data[i+5], data[i+6], data[i+7]);
++	}
++
++	scsiData.device_type = scsi_dev_direct_access;
++	scsiData.device_qualifier = scsi_periph_qual_connected;
++	scsiData.device_type_modifier = 0;
++	scsiData.removable_medium = false;
++	scsiData.ansi_version = 2;
++	scsiData.ecma_version = 0;
++	scsiData.iso_version = 0;
++	scsiData.response_data_format = 2;
++	scsiData.term_iop = false;
++	scsiData.additional_length = sizeof(scsiData) - 4;
++	scsiData.soft_reset = false;
++	scsiData.cmd_queue = false;
++	scsiData.linked = false;
++	scsiData.sync = false;
++	scsiData.write_bus16 = true;
++	scsiData.write_bus32 = false;
++	scsiData.relative_address = false;
++
++	bool lba			= (ataData.words[49] &amp; (1 &lt;&lt; 9)) != 0;
++	bool lba48			= (ataData.words[83] &amp; (1 &lt;&lt; 10)) != 0;
++	uint32 sectors		= *(uint32*)&amp;ataData.words[60];
++	uint64 sectors48	= *(uint64*)&amp;ataData.words[100];
++	uint64 size = !(lba || sectors) ? 0 : lba48 ? (sectors48 * 512) : (sectors * 512ull);
++
++	TRACE(&quot;model_number: %40.40s\n&quot;, ataData.model_number);
++	TRACE(&quot;serial_number: %20.20s\n&quot;, ataData.serial_number);
++	TRACE(&quot;firmware_revision: %8.8s\n&quot;, ataData.firmware_revision);
++	TRACE(&quot;lba %d, lba48 %d, sectors %lu, sectors48 %llu, size %llu\n&quot;,
++		lba, lba48, sectors, sectors48, size);
++
++	memcpy(scsiData.vendor_ident, ataData.model_number, sizeof(scsiData.vendor_ident));
++	memcpy(scsiData.product_ident, ataData.model_number + 8, sizeof(scsiData.product_ident));
++	memcpy(scsiData.product_rev, ataData.serial_number, sizeof(scsiData.product_rev));
++
++	if (sg_memcpy(request-&gt;sg_list, request-&gt;sg_count, &amp;scsiData, sizeof(scsiData)) &lt; B_OK) {
++		request-&gt;subsys_status = SCSI_DATA_RUN_ERR;
++	} else {
++		request-&gt;subsys_status = SCSI_REQ_CMP;
++		request-&gt;data_resid = request-&gt;data_length - sizeof(scsiData);// ???
++		request-&gt;data_length = sizeof(scsiData); // ???
++	}
++
++	gSCSI-&gt;finished(request, 1);
++}
++
++
++void
+ AHCIPort::ScsiExecuteRequest(scsi_ccb *request)
+ {
+ 
+-	TRACE(&quot;AHCIPort::ScsiExecuteRequest port %d, opcode %u, length %u\n&quot;, fIndex, request-&gt;cdb[0], request-&gt;cdb_length);
++	TRACE(&quot;AHCIPort::ScsiExecuteRequest port %d, opcode 0x%02x, length %u\n&quot;, fIndex, request-&gt;cdb[0], request-&gt;cdb_length);
+ 
++	if (request-&gt;cdb[0] == SCSI_OP_REQUEST_SENSE) {
++		TRACE(&quot;SCSI_OP_REQUEST_SENSE\n&quot;);
++		request-&gt;subsys_status = SCSI_DEV_NOT_THERE;
++		gSCSI-&gt;finished(request, 1);
++		return;
++	}
++	
++	request-&gt;subsys_status = SCSI_REQ_CMP;
++
+ 	switch (request-&gt;cdb[0]) {
+-		case 0x00:
++		case SCSI_OP_TEST_UNIT_READY:
++			ScsiTestUnitReady(request);
+ 			break;
+-		case 0x12:
+-			IdentifyDevice();
++		case SCSI_OP_INQUIRY:
++			ScsiInquiry(request);
+ 			break;
++		default:
++		request-&gt;subsys_status = SCSI_DEV_NOT_THERE;
++		gSCSI-&gt;finished(request, 1);
+ 	}
+-
+-	request-&gt;subsys_status = SCSI_DEV_NOT_THERE;
+-	gSCSI-&gt;finished(request, 1);
+-	return;
+-
+-	request-&gt;subsys_status = SCSI_REQ_CMP;
+-	gSCSI-&gt;finished(request, 1);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h	2007-09-28 21:20:57 UTC (rev 22353)
++++ haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h	2007-09-28 21:22:25 UTC (rev 22354)
+@@ -27,12 +27,20 @@
+ 	uchar		ScsiResetDevice();
+ 
+ private:
++	void		ScsiTestUnitReady(scsi_ccb *request);
++	void		ScsiInquiry(scsi_ccb *request);
++
++
+ 	status_t	ResetDevice();
+ 	status_t	PostResetDevice();
+ 	void		FlushPostedWrites();
+ 	void		DumpD2HFis();
+-	void		IdentifyDevice();
+ 
++
++//	uint8 *		SetCommandFis(volatile command_list_entry *cmd, volatile fis *fis, const void *data, size_t dataSize);
++	status_t	FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const void *data, size_t dataSize, bool ioc = false);
++	status_t	FillPrdTable(volatile prd *prdTable, int *prdCount, int prdMax, const physical_entry *sgTable, int sgCount, bool ioc = false);
++
+ private:
+ 	int						fIndex;
+ 	volatile ahci_port *	fRegs;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004040.html">[Haiku-commits] r22353 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="004042.html">[Haiku-commits] r22355 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4041">[ date ]</a>
+              <a href="thread.html#4041">[ thread ]</a>
+              <a href="subject.html#4041">[ subject ]</a>
+              <a href="author.html#4041">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,221 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28438 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28438%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200811011904.mA1J4Fjn011960%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013195.html">
+   <LINK REL="Next"  HREF="013194.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28438 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28438%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200811011904.mA1J4Fjn011960%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28438 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sat Nov  1 20:04:15 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013195.html">[Haiku-commits] r28437 - haiku/trunk/src/add-ons/disk_systems/bfs
+</A></li>
+        <LI>Next message: <A HREF="013194.html">[Haiku-commits] r28439 - haiku/trunk/src/kits/storage/disk_device
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13193">[ date ]</a>
+              <a href="thread.html#13193">[ thread ]</a>
+              <a href="subject.html#13193">[ subject ]</a>
+              <a href="author.html#13193">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-11-01 20:04:14 +0100 (Sat, 01 Nov 2008)
+New Revision: 28438
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28438&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28438&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h
+Log:
+* The check mechanism in the block allocator now locks the journal as well to
+  fix a potential deadlock.
+* Journal::Lock() now accepts another parameter that specified whether child
+  transactions should be split - this is nothing you would want in normal
+  operation unless the parent transaction is only there to prevent others from
+  writing (such as with the block allocator check stuff).
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp	2008-11-01 17:31:31 UTC (rev 28437)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp	2008-11-01 19:04:14 UTC (rev 28438)
+@@ -1116,14 +1116,20 @@
+ 	if (!_IsValidCheckControl(control))
+ 		return B_BAD_VALUE;
+ 
++	fVolume-&gt;GetJournal(0)-&gt;Lock(NULL, true);
++		// Lock the volume's journal
++
+ 	status_t status = mutex_lock(&amp;fLock);
+-	if (status &lt; B_OK)
++	if (status &lt; B_OK) {
++		fVolume-&gt;GetJournal(0)-&gt;Unlock(NULL, true);
+ 		return status;
++	}
+ 
+ 	size_t size = BitmapSize();
+ 	fCheckBitmap = (uint32*)malloc(size);
+ 	if (fCheckBitmap == NULL) {
+ 		mutex_unlock(&amp;fLock);
++		fVolume-&gt;GetJournal(0)-&gt;Unlock(NULL, true);
+ 		return B_NO_MEMORY;
+ 	}
+ 
+@@ -1132,6 +1138,7 @@
+ 		free(fCheckBitmap);
+ 		fCheckBitmap = NULL;
+ 		mutex_unlock(&amp;fLock);
++		fVolume-&gt;GetJournal(0)-&gt;Unlock(NULL, true);
+ 
+ 		return B_NO_MEMORY;
+ 	}
+@@ -1209,7 +1216,7 @@
+ 				= HOST_ENDIAN_TO_BFS_INT64(usedBlocks);
+ 
+ 			int32 blocksInBitmap = fNumGroups * fBlocksPerGroup;
+-			int32 blockSize = fVolume-&gt;BlockSize();
++			size_t blockSize = fVolume-&gt;BlockSize();
+ 
+ 			for (int32 i = 0; i &lt; blocksInBitmap; i += 512) {
+ 				Transaction transaction(fVolume, 1 + i);
+@@ -1235,6 +1242,7 @@
+ 	fCheckCookie = NULL;
+ 	delete cookie;
+ 	mutex_unlock(&amp;fLock);
++	fVolume-&gt;GetJournal(0)-&gt;Unlock(NULL, true);
+ 
+ 	return B_OK;
+ }
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2008-11-01 17:31:31 UTC (rev 28437)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2008-11-01 19:04:14 UTC (rev 28438)
+@@ -403,7 +403,8 @@
+ 	fMaxTransactionSize(fLogSize / 2 - 5),
+ 	fUsed(0),
+ 	fUnwrittenTransactions(0),
+-	fHasSubtransaction(false)
++	fHasSubtransaction(false),
++	fSeparateSubTransactions(false)
+ {
+ 	recursive_lock_init(&amp;fLock, &quot;bfs journal&quot;);
+ 	mutex_init(&amp;fEntriesLock, &quot;bfs journal entries&quot;);
+@@ -909,17 +910,20 @@
+ 
+ 
+ status_t
+-Journal::Lock(Transaction* owner)
++Journal::Lock(Transaction* owner, bool separateSubTransactions)
+ {
+ 	status_t status = recursive_lock_lock(&amp;fLock);
+ 	if (status != B_OK)
+ 		return status;
+ 
+-	if (recursive_lock_get_recursion(&amp;fLock) &gt; 1) {
++	if (!fSeparateSubTransactions &amp;&amp; recursive_lock_get_recursion(&amp;fLock) &gt; 1) {
+ 		// we'll just use the current transaction again
+ 		return B_OK;
+ 	}
+ 
++	if (separateSubTransactions)
++		fSeparateSubTransactions = true;
++
+ 	fOwner = owner;
+ 
+ 	// TODO: we need a way to find out how big the current transaction is;
+@@ -951,13 +955,18 @@
+ void
+ Journal::Unlock(Transaction* owner, bool success)
+ {
+-	if (recursive_lock_get_recursion(&amp;fLock) == 1) {
++	if (fSeparateSubTransactions || recursive_lock_get_recursion(&amp;fLock) == 1) {
+ 		// we only end the transaction if we would really unlock it
+ 		// TODO: what about failing transactions that do not unlock?
++		// (they must make the parent fail, too)
+ 		_TransactionDone(success);
+ 
+ 		fTimestamp = system_time();
+ 		fOwner = NULL;
++
++		if (fSeparateSubTransactions
++			&amp;&amp; recursive_lock_get_recursion(&amp;fLock) == 1)
++			fSeparateSubTransactions = false;
+ 	}
+ 
+ 	recursive_lock_unlock(&amp;fLock);
+@@ -1061,7 +1070,7 @@
+ 		return B_OK;
+ 
+ 	fJournal = volume-&gt;GetJournal(refBlock);
+-	if (fJournal != NULL &amp;&amp; fJournal-&gt;Lock(this) == B_OK)
++	if (fJournal != NULL &amp;&amp; fJournal-&gt;Lock(this, false) == B_OK)
+ 		return B_OK;
+ 
+ 	fJournal = NULL;
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h	2008-11-01 17:31:31 UTC (rev 28437)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h	2008-11-01 19:04:14 UTC (rev 28438)
+@@ -26,7 +26,8 @@
+ 
+ 			status_t		InitCheck();
+ 
+-			status_t		Lock(Transaction* owner);
++			status_t		Lock(Transaction* owner,
++								bool separateSubTransactions);
+ 			void			Unlock(Transaction* owner, bool success);
+ 
+ 			status_t		ReplayLog();
+@@ -69,6 +70,7 @@
+ 			bigtime_t		fTimestamp;
+ 			int32			fTransactionID;
+ 			bool			fHasSubtransaction;
++			bool			fSeparateSubTransactions;
+ };
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013195.html">[Haiku-commits] r28437 - haiku/trunk/src/add-ons/disk_systems/bfs
+</A></li>
+	<LI>Next message: <A HREF="013194.html">[Haiku-commits] r28439 - haiku/trunk/src/kits/storage/disk_device
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13193">[ date ]</a>
+              <a href="thread.html#13193">[ thread ]</a>
+              <a href="subject.html#13193">[ subject ]</a>
+              <a href="author.html#13193">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

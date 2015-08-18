@@ -1,0 +1,357 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27320 - haiku/trunk/src/system/kernel/posix
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27320%20-%20haiku/trunk/src/system/kernel/posix&In-Reply-To=%3C200809041234.m84CYQkF025171%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011526.html">
+   <LINK REL="Next"  HREF="011528.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27320 - haiku/trunk/src/system/kernel/posix</H1>
+    <B>sbenedetto at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27320%20-%20haiku/trunk/src/system/kernel/posix&In-Reply-To=%3C200809041234.m84CYQkF025171%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27320 - haiku/trunk/src/system/kernel/posix">sbenedetto at mail.berlios.de
+       </A><BR>
+    <I>Thu Sep  4 14:34:26 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011526.html">[Haiku-commits] r27319 - haiku/trunk/src/kits/interface/layouter
+</A></li>
+        <LI>Next message: <A HREF="011528.html">[Haiku-commits] r27321 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11527">[ date ]</a>
+              <a href="thread.html#11527">[ thread ]</a>
+              <a href="subject.html#11527">[ subject ]</a>
+              <a href="author.html#11527">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: sbenedetto
+Date: 2008-09-04 14:34:26 +0200 (Thu, 04 Sep 2008)
+New Revision: 27320
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27320&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27320&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/posix/xsi_semaphore.cpp
+Log:
+* split Wait() method into Enqueue() - BlockAndUnlock() - Deque() in order to
+  remove a race condition pointed out by Ingo, hopefully in a clean way. The
+  set is now unlocked right before blocking
+* Reworked the way ID were assgned: the current time is now used as ID. This
+  lower quite a lot the probability of having an ID reused.
+* Introduced a sequence number field in the set class as a second ID, as
+  suggested by Ingo. It is used on wake up in order not to confuse a no more
+  existing set with a new one with the same ID
+* Removed a now unnecessary UnsetID() method
+* Increased the arbitraty limit of max sempahore allowed in the system, and
+  introduced a new one for the total number of set.
+
+
+
+Modified: haiku/trunk/src/system/kernel/posix/xsi_semaphore.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/posix/xsi_semaphore.cpp	2008-09-04 11:58:01 UTC (rev 27319)
++++ haiku/trunk/src/system/kernel/posix/xsi_semaphore.cpp	2008-09-04 12:34:26 UTC (rev 27320)
+@@ -136,6 +136,42 @@
+ 		}
+ 	}
+ 
++	status_t BlockAndUnlock(struct thread *thread, MutexLocker *setLocker)
++	{
++		thread_prepare_to_block(thread, B_CAN_INTERRUPT,
++			THREAD_BLOCK_TYPE_OTHER, (void*)&quot;xsi semaphore&quot;);
++		// Unlock the set before blocking
++		setLocker-&gt;Unlock();
++
++		InterruptsSpinLocker _(gThreadSpinlock);
++		return thread_block_locked(thread);
++	}
++
++	void Deque(queued_thread *queueEntry, bool waitForZero)
++	{
++		if (queueEntry-&gt;queued) {
++			if (waitForZero) {
++				fWaitingToBeZeroQueue.Remove(queueEntry);
++				fThreadsWaitingToBeZero--;
++			} else {
++				fWaitingToIncreaseQueue.Remove(queueEntry);
++				fThreadsWaitingToIncrease--;
++			}
++		}
++	}
++
++	void Enqueue(queued_thread *queueEntry, bool waitForZero)
++	{
++		if (waitForZero) {
++			fWaitingToBeZeroQueue.Add(queueEntry);
++			fThreadsWaitingToBeZero++;
++		} else {
++			fWaitingToIncreaseQueue.Add(queueEntry);
++			fThreadsWaitingToIncrease++;
++		}
++		queueEntry-&gt;queued = true;
++	}
++
+ 	pid_t LastPid() const
+ 	{
+ 		return fLastPidOperation;
+@@ -175,42 +211,6 @@
+ 		return fValue;
+ 	}
+ 
+-	status_t Wait(int32 count, bool waitForZero)
+-	{
+-		TRACE((&quot;XsiSemaphore::Wait: going to sleep\n&quot;));
+-		// enqueue the thread in the appropriate
+-		// queue and get ready to wait
+-		struct thread *thread = thread_get_current_thread();
+-		queued_thread queueEntry(thread, count);
+-		if (waitForZero) {
+-			fWaitingToBeZeroQueue.Add(&amp;queueEntry);
+-			fThreadsWaitingToBeZero++;
+-		} else {
+-			fWaitingToIncreaseQueue.Add(&amp;queueEntry);
+-			fThreadsWaitingToIncrease++;
+-		}
+-		queueEntry.queued = true;
+-
+-		thread_prepare_to_block(thread, B_CAN_INTERRUPT,
+-			THREAD_BLOCK_TYPE_OTHER, (void*)&quot;xsi semaphore&quot;);
+-
+-		InterruptsSpinLocker _(gThreadSpinlock);
+-		status_t result = thread_block_locked(thread);
+-
+-		if (queueEntry.queued) {
+-			// If we are still queued, we failed to acquire
+-			// the semaphore for some reason
+-			if (waitForZero) {
+-				fWaitingToBeZeroQueue.Remove(&amp;queueEntry);
+-				fThreadsWaitingToBeZero--;
+-			} else {
+-				fWaitingToIncreaseQueue.Remove(&amp;queueEntry);
+-				fThreadsWaitingToIncrease--;
+-			}
+-		}
+-		return result;
+-	}
+-
+ 	void WakeUpThread(bool waitingForZero)
+ 	{
+ 		InterruptsSpinLocker _(gThreadSpinlock);
+@@ -269,7 +269,6 @@
+ 		TRACE((&quot;XsiSemaphoreSet::~XsiSemaphoreSet(): removing semaphore &quot;
+ 			&quot;set %d\n&quot;, fID));
+ 		mutex_destroy(&amp;fLock);
+-		UnsetID();
+ 		delete[] fSemaphores;
+ 	}
+ 
+@@ -340,7 +339,7 @@
+ 		return HasPermission();
+ 	}
+ 
+-	int	ID() const
++	int ID() const
+ 	{
+ 		return fID;
+ 	}
+@@ -477,7 +476,12 @@
+ 		return &amp;fSemaphores[nth];
+ 	}
+ 
+-	// Implemented after sSemaphoreHashTable is declared
++	uint32 SequenceNumber() const
++	{
++		return fSequenceNumber;
++	}
++
++	// Implemented after sGlobalSequenceNumber is declared
+ 	void SetID();
+ 
+ 	void SetIpcKey(key_t key)
+@@ -507,9 +511,6 @@
+ 		return fUndoList;
+ 	}
+ 
+-	// Implemented after sSemaphoreHashTable is declared
+-	void UnsetID();
+-
+ 	HashTableLink&lt;XsiSemaphoreSet&gt;* Link()
+ 	{
+ 		return &fLink;
+@@ -522,6 +523,7 @@
+ 	time_t						fLastSemopTime;			// sem_otime
+ 	ushort						fNumberOfSemaphores;	// sem_nsems
+ 	struct ipc_perm				fPermissions;			// sem_perm
++	uint32						fSequenceNumber;		// used as a second id
+ 	XsiSemaphore				*fSemaphores;			// array of semaphores
+ 	UndoList					fUndoList;				// undo list requests
+ 	mutex 						fLock;					// private lock
+@@ -618,15 +620,17 @@
+ };
+ 
+ // Arbitrary limit
+-#define MAX_XSI_SEMAPHORE		2048
++#define MAX_XSI_SEMAPHORE		4096
++#define MAX_XSI_SEMAPHORE_SET	2048
+ static OpenHashTable&lt;IpcHashTableDefinition&gt; sIpcHashTable;
+ static OpenHashTable&lt;SemaphoreHashTableDefinition&gt; sSemaphoreHashTable;
+ 
+ static mutex sIpcLock;
+ static mutex sXsiSemaphoreSetLock;
+ 
+-static vint32 sNextAvailableID = 1;
++static uint32 sGlobalSequenceNumber = 1;
+ static vint32 sXsiSemaphoreCount = 0;
++static vint32 sXsiSemaphoreSetCount = 0;
+ 
+ 
+ //	#pragma mark -
+@@ -635,23 +639,18 @@
+ void
+ XsiSemaphoreSet::SetID()
+ {
++	fID = real_time_clock();
+ 	// The lock is held before calling us
+ 	while (true) {
+-		if (sSemaphoreHashTable.Lookup(sNextAvailableID) == NULL)
++		if (sSemaphoreHashTable.Lookup(fID) == NULL)
+ 			break;
+-		sNextAvailableID++;
++		fID = (fID + 1) % INT_MAX;
+ 	}
+-	fID = sNextAvailableID++;
++	sGlobalSequenceNumber = (sGlobalSequenceNumber + 1) % UINT_MAX;
++	fSequenceNumber = sGlobalSequenceNumber;
+ }
+ 
+ 
+-void
+-XsiSemaphoreSet::UnsetID()
+-{
+-	sNextAvailableID = fID;
+-}
+-
+-
+ //	#pragma mark - Kernel exported API
+ 
+ 
+@@ -781,7 +780,8 @@
+ 			TRACE_ERROR((&quot;xsi_semget: numberOfSemaphores out of range\n&quot;));
+ 			return EINVAL;
+ 		}
+-		if (sXsiSemaphoreCount &gt;= MAX_XSI_SEMAPHORE) {
++		if (sXsiSemaphoreCount &gt;= MAX_XSI_SEMAPHORE
++			|| sXsiSemaphoreSetCount &gt;= MAX_XSI_SEMAPHORE_SET) {
+ 			TRACE_ERROR((&quot;xsi_semget: reached limit of maximum number of &quot;
+ 				&quot;semaphores allowed\n&quot;));
+ 			return ENOSPC;
+@@ -795,6 +795,7 @@
+ 			return ENOMEM;
+ 		}
+ 		atomic_add(&amp;sXsiSemaphoreCount, numberOfSemaphores);
++		atomic_add(&amp;sXsiSemaphoreSetCount, 1);
+ 
+ 		MutexLocker _(sXsiSemaphoreSetLock);
+ 		semaphoreSet-&gt;SetID();
+@@ -805,6 +806,8 @@
+ 			ipcKey-&gt;SetSemaphoreSetID(semaphoreSet);
+ 		}
+ 		sSemaphoreHashTable.Insert(semaphoreSet);
++		TRACE((&quot;semget: new set = %d created, sequence = %ld\n&quot;,
++			semaphoreSet-&gt;ID(), semaphoreSet-&gt;SequenceNumber()));
+ 	}
+ 
+ 	return semaphoreSet-&gt;ID();
+@@ -1030,6 +1033,7 @@
+ 			if (key != -1)
+ 				delete ipcKey;
+ 			atomic_add(&amp;sXsiSemaphoreCount, -semaphoreSet-&gt;NumberOfSemaphores());
++			atomic_add(&amp;sXsiSemaphoreSetCount, -1);
+ 			// Remove any sem_undo request
+ 			while (struct sem_undo *entry
+ 					= semaphoreSet-&gt;GetUndoList().RemoveHead()) {
+@@ -1154,23 +1158,40 @@
+ 			if (result != 0)
+ 				return result;
+ 
++			// We have to wait: first enqueue the thread
++			// in the appropriate set waiting list, then
++			// unlock the set itself and block the thread.
+ 			bool waitOnZero = true;
+ 			if (operations[i].sem_op != 0)
+ 				waitOnZero = false;
+ 
+-			setLocker.Unlock();
+-			result = semaphore-&gt;Wait((int32)operations[i].sem_op, waitOnZero);
+-			TRACE((&quot;xsi_semop: back to life\n&quot;));
++			struct thread *thread = thread_get_current_thread();
++			queued_thread queueEntry(thread, (int32)operations[i].sem_op);
++			semaphore-&gt;Enqueue(&amp;queueEntry, waitOnZero);
+ 
+-			// We are back to life.
+-			// Find out why!
++			uint32 sequenceNumber = semaphoreSet-&gt;SequenceNumber();
++
++			TRACE((&quot;xsi_semop: thread %d going to sleep\n&quot;, (int)thread-&gt;id));
++			result = semaphore-&gt;BlockAndUnlock(thread, &amp;setLocker);
++			TRACE((&quot;xsi_semop: thread %d back to life\n&quot;, (int)thread-&gt;id));
++
++			// We are back to life. Find out why!
++			// Make sure the set hasn't been deleted or worst yet
++			// replaced.
+ 			setHashLocker.Lock();
+ 			semaphoreSet = sSemaphoreHashTable.Lookup(semaphoreID);
+-			if (result == EIDRM || result == B_INTERRUPTED
+-				|| semaphoreSet == NULL) {
+-				TRACE_ERROR((&quot;xsi_semop: semaphore set id %d got destroyed\n&quot;,
++			if (result == EIDRM || semaphoreSet == NULL || (semaphoreSet != NULL
++				&amp;&amp; sequenceNumber != semaphoreSet-&gt;SequenceNumber())) {
++				TRACE_ERROR((&quot;xsi_semop: semaphore set id %d (sequence = %ld) &quot;
++					&quot;got destroyed\n&quot;, semaphoreID, sequenceNumber));
++				notDone = false;
++				result = EIDRM;
++			} else if (result == B_INTERRUPTED) {
++				TRACE_ERROR((&quot;xsi_semop: thread %d got interrupted while &quot;
++					&quot;waiting on semaphore set id %d\n&quot;,(int)thread-&gt;id,
+ 					semaphoreID));
+-				result = EIDRM;
++				semaphore-&gt;Deque(&amp;queueEntry, waitOnZero);
++				result = EINTR;
+ 				notDone = false;
+ 			} else {
+ 				setLocker.Lock();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011526.html">[Haiku-commits] r27319 - haiku/trunk/src/kits/interface/layouter
+</A></li>
+	<LI>Next message: <A HREF="011528.html">[Haiku-commits] r27321 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11527">[ date ]</a>
+              <a href="thread.html#11527">[ thread ]</a>
+              <a href="subject.html#11527">[ subject ]</a>
+              <a href="author.html#11527">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

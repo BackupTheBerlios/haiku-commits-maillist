@@ -1,0 +1,313 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20407 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20407%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200703231148.l2NBmfo9028716%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001185.html">
+   <LINK REL="Next"  HREF="001187.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20407 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20407%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200703231148.l2NBmfo9028716%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20407 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Mar 23 12:48:41 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001185.html">[Haiku-commits] r20406 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server
+</A></li>
+        <LI>Next message: <A HREF="001187.html">[Haiku-commits] r20408 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1186">[ date ]</a>
+              <a href="thread.html#1186">[ thread ]</a>
+              <a href="subject.html#1186">[ subject ]</a>
+              <a href="author.html#1186">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-03-23 12:48:37 +0100 (Fri, 23 Mar 2007)
+New Revision: 20407
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20407&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20407&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm.h
+   haiku/trunk/headers/private/kernel/vm_page.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.c
+Log:
+* The new vm_page_mappings weren't updated correctly in many cases.
+* Added a comment to vm_remove_all_page_mappings() that shows that we need to
+  change the mapping spinlock into a mutex.
+* Pointed out some potential problems in the code.
+* Added vm_page_at_index(), vm_clear_map_activation(), and vm_test_map_activation()
+  in preparation of the page scanner rewrite.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm.h	2007-03-23 00:09:55 UTC (rev 20406)
++++ haiku/trunk/headers/private/kernel/vm.h	2007-03-23 11:48:37 UTC (rev 20407)
+@@ -62,6 +62,8 @@
+ vm_area *vm_area_lookup(vm_address_space *addressSpace, addr_t address);
+ status_t vm_set_area_memory_type(area_id id, addr_t physicalBase, uint32 type);
+ status_t vm_get_page_mapping(team_id team, addr_t vaddr, addr_t *paddr);
++int32 vm_test_map_activation(vm_page *page);
++void vm_clear_map_activation(vm_page *page);
+ void vm_remove_all_page_mappings(vm_page *page);
+ status_t vm_unmap_pages(vm_area *area, addr_t base, size_t length);
+ status_t vm_map_page(vm_area *area, vm_page *page, addr_t address,
+
+Modified: haiku/trunk/headers/private/kernel/vm_page.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_page.h	2007-03-23 00:09:55 UTC (rev 20406)
++++ haiku/trunk/headers/private/kernel/vm_page.h	2007-03-23 11:48:37 UTC (rev 20407)
+@@ -38,7 +38,8 @@
+ status_t vm_page_allocate_pages(int pageState, vm_page **pages, uint32 numPages);
+ vm_page *vm_page_allocate_page_run(int state, addr_t length);
+ vm_page *vm_page_allocate_specific_page(addr_t page_num, int state);
+-vm_page *vm_lookup_page(addr_t page_num);
++vm_page *vm_page_at_index(int32 index);
++vm_page *vm_lookup_page(addr_t pageNumber);
+ 
+ #ifdef __cplusplus
+ }
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-03-23 00:09:55 UTC (rev 20406)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-03-23 11:48:37 UTC (rev 20407)
+@@ -1616,6 +1616,9 @@
+ 	map-&gt;ops-&gt;unmap(map, area-&gt;base, area-&gt;base - 1 + area-&gt;size);
+ 	map-&gt;ops-&gt;flush(map);
+ 
++	// TODO: does anything guarantee that we remap the same pages here?
++	//	Shouldn't we better introduce a &quot;change mapping&quot;?
++
+ 	for (page = lowerCache-&gt;page_list; page; page = page-&gt;cache_next) {
+ 		map-&gt;ops-&gt;map(map, area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT)
+ 			- area-&gt;cache_offset, page-&gt;physical_page_number &lt;&lt; PAGE_SHIFT,
+@@ -1836,9 +1839,67 @@
+ }
+ 
+ 
++int32
++vm_test_map_activation(vm_page *page)
++{
++	int32 activation = 0;
++
++	// TODO: this can't work... (we need to lock the map, so this has to be a mutex)
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&amp;sMappingLock);
++
++	vm_page_mappings::Iterator iterator = page-&gt;mappings.GetIterator();
++	vm_page_mapping *mapping;
++	while ((mapping = iterator.Next()) != NULL) {
++		vm_area *area = mapping-&gt;area;
++		vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
++
++		addr_t physicalAddress;
++		uint32 flags;
++//		map-&gt;ops-&gt;lock(map);
++		addr_t address = area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++		map-&gt;ops-&gt;query_interrupt(map, address, &amp;physicalAddress, &amp;flags);
++//		map-&gt;ops-&gt;unlock(map);
++
++		if (flags &amp; PAGE_ACCESSED)
++			activation++;
++	}
++
++	release_spinlock(&amp;sMappingLock);
++	restore_interrupts(state);
++
++	return activation;
++}
++
++
+ void
++vm_clear_map_activation(vm_page *page)
++{
++	// TODO: this can't work... (we need to lock the map, so this has to be a mutex)
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&amp;sMappingLock);
++
++	vm_page_mappings::Iterator iterator = page-&gt;mappings.GetIterator();
++	vm_page_mapping *mapping;
++	while ((mapping = iterator.Next()) != NULL) {
++		vm_area *area = mapping-&gt;area;
++		vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
++
++//		map-&gt;ops-&gt;lock(map);
++		addr_t address = area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++		map-&gt;ops-&gt;clear_flags(map, address, PAGE_ACCESSED);
++//		map-&gt;ops-&gt;unlock(map);
++	}
++
++	release_spinlock(&amp;sMappingLock);
++	restore_interrupts(state);
++}
++
++
++void
+ vm_remove_all_page_mappings(vm_page *page)
+ {
++	// TODO: this can't work... (we need to lock the map, so this has to be a mutex)
+ 	cpu_status state = disable_interrupts();
+ 	acquire_spinlock(&amp;sMappingLock);
+ 
+@@ -1851,10 +1912,10 @@
+ 		vm_area *area = mapping-&gt;area;
+ 		vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
+ 
+-		map-&gt;ops-&gt;lock(map);
++//		map-&gt;ops-&gt;lock(map);
+ 		addr_t base = area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+ 		map-&gt;ops-&gt;unmap(map, base, base + (B_PAGE_SIZE - 1));
+-		map-&gt;ops-&gt;unlock(map);
++//		map-&gt;ops-&gt;unlock(map);
+ 
+ 		area-&gt;mappings.Remove(mapping);
+ 	}
+@@ -2485,6 +2546,9 @@
+ }
+ 
+ 
++/*!
++	Frees physical pages that were used during the boot process.
++*/
+ static void
+ unmap_and_free_physical_pages(vm_translation_map *map, addr_t start, addr_t end)
+ {
+@@ -3470,6 +3534,13 @@
+ 	if (status == B_OK) {
+ 		// All went fine, all there is left to do is to map the page into the address space
+ 
++		// In case this is a copy-on-write page, we need to unmap it from the area now
++		if (isWrite &amp;&amp; page-&gt;cache == topCacheRef-&gt;cache)
++			vm_unmap_pages(area, address - area-&gt;base, B_PAGE_SIZE);
++
++		// TODO: there is currently no mechanism to prevent a page being mapped
++		//	more than once in case of a second page fault!
++
+ 		// If the page doesn't reside in the area's cache, we need to make sure it's
+ 		// mapped in read-only, so that we cannot overwrite someone else's data (copy-on-write)
+ 		uint32 newProtection = area-&gt;protection;
+@@ -4127,13 +4198,8 @@
+ 		current-&gt;size = newSize;
+ 
+ 		// we also need to unmap all pages beyond the new size, if the area has shrinked
+-		if (newSize &lt; oldSize) {
+-			vm_translation_map *map = &amp;current-&gt;address_space-&gt;translation_map;
+-
+-			map-&gt;ops-&gt;lock(map);
+-			map-&gt;ops-&gt;unmap(map, current-&gt;base + newSize, current-&gt;base + oldSize - 1);
+-			map-&gt;ops-&gt;unlock(map);
+-		}
++		if (newSize &lt; oldSize)
++			vm_unmap_pages(current, current-&gt;base + newSize, oldSize - newSize);
+ 	}
+ 
+ 	if (status == B_OK)
+@@ -4193,6 +4259,11 @@
+ 
+ 	acquire_sem_etc(sourceAddressSpace-&gt;sem, WRITE_COUNT, 0, 0);
+ 
++	// unmap the area in the source address space
++	vm_unmap_pages(area, area-&gt;base, area-&gt;size);
++
++	// TODO: there might be additional page faults at this point!
++
+ 	reservedAddress = (void *)area-&gt;base;
+ 	remove_area_from_address_space(sourceAddressSpace, area, true);
+ 	status = insert_area(sourceAddressSpace, &amp;reservedAddress, B_EXACT_ADDRESS,
+@@ -4204,12 +4275,6 @@
+ 	if (status != B_OK)
+ 		goto err3;
+ 
+-	// unmap the area in the source address space
+-	map = &amp;sourceAddressSpace-&gt;translation_map;
+-	map-&gt;ops-&gt;lock(map);
+-	map-&gt;ops-&gt;unmap(map, area-&gt;base, area-&gt;base + (area-&gt;size - 1));
+-	map-&gt;ops-&gt;unlock(map);
+-
+ 	// insert the area into the target address space
+ 
+ 	acquire_sem_etc(targetAddressSpace-&gt;sem, WRITE_COUNT, 0, 0);
+@@ -4228,6 +4293,8 @@
+ 	// The area was successfully transferred to the new team when we got here
+ 	area-&gt;address_space = targetAddressSpace;
+ 
++	// TODO: take area lock/wiring into account!
++
+ 	release_sem_etc(targetAddressSpace-&gt;sem, WRITE_COUNT, 0);
+ 
+ 	vm_unreserve_address_range(sourceAddressSpace-&gt;id, reservedAddress, area-&gt;size);
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.c	2007-03-23 00:09:55 UTC (rev 20406)
++++ haiku/trunk/src/system/kernel/vm/vm_page.c	2007-03-23 11:48:37 UTC (rev 20407)
+@@ -1030,16 +1030,23 @@
+ 
+ 
+ vm_page *
+-vm_lookup_page(addr_t page_num)
++vm_page_at_index(int32 index)
+ {
+-	if (page_num &lt; sPhysicalPageOffset)
++	return &amp;sPages[index];
++}
++
++
++vm_page *
++vm_lookup_page(addr_t pageNumber)
++{
++	if (pageNumber &lt; sPhysicalPageOffset)
+ 		return NULL;
+ 
+-	page_num -= sPhysicalPageOffset;
+-	if (page_num &gt;= sNumPages)
++	pageNumber -= sPhysicalPageOffset;
++	if (pageNumber &gt;= sNumPages)
+ 		return NULL;
+ 
+-	return &amp;sPages[page_num];
++	return &amp;sPages[pageNumber];
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001185.html">[Haiku-commits] r20406 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server
+</A></li>
+	<LI>Next message: <A HREF="001187.html">[Haiku-commits] r20408 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1186">[ date ]</a>
+              <a href="thread.html#1186">[ thread ]</a>
+              <a href="subject.html#1186">[ subject ]</a>
+              <a href="author.html#1186">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

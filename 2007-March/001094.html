@@ -1,0 +1,354 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20356 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20356%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200703081435.l28EZRNV001359%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001091.html">
+   <LINK REL="Next"  HREF="001095.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20356 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20356%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200703081435.l28EZRNV001359%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20356 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Mar  8 15:35:27 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001091.html">[Haiku-commits] r20355 - haiku/trunk/src/apps/abouthaiku
+</A></li>
+        <LI>Next message: <A HREF="001095.html">[Haiku-commits] r20357 -	haiku/trunk/src/add-ons/kernel/bus_managers/ps2
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1094">[ date ]</a>
+              <a href="thread.html#1094">[ thread ]</a>
+              <a href="subject.html#1094">[ subject ]</a>
+              <a href="author.html#1094">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-03-08 15:35:26 +0100 (Thu, 08 Mar 2007)
+New Revision: 20356
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20356&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20356&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm.h
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.c
+Log:
+* All mapped pages that are not wired (ie. locked) now have a vm_page_mapping object
+  that points to both, the page and the area the page is in. This will allow a page
+  scanner to steal unused pages when necessary.
+* The locking is currently done with a spinlock which we might want to have another
+  look at one day.
+* dump_page() and dump_area_struct() now dump the page mappings as well.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm.h	2007-03-08 13:10:09 UTC (rev 20355)
++++ haiku/trunk/headers/private/kernel/vm.h	2007-03-08 14:35:26 UTC (rev 20356)
+@@ -62,6 +62,7 @@
+ vm_area *vm_area_lookup(vm_address_space *addressSpace, addr_t address);
+ status_t vm_set_area_memory_type(area_id id, addr_t physicalBase, uint32 type);
+ status_t vm_get_page_mapping(team_id team, addr_t vaddr, addr_t *paddr);
++void vm_remove_all_page_mappings(vm_page *page);
+ status_t vm_unmap_pages(vm_area *area, addr_t base, size_t length);
+ status_t vm_map_page(vm_area *area, vm_page *page, addr_t address,
+ 			uint32 protection);
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2007-03-08 13:10:09 UTC (rev 20355)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2007-03-08 14:35:26 UTC (rev 20356)
+@@ -61,8 +61,8 @@
+ typedef class DoublyLinkedQueue&lt;vm_page_mapping, DoublyLinkedPageLink&gt; vm_page_mappings;
+ typedef class DoublyLinkedQueue&lt;vm_page_mapping, DoublyLinkedAreaLink&gt; vm_area_mappings;
+ #else	// !__cplusplus
+-typedef void *vm_page_mappings;
+-typedef void *vm_area_mappings;
++typedef struct vm_page_mapping *vm_page_mappings;
++typedef struct vm_page_mapping *vm_area_mappings;
+ #endif
+ 
+ // vm page
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-03-08 13:10:09 UTC (rev 20355)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-03-08 14:35:26 UTC (rev 20356)
+@@ -64,6 +64,7 @@
+ static area_id sNextAreaID;
+ static hash_table *sAreaHash;
+ static sem_id sAreaHashLock;
++static spinlock sMappingLock;
+ 
+ static off_t sAvailableMemory;
+ static benaphore sAvailableMemoryLock;
+@@ -170,6 +171,7 @@
+ 	area-&gt;address_space_next = NULL;
+ 	area-&gt;cache_next = area-&gt;cache_prev = NULL;
+ 	area-&gt;hash_next = NULL;
++	new (&amp;area-&gt;mappings) vm_area_mappings;
+ 
+ 	return area;
+ }
+@@ -1834,6 +1836,40 @@
+ }
+ 
+ 
++void
++vm_remove_all_page_mappings(vm_page *page)
++{
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&amp;sMappingLock);
++
++	vm_page_mappings queue;
++	queue.MoveFrom(&amp;page-&gt;mappings);
++
++	vm_page_mappings::Iterator iterator = queue.GetIterator();
++	vm_page_mapping *mapping;
++	while ((mapping = iterator.Next()) != NULL) {
++		vm_area *area = mapping-&gt;area;
++		vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
++
++		map-&gt;ops-&gt;lock(map);
++		addr_t base = area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++		map-&gt;ops-&gt;unmap(map, base, base + (B_PAGE_SIZE - 1));
++		map-&gt;ops-&gt;unlock(map);
++
++		area-&gt;mappings.Remove(mapping);
++	}
++
++	release_spinlock(&amp;sMappingLock);
++	restore_interrupts(state);
++
++	// free now unused mappings
++
++	while ((mapping = queue.RemoveHead()) != NULL) {
++		free(mapping);
++	}
++}
++
++
+ status_t
+ vm_unmap_pages(vm_area *area, addr_t base, size_t size)
+ {
+@@ -1864,6 +1900,37 @@
+ 	}
+ 
+ 	map-&gt;ops-&gt;unmap(map, base, base + (size - 1));
++
++	if (area-&gt;wiring == B_NO_LOCK) {
++		vm_area_mappings queue;
++		uint32 count = 0;
++
++		cpu_status state = disable_interrupts();
++		acquire_spinlock(&amp;sMappingLock);
++
++		vm_page_mapping *mapping;
++		while ((mapping = area-&gt;mappings.RemoveHead()) != NULL) {
++			mapping-&gt;page-&gt;mappings.Remove(mapping);
++			queue.Add(mapping);
++
++			// temporary unlock to handle interrupts and let others play as well
++			if ((++count % 256) == 0) {
++				release_spinlock(&amp;sMappingLock);
++				restore_interrupts(state);
++
++				state = disable_interrupts();
++				acquire_spinlock(&amp;sMappingLock);
++			}
++		}
++
++		release_spinlock(&amp;sMappingLock);
++		restore_interrupts(state);
++
++		while ((mapping = queue.RemoveHead()) != NULL) {
++			free(mapping);
++		}
++	}
++
+ 	map-&gt;ops-&gt;unlock(map);
+ 	return B_OK;
+ }
+@@ -1873,17 +1940,38 @@
+ vm_map_page(vm_area *area, vm_page *page, addr_t address, uint32 protection)
+ {
+ 	vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
++	vm_page_mapping *mapping = NULL;
+ 
++	if (area-&gt;wiring == B_NO_LOCK) {
++		mapping = (vm_page_mapping *)malloc(sizeof(vm_page_mapping));
++		if (mapping == NULL)
++			return B_NO_MEMORY;
++		
++		mapping-&gt;page = page;
++		mapping-&gt;area = area;
++	}
++
+ 	map-&gt;ops-&gt;lock(map);
+ 	map-&gt;ops-&gt;map(map, address, page-&gt;physical_page_number * B_PAGE_SIZE,
+ 		protection);
+-	map-&gt;ops-&gt;unlock(map);
+ 
+ 	if (area-&gt;wiring != B_NO_LOCK) {
+ 		page-&gt;wired_count++;
+ 			// TODO: needs to be atomic on all platforms!
++	} else {
++		// insert mapping into lists
++		cpu_status state = disable_interrupts();
++		acquire_spinlock(&amp;sMappingLock);
++
++		page-&gt;mappings.Add(mapping);
++		area-&gt;mappings.Add(mapping);
++
++		release_spinlock(&amp;sMappingLock);
++		restore_interrupts(state);
+ 	}
+ 
++	map-&gt;ops-&gt;unlock(map);
++
+ 	vm_page_set_state(page, PAGE_STATE_ACTIVE);
+ 	return B_OK;
+ }
+@@ -2211,7 +2299,7 @@
+ 
+ 
+ static void
+-_dump_area(vm_area *area)
++dump_area_struct(vm_area *area, bool mappings)
+ {
+ 	kprintf(&quot;AREA: %p\n&quot;, area);
+ 	kprintf(&quot;name:\t\t'%s'\n&quot;, area-&gt;name);
+@@ -2228,39 +2316,62 @@
+ 	kprintf(&quot;cache_offset:\t0x%Lx\n&quot;, area-&gt;cache_offset);
+ 	kprintf(&quot;cache_next:\t%p\n&quot;, area-&gt;cache_next);
+ 	kprintf(&quot;cache_prev:\t%p\n&quot;, area-&gt;cache_prev);
++
++	vm_area_mappings::Iterator iterator = area-&gt;mappings.GetIterator();
++	if (mappings) {
++		kprintf(&quot;page mappings:\n&quot;);
++		while (iterator.HasNext()) {
++			vm_page_mapping *mapping = iterator.Next();
++			kprintf(&quot;  %p&quot;, mapping-&gt;page);
++		}
++		kprintf(&quot;\n&quot;);
++	} else {
++		uint32 count = 0;
++		while (iterator.Next() != NULL) {
++			count++;
++		}
++		kprintf(&quot;page mappings:\t%lu\n&quot;, count);
++	}
+ }
+ 
+ 
+ static int
+ dump_area(int argc, char **argv)
+ {
++	bool mappings = false;
+ 	bool found = false;
++	int32 index = 1;
+ 	vm_area *area;
+ 	addr_t num;
+ 
+ 	if (argc &lt; 2) {
+-		kprintf(&quot;usage: area &lt;id|address|name&gt;\n&quot;);
++		kprintf(&quot;usage: area [-m] &lt;id|address|name&gt;\n&quot;);
+ 		return 0;
+ 	}
+ 
+-	num = strtoul(argv[1], NULL, 0);
++	if (!strcmp(argv[1], &quot;-m&quot;)) {
++		mappings = true;
++		index++;
++	}
+ 
++	num = strtoul(argv[index], NULL, 0);
++
+ 	// walk through the area list, looking for the arguments as a name
+ 	struct hash_iterator iter;
+ 
+ 	hash_open(sAreaHash, &amp;iter);
+ 	while ((area = (vm_area *)hash_next(sAreaHash, &amp;iter)) != NULL) {
+-		if ((area-&gt;name != NULL &amp;&amp; !strcmp(argv[1], area-&gt;name))
++		if ((area-&gt;name != NULL &amp;&amp; !strcmp(argv[index], area-&gt;name))
+ 			|| num != 0
+ 				&amp;&amp; ((addr_t)area-&gt;id == num
+ 					|| area-&gt;base &lt;= num &amp;&amp; area-&gt;base + area-&gt;size &gt; num)) {
+-			_dump_area(area);
++			dump_area_struct(area, mappings);
+ 			found = true;
+ 		}
+ 	}
+ 
+ 	if (!found)
+-		kprintf(&quot;could not find area %s (%ld)\n&quot;, argv[1], num);
++		kprintf(&quot;could not find area %s (%ld)\n&quot;, argv[index], num);
+ 	return 0;
+ }
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.c	2007-03-08 13:10:09 UTC (rev 20355)
++++ haiku/trunk/src/system/kernel/vm/vm_page.c	2007-03-08 14:35:26 UTC (rev 20356)
+@@ -136,6 +136,7 @@
+ static int
+ dump_page(int argc, char **argv)
+ {
++	struct vm_page_mapping *mapping;
+ 	struct vm_page *page;
+ 	addr_t address;
+ 	bool physical = false;
+@@ -187,7 +188,14 @@
+ 	kprintf(&quot;state:           %d\n&quot;, page-&gt;state);
+ 	kprintf(&quot;wired_count:     %u\n&quot;, page-&gt;wired_count);
+ 	kprintf(&quot;usage_count:     %u\n&quot;, page-&gt;usage_count);
++	kprintf(&quot;area mappings:\n&quot;);
+ 
++	mapping = page-&gt;mappings;
++	while (mapping != NULL) {
++		kprintf(&quot;  %p\n&quot;, mapping-&gt;area);
++		mapping = mapping-&gt;page_link.next;
++	}
++
+ 	return 0;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001091.html">[Haiku-commits] r20355 - haiku/trunk/src/apps/abouthaiku
+</A></li>
+	<LI>Next message: <A HREF="001095.html">[Haiku-commits] r20357 -	haiku/trunk/src/add-ons/kernel/bus_managers/ps2
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1094">[ date ]</a>
+              <a href="thread.html#1094">[ thread ]</a>
+              <a href="subject.html#1094">[ subject ]</a>
+              <a href="author.html#1094">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

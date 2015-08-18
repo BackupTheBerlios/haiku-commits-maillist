@@ -1,0 +1,230 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20750 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20750%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704191023.l3JANFPv031748%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001697.html">
+   <LINK REL="Next"  HREF="001687.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20750 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20750%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704191023.l3JANFPv031748%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20750 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 19 12:23:15 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001697.html">[Haiku-commits] r20749 - in haiku/trunk: build/jam
+</A></li>
+        <LI>Next message: <A HREF="001687.html">[Haiku-commits] r20751 - haiku/trunk/src/apps/fontdemo
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1685">[ date ]</a>
+              <a href="thread.html#1685">[ thread ]</a>
+              <a href="subject.html#1685">[ subject ]</a>
+              <a href="author.html#1685">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-19 12:23:04 +0200 (Thu, 19 Apr 2007)
+New Revision: 20750
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20750&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20750&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+Log:
+some TCP tweaks.
+
+ - check the effective window against the flight size.
+ - start the RTT estimates relatively high.
+ - introduced a TCP PROBE debug message for offline processing and TCP debugging.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-19 06:39:05 UTC (rev 20749)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-19 10:23:04 UTC (rev 20750)
+@@ -46,7 +46,11 @@
+ // SACK, Selective Acknowledgment - RFC 2018, RFC 2883, RFC 3517
+ // Forward RTO-Recovery, RFC 4138
+ 
++#define PrintAddress(address) \
++	AddressString(Domain(), (const sockaddr *)(address), true).Data()
++
+ //#define TRACE_TCP
++//#define PROBE_TCP
+ 
+ #ifdef TRACE_TCP
+ // the space before ', ##args' is important in order for this to work with cpp 2.95
+@@ -56,6 +60,18 @@
+ #	define TRACE(args...)			do { } while (0)
+ #endif
+ 
++#ifdef PROBE_TCP
++#	define PROBE(buffer, window) \
++	dprintf(&quot;TCP PROBE %llu %s %s %ld %lu %lu %lu %lu %lu %lu %lu %lu %llu\n&quot;, \
++		system_time(), PrintAddress(&amp;buffer-&gt;source), \
++		PrintAddress(&amp;buffer-&gt;destination), buffer-&gt;size, (uint32)fSendNext, \
++		(uint32)fSendUnacknowledged, fCongestionWindow, fSlowStartThreshold, \
++		window, fSendWindow, (uint32)(fSendMax - fSendUnacknowledged), \
++		fSendQueue.Used(), fRetransmitTimeout)
++#else
++#	define PROBE(buffer, window)	do { } while (0)
++#endif
++
+ // Initial estimate for packet round trip time (RTT)
+ #define TCP_INITIAL_RTT		4000000
+ 
+@@ -201,7 +217,8 @@
+ 	fSendWindowShift(0),
+ 	fReceiveWindowShift(0),
+ 	fSendUnacknowledged(0),
+-	fSendNext(fSendUnacknowledged),
++	fSendNext(0),
++	fSendMax(0),
+ 	fSendWindow(0),
+ 	fSendMaxWindow(0),
+ 	fSendMaxSegmentSize(TCP_DEFAULT_MAX_SEGMENT_SIZE),
+@@ -214,8 +231,8 @@
+ 	fReceiveWindow(socket-&gt;receive.buffer_size),
+ 	fReceiveMaxSegmentSize(TCP_DEFAULT_MAX_SEGMENT_SIZE),
+ 	fReceiveQueue(socket-&gt;receive.buffer_size),
+-	fRoundTripTime(0),
+-	fRoundTripDeviation(0),
++	fRoundTripTime(TCP_INITIAL_RTT / kTimestampFactor),
++	fRoundTripDeviation(TCP_INITIAL_RTT / kTimestampFactor),
+ 	fRetransmitTimeout(TCP_INITIAL_RTT),
+ 	fReceivedTSval(0),
+ 	fCongestionWindow(0),
+@@ -356,8 +373,7 @@
+ status_t
+ TCPEndpoint::Connect(const sockaddr *address)
+ {
+-	TRACE(&quot;Connect() on address %s&quot;,
+-		AddressString(Domain(), address, true).Data());
++	TRACE(&quot;Connect() on address %s&quot;, PrintAddress(address));
+ 
+ 	RecursiveLocker locker(fLock);
+ 
+@@ -444,8 +460,7 @@
+ 
+ 	RecursiveLocker lock(fLock);
+ 
+-	TRACE(&quot;Bind() on address %s&quot;,
+-		  AddressString(Domain(), address, true).Data());
++	TRACE(&quot;Bind() on address %s&quot;, PrintAddress(address));
+ 
+ 	if (fState != CLOSED)
+ 		return EISCONN;
+@@ -460,9 +475,8 @@
+ 	else
+ 		status = fManager-&gt;Bind(this);
+ 
+-	TRACE(&quot;  Bind() bound to %s (status %i)&quot;,
+-		  AddressString(Domain(), (sockaddr *)&amp;socket-&gt;address, true).Data(),
+-		  (int)status);
++	TRACE(&quot;  Bind() bound to %s (status %i)&quot;, PrintAddress(&amp;socket-&gt;address),
++	  (int)status);
+ 
+ 	return status;
+ }
+@@ -849,9 +863,8 @@
+ 	RecursiveLocker locker(fLock);
+ 
+ 	TRACE(&quot;SegmentReceived(): buffer %p (%lu bytes) address %s to %s&quot;,
+-		buffer, buffer-&gt;size, AddressString(Domain(),
+-		(sockaddr *)&amp;buffer-&gt;source, true).Data(), AddressString(Domain(),
+-		(sockaddr *)&amp;buffer-&gt;destination, true).Data());
++		buffer, buffer-&gt;size, PrintAddress(&amp;buffer-&gt;source),
++		PrintAddress(&amp;buffer-&gt;destination));
+ 	TRACE(&quot;                   flags 0x%x, seq %lu, ack %lu, wnd %lu&quot;,
+ 		segment.flags, segment.sequence, segment.acknowledge,
+ 		(uint32)segment.advertised_window &lt;&lt; fSendWindowShift);
+@@ -1063,23 +1076,23 @@
+ 	if (fCongestionWindow &gt; 0)
+ 		sendWindow = min_c(sendWindow, fCongestionWindow);
+ 
+-	if (force &amp;&amp; sendWindow == 0 &amp;&amp; fSendNext &lt;= fSendQueue.LastSequence()) {
+-		// send one byte of data to ask for a window update
+-		// (triggered by the persist timer)
+-		sendWindow = 1;
+-	}
+-
+ 	// a TCP may not send more data to the network than the
+ 	// currently unacknowledged sequence (SND.UNA) plus the
+ 	// calculated send window.
+ 
+-	if ((fSendNext - fSendUnacknowledged) &gt; sendWindow) {
++	uint32 flightSize = fSendMax - fSendUnacknowledged;
++	if (flightSize &gt; sendWindow) {
+ 		sendWindow = 0;
+ 		// TODO enter persist state? try to get a window update.
+ 	} else
+-		sendWindow -= (fSendNext - fSendUnacknowledged);
++		sendWindow -= flightSize;
+ 
+-	uint32 flightSize = fSendMax - fSendUnacknowledged;
++	if (force &amp;&amp; sendWindow == 0 &amp;&amp; fSendNext &lt;= fSendQueue.LastSequence()) {
++		// send one byte of data to ask for a window update
++		// (triggered by the persist timer)
++		sendWindow = 1;
++	}
++
+ 	uint32 length = min_c(fSendQueue.Available(fSendNext), sendWindow);
+ 	tcp_sequence previousSendNext = fSendNext;
+ 
+@@ -1124,14 +1137,16 @@
+ 		segment.sequence = fSendNext;
+ 
+ 		TRACE(&quot;SendQueued(): buffer %p (%lu bytes) address %s to %s&quot;,
+-			buffer, buffer-&gt;size, AddressString(Domain(),
+-			(sockaddr *)&amp;buffer-&gt;source, true).Data(), AddressString(Domain(),
+-			(sockaddr *)&amp;buffer-&gt;destination, true).Data());
++			buffer, buffer-&gt;size, PrintAddress(&amp;buffer-&gt;source),
++			PrintAddress(&amp;buffer-&gt;destination));
+ 		TRACE(&quot;              flags 0x%x, seq %lu, ack %lu, rwnd %hu, cwnd %lu&quot;
+ 			  &quot;, ssthresh %lu&quot;, segment.flags, segment.sequence,
+ 			  segment.acknowledge, segment.advertised_window,
+ 			  fCongestionWindow, fSlowStartThreshold);
+ 
++		PROBE(buffer, sendWindow);
++		sendWindow -= buffer-&gt;size;
++
+ 		status = add_tcp_header(AddressModule(), segment, buffer);
+ 		if (status != B_OK) {
+ 			gBufferModule-&gt;free(buffer);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001697.html">[Haiku-commits] r20749 - in haiku/trunk: build/jam
+</A></li>
+	<LI>Next message: <A HREF="001687.html">[Haiku-commits] r20751 - haiku/trunk/src/apps/fontdemo
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1685">[ date ]</a>
+              <a href="thread.html#1685">[ thread ]</a>
+              <a href="subject.html#1685">[ subject ]</a>
+              <a href="author.html#1685">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

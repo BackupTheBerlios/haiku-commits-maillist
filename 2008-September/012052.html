@@ -1,0 +1,555 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27657 - haiku/trunk/src/bin/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27657%20-%20haiku/trunk/src/bin/debug&In-Reply-To=%3C200809202044.m8KKiKPo004739%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012051.html">
+   <LINK REL="Next"  HREF="012053.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27657 - haiku/trunk/src/bin/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27657%20-%20haiku/trunk/src/bin/debug&In-Reply-To=%3C200809202044.m8KKiKPo004739%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27657 - haiku/trunk/src/bin/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Sep 20 22:44:20 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012051.html">[Haiku-commits] r27656 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="012053.html">[Haiku-commits] r27658 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12052">[ date ]</a>
+              <a href="thread.html#12052">[ thread ]</a>
+              <a href="subject.html#12052">[ subject ]</a>
+              <a href="author.html#12052">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-20 22:44:19 +0200 (Sat, 20 Sep 2008)
+New Revision: 27657
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27657&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27657&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/bin/debug/profile.cpp
+Log:
+* Completed image tracking using the image event counter sent with
+  various debugger messages. We do now correctly match all sampled
+  addresses.
+* Update the saved info of a team's main thread after exec*(), so we
+  can print a more useful name.
+* Improved the output: The images are listed in a table, now. The
+  function table also includes the image IDs for the functions.
+* Cleaned up debug output.
+
+
+Modified: haiku/trunk/src/bin/debug/profile.cpp
+===================================================================
+--- haiku/trunk/src/bin/debug/profile.cpp	2008-09-20 20:37:10 UTC (rev 27656)
++++ haiku/trunk/src/bin/debug/profile.cpp	2008-09-20 20:44:19 UTC (rev 27657)
+@@ -80,11 +80,13 @@
+ 
+ class Image : public Referenceable {
+ public:
+-	Image(const image_info&amp; info)
++	Image(const image_info&amp; info, int32 creationEvent)
+ 		:
+ 		fInfo(info),
+ 		fSymbols(NULL),
+-		fSymbolCount(0)
++		fSymbolCount(0),
++		fCreationEvent(creationEvent),
++		fDeletionEvent(-1)
+ 	{
+ 	}
+ 
+@@ -107,10 +109,25 @@
+ 		return fInfo;
+ 	}
+ 
++	int32 CreationEvent() const
++	{
++		return fCreationEvent;
++	}
++
++	int32 DeletionEvent() const
++	{
++		return fDeletionEvent;
++	}
++
++	void SetDeletionEvent(int32 event)
++	{
++		fDeletionEvent = event;
++	}
++
+ 	status_t LoadSymbols(debug_symbol_lookup_context* lookupContext)
+ 	{
+-		printf(&quot;Loading symbols of image \&quot;%s\&quot; (%ld)...\n&quot;, fInfo.name,
+-			fInfo.id);
++//		printf(&quot;Loading symbols of image \&quot;%s\&quot; (%ld)...\n&quot;, fInfo.name,
++//			fInfo.id);
+ 
+ 		// create symbol iterator
+ 		debug_symbol_iterator* iterator;
+@@ -203,6 +220,8 @@
+ 	image_info			fInfo;
+ 	Symbol**			fSymbols;
+ 	int32				fSymbolCount;
++	int32				fCreationEvent;
++	int32				fDeletionEvent;
+ };
+ 
+ 
+@@ -316,6 +335,13 @@
+ 	addr_t* Samples() const		{ return fSamples; }
+ 	Team* GetTeam() const		{ return fTeam; }
+ 
++	void UpdateInfo()
++	{
++		thread_info info;
++		if (get_thread_info(ID(), &amp;info) == B_OK)
++			fInfo = info;
++	}
++
+ 	void SetSampleArea(area_id area, addr_t* samples)
+ 	{
+ 		fSampleArea = area;
+@@ -369,8 +395,21 @@
+ 		return NULL;
+ 	}
+ 
+-	void AddSamples(int32 count, int32 stackDepth)
++	void AddSamples(int32 count, int32 stackDepth, int32 event)
+ 	{
++		_RemoveObsoleteImages(event);
++
++		// Temporarily remove images that have been created after the given
++		// event.
++		ImageList newImages;
++		ImageList::Iterator it = fImages.GetIterator();
++		while (ThreadImage* image = it.Next()) {
++			if (image-&gt;GetImage()-&gt;CreationEvent() &gt; event) {
++				it.Remove();
++				newImages.Add(image);
++			}
++		}
++
+ 		count = count / stackDepth * stackDepth;
+ 
+ 		for (int32 i = 0; i &lt; count; i += stackDepth) {
+@@ -389,37 +428,68 @@
+ 		}
+ 
+ 		fTotalHits += count / stackDepth;
++
++		// re-add the new images
++		fImages.MoveFrom(&amp;newImages);
++
++		_SynchronizeImages();
+ 	}
+ 
+ 	void PrintResults() const
+ 	{
+-		printf(&quot;total hits: %lld, missed: %lld\n&quot;, fTotalHits, fMissedTicks);
+-
++		// count images and symbols
++		int32 imageCount = 0;
+ 		int32 symbolCount = 0;
+ 
+-		ImageList::ConstIterator it = fImages.GetIterator();
++		ImageList::ConstIterator it = fOldImages.GetIterator();
+ 		while (ThreadImage* image = it.Next()) {
+-			const image_info&amp; imageInfo = image-&gt;GetImage()-&gt;Info();
+-			printf(&quot;  image: %s (%ld): %lld hits, %lld misses\n&quot;,
+-				imageInfo.name, imageInfo.id, image-&gt;TotalHits(),
+-				image-&gt;MissedHits());
+-			symbolCount += image-&gt;GetImage()-&gt;SymbolCount();
++			if (image-&gt;TotalHits() &gt; 0) {
++				imageCount++;
++				if (image-&gt;TotalHits() &gt; image-&gt;MissedHits())
++					symbolCount += image-&gt;GetImage()-&gt;SymbolCount();
++			}
+ 		}
+ 
++		it = fImages.GetIterator();
++		while (ThreadImage* image = it.Next()) {
++			if (image-&gt;TotalHits() &gt; 0) {
++				imageCount++;
++				if (image-&gt;TotalHits() &gt; image-&gt;MissedHits())
++					symbolCount += image-&gt;GetImage()-&gt;SymbolCount();
++			}
++		}
++
++		ThreadImage* images[imageCount];
++		imageCount = 0;
++
++		it = fOldImages.GetIterator();
++		while (ThreadImage* image = it.Next()) {
++			if (image-&gt;TotalHits() &gt; 0)
++				images[imageCount++] = image;
++		}
++
++		it = fImages.GetIterator();
++		while (ThreadImage* image = it.Next()) {
++			if (image-&gt;TotalHits() &gt; 0)
++				images[imageCount++] = image;
++		}
++
+ 		// find and sort the hit symbols
+ 		HitSymbol hitSymbols[symbolCount];
+ 		int32 hitSymbolCount = 0;
+ 
+-		it = fImages.GetIterator();
+-		while (ThreadImage* image = it.Next()) {
+-			Symbol** symbols = image-&gt;GetImage()-&gt;Symbols();
+-			const int64* symbolHits = image-&gt;SymbolHits();
+-			int32 imageSymbolCount = image-&gt;GetImage()-&gt;SymbolCount();
+-			for (int32 i = 0; i &lt; imageSymbolCount; i++) {
+-				if (symbolHits[i] &gt; 0) {
+-					HitSymbol&amp; hitSymbol = hitSymbols[hitSymbolCount++];
+-					hitSymbol.hits = symbolHits[i];
+-					hitSymbol.symbol = symbols[i];
++		for (int32 k = 0; k &lt; imageCount; k++) {
++			ThreadImage* image = images[k];
++			if (image-&gt;TotalHits() &gt; image-&gt;MissedHits()) {
++				Symbol** symbols = image-&gt;GetImage()-&gt;Symbols();
++				const int64* symbolHits = image-&gt;SymbolHits();
++				int32 imageSymbolCount = image-&gt;GetImage()-&gt;SymbolCount();
++				for (int32 i = 0; i &lt; imageSymbolCount; i++) {
++					if (symbolHits[i] &gt; 0) {
++						HitSymbol&amp; hitSymbol = hitSymbols[hitSymbolCount++];
++						hitSymbol.hits = symbolHits[i];
++						hitSymbol.symbol = symbols[i];
++					}
+ 				}
+ 			}
+ 		}
+@@ -438,18 +508,30 @@
+ 			fMissedTicks, fMissedTicks * fInterval,
+ 			100.0 * fMissedTicks / totalTicks);
+ 
++		if (imageCount &gt; 0) {
++			printf(&quot;\n&quot;);
++			printf(&quot;        hits     unknown    image\n&quot;);
++			printf(&quot;  -------------------------------------------------&quot;
++				&quot;-----------------------------\n&quot;);
++			for (int32 k = 0; k &lt; imageCount; k++) {
++				ThreadImage* image = images[k];
++				const image_info&amp; imageInfo = image-&gt;GetImage()-&gt;Info();
++				printf(&quot;  %10lld  %10lld  %7ld %s\n&quot;, image-&gt;TotalHits(),
++					image-&gt;MissedHits(), imageInfo.id, imageInfo.name);
++			}
++		}
+ 
+ 		if (hitSymbolCount &gt; 0) {
+ 			printf(&quot;\n&quot;);
+-			printf(&quot;        hits       in us    in %%  function\n&quot;);
++			printf(&quot;        hits       in us    in %%   image  function\n&quot;);
+ 			printf(&quot;  -------------------------------------------------&quot;
+ 				&quot;-----------------------------\n&quot;);
+ 			for (int32 i = 0; i &lt; hitSymbolCount; i++) {
+ 				const HitSymbol&amp; hitSymbol = hitSymbols[i];
+ 				const Symbol* symbol = hitSymbol.symbol;
+-				printf(&quot;  %10lld  %10lld  %6.2f  %s\n&quot;, hitSymbol.hits,
++				printf(&quot;  %10lld  %10lld  %6.2f  %6ld  %s\n&quot;, hitSymbol.hits,
+ 					hitSymbol.hits * fInterval,
+-					100.0 * hitSymbol.hits / totalTicks,
++					100.0 * hitSymbol.hits / totalTicks, symbol-&gt;image-&gt;ID(),
+ 					symbol-&gt;Name());
+ 			}
+ 		} else
+@@ -457,9 +539,38 @@
+ 	}
+ 
+ private:
++	void _SynchronizeImages();
++
++	void _RemoveObsoleteImages(int32 event)
++	{
++		// remove obsolete images
++		ImageList::Iterator it = fImages.GetIterator();
++		while (ThreadImage* image = it.Next()) {
++			int32 deleted = image-&gt;GetImage()-&gt;DeletionEvent();
++			if (deleted &gt;= 0 &amp;&amp; event &gt;= deleted) {
++				it.Remove();
++				if (image-&gt;TotalHits() &gt; 0)
++					fOldImages.Add(image);
++				else
++					delete image;
++			}
++		}
++	}
++
++	ThreadImage* _FindImageByID(image_id id) const
++	{
++		ImageList::ConstIterator it = fImages.GetIterator();
++		while (ThreadImage* image = it.Next()) {
++			if (image-&gt;ID() == id)
++				return image;
++		}
++
++		return NULL;
++	}
++
++private:
+ 	typedef DoublyLinkedList&lt;ThreadImage&gt;	ImageList;
+ 
+-private:
+ 	thread_info	fInfo;
+ 	::Team*		fTeam;
+ 	area_id		fSampleArea;
+@@ -595,7 +706,6 @@
+ 		}
+ 
+ 		thread-&gt;SetInterval(reply.interval);
+-//reply.profile_event
+ 
+ 		fThreads.Add(thread);
+ 
+@@ -610,15 +720,24 @@
+ 		fThreads.Remove(thread);
+ 	}
+ 
+-	void Exec()
++	void Exec(int32 event)
+ 	{
+ 		// remove all images
+ 		int32 imageCount = fImages.CountItems();
+ 		for (int32 i = imageCount - 1; i &gt;= 0; i--)
+-			_RemoveImage(i);
++			_RemoveImage(i, event);
++
++		// update the main thread
++		ThreadList::Iterator it = fThreads.GetIterator();
++		while (Thread* thread = it.Next()) {
++			if (thread-&gt;ID() == ID()) {
++				thread-&gt;UpdateInfo();
++				break;
++			}
++		}
+ 	}
+ 
+-	status_t AddImage(const image_info&amp; imageInfo)
++	status_t AddImage(const image_info&amp; imageInfo, int32 event)
+ 	{
+ 		// create symbol lookup context
+ 		debug_symbol_lookup_context* lookupContext;
+@@ -631,24 +750,26 @@
+ 		}
+ 
+ 		Image* image;
+-		error = _LoadImageSymbols(lookupContext, imageInfo, &amp;image);
++		error = _LoadImageSymbols(lookupContext, imageInfo, event, &amp;image);
+ 		debug_delete_symbol_lookup_context(lookupContext);
+ 
+-// TODO: Remove! The threads must be updated lazily.
+-if (error == B_OK) {
+-	ThreadList::Iterator it = fThreads.GetIterator();
+-	while (Thread* thread = it.Next())
+-		thread-&gt;AddImage(image);
+-}
++		// Although we generally synchronize the threads' images lazily, we have
++		// to add new images at least, since otherwise images could be added
++		// and removed again, and the hits inbetween could never be matched.
++		if (error == B_OK) {
++			ThreadList::Iterator it = fThreads.GetIterator();
++			while (Thread* thread = it.Next())
++				thread-&gt;AddImage(image);
++		}
+ 
+ 		return error;
+ 	}
+ 
+-	status_t RemoveImage(const image_info&amp; imageInfo)
++	status_t RemoveImage(const image_info&amp; imageInfo, int32 event)
+ 	{
+ 		for (int32 i = 0; Image* image = fImages.ItemAt(i); i++) {
+ 			if (image-&gt;ID() == imageInfo.id) {
+-				_RemoveImage(i);
++				_RemoveImage(i, event);
+ 				return B_OK;
+ 			}
+ 		}
+@@ -656,6 +777,21 @@
+ 		return B_ENTRY_NOT_FOUND;
+ 	}
+ 
++	const BObjectList&lt;Image&gt;&amp; Images() const
++	{
++		return fImages;
++	}
++
++	Image* FindImage(image_id id) const
++	{
++		for (int32 i = 0; Image* image = fImages.ItemAt(i); i++) {
++			if (image-&gt;ID() == id)
++				return image;
++		}
++
++		return NULL;
++	}
++
+ 	team_id ID() const
+ 	{
+ 		return fInfo.team;
+@@ -668,7 +804,7 @@
+ 		image_info imageInfo;
+ 		int32 cookie = 0;
+ 		while (get_next_image_info(fInfo.team, &amp;cookie, &amp;imageInfo) == B_OK) {
+-			status_t error = _LoadImageSymbols(lookupContext, imageInfo);
++			status_t error = _LoadImageSymbols(lookupContext, imageInfo, 0);
+ 			if (error == B_NO_MEMORY)
+ 				return error;
+ 		}
+@@ -677,9 +813,9 @@
+ 	}
+ 
+ 	status_t _LoadImageSymbols(debug_symbol_lookup_context* lookupContext,
+-		const image_info&amp; imageInfo, Image** _image = NULL)
++		const image_info&amp; imageInfo, int32 event, Image** _image = NULL)
+ 	{
+-		Image* image = new(std::nothrow) Image(imageInfo);
++		Image* image = new(std::nothrow) Image(imageInfo, event);
+ 		if (image == NULL)
+ 			return B_NO_MEMORY;
+ 
+@@ -700,17 +836,18 @@
+ 		return B_OK;
+ 	}
+ 
+-	void _RemoveImage(int32 index)
++	void _RemoveImage(int32 index, int32 event)
+ 	{
+ 		Image* image = fImages.RemoveItemAt(index);
+ 		if (image == NULL)
+ 			return;
+ 
+-		// notify all threads that the image has been removed
+-		ThreadList::Iterator it = fThreads.GetIterator();
+-		while (Thread* thread = it.Next())
+-			thread-&gt;ImageRemoved(image);
++		// Note: We don't tell the threads that the image has been removed. They
++		// will be updated lazily when their next profiler update arrives. This
++		// is necessary, since the update might contain samples hitting that
++		// image.
+ 
++		image-&gt;SetDeletionEvent(event);
+ 		image-&gt;RemoveReference();
+ 	}
+ 
+@@ -825,6 +962,31 @@
+ };
+ 
+ 
++void
++Thread::_SynchronizeImages()
++{
++	const BObjectList&lt;Image&gt;&amp; teamImages = fTeam-&gt;Images();
++
++	// remove obsolete images
++	ImageList::Iterator it = fImages.GetIterator();
++	while (ThreadImage* image = it.Next()) {
++		if (fTeam-&gt;FindImage(image-&gt;ID()) == NULL) {
++			it.Remove();
++			if (image-&gt;TotalHits() &gt; 0)
++				fOldImages.Add(image);
++			else
++				delete image;
++		}
++	}
++
++	// add new images
++	for (int32 i = 0; Image* image = teamImages.ItemAt(i); i++) {
++		if (_FindImageByID(image-&gt;ID()) == NULL)
++			AddImage(image);
++	}
++}
++
++
+ // TODO: Adjust!
+ static const char* kUsage =
+ 	&quot;Usage: %s [ &lt;options&gt; ] &lt;command line&gt;\n&quot;
+@@ -974,7 +1136,8 @@
+ 					break;
+ 
+ 				thread-&gt;AddSamples(message.profiler_update.sample_count,
+-					message.profiler_update.stack_depth);
++					message.profiler_update.stack_depth,
++					message.profiler_update.image_event);
+ 
+ 				if (message.profiler_update.stopped) {
+ 					thread-&gt;PrintResults();
+@@ -995,7 +1158,7 @@
+ 				break;
+ 			case B_DEBUGGER_MESSAGE_TEAM_EXEC:
+ 				if (Team* team = threadManager.FindTeam(message.origin.team))
+-					team-&gt;Exec();
++					team-&gt;Exec(message.team_exec.image_event);
+ 				break;
+ 
+ 			case B_DEBUGGER_MESSAGE_THREAD_CREATED:
+@@ -1006,21 +1169,17 @@
+ 				break;
+ 
+ 			case B_DEBUGGER_MESSAGE_IMAGE_CREATED:
+-{
+-const image_info&amp; info = message.image_created.info;
+-printf(&quot;B_DEBUGGER_MESSAGE_IMAGE_CREATED: %s (%ld)\n&quot;, info.name, info.id);
+-				if (Team* team = threadManager.FindTeam(message.origin.team))
+-					team-&gt;AddImage(message.image_created.info);
++				if (Team* team = threadManager.FindTeam(message.origin.team)) {
++					team-&gt;AddImage(message.image_created.info,
++						message.image_created.image_event);
++				}
+ 				break;
+-}
+ 			case B_DEBUGGER_MESSAGE_IMAGE_DELETED:
+-{
+-const image_info&amp; info = message.image_deleted.info;
+-printf(&quot;B_DEBUGGER_MESSAGE_IMAGE_DELETED: %s (%ld)\n&quot;, info.name, info.id);
+-				if (Team* team = threadManager.FindTeam(message.origin.team))
+-					team-&gt;RemoveImage(message.image_deleted.info);
++				if (Team* team = threadManager.FindTeam(message.origin.team)) {
++					team-&gt;RemoveImage(message.image_deleted.info,
++						message.image_deleted.image_event);
++				}
+ 				break;
+-}
+ 
+ 			case B_DEBUGGER_MESSAGE_POST_SYSCALL:
+ 			case B_DEBUGGER_MESSAGE_SIGNAL_RECEIVED:
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012051.html">[Haiku-commits] r27656 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="012053.html">[Haiku-commits] r27658 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12052">[ date ]</a>
+              <a href="thread.html#12052">[ thread ]</a>
+              <a href="subject.html#12052">[ subject ]</a>
+              <a href="author.html#12052">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

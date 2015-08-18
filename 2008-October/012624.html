@@ -1,0 +1,450 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28025 -	haiku/trunk/src/add-ons/media/plugins/wav_reader
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28025%20-%0A%09haiku/trunk/src/add-ons/media/plugins/wav_reader&In-Reply-To=%3C200810131043.m9DAh7IF000513%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012623.html">
+   <LINK REL="Next"  HREF="012625.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28025 -	haiku/trunk/src/add-ons/media/plugins/wav_reader</H1>
+    <B>dlmcpaul at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28025%20-%0A%09haiku/trunk/src/add-ons/media/plugins/wav_reader&In-Reply-To=%3C200810131043.m9DAh7IF000513%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28025 -	haiku/trunk/src/add-ons/media/plugins/wav_reader">dlmcpaul at mail.berlios.de
+       </A><BR>
+    <I>Mon Oct 13 12:43:07 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012623.html">[Haiku-commits] r28024 -	haiku/trunk/src/add-ons/media/plugins/raw_decoder
+</A></li>
+        <LI>Next message: <A HREF="012625.html">[Haiku-commits] r28026 -	haiku/trunk/src/add-ons/media/plugins/mp3_decoder
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12624">[ date ]</a>
+              <a href="thread.html#12624">[ thread ]</a>
+              <a href="subject.html#12624">[ subject ]</a>
+              <a href="author.html#12624">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: dlmcpaul
+Date: 2008-10-13 12:43:06 +0200 (Mon, 13 Oct 2008)
+New Revision: 28025
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28025&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28025&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/media/plugins/wav_reader/WavReaderPlugin.cpp
+   haiku/trunk/src/add-ons/media/plugins/wav_reader/WavReaderPlugin.h
+Log:
+rework seeking calculations
+
+Modified: haiku/trunk/src/add-ons/media/plugins/wav_reader/WavReaderPlugin.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/wav_reader/WavReaderPlugin.cpp	2008-10-13 10:41:37 UTC (rev 28024)
++++ haiku/trunk/src/add-ons/media/plugins/wav_reader/WavReaderPlugin.cpp	2008-10-13 10:43:06 UTC (rev 28025)
+@@ -46,16 +46,16 @@
+ 
+ struct wavdata
+ {
+-	uint64 position;
+-	uint64 datasize;
++	int64 position;
++	int64 datasize;
+ 
+-	int32 bitsperframe;
+-	int32 fps;
++	uint32 bitrate;
++	uint32 fps;
+ 
+ 	void *buffer;
+-	int32 buffersize;
++	uint32 buffersize;
+ 	
+-	int64 framecount;
++	uint64 framecount;
+ 	bigtime_t duration;
+ 	
+ 	bool raw;
+@@ -63,6 +63,30 @@
+ 	media_format format;
+ };
+ 
++static bigtime_t FrameToTime(uint64 frame, uint32 fps) {
++	return frame * 1000000LL / fps;
++}
++
++static uint64 TimeToFrame(bigtime_t time, uint32 fps) {
++	return (time * fps) / 1000000LL;
++}
++
++static int64 TimeToPosition(bigtime_t time, uint32 bitrate) {
++	return (time * bitrate) / 8000000LL;
++}
++
++static bigtime_t PositionToTime(int64 position, uint32 bitrate) {
++	return (position * 8000000LL) / bitrate;
++}
++
++static int64 FrameToPosition(uint64 frame, uint32 bitrate, uint32 fps) {
++	return TimeToPosition(FrameToTime(frame,fps),bitrate);
++}
++
++static uint64 PositionToFrame(int64 position, uint32 bitrate, uint32 fps) {
++	return TimeToFrame(PositionToTime(position,bitrate),fps);
++}
++
+ WavReader::WavReader()
+ {
+ 	TRACE(&quot;WavReader::WavReader\n&quot;);
+@@ -204,19 +228,23 @@
+ 	}
+ 
+ 	fChannelCount = UINT16(format.channels);
+-	fFrameRate = UINT32(format.samples_per_sec);
++	fSampleRate = UINT32(format.samples_per_sec);
++	fBlockAlign = UINT16(format.block_align);
+ 	fBitsPerSample = UINT16(format.bits_per_sample);
+ 	if (fBitsPerSample == 0) {
+-		printf(&quot;WavReader::Sniff: Error, bits_per_sample = 0 assuming 8\n&quot;);
+-		fBitsPerSample = 8;
++		printf(&quot;WavReader::Sniff: Error, bits_per_sample = 0 calculating\n&quot;);
++		fBitsPerSample = fBlockAlign * 8 / fChannelCount;
+ 	}
++	fFrameRate = fSampleRate * fChannelCount;
++	
+ 	fAvgBytesPerSec = format.avg_bytes_per_sec;
+-	fFrameCount = foundFact ? UINT32(fact.sample_length) : 0;
++	
++	// fact.sample_length is really no of samples for all channels
++	fFrameCount = foundFact ? UINT32(fact.sample_length) / fChannelCount : 0;
+ 	fFormatCode = UINT16(format.format_tag);
+ 	if (fFormatCode == 0xfffe &amp;&amp; foundFmtExt)
+ 		fFormatCode = (format_ext.guid[1] &lt;&lt; 8) | format_ext.guid[0];
+ 
+-	fBlockAlign = UINT16(format.block_align);
+ 	int min_align = (fFormatCode == 0x0001) ? (fBitsPerSample * fChannelCount + 7) / 8 : 1;
+ 	if (fBlockAlign &lt; min_align)
+ 		fBlockAlign = min_align;
+@@ -224,6 +252,7 @@
+ 	TRACE(&quot;  fDataStart     %Ld\n&quot;, fDataStart);
+ 	TRACE(&quot;  fDataSize      %Ld\n&quot;, fDataSize);
+ 	TRACE(&quot;  fChannelCount  %ld\n&quot;, fChannelCount);
++	TRACE(&quot;  fSampleRate    %ld\n&quot;, fSampleRate);
+ 	TRACE(&quot;  fFrameRate     %ld\n&quot;, fFrameRate);
+ 	TRACE(&quot;  fFrameCount    %Ld\n&quot;, fFrameCount);
+ 	TRACE(&quot;  fBitsPerSample %d\n&quot;, fBitsPerSample);
+@@ -231,7 +260,7 @@
+ 	TRACE(&quot;  min_align      %d\n&quot;, min_align);
+ 	TRACE(&quot;  fFormatCode    0x%04x\n&quot;, fFormatCode);
+ 	
+-	// XXX fact.sample_length contains duration of encodec files?
++	// XXX fact.sample_length contains duration of encoded files?
+ 
+ 	*streamCount = 1;
+ 	return B_OK;
+@@ -262,29 +291,25 @@
+ 
+ 	data-&gt;position = 0;
+ 	data-&gt;datasize = fDataSize;
+-	data-&gt;bitsperframe = fChannelCount * fBitsPerSample;
+-	data-&gt;fps = fFrameRate;
++	data-&gt;fps = fSampleRate;
+ 	data-&gt;buffersize = (BUFFER_SIZE / fBlockAlign) * fBlockAlign;
+ 	data-&gt;buffer = malloc(data-&gt;buffersize);
+-	data-&gt;framecount = fFrameCount ? fFrameCount : (8 * fDataSize) / data-&gt;bitsperframe;
+-	if (fFormatCode == 0x0055) {
+-		// mp3 in wav file
+-		if (fAvgBytesPerSec) {
+-			data-&gt;duration = (data-&gt;datasize * 1000000LL) / fAvgBytesPerSec;
+-		} else {
+-			data-&gt;duration = (data-&gt;framecount * 1000000LL) / data-&gt;fps / fBitsPerSample * fChannelCount;
+-		}
+-	} else {
+-		data-&gt;duration = (data-&gt;framecount * 1000000LL) / data-&gt;fps;
+-	}
++	data-&gt;framecount = fFrameCount ? fFrameCount : (8 * fDataSize) / (fChannelCount * fBitsPerSample);
+ 	data-&gt;raw = fFormatCode == 0x0001;
+ 
+-	TRACE(&quot; bitsperframe %ld\n&quot;, data-&gt;bitsperframe);
+-	TRACE(&quot; fps %ld\n&quot;, data-&gt;fps);
++	if (!fAvgBytesPerSec) {
++		fAvgBytesPerSec = fSampleRate * fBlockAlign;
++	}
++
++	data-&gt;duration = (data-&gt;datasize * 1000000LL) / fAvgBytesPerSec;
++	data-&gt;bitrate = fAvgBytesPerSec * 8;
++
++	TRACE(&quot; raw        %s\n&quot;, data-&gt;raw ? &quot;true&quot; : &quot;false&quot;);
++	TRACE(&quot; framecount %Ld\n&quot;, data-&gt;framecount);
++	TRACE(&quot; duration   %Ld\n&quot;, data-&gt;duration);
++	TRACE(&quot; bitrate    %ld\n&quot;, data-&gt;bitrate);
++	TRACE(&quot; fps        %ld\n&quot;, data-&gt;fps);
+ 	TRACE(&quot; buffersize %ld\n&quot;, data-&gt;buffersize);
+-	TRACE(&quot; framecount %Ld\n&quot;, data-&gt;framecount);
+-	TRACE(&quot; duration %Ld\n&quot;, data-&gt;duration);
+-	TRACE(&quot; raw %d\n&quot;, data-&gt;raw);
+ 	
+ 	BMediaFormats formats;
+ 	if (fFormatCode == 0x0001) {
+@@ -293,7 +318,8 @@
+ 		description.family = B_BEOS_FORMAT_FAMILY;
+ 		description.u.beos.format = B_BEOS_FORMAT_RAW_AUDIO;
+ 		formats.GetFormatFor(description, &amp;data-&gt;format);
+-		data-&gt;format.u.raw_audio.frame_rate = fFrameRate;
++		// Really SampleRate
++		data-&gt;format.u.raw_audio.frame_rate = fSampleRate;
+ 		data-&gt;format.u.raw_audio.channel_count = fChannelCount;
+ 		switch (fBitsPerSample) {
+ 			case 8:
+@@ -321,7 +347,8 @@
+ 		description.family = B_WAV_FORMAT_FAMILY;
+ 		description.u.wav.codec = fFormatCode;
+ 		formats.GetFormatFor(description, &amp;data-&gt;format);
+-		data-&gt;format.u.encoded_audio.output.frame_rate = fFrameRate;
++		// Really SampleRate
++		data-&gt;format.u.encoded_audio.output.frame_rate = fSampleRate;
+ 		data-&gt;format.u.encoded_audio.output.channel_count = fChannelCount;
+ 	}
+ 	
+@@ -358,96 +385,76 @@
+ 	return B_OK;
+ }
+ 
+-
+ status_t
+-WavReader::Seek(void *cookie,
++WavReader::CalculateNewPosition(void *cookie,
+ 				uint32 flags,
+-				int64 *frame, bigtime_t *time)
++				int64 *frame, bigtime_t *time, int64 *position)
+ {
+-	// Seek to the given position
+ 	wavdata *data = reinterpret_cast&lt;wavdata *&gt;(cookie);
+-	uint64 pos;
+ 
+ 	if (flags &amp; B_MEDIA_SEEK_TO_FRAME) {
+-		if (data-&gt;raw)
+-			pos = (*frame * data-&gt;bitsperframe) / 8;
+-		else
+-			pos = (*frame * fDataSize) / data-&gt;framecount;
+-		pos = (pos / fBlockAlign) * fBlockAlign; // round down to a block start
+-		TRACE(&quot;WavReader::Seek to frame %Ld, pos %Ld\n&quot;, *frame, pos);
++		TRACE(&quot; to frame %Ld&quot;,*frame);
++		*position = FrameToPosition(*frame, data-&gt;bitrate, data-&gt;fps);
++
+ 	} else if (flags &amp; B_MEDIA_SEEK_TO_TIME) {
+-		if (data-&gt;raw)
+-			pos = (*time * data-&gt;fps * data-&gt;bitsperframe) / (1000000LL * 8);
+-		else
+-			pos = (*time * fDataSize) / data-&gt;duration;
+-		pos = (pos / fBlockAlign) * fBlockAlign; // round down to a block start
+-		TRACE(&quot;WavReader::Seek to time %Ld, pos %Ld\n&quot;, *time, pos);
++		TRACE(&quot; to time %Ld&quot;, *time);
++		*position = TimeToPosition(*time, data-&gt;bitrate);
+ 	} else {
++		printf(&quot;WavReader::CalculateNewPosition invalid flag passed %ld\n&quot;, flags);
+ 		return B_ERROR;
+ 	}
+ 
+-	if (data-&gt;raw)
+-		*frame = (8 * pos) / data-&gt;bitsperframe;
+-	else
+-		*frame = (pos * data-&gt;framecount) / fDataSize;
+-	*time = (*frame * 1000000LL) / data-&gt;fps;
++	*position = (*position / fBlockAlign) * fBlockAlign; // round down to a block start
+ 
+-	TRACE(&quot;WavReader::Seek newtime %Ld\n&quot;, *time);
+-	TRACE(&quot;WavReader::Seek newframe %Ld\n&quot;, *frame);
++	TRACE(&quot;, position %Ld &quot;, *position);
++
++	*frame = PositionToFrame(*position, data-&gt;bitrate, data-&gt;fps);
++	*time = FrameToTime(*frame,data-&gt;fps);
++
++	TRACE(&quot;newtime %Ld &quot;, *time);
++	TRACE(&quot;newframe %Ld\n&quot;, *frame);
+ 	
+-	if (pos &lt; 0 || pos &gt; data-&gt;datasize) {
+-		TRACE(&quot;WavReader::Seek invalid position %Ld\n&quot;, pos);
++	if (*position &lt; 0 || *position &gt; data-&gt;datasize) {
++		printf(&quot;WavReader::CalculateNewPosition invalid position %Ld\n&quot;, *position);
+ 		return B_ERROR;
+ 	}
+ 	
+-	data-&gt;position = pos;
+ 	return B_OK;
+ }
+ 
+ status_t
+-WavReader::FindKeyFrame(void* cookie, uint32 flags,
+-							int64* frame, bigtime_t* time)
++WavReader::Seek(void *cookie,
++				uint32 flags,
++				int64 *frame, bigtime_t *time)
+ {
+-	// Find a seek position without actually seeking
++	// Seek to the given position
+ 	wavdata *data = reinterpret_cast&lt;wavdata *&gt;(cookie);
+-	uint64 pos;
+-
+-	if (flags &amp; B_MEDIA_SEEK_TO_FRAME) {
+-		if (data-&gt;raw)
+-			pos = (*frame * data-&gt;bitsperframe) / 8;
+-		else
+-			pos = (*frame * fDataSize) / data-&gt;framecount;
+-		pos = (pos / fBlockAlign) * fBlockAlign; // round down to a block start
+-		TRACE(&quot;WavReader::Seek to frame %Ld, pos %Ld\n&quot;, *frame, pos);
+-	} else if (flags &amp; B_MEDIA_SEEK_TO_TIME) {
+-		if (data-&gt;raw)
+-			pos = (*time * data-&gt;fps * data-&gt;bitsperframe) / (1000000LL * 8);
+-		else
+-			pos = (*time * fDataSize) / data-&gt;duration;
+-		pos = (pos / fBlockAlign) * fBlockAlign; // round down to a block start
+-		TRACE(&quot;WavReader::Seek to time %Ld, pos %Ld\n&quot;, *time, pos);
+-	} else {
+-		return B_ERROR;
+-	}
+-
+-	if (data-&gt;raw)
+-		*frame = (8 * pos) / data-&gt;bitsperframe;
+-	else
+-		*frame = (pos * data-&gt;framecount) / fDataSize;
+-	*time = (*frame * 1000000LL) / data-&gt;fps;
+-
+-	TRACE(&quot;WavReader::Seek newtime %Ld\n&quot;, *time);
+-	TRACE(&quot;WavReader::Seek newframe %Ld\n&quot;, *frame);
++	status_t status;
++	int64 pos;
+ 	
+-	if (pos &lt; 0 || pos &gt; data-&gt;datasize) {
+-		TRACE(&quot;WavReader::Seek invalid position %Ld\n&quot;, pos);
+-		return B_ERROR;
++	TRACE(&quot;WavReader::Seek&quot;);
++	status = CalculateNewPosition(cookie, flags, frame, time, &amp;pos);
++	
++	if (status == B_OK) {
++		// set the new position so next GetNextChunk will read from new seek pos
++		data-&gt;position = pos;
+ 	}
+ 	
+-	return B_OK;
++	return status;
+ }
+ 
+ status_t
++WavReader::FindKeyFrame(void* cookie, uint32 flags,
++							int64* frame, bigtime_t* time)
++{
++	// Find a seek position without actually seeking
++	int64 pos;
++	TRACE(&quot;WavReader::FindKeyFrame&quot;);
++	
++	return CalculateNewPosition(cookie, flags, frame, time, &amp;pos);
++}
++
++status_t
+ WavReader::GetNextChunk(void *cookie,
+ 						const void **chunkBuffer, size_t *chunkSize,
+ 						media_header *mediaHeader)
+@@ -456,28 +463,25 @@
+ 
+ 	// XXX it might be much better to not return any start_time information for encoded formats here,
+ 	// XXX and instead use the last time returned from seek and count forward after decoding.
+-	if (data-&gt;raw)
+-		mediaHeader-&gt;start_time = (((8 * data-&gt;position) / data-&gt;bitsperframe) * 1000000LL) / data-&gt;fps;
+-	else
+-		mediaHeader-&gt;start_time = (data-&gt;position * data-&gt;duration) / fDataSize;
++	mediaHeader-&gt;start_time = PositionToTime(data-&gt;position,data-&gt;bitrate);
+ 	mediaHeader-&gt;file_pos = fDataStart + data-&gt;position;
+ 
+-/*
+-	printf(&quot;position   = %9Ld\n&quot;, data-&gt;position);
+-	printf(&quot;fDataSize  = %9Ld\n&quot;, fDataSize);
+-	printf(&quot;duration   = %9Ld\n&quot;, data-&gt;duration);
+-	printf(&quot;start_time = %9Ld\n&quot;, mediaHeader-&gt;start_time);
+-*/	
++	TRACE(&quot;(%s) position   = %9Ld &quot;, data-&gt;raw ? &quot;raw&quot; : &quot;encoded&quot;, data-&gt;position);
++	TRACE(&quot;frame      = %9Ld &quot;, PositionToFrame(data-&gt;position,data-&gt;bitrate,data-&gt;fps));
++	TRACE(&quot;fDataSize  = %9Ld &quot;, fDataSize);
++	TRACE(&quot;start_time = %9Ld\n&quot;, mediaHeader-&gt;start_time);
+ 
+ 	int64 maxreadsize = data-&gt;datasize - data-&gt;position;
+ 	int32 readsize = data-&gt;buffersize;
+ 	if (maxreadsize &lt; readsize)
+ 		readsize = maxreadsize;
+-	if (readsize == 0)
++	if (readsize == 0) {
++		printf(&quot;WavReader::GetNextChunk: LAST BUFFER ERROR at time %9Ld\n&quot;,mediaHeader-&gt;start_time);
+ 		return B_LAST_BUFFER_ERROR;
+-		
++	}
++			
+ 	if (readsize != Source()-&gt;ReadAt(fDataStart + data-&gt;position, data-&gt;buffer, readsize)) {
+-		TRACE(&quot;WavReader::GetNextChunk: unexpected read error\n&quot;);
++		printf(&quot;WavReader::GetNextChunk: unexpected read error at position %9Ld\n&quot;,fDataStart + data-&gt;position);
+ 		return B_ERROR;
+ 	}
+ 	
+
+Modified: haiku/trunk/src/add-ons/media/plugins/wav_reader/WavReaderPlugin.h
+===================================================================
+--- haiku/trunk/src/add-ons/media/plugins/wav_reader/WavReaderPlugin.h	2008-10-13 10:41:37 UTC (rev 28024)
++++ haiku/trunk/src/add-ons/media/plugins/wav_reader/WavReaderPlugin.h	2008-10-13 10:43:06 UTC (rev 28025)
+@@ -55,7 +55,10 @@
+ 	status_t	GetNextChunk(void *cookie,
+ 					const void **chunkBuffer, size_t *chunkSize,
+ 					media_header *mediaHeader);
+-									 
++					
++	status_t	CalculateNewPosition(void* cookie, uint32 flags,
++					int64 *frame, bigtime_t *time, int64 *position);
++
+ 	BPositionIO *Source() { return fSource; }
+ 	
+ private:
+@@ -67,10 +70,11 @@
+ 	int64			fFrameCount;
+ 	int32			fChannelCount;
+ 	int32			fFrameRate;
+-	int				fBitsPerSample;
++	int32			fSampleRate;
++	uint16			fBitsPerSample;
+ 	uint16			fFormatCode;
+ 	uint16			fBlockAlign;
+-	uint16			fAvgBytesPerSec;
++	uint32			fAvgBytesPerSec;
+ };
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012623.html">[Haiku-commits] r28024 -	haiku/trunk/src/add-ons/media/plugins/raw_decoder
+</A></li>
+	<LI>Next message: <A HREF="012625.html">[Haiku-commits] r28026 -	haiku/trunk/src/add-ons/media/plugins/mp3_decoder
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12624">[ date ]</a>
+              <a href="thread.html#12624">[ thread ]</a>
+              <a href="subject.html#12624">[ subject ]</a>
+              <a href="author.html#12624">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

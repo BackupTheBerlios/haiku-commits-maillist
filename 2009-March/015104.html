@@ -1,0 +1,624 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29687 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29687%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse&In-Reply-To=%3C200903242321.n2ONL4fq017289%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015103.html">
+   <LINK REL="Next"  HREF="015107.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29687 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29687%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse&In-Reply-To=%3C200903242321.n2ONL4fq017289%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29687 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Mar 25 00:21:04 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015103.html">[Haiku-commits] r29686 - in haiku/trunk: headers/private/shared	src/kits/shared
+</A></li>
+        <LI>Next message: <A HREF="015107.html">[Haiku-commits] r29688 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15104">[ date ]</a>
+              <a href="thread.html#15104">[ thread ]</a>
+              <a href="subject.html#15104">[ subject ]</a>
+              <a href="author.html#15104">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-03-25 00:21:01 +0100 (Wed, 25 Mar 2009)
+New Revision: 29687
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29687&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29687&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEEntry.h
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.h
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/Jamfile
+Log:
+* Preparations for write support: Added a locking to the existing hooks. We
+  need to make sure that the paths of nodes don't change while we're meddling
+  with them. We read-lock the directories up to the root directory for that
+  purpose.
+* Added missing locking for directory and attribute directory cookies.
+  We have to do that, since concurrent readdir()s on the same dir handle are
+  possible and we write-access the cookie data in such a case.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEEntry.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEEntry.h	2009-03-24 23:13:56 UTC (rev 29686)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEEntry.h	2009-03-24 23:21:01 UTC (rev 29687)
+@@ -7,6 +7,8 @@
+ 
+ #include &lt;new&gt;
+ 
++#include &lt;RWLockManager.h&gt;
++
+ #include &lt;util/DoublyLinkedList.h&gt;
+ #include &lt;util/OpenHashTable.h&gt;
+ 
+@@ -75,7 +77,7 @@
+ typedef DoublyLinkedList&lt;FUSEEntry&gt; FUSEEntryList;
+ 
+ 
+-struct FUSENode : public HashTableLink&lt;FUSENode&gt; {
++struct FUSENode : RWLockable, HashTableLink&lt;FUSENode&gt; {
+ 	ino_t			id;
+ 	FUSEEntryList	entries;
+ 	int				type;
+@@ -88,6 +90,12 @@
+ 		refCount(1)
+ 	{
+ 	}
++
++	FUSENode* Parent() const
++	{
++		FUSEEntry* entry = entries.Head();
++		return entry != NULL ? entry-&gt;parent : NULL;
++	}
+ };
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp	2009-03-24 23:13:56 UTC (rev 29686)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp	2009-03-24 23:21:01 UTC (rev 29687)
+@@ -132,7 +132,7 @@
+ };
+ 
+ 
+-struct FUSEVolume::DirCookie : fuse_file_info {
++struct FUSEVolume::DirCookie : fuse_file_info, RWLockable {
+ 	union {
+ 		off_t		currentEntryOffset;
+ 		uint32		currentEntryIndex;
+@@ -178,7 +178,7 @@
+ };
+ 
+ 
+-struct FUSEVolume::AttrDirCookie {
++struct FUSEVolume::AttrDirCookie : RWLockable {
+ 	AttrDirCookie()
+ 		:
+ 		fAttributes(NULL),
+@@ -297,6 +297,108 @@
+ };
+ 
+ 
++struct FUSEVolume::RWLockableWriteLocking {
++	RWLockableWriteLocking(FUSEVolume* volume)
++		:
++		fLockManager(volume != NULL ? &amp;volume-&gt;fLockManager : NULL)
++	{
++	}
++
++	RWLockableWriteLocking(RWLockManager* lockManager)
++		:
++		fLockManager(lockManager)
++	{
++	}
++
++	RWLockableWriteLocking(const RWLockableWriteLocking&amp; other)
++		:
++		fLockManager(other.fLockManager)
++	{
++	}
++
++	inline bool Lock(RWLockable* lockable)
++	{
++		return fLockManager != NULL &amp;&amp; fLockManager-&gt;WriteLock(lockable);
++	}
++
++	inline void Unlock(RWLockable* lockable)
++	{
++		if (fLockManager != NULL)
++			fLockManager-&gt;WriteUnlock(lockable);
++	}
++
++private:
++	RWLockManager*	fLockManager;
++};
++
++
++struct FUSEVolume::RWLockableWriteLocker
++	: public AutoLocker&lt;RWLockable, RWLockableWriteLocking&gt; {
++
++	RWLockableWriteLocker(FUSEVolume* volume, RWLockable* lockable)
++		:
++		AutoLocker&lt;RWLockable, RWLockableWriteLocking&gt;(
++			RWLockableWriteLocking(volume))
++	{
++		SetTo(lockable, false);
++	}
++};
++
++
++struct FUSEVolume::NodeLocker {
++	NodeLocker(FUSEVolume* volume, FUSENode* node, bool parent, bool writeLock)
++		:
++		fVolume(volume),
++		fNode(NULL),
++		fParent(parent),
++		fWriteLock(writeLock)
++	{
++		fStatus = volume-&gt;_LockNodeChain(node, parent, writeLock);
++		if (fStatus == B_OK)
++			fNode = node;
++	}
++
++	~NodeLocker()
++	{
++		if (fNode != NULL)
++			fVolume-&gt;_UnlockNodeChain(fNode, fParent, fWriteLock);
++	}
++
++	status_t Status() const
++	{
++		return fStatus;
++	}
++
++private:
++	FUSEVolume*	fVolume;
++	FUSENode*	fNode;
++	status_t	fStatus;
++	bool		fParent;
++	bool		fWriteLock;
++};
++
++
++struct FUSEVolume::NodeReadLocker : NodeLocker {
++	NodeReadLocker(FUSEVolume* volume, FUSENode* node, bool parent)
++		:
++		NodeLocker(volume, node, parent, false)
++	{
++	}
++};
++
++
++struct FUSEVolume::NodeWriteLocker : NodeLocker {
++	NodeWriteLocker(FUSEVolume* volume, FUSENode* node, bool parent)
++		:
++		NodeLocker(volume, node, parent, true)
++	{
++	}
++};
++
++
++// #pragma mark -
++
++
+ inline FUSEFileSystem*
+ FUSEVolume::_FileSystem() const
+ {
+@@ -323,8 +425,13 @@
+ status_t
+ FUSEVolume::Init()
+ {
++	// init lock manager
++	status_t error = fLockManager.Init();
++	if (error != B_OK)
++		return error;
++
+ 	// init entry and node tables
+-	status_t error = fEntries.Init();
++	error = fEntries.Init();
+ 	if (error != B_OK)
+ 		return error;
+ 
+@@ -459,6 +566,11 @@
+ {
+ 	FUSENode* dir = (FUSENode*)_dir;
+ 
++	// lock the directory
++	NodeReadLocker nodeLocker(this, dir, false);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	// look the node up
+ 	FUSENode* node;
+ 	status_t error = _GetNode(dir, entryName, &amp;node);
+@@ -619,6 +731,11 @@
+ {
+ 	FUSENode* node = (FUSENode*)_node;
+ 
++	// lock the directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	AutoLocker&lt;Locker&gt; locker(fLock);
+ 
+ 	// get a path for the node
+@@ -685,6 +802,11 @@
+ {
+ 	FUSENode* node = (FUSENode*)_node;
+ 
++	// lock the directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	AutoLocker&lt;Locker&gt; locker(fLock);
+ 
+ 	// get a path for the node
+@@ -711,6 +833,11 @@
+ 	FUSENode* node = (FUSENode*)_node;
+ PRINT((&quot;FUSEVolume::ReadStat(%p (%lld), %p)\n&quot;, node, node-&gt;id, st));
+ 
++	// lock the directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	AutoLocker&lt;Locker&gt; locker(fLock);
+ 
+ 	// get a path for the node
+@@ -757,6 +884,11 @@
+ 	FUSENode* node = (FUSENode*)_node;
+ PRINT((&quot;FUSEVolume::Open(%p (%lld), %#x)\n&quot;, node, node-&gt;id, openMode));
+ 
++	// lock the directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	bool truncate = (openMode &amp; O_TRUNC) != 0;
+ 	openMode &amp;= ~O_TRUNC;
+ 
+@@ -799,6 +931,11 @@
+ 	FUSENode* node = (FUSENode*)_node;
+ 	FileCookie* cookie = (FileCookie*)_cookie;
+ 
++	// lock the directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	AutoLocker&lt;Locker&gt; locker(fLock);
+ 
+ 	// get a path for the node
+@@ -825,6 +962,11 @@
+ 	FUSENode* node = (FUSENode*)_node;
+ 	FileCookie* cookie = (FileCookie*)_cookie;
+ 
++	// lock the directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	ObjectDeleter&lt;FileCookie&gt; cookieDeleter(cookie);
+ 
+ 	AutoLocker&lt;Locker&gt; locker(fLock);
+@@ -856,6 +998,11 @@
+ 
+ 	*_bytesRead = 0;
+ 
++	// lock the directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	AutoLocker&lt;Locker&gt; locker(fLock);
+ 
+ 	// get a path for the node
+@@ -913,6 +1060,11 @@
+ 	FUSENode* node = (FUSENode*)_node;
+ PRINT((&quot;FUSEVolume::OpenDir(%p (%lld), %p)\n&quot;, node, node-&gt;id, _cookie));
+ 
++	// lock the parent directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	// allocate a dir cookie
+ 	DirCookie* cookie = new(std::nothrow) DirCookie;
+ 	if (cookie == NULL)
+@@ -961,6 +1113,11 @@
+ 	FUSENode* node = (FUSENode*)_node;
+ 	DirCookie* cookie = (DirCookie*)_cookie;
+ 
++	// lock the parent directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	ObjectDeleter&lt;DirCookie&gt; cookieDeleter(cookie);
+ 
+ 	if (cookie-&gt;getdirInterface)
+@@ -997,6 +1154,8 @@
+ 	FUSENode* node = (FUSENode*)_node;
+ 	DirCookie* cookie = (DirCookie*)_cookie;
+ 
++	RWLockableWriteLocker cookieLocker(this, cookie);
++
+ 	uint32 countRead = 0;
+ 	status_t readDirError = B_OK;
+ 
+@@ -1005,6 +1164,16 @@
+ 	if (cookie-&gt;entryCache == NULL) {
+ 		// We don't have an entry cache (yet), so we need to ask the client
+ 		// file system to read the directory.
++
++		locker.Unlock();
++
++		// lock the directory
++		NodeReadLocker nodeLocker(this, node, false);
++		if (nodeLocker.Status() != B_OK)
++			RETURN_ERROR(nodeLocker.Status());
++
++		locker.Lock();
++
+ 		ReadDirBuffer readDirBuffer(this, node, cookie, buffer, bufferSize,
+ 			count);
+ 
+@@ -1064,7 +1233,7 @@
+ PRINT((&quot;FUSEVolume::RewindDir(%p, %p)\n&quot;, _node, _cookie));
+ 	DirCookie* cookie = (DirCookie*)_cookie;
+ 
+-	AutoLocker&lt;Locker&gt; locker(fLock);
++	RWLockableWriteLocker cookieLocker(this, cookie);
+ 
+ 	if (cookie-&gt;getdirInterface) {
+ 		delete cookie-&gt;entryCache;
+@@ -1121,8 +1290,15 @@
+ 	FUSENode* node = (FUSENode*)_node;
+ 	AttrDirCookie* cookie = (AttrDirCookie*)_cookie;
+ 
++	RWLockableWriteLocker cookieLocker(this, cookie);
++
+ 	*_countRead = 0;
+ 
++	// lock the directory
++	NodeReadLocker nodeLocker(this, node, true);
++	if (nodeLocker.Status() != B_OK)
++		RETURN_ERROR(nodeLocker.Status());
++
+ 	AutoLocker&lt;Locker&gt; locker(fLock);
+ 
+ 	// get a path for the node
+@@ -1184,6 +1360,8 @@
+ {
+ 	AttrDirCookie* cookie = (AttrDirCookie*)_cookie;
+ 
++	RWLockableWriteLocker cookieLocker(this, cookie);
++
+ 	cookie-&gt;Clear();
+ 
+ 	return B_OK;
+@@ -1369,7 +1547,116 @@
+ }
+ 
+ 
++void
++FUSEVolume::_PutNodes(FUSENode* const* nodes, int32 count)
++{
++	for (int32 i = 0; i &lt; count; i++)
++		_PutNode(nodes[i]);
++}
++
++
++/*!	Locks the given node and all of its ancestors up to the root. The given
++	node is write-locked, if \a writeLock is \c true, read-locked otherwise. All
++	ancestors are always read-locked in either case.
++
++	If \a parent is \c true, the given node itself is ignored, but locking
++	starts with the parent node of the given node (\a writeLock applies to the
++	parent node then).
++
++	If the method fails, none of the nodes is locked.
++
++	The volume lock must not be held.
++*/
+ status_t
++FUSEVolume::_LockNodeChain(FUSENode* node, bool parent, bool writeLock)
++{
++	AutoLocker&lt;Locker&gt; locker(fLock);
++
++	if (parent &amp;&amp; node != NULL)
++		node = node-&gt;Parent();
++
++	if (node == NULL)
++		RETURN_ERROR(B_ENTRY_NOT_FOUND);
++
++	FUSENode* originalNode = node;
++
++	status_t error = B_OK;
++
++	do {
++		// increment the ref count first
++		node-&gt;refCount++;
++
++		// lock the node
++		if (!fLockManager.TryGenericLock(node == originalNode &amp;&amp; writeLock,
++				node)) {
++			// node is locked -- we need to unlock the volume and wait for
++			// the lock
++			locker.Unlock();
++			error = fLockManager.GenericLock(node == originalNode &amp;&amp; writeLock,
++				node);
++			locker.Lock();
++
++			if (error != B_OK)
++				break;
++		}
++
++		// get the parent node
++		FUSENode* parent = node-&gt;Parent();
++		if (parent == node)
++			break;
++		node = parent;
++	} while (node != NULL);
++
++	// Fail, if we couldn't lock all nodes up to the root.
++	if (error == B_OK &amp;&amp; node == NULL)
++		error = B_ENTRY_NOT_FOUND;
++
++	if (error != B_OK) {
++		// locking failed -- unlock and release the references of all
++		// nodes
++		FUSENode* stopNode = node;
++		node = originalNode;
++		while (node != stopNode) {
++			fLockManager.GenericUnlock(
++				node == originalNode &amp;&amp; writeLock, node);
++			FUSENode* parent = node-&gt;Parent();
++			_PutNode(node);
++			node = parent;
++		}
++
++		if (stopNode != NULL)
++			_PutNode(stopNode);
++		RETURN_ERROR(error);
++	}
++
++	return B_OK;
++}
++
++
++void
++FUSEVolume::_UnlockNodeChain(FUSENode* node, bool parent, bool writeLock)
++{
++	AutoLocker&lt;Locker&gt; locker(fLock);
++
++	if (parent &amp;&amp; node != NULL)
++		node = node-&gt;Parent();
++
++	FUSENode* originalNode = node;
++
++	while (node != NULL) {
++		FUSENode* parent = node-&gt;Parent();
++
++		fLockManager.GenericUnlock(node == originalNode &amp;&amp; writeLock, node);
++		_PutNode(node);
++
++		if (parent == node)
++			break;
++		node = parent;
++	}
++}
++
++
++status_t
+ FUSEVolume::_BuildPath(FUSENode* dir, const char* entryName, char* path,
+ 	size_t&amp; pathLen)
+ {
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.h	2009-03-24 23:13:56 UTC (rev 29686)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.h	2009-03-24 23:21:01 UTC (rev 29687)
+@@ -6,6 +6,7 @@
+ #define USERLAND_FS_FUSE_VOLUME_H
+ 
+ #include &lt;AutoLocker.h&gt;
++#include &lt;RWLockManager.h&gt;
+ 
+ #include &quot;Locker.h&quot;
+ 
+@@ -134,7 +135,15 @@
+ 	struct FileCookie;
+ 	struct AttrDirCookie;
+ 	struct ReadDirBuffer;
++	struct RWLockableWriteLocking;
++	struct RWLockableWriteLocker;
++	struct NodeLocker;
++	struct NodeReadLocker;
++	struct NodeWriteLocker;
+ 
++	friend struct RWLockableWriteLocking;
++	friend struct NodeLocker;
++
+ private:
+ 	inline	FUSEFileSystem*		_FileSystem() const;
+ 
+@@ -146,7 +155,13 @@
+ 									const char* entryName, FUSENode** _node,
+ 									AutoLocker&lt;Locker&gt;&amp; locker);
+ 			void				_PutNode(FUSENode* node);
++			void				_PutNodes(FUSENode* const* nodes, int32 count);
+ 
++			status_t			_LockNodeChain(FUSENode* node, bool parent,
++									bool writeLock);
++			void				_UnlockNodeChain(FUSENode* node, bool parent,
++									bool writeLock);
++
+ 			status_t			_BuildPath(FUSENode* dir, const char* entryName,
+ 									char* path, size_t&amp; pathLen);
+ 			status_t			_BuildPath(FUSENode* node, char* path,
+@@ -161,6 +176,7 @@
+ 									off_t offset);
+ 
+ private:
++			RWLockManager		fLockManager;
+ 			Locker				fLock;
+ 			fuse_fs*			fFS;
+ 			FUSEEntryTable		fEntries;
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/Jamfile
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/Jamfile	2009-03-24 23:13:56 UTC (rev 29686)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/Jamfile	2009-03-24 23:21:01 UTC (rev 29687)
+@@ -27,5 +27,5 @@
+ 	FUSEVolume.cpp
+ 
+ 	:
+-	&lt;nogrist&gt;userlandfs_server be
++	&lt;nogrist&gt;userlandfs_server libshared.a be
+ ;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015103.html">[Haiku-commits] r29686 - in haiku/trunk: headers/private/shared	src/kits/shared
+</A></li>
+	<LI>Next message: <A HREF="015107.html">[Haiku-commits] r29688 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15104">[ date ]</a>
+              <a href="thread.html#15104">[ thread ]</a>
+              <a href="subject.html#15104">[ subject ]</a>
+              <a href="author.html#15104">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,430 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20833 - in haiku/trunk:	headers/private/kernel/slab headers/private/kernel/util	src/system/kernel/slab
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20833%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/slab%20headers/private/kernel/util%0A%09src/system/kernel/slab&In-Reply-To=%3C200704260605.l3Q65N5j012152%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001823.html">
+   <LINK REL="Next"  HREF="001825.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20833 - in haiku/trunk:	headers/private/kernel/slab headers/private/kernel/util	src/system/kernel/slab</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20833%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/slab%20headers/private/kernel/util%0A%09src/system/kernel/slab&In-Reply-To=%3C200704260605.l3Q65N5j012152%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20833 - in haiku/trunk:	headers/private/kernel/slab headers/private/kernel/util	src/system/kernel/slab">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 26 08:05:23 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001823.html">[Haiku-commits] r20832 - in haiku/trunk: headers/private/kernel	headers/private/kernel/slab src/system/kernel src/system/kernel/slab
+</A></li>
+        <LI>Next message: <A HREF="001825.html">[Haiku-commits] r20834 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1824">[ date ]</a>
+              <a href="thread.html#1824">[ thread ]</a>
+              <a href="subject.html#1824">[ subject ]</a>
+              <a href="author.html#1824">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-26 08:05:08 +0200 (Thu, 26 Apr 2007)
+New Revision: 20833
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20833&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20833&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/slab/Base.h
+   haiku/trunk/headers/private/kernel/slab/HashStrategy.h
+   haiku/trunk/headers/private/kernel/slab/MergedStrategy.h
+   haiku/trunk/headers/private/kernel/slab/Strategy.h
+   haiku/trunk/headers/private/kernel/util/OpenHashTable.h
+   haiku/trunk/src/system/kernel/slab/Slab.cpp
+Log:
+assorted slab fixes.
+
+
+Modified: haiku/trunk/headers/private/kernel/slab/Base.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/slab/Base.h	2007-04-26 03:41:24 UTC (rev 20832)
++++ haiku/trunk/headers/private/kernel/slab/Base.h	2007-04-26 06:05:08 UTC (rev 20833)
+@@ -25,13 +25,16 @@
+ typedef void (*base_cache_constructor)(void *cookie, void *object);
+ typedef void (*base_cache_destructor)(void *cookie, void *object);
+ 
+-/* base Slab implementation, opaque to the backend used. */
++/* base Slab implementation, opaque to the backend used.
++ *
++ * NOTE: the caller is responsible for the Cache's locking. */
+ 
+ typedef struct base_cache {
+ 	char name[32];
+ 	size_t object_size;
+ 	size_t cache_color_cycle;
+-	struct list partial, full;
++	struct list empty, partial, full;
++	size_t empty_count;
+ 	base_cache_constructor constructor;
+ 	base_cache_destructor destructor;
+ 	void *cookie;
+@@ -51,8 +54,12 @@
+ void base_cache_init(base_cache *cache, const char *name, size_t object_size,
+ 	size_t alignment, base_cache_constructor constructor,
+ 	base_cache_destructor destructor, void *cookie);
++void base_cache_destroy(base_cache *cache,
++	void (*return_slab)(base_cache *, cache_slab *));
+ 
+ cache_object_link *base_cache_allocate_object(base_cache *cache);
++cache_object_link *base_cache_allocate_object_with_new_slab(base_cache *cache,
++	cache_slab *slab);
+ int base_cache_return_object(base_cache *cache, cache_slab *slab,
+ 	cache_object_link *link);
+ 
+@@ -82,16 +89,26 @@
+ 			destructor, cookie);
+ 	}
+ 
++	~Cache()
++	{
++		base_cache_destroy(this, _ReturnSlab);
++	}
++
+ 	void *AllocateObject(uint32_t flags)
+ 	{
+-		if (list_is_empty(&amp;partial)) {
++		cache_object_link *link = base_cache_allocate_object(this);
++
++		// if the cache is returning NULL it is because it ran out of slabs
++		if (link == NULL) {
+ 			cache_slab *newSlab = fStrategy.NewSlab(flags);
+ 			if (newSlab == NULL)
+ 				return NULL;
+-			list_add_item(&amp;partial, newSlab);
++			link = base_cache_allocate_object_with_new_slab(this, newSlab);
++			if (link == NULL)
++				panic(&quot;cache: failed to allocate with an empty slab&quot;);
+ 		}
+ 
+-		return fStrategy.Object(base_cache_allocate_object(this));
++		return fStrategy.Object(link);
+ 	}
+ 
+ 	void ReturnObject(void *object)
+@@ -103,9 +120,14 @@
+ 	}
+ 
+ private:
++	static void _ReturnSlab(base_cache *self, cache_slab *slab)
++	{
++		((Cache&lt;Strategy&gt; *)self)-&gt;fStrategy.ReturnSlab(slab);
++	}
++
+ 	Strategy fStrategy;
+ };
+ 
+-#endif
++#endif /* __cplusplus */
+ 
+ #endif
+
+Modified: haiku/trunk/headers/private/kernel/slab/HashStrategy.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/slab/HashStrategy.h	2007-04-26 03:41:24 UTC (rev 20832)
++++ haiku/trunk/headers/private/kernel/slab/HashStrategy.h	2007-04-26 06:05:08 UTC (rev 20833)
+@@ -133,8 +133,8 @@
+ 
+ 		// it's very important that we cast this to BaseHashCacheStrategy
+ 		// so we get the proper instance offset through void *
+-		return BaseCacheStrategy&lt;Backend&gt;::_ConstructSlab(slab, pages, 0,
+-			_Linkage, (BaseHashCacheStrategy *)this);
++		return BaseCacheStrategy&lt;Backend&gt;::_ConstructSlab(slab, pages,
++			_SlabSize(), _Linkage, (BaseHashCacheStrategy *)this);
+ 	}
+ 
+ 	void ReturnSlab(BaseSlab *slab)
+
+Modified: haiku/trunk/headers/private/kernel/slab/MergedStrategy.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/slab/MergedStrategy.h	2007-04-26 03:41:24 UTC (rev 20832)
++++ haiku/trunk/headers/private/kernel/slab/MergedStrategy.h	2007-04-26 06:05:08 UTC (rev 20833)
+@@ -57,9 +57,6 @@
+ 		void *pages;
+ 
+ 		size_t byteCount = _SlabSize();
+-		if (byteCount &gt; Backend::kMaximumAlignedLength)
+-			byteCount = Backend::kMaximumAlignedLength;
+-
+ 		// in order to save a pointer per object or a hash table to
+ 		// map objects to slabs we required this set of pages to be
+ 		// aligned in a (pageCount * PAGE_SIZE) boundary.
+@@ -70,7 +67,7 @@
+ 		_SlabInPages(pages)-&gt;id = id;
+ 
+ 		return BaseCacheStrategy&lt;Backend&gt;::_ConstructSlab(_SlabInPages(pages),
+-			pages, sizeof(Slab), _Linkage, this);
++			pages, _SlabSize() - sizeof(Slab), _Linkage, this);
+ 	}
+ 
+ 	void ReturnSlab(BaseSlab *slab)
+@@ -81,7 +78,10 @@
+ private:
+ 	size_t _SlabSize() const
+ 	{
+-		return BaseCacheStrategy&lt;Backend&gt;::SlabSize(sizeof(Slab));
++		size_t byteCount = BaseCacheStrategy&lt;Backend&gt;::SlabSize(sizeof(Slab));
++		if (byteCount &gt; Backend::kMaximumAlignedLength)
++			byteCount = Backend::kMaximumAlignedLength;
++		return byteCount;
+ 	}
+ 
+ 	Link *_Linkage(void *object) const
+
+Modified: haiku/trunk/headers/private/kernel/slab/Strategy.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/slab/Strategy.h	2007-04-26 03:41:24 UTC (rev 20832)
++++ haiku/trunk/headers/private/kernel/slab/Strategy.h	2007-04-26 06:05:08 UTC (rev 20833)
+@@ -34,11 +34,11 @@
+ 		typename Backend::AllocationID id;
+ 	};
+ 
+-	BaseSlab *_ConstructSlab(Slab *slab, void *pages, size_t tailSpace,
++	BaseSlab *_ConstructSlab(Slab *slab, void *pages, size_t byteCount,
+ 		ObjectLink *(*getLink)(void *parent, void *object), void *parent)
+ 	{
+-		return base_cache_construct_slab(fParent, slab, pages,
+-			SlabSize(tailSpace) - tailSpace, getLink, parent);
++		return base_cache_construct_slab(fParent, slab, pages, byteCount,
++			getLink, parent);
+ 	}
+ 
+ 	void _DestructSlab(BaseSlab *slab)
+
+Modified: haiku/trunk/headers/private/kernel/util/OpenHashTable.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/util/OpenHashTable.h	2007-04-26 03:41:24 UTC (rev 20832)
++++ haiku/trunk/headers/private/kernel/util/OpenHashTable.h	2007-04-26 06:05:08 UTC (rev 20833)
+@@ -11,6 +11,7 @@
+ #define _OPEN_HASH_TABLE_H_
+ 
+ #include &lt;KernelExport.h&gt;
++#include &lt;util/kernel_cpp.h&gt;
+ 
+ // the Definition template must have four methods: `HashKey', `Hash',
+ // `Compare' and `GetLink;. It must also define several types as shown in the
+
+Modified: haiku/trunk/src/system/kernel/slab/Slab.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/slab/Slab.cpp	2007-04-26 03:41:24 UTC (rev 20832)
++++ haiku/trunk/src/system/kernel/slab/Slab.cpp	2007-04-26 06:05:08 UTC (rev 20833)
+@@ -21,7 +21,16 @@
+ //      same code. We'll have to resolve all of the dependencies
+ //      then, for now, it is still not required.
+ 
++//#define TRACE_SLAB
+ 
++#ifdef TRACE_SLAB
++#define TRACE_CACHE(cache, format, args...) \
++	dprintf(&quot;Cache[%p, %s] &quot; format &quot;\n&quot;, cache, cache-&gt;name , ##args)
++#else
++#define TRACE_CACHE(cache, format, bananas...) do { } while (0)
++#endif
++
++
+ // TODO this value should be dynamically tuned per cache.
+ static const int kMagazineCapacity = 32;
+ 
+@@ -54,14 +63,14 @@
+ 	if (flags &amp; CACHE_ALIGN_TO_TOTAL &amp;&amp; byteCount &gt; B_PAGE_SIZE)
+ 		return NULL;
+ 
+-	dprintf(&quot;AreaBackend::AllocatePages(%lu, 0x%lx)\n&quot;, byteCount, flags);
++	TRACE_CACHE(cache, &quot;allocate pages (%lu, 0x0%lx)&quot;, byteCount, flags);
+ 
+ 	area_id areaId = create_area(cache-&gt;name, pages,
+ 		B_ANY_KERNEL_ADDRESS, byteCount, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
+ 	if (areaId &lt; 0)
+ 		return areaId;
+ 
+-	dprintf(&quot;  AreaBackend::AllocatePages() = { %ld, %p }\n&quot;, areaId, *pages);
++	TRACE_CACHE(cache, &quot;  ... = { %ld, %p }&quot;, areaId, *pages);
+ 
+ 	*id = areaId;
+ 	return B_OK;
+@@ -70,7 +79,7 @@
+ void
+ slab_area_backend_free(base_cache *cache, area_id area)
+ {
+-	dprintf(&quot;AreaBackend::DeletePages(%ld)\n&quot;, area);
++	TRACE_CACHE(cache, &quot;delete pages %ld&quot;, area);
+ 	delete_area(area);
+ }
+ 
+@@ -82,6 +91,8 @@
+ {
+ 	strlcpy(cache-&gt;name, name, sizeof(cache-&gt;name));
+ 
++	TRACE_CACHE(cache, &quot;init %lu, %lu&quot;, objectSize, alignment);
++
+ 	if (alignment &gt; 0 &amp;&amp; (objectSize &amp; (alignment - 1)))
+ 		cache-&gt;object_size = objectSize + alignment
+ 			- (objectSize &amp; (alignment - 1));
+@@ -90,19 +101,54 @@
+ 
+ 	cache-&gt;cache_color_cycle = 0;
+ 
++	list_init_etc(&amp;cache-&gt;empty, offsetof(cache_slab, link));
+ 	list_init_etc(&amp;cache-&gt;partial, offsetof(cache_slab, link));
+ 	list_init_etc(&amp;cache-&gt;full, offsetof(cache_slab, link));
++
++	cache-&gt;empty_count = 0;
++
++	cache-&gt;constructor = constructor;
++	cache-&gt;destructor = destructor;
++	cache-&gt;cookie = cookie;
+ }
+ 
+ 
++void
++base_cache_destroy(base_cache *cache,
++	void (*return_slab)(base_cache *, cache_slab *))
++{
++	if (!list_is_empty(&amp;cache-&gt;full))
++		panic(&quot;cache destroy: still has full slabs&quot;);
++
++	if (!list_is_empty(&amp;cache-&gt;partial))
++		panic(&quot;cache destroy: still has partial slabs&quot;);
++
++	while (!list_is_empty(&amp;cache-&gt;empty)) {
++		cache_slab *slab = (cache_slab *)list_remove_head_item(&amp;cache-&gt;empty);
++		return_slab(cache, slab);
++	}
++
++	cache-&gt;empty_count = 0;
++}
++
++
+ cache_object_link *
+ base_cache_allocate_object(base_cache *cache)
+ {
+-	cache_slab *slab = (cache_slab *)list_get_first_item(&amp;cache-&gt;partial);
++	cache_slab *slab;
+ 
+-	dprintf(&quot;BaseCache::AllocateObject() from %p, %lu remaining\n&quot;,
+-		slab, slab-&gt;count);
++	if (list_is_empty(&amp;cache-&gt;partial)) {
++		if (list_is_empty(&amp;cache-&gt;empty))
++			return NULL;
+ 
++		cache-&gt;empty_count--;
++		slab = (cache_slab *)list_remove_head_item(&amp;cache-&gt;empty);
++		list_add_item(&amp;cache-&gt;partial, slab);
++	} else
++		slab = (cache_slab *)list_get_first_item(&amp;cache-&gt;partial);
++
++	TRACE_CACHE(cache, &quot;allocate from %p, %lu remaining.&quot;, slab, slab-&gt;count);
++
+ 	cache_object_link *link = SListPop(slab-&gt;free);
+ 	slab-&gt;count--;
+ 	if (slab-&gt;count == 0) {
+@@ -115,17 +161,34 @@
+ }
+ 
+ 
++cache_object_link *
++base_cache_allocate_object_with_new_slab(base_cache *cache,
++	cache_slab *newSlab)
++{
++	list_add_item(&amp;cache-&gt;partial, newSlab);
++	return base_cache_allocate_object(cache);
++}
++
++
+ int
+ base_cache_return_object(base_cache *cache, cache_slab *slab,
+ 	cache_object_link *link)
+ {
+ 	// We return true if the slab is completely unused.
+ 
++	TRACE_CACHE(cache, &quot;returning %p to %p, %lu used (%lu empty slabs).&quot;,
++		link, slab, slab-&gt;size - slab-&gt;count, cache-&gt;empty_count);
++
+ 	SListPush(slab-&gt;free, link);
+ 	slab-&gt;count++;
+ 	if (slab-&gt;count == slab-&gt;size) {
+ 		list_remove_item(&amp;cache-&gt;partial, slab);
+-		return 1;
++
++		if (cache-&gt;empty_count &gt; 2)
++			return 1;
++
++		cache-&gt;empty_count++;
++		list_add_item(&amp;cache-&gt;empty, slab);
+ 	} else if (slab-&gt;count == 1) {
+ 		list_remove_item(&amp;cache-&gt;full, slab);
+ 		list_add_item(&amp;cache-&gt;partial, slab);
+@@ -140,8 +203,7 @@
+ 	size_t byteCount, cache_object_link *(*getLink)(void *parent, void *object),
+ 	void *parent)
+ {
+-	dprintf(&quot;BaseCache::ConstructSlab(%p, %p, %lu, %p, %p)\n&quot;, slab, pages,
+-		byteCount, getLink, parent);
++	TRACE_CACHE(cache, &quot;construct (%p, %p, %lu)&quot;, slab, pages, byteCount);
+ 
+ 	slab-&gt;pages = pages;
+ 	slab-&gt;count = slab-&gt;size = byteCount / cache-&gt;object_size;
+@@ -155,7 +217,7 @@
+ 	else
+ 		cache-&gt;cache_color_cycle += kCacheColorPeriod;
+ 
+-	dprintf(&quot;  %lu objects, %lu spare bytes, cycle %lu\n&quot;,
++	TRACE_CACHE(cache, &quot;  %lu objects, %lu spare bytes, cycle %lu&quot;,
+ 		slab-&gt;size, spareBytes, cycle);
+ 
+ 	uint8_t *data = ((uint8_t *)pages) + cycle;
+@@ -174,9 +236,14 @@
+ void
+ base_cache_destruct_slab(base_cache *cache, cache_slab *slab)
+ {
++	TRACE_CACHE(cache, &quot;destruct %p&quot;, slab);
++
+ 	if (cache-&gt;destructor == NULL)
+ 		return;
+ 
++	if (slab-&gt;count != slab-&gt;size)
++		panic(&quot;cache: destroying a slab which isn't empty.&quot;);
++
+ 	uint8_t *data = (uint8_t *)slab-&gt;pages;
+ 
+ 	for (size_t i = 0; i &lt; slab-&gt;size; i++) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001823.html">[Haiku-commits] r20832 - in haiku/trunk: headers/private/kernel	headers/private/kernel/slab src/system/kernel src/system/kernel/slab
+</A></li>
+	<LI>Next message: <A HREF="001825.html">[Haiku-commits] r20834 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1824">[ date ]</a>
+              <a href="thread.html#1824">[ thread ]</a>
+              <a href="subject.html#1824">[ subject ]</a>
+              <a href="author.html#1824">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

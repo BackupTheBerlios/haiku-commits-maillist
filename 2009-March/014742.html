@@ -1,0 +1,297 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29439 - in haiku/trunk: headers/os/interface	src/kits/interface
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29439%20-%20in%20haiku/trunk%3A%20headers/os/interface%0A%09src/kits/interface&In-Reply-To=%3C200903081418.n28EI60h004404%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014741.html">
+   <LINK REL="Next"  HREF="014743.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29439 - in haiku/trunk: headers/os/interface	src/kits/interface</H1>
+    <B>aldeck at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29439%20-%20in%20haiku/trunk%3A%20headers/os/interface%0A%09src/kits/interface&In-Reply-To=%3C200903081418.n28EI60h004404%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29439 - in haiku/trunk: headers/os/interface	src/kits/interface">aldeck at mail.berlios.de
+       </A><BR>
+    <I>Sun Mar  8 15:18:06 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014741.html">[Haiku-commits] r29438 - haiku/trunk/headers/posix
+</A></li>
+        <LI>Next message: <A HREF="014743.html">[Haiku-commits] r29440 -	haiku/trunk/src/add-ons/kernel/drivers/audio/ac97/geode
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14742">[ date ]</a>
+              <a href="thread.html#14742">[ thread ]</a>
+              <a href="subject.html#14742">[ subject ]</a>
+              <a href="author.html#14742">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: aldeck
+Date: 2009-03-08 15:18:06 +0100 (Sun, 08 Mar 2009)
+New Revision: 29439
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29439&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29439&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/os/interface/Shelf.h
+   haiku/trunk/src/kits/interface/Shelf.cpp
+Log:
+* Use ref counting to determine when to unload a replicants add_on image, fixes #2712.
+* Don't delete fStream if we don't own it, would crash ShelfTest on quit.
+
+
+Modified: haiku/trunk/headers/os/interface/Shelf.h
+===================================================================
+--- haiku/trunk/headers/os/interface/Shelf.h	2009-03-08 13:56:15 UTC (rev 29438)
++++ haiku/trunk/headers/os/interface/Shelf.h	2009-03-08 14:18:06 UTC (rev 29439)
+@@ -1,15 +1,19 @@
+ /*
+- * Copyright 2001-2007, Haiku Inc.
++ * Copyright 2001-2009, Haiku Inc.
+  * Distributed under the terms of the MIT License.
+  */
+ #ifndef _SHELF_H
+ #define _SHELF_H
+ 
+-
+ #include &lt;Dragger.h&gt;
+ #include &lt;Handler.h&gt;
+ #include &lt;List.h&gt;
++#include &lt;Locker.h&gt;
++#include &lt;String.h&gt;
+ 
++#include &lt;map&gt;
++#include &lt;utility&gt;
++
+ class BDataIO;
+ class BPoint;
+ class BView;
+@@ -123,6 +127,10 @@
+ 		bool				fAllowZombies;
+ 		bool				fTypeEnforced;
+ 
++		typedef std::map&lt;BString, std::pair&lt;image_id, int32&gt; &gt; LoadedImageMap;
++		static LoadedImageMap	sLoadedImages;
++		static BLocker			sLoadedImageMapLocker;
++
+ 		uint32				_reserved[8];
+ };
+ 
+
+Modified: haiku/trunk/src/kits/interface/Shelf.cpp
+===================================================================
+--- haiku/trunk/src/kits/interface/Shelf.cpp	2009-03-08 13:56:15 UTC (rev 29438)
++++ haiku/trunk/src/kits/interface/Shelf.cpp	2009-03-08 14:18:06 UTC (rev 29439)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2008, Haiku.
++ * Copyright 2001-2009, Haiku.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -7,11 +7,12 @@
+  *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
+  *		J&#233;r&#244;me Duval
+  *		Ren&#233; Gollent
++ *		Alexandre Deckner, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">alex at zappotek.com</A>
+  */
+ 
+ /*!	BShelf stores replicant views that are dropped onto it */
+ 
+-
++#include &lt;AutoLock.h&gt;
+ #include &lt;Beep.h&gt;
+ #include &lt;Dragger.h&gt;
+ #include &lt;Entry.h&gt;
+@@ -103,7 +104,7 @@
+ 
+ struct replicant_data {
+ 	replicant_data(BMessage *message, BView *view, BDragger *dragger,
+-		BDragger::relation relation, unsigned long id, image_id image);
++		BDragger::relation relation, unsigned long id);
+ 	replicant_data();
+ 	~replicant_data();
+ 
+@@ -122,7 +123,6 @@
+ 	BDragger*			dragger;
+ 	BDragger::relation	relation;
+ 	unsigned long		id;
+-	image_id			image;
+ 	status_t			error;
+ 	BView*				zombie_view;
+ };
+@@ -201,14 +201,13 @@
+ 
+ 
+ replicant_data::replicant_data(BMessage *_message, BView *_view, BDragger *_dragger,
+-	BDragger::relation _relation, unsigned long _id, image_id _image)
++	BDragger::relation _relation, unsigned long _id)
+ 	:
+ 	message(_message),
+ 	view(_view),
+ 	dragger(NULL),
+ 	relation(_relation),
+ 	id(_id),
+-	image(_image),
+ 	error(B_OK),
+ 	zombie_view(NULL)
+ {
+@@ -222,7 +221,6 @@
+ 	dragger(NULL),
+ 	relation(BDragger::TARGET_UNKNOWN),
+ 	id(0),
+-	image(-1),
+ 	error(B_ERROR),
+ 	zombie_view(NULL)
+ {
+@@ -231,12 +229,6 @@
+ replicant_data::~replicant_data()
+ {
+ 	delete message;
+-	// we can't delete the view or image here since 
+-	// 1 - the view may already have been deleted and thus our pointer is invalid
+-	// and 2 - we don't know what order they will be deleted in, so we can't unload the image yet
+-	// since the destructor code for the view might still be needed if it has not been destroyed yet.
+-	// this does mean we technically leak add-on images on exit, but I don't see a way around that,
+-	// and in theory they should be unloaded by team cleanup on exit anyways.
+ }
+ 
+ status_t
+@@ -463,7 +455,10 @@
+ 
+ //	#pragma mark -
+ 
++BShelf::LoadedImageMap 	BShelf::sLoadedImages;
++BLocker					BShelf::sLoadedImageMapLocker(&quot;BShelf loaded image map&quot;);
+ 
++
+ BShelf::BShelf(BView *view, bool allowDrags, const char *shelfType)
+ 	: BHandler(shelfType)
+ {
+@@ -498,8 +493,11 @@
+ {
+ 	Save();
+ 
+-	delete fEntry;
+-	delete fStream;
++	// we own fStream only when fEntry is set
++	if (fEntry) {
++		delete fEntry;
++		delete fStream;
++	}
+ 
+ 	while (fReplicants.CountItems() &gt; 0) {
+ 		replicant_data *data = (replicant_data *)fReplicants.ItemAt(0);
+@@ -1135,8 +1133,6 @@
+ status_t
+ BShelf::_DeleteReplicant(replicant_data* item)
+ {
+-	bool loadedImage = item-&gt;message-&gt;FindBool(&quot;_loaded_image_&quot;);
+-
+ 	BView *view = item-&gt;view;
+ 	if (view == NULL)
+ 		view = item-&gt;zombie_view;
+@@ -1162,14 +1158,26 @@
+ 		delete item-&gt;dragger;
+ 	}
+ 
+-	image_id image = item-&gt;image;
++	// Update use count for image and unload if necessary
++	const char* signature = NULL;
++	if (item-&gt;message-&gt;FindString(&quot;add_on&quot;, &amp;signature) == B_OK
++		&amp;&amp; signature != NULL) {
++		AutoLock&lt;BLocker&gt; lock(sLoadedImageMapLocker);
++		if (lock.IsLocked()) {
++			LoadedImageMap::iterator it = sLoadedImages.find(BString(signature));
+ 
++			if (it != sLoadedImages.end()) {
++				(*it).second.second -= 1;
++				if ((*it).second.second &lt;= 0) {
++					unload_add_on((*it).second.first);
++					sLoadedImages.erase(it);
++				}
++			}
++		}
++	}
++
+ 	delete item;
+ 
+-	if (loadedImage &amp;&amp; image &gt;= 0)
+-		unload_add_on(image);
+-
+-
+ 	return B_OK;
+ }
+ 
+@@ -1218,8 +1226,24 @@
+ 	}
+ 
+ 	// Instantiate the object, if this fails we have a zombie
+-	image_id image;
++	image_id image = -1;
+ 	BArchivable *archivable = _InstantiateObject(data, &amp;image);
++
++	// Update use count for image
++	const char* signature = NULL;
++	if (data-&gt;FindString(&quot;add_on&quot;, &amp;signature) == B_OK &amp;&amp; signature != NULL) {
++		AutoLock&lt;BLocker&gt; lock(sLoadedImageMapLocker);
++		if (lock.IsLocked()) {
++			LoadedImageMap::iterator it = sLoadedImages.find(BString(signature));
++
++			if (it == sLoadedImages.end())
++				sLoadedImages.insert(LoadedImageMap::value_type(
++					BString(signature), std::pair&lt;image_id, int&gt;(image, 1)));
++			else
++				(*it).second.second += 1;
++		}
++	}
++
+ 	BView *view = dynamic_cast&lt;BView*&gt;(archivable);
+ 	if (archivable != NULL &amp;&amp; view == NULL) {
+ 		printf(&quot;Replicant was rejected: it's not a view!&quot;);
+@@ -1247,11 +1271,8 @@
+ 	data-&gt;RemoveName(&quot;_drop_point_&quot;);
+ 	data-&gt;RemoveName(&quot;_drop_offset_&quot;);
+ 
+-	if (image &gt;= 0)
+-		data-&gt;AddBool(&quot;_loaded_image_&quot;, true);
+-
+ 	replicant_data *item = new replicant_data(data, replicant, dragger,
+-		relation, uniqueID, image);
++		relation, uniqueID);
+ 
+ 	item-&gt;error = B_OK;
+ 	item-&gt;zombie_view = zombie;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014741.html">[Haiku-commits] r29438 - haiku/trunk/headers/posix
+</A></li>
+	<LI>Next message: <A HREF="014743.html">[Haiku-commits] r29440 -	haiku/trunk/src/add-ons/kernel/drivers/audio/ac97/geode
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14742">[ date ]</a>
+              <a href="thread.html#14742">[ thread ]</a>
+              <a href="subject.html#14742">[ subject ]</a>
+              <a href="author.html#14742">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

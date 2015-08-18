@@ -1,0 +1,147 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31267 -	haiku/trunk/src/system/kernel/device_manager
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31267%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200906271424.n5REOt5D020669%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017512.html">
+   <LINK REL="Next"  HREF="017515.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31267 -	haiku/trunk/src/system/kernel/device_manager</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31267%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200906271424.n5REOt5D020669%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31267 -	haiku/trunk/src/system/kernel/device_manager">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sat Jun 27 16:24:55 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017512.html">[Haiku-commits] r31266 - haiku/trunk/src/apps/debugger/demangler
+</A></li>
+        <LI>Next message: <A HREF="017515.html">[Haiku-commits] r31268 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17513">[ date ]</a>
+              <a href="thread.html#17513">[ thread ]</a>
+              <a href="subject.html#17513">[ subject ]</a>
+              <a href="author.html#17513">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-06-27 16:24:55 +0200 (Sat, 27 Jun 2009)
+New Revision: 31267
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31267&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31267&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp
+Log:
+* reload_driver() now also checks if the binary node changed, and will update
+  the node listener, to make sure it won't lose track.
+* The DriverWatcher now also listens for B_ENTRY_REMOVED. This causes drivers to
+  be unpublished even if they are only symlinked.
+* However, to detect new drivers in a symlinked location, we'd need special
+  support for those, and also need to watch the parent directory of the symlink
+  target - this is close to overkill, so I stayed away from implementing that
+  for now :-)
+
+
+Modified: haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp	2009-06-27 14:23:47 UTC (rev 31266)
++++ haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp	2009-06-27 14:24:55 UTC (rev 31267)
+@@ -108,6 +108,8 @@
+ 	char			path[B_PATH_NAME_LENGTH];
+ };
+ 
++typedef DoublyLinkedList&lt;path_entry&gt; EntryList;
++
+ struct driver_entry : public DoublyLinkedListLinkImpl&lt;driver_entry&gt; {
+ 	char*				path;
+ 	dev_t				device;
+@@ -191,8 +193,8 @@
+ static hash_table* sDriverHash;
+ static DriverWatcher sDriverWatcher;
+ static int32 sDriverEvents;
+-static DoublyLinkedList&lt;path_entry&gt; sDriversToAdd;
+-static DoublyLinkedList&lt;path_entry&gt; sDriversToRemove;
++static EntryList sDriversToAdd;
++static EntryList sDriversToRemove;
+ static mutex sDriversListLock = MUTEX_INITIALIZER(&quot;driversList&quot;);
+ static DirectoryWatcher sDirectoryWatcher;
+ static DirectoryNodeHash sDirectoryNodeHash;
+@@ -581,7 +583,7 @@
+ 
+ 	hash_insert(sDriverHash, driver);
+ 	if (stat.st_dev &gt; 0) {
+-		add_node_listener(stat.st_dev, stat.st_ino, B_WATCH_STAT,
++		add_node_listener(stat.st_dev, stat.st_ino, B_WATCH_STAT | B_WATCH_NAME,
+ 			sDriverWatcher);
+ 	}
+ 
+@@ -612,8 +614,19 @@
+ 
+ 	unload_driver(driver);
+ 
++	struct stat stat;
++	if (::stat(driver-&gt;path, &amp;stat) == 0
++		&amp;&amp; (stat.st_dev != driver-&gt;device || stat.st_ino != driver-&gt;node)) {
++		// The driver file has been changed, so we need to update its listener
++		if (driver-&gt;device != -1)
++			remove_node_listener(driver-&gt;device, driver-&gt;node, sDriverWatcher);
++
++		add_node_listener(driver-&gt;device, driver-&gt;node,
++			B_WATCH_STAT | B_WATCH_NAME, sDriverWatcher);
++	}
++
+ 	status_t status = load_driver(driver);
+-	if (status &lt; B_OK)
++	if (status != B_OK)
+ 		unpublish_driver(driver);
+ 
+ 	return status;
+@@ -691,8 +704,10 @@
+ DriverWatcher::EventOccured(NotificationService&amp; service,
+ 	const KMessage* event)
+ {
+-	if (event-&gt;GetInt32(&quot;opcode&quot;, -1) != B_STAT_CHANGED
+-		|| (event-&gt;GetInt32(&quot;fields&quot;, 0) &amp; B_STAT_MODIFICATION_TIME) == 0)
++	int32 opcode = event-&gt;GetInt32(&quot;opcode&quot;, -1);
++	if ((opcode == B_STAT_CHANGED
++			&amp;&amp; (event-&gt;GetInt32(&quot;fields&quot;, 0) &amp; B_STAT_MODIFICATION_TIME) == 0)
++		|| opcode != B_ENTRY_REMOVED)
+ 		return;
+ 
+ 	RecursiveLocker locker(sLock);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017512.html">[Haiku-commits] r31266 - haiku/trunk/src/apps/debugger/demangler
+</A></li>
+	<LI>Next message: <A HREF="017515.html">[Haiku-commits] r31268 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17513">[ date ]</a>
+              <a href="thread.html#17513">[ thread ]</a>
+              <a href="subject.html#17513">[ subject ]</a>
+              <a href="author.html#17513">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,205 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r19878 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19878%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200701201249.l0KCniBO027358%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000337.html">
+   <LINK REL="Next"  HREF="000339.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r19878 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19878%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200701201249.l0KCniBO027358%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r19878 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sat Jan 20 13:49:44 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000337.html">[Haiku-commits] r19877 - haiku/trunk/src/apps/showimage
+</A></li>
+        <LI>Next message: <A HREF="000339.html">[Haiku-commits] r19879 -	haiku/trunk/src/add-ons/kernel/file_systems/nfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#338">[ date ]</a>
+              <a href="thread.html#338">[ thread ]</a>
+              <a href="subject.html#338">[ subject ]</a>
+              <a href="author.html#338">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-01-20 13:49:44 +0100 (Sat, 20 Jan 2007)
+New Revision: 19878
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=19878&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=19878&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/vm/vm_cache.c
+Log:
+* Mixed consumer with consumerRef to identify the cache in the consumer list;
+  this fixes bug #227 again (which I recently opened again accidently).
+* We actually switched the last consumer's source without having acquired its
+  lock! This fixes some rare random app crashes as well as potential kernel
+  crash (&quot;cache to be deleted still has consumers&quot;).
+* Some more comments to explain why things are done and can be done the way they
+  are done :-)
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2007-01-20 03:18:10 UTC (rev 19877)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2007-01-20 12:49:44 UTC (rev 19878)
+@@ -92,7 +92,7 @@
+ 	uint32				protection;
+ 	uint16				wiring;
+ 	uint16				memory_type;
+-	int32				ref_count;
++	vint32				ref_count;
+ 
+ 	struct vm_cache_ref	*cache_ref;
+ 	off_t				cache_offset;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.c	2007-01-20 03:18:10 UTC (rev 19877)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.c	2007-01-20 12:49:44 UTC (rev 19878)
+@@ -407,12 +407,12 @@
+ void
+ vm_cache_remove_consumer(vm_cache_ref *cacheRef, vm_cache *consumer)
+ {
+-	vm_cache *newSource = NULL;
+ 	vm_cache *cache;
+ 
+ 	TRACE((&quot;remove consumer vm cache %p from cache %p\n&quot;, consumer, cacheRef-&gt;cache));
+ 	ASSERT_LOCKED_MUTEX(&amp;consumer-&gt;ref-&gt;lock);
+ 
++	// remove the consumer from the cache, but keep its reference until later
+ 	mutex_lock(&amp;cacheRef-&gt;lock);
+ 	cache = cacheRef-&gt;cache;
+ 	list_remove_item(&amp;cache-&gt;consumers, consumer);
+@@ -427,17 +427,22 @@
+ 		bool merge = false;
+ 
+ 		consumer = list_get_first_item(&amp;cache-&gt;consumers);
+-		consumerRef = consumer-&gt;ref;
+ 
+ 		// Our cache doesn't have a ref to its consumer (only the other way around), 
+ 		// so we cannot just acquire it here; it might be deleted right now
+ 		while (true) {
+-			int32 count = consumerRef-&gt;ref_count;
++			int32 count;
++			consumerRef = consumer-&gt;ref;
++
++			count = consumerRef-&gt;ref_count;
+ 			if (count == 0)
+ 				break;
+ 
+ 			if (atomic_test_and_set(&amp;consumerRef-&gt;ref_count, count + 1, count) == count) {
+-				// we managed to grab a reference to the consumer
++				// We managed to grab a reference to the consumerRef.
++				// Since this doesn't guarantee that we get the cache we wanted
++				// to, we need to check if this cache is really the last
++				// consumer of the cache we want to merge it with.
+ 				merge = true;
+ 				break;
+ 			}
+@@ -453,10 +458,12 @@
+ 
+ 			// the cache and the situation might have changed
+ 			cache = cacheRef-&gt;cache;
++			consumer = consumerRef-&gt;cache;
++
+ 			if (cacheRef-&gt;areas != NULL || cache-&gt;source == NULL
+ 				|| list_is_empty(&amp;cache-&gt;consumers)
+ 				|| cache-&gt;consumers.link.next != cache-&gt;consumers.link.prev
+-				|| consumerRef != list_get_first_item(&amp;cache-&gt;consumers)) {
++				|| consumer != list_get_first_item(&amp;cache-&gt;consumers)) {
+ 				merge = false;
+ 				mutex_unlock(&amp;consumerRef-&gt;lock);
+ 			}
+@@ -464,6 +471,7 @@
+ 
+ 		if (merge) {
+ 			vm_page *page, *nextPage;
++			vm_cache *newSource;
+ 
+ 			consumer = list_remove_head_item(&amp;cache-&gt;consumers);
+ 
+@@ -488,27 +496,28 @@
+ 			}
+ 
+ 			newSource = cache-&gt;source;
++			if (newSource != NULL) {
++				// The remaining consumer has gotten a new source
++				mutex_lock(&amp;newSource-&gt;ref-&gt;lock);
++
++				list_remove_item(&amp;newSource-&gt;consumers, cache);
++				list_add_item(&amp;newSource-&gt;consumers, consumer);
++				consumer-&gt;source = newSource;
++				cache-&gt;source = NULL;
++
++				mutex_unlock(&amp;newSource-&gt;ref-&gt;lock);
++
++				// Release the other reference to the cache - we take over
++				// its reference of its source cache; we can do this here
++				// (with the cacheRef locked) since we own another reference
++				// from the first consumer we removed
++				vm_cache_release_ref(cacheRef);
++			}
+ 			mutex_unlock(&amp;consumerRef-&gt;lock);
+ 		}
+ 		vm_cache_release_ref(consumerRef);
+ 	}
+ 
+-	if (newSource != NULL) {
+-		// The remaining consumer has gotten a new source
+-		mutex_lock(&amp;newSource-&gt;ref-&gt;lock);
+-
+-		list_remove_item(&amp;newSource-&gt;consumers, cache);
+-		list_add_item(&amp;newSource-&gt;consumers, consumer);
+-		consumer-&gt;source = newSource;
+-		cache-&gt;source = NULL;
+-
+-		mutex_unlock(&amp;newSource-&gt;ref-&gt;lock);
+-
+-		// Release the other reference to the cache - we take over
+-		// its reference of its source cache
+-		vm_cache_release_ref(cacheRef);
+-	}
+-
+ 	mutex_unlock(&amp;cacheRef-&gt;lock);
+ 	vm_cache_release_ref(cacheRef);
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000337.html">[Haiku-commits] r19877 - haiku/trunk/src/apps/showimage
+</A></li>
+	<LI>Next message: <A HREF="000339.html">[Haiku-commits] r19879 -	haiku/trunk/src/add-ons/kernel/file_systems/nfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#338">[ date ]</a>
+              <a href="thread.html#338">[ thread ]</a>
+              <a href="subject.html#338">[ subject ]</a>
+              <a href="author.html#338">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

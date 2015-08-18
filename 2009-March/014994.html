@@ -1,0 +1,1087 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29619 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29619%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse&In-Reply-To=%3C200903200126.n2K1Qus6018906%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014993.html">
+   <LINK REL="Next"  HREF="014995.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29619 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29619%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse&In-Reply-To=%3C200903200126.n2K1Qus6018906%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29619 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Mar 20 02:26:56 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014993.html">[Haiku-commits] r29618 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on
+</A></li>
+        <LI>Next message: <A HREF="014995.html">[Haiku-commits] r29620 - haiku/trunk/src/bin/desklink
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14994">[ date ]</a>
+              <a href="thread.html#14994">[ thread ]</a>
+              <a href="subject.html#14994">[ subject ]</a>
+              <a href="author.html#14994">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-03-20 02:26:53 +0100 (Fri, 20 Mar 2009)
+New Revision: 29619
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29619&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29619&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.h
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.h
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/Jamfile
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/fuse_api.h
+Log:
+* More work on the file system initialization. Mounting/unmounting works now
+  with sshfs.
+* Added basic node and entry management, which we need, since the FUSE
+  interface works with paths only, while our VFS plays with node IDs and
+  node cookies.
+* Implemented most of the mandatory hooks (vnode operations, lookup, read stat,
+  open/close/read dir). I was hoping to get directory listings with sshfs now,
+  but as I had to find out, it implements the deprecated getdir() while we
+  only support the new {open,read,release}dir() interface yet.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.cpp	2009-03-20 01:18:32 UTC (rev 29618)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.cpp	2009-03-20 01:26:53 UTC (rev 29619)
+@@ -10,6 +10,7 @@
+ 
+ #include &lt;new&gt;
+ 
++#include &quot;fuse_fs.h&quot;
+ #include &quot;FUSEVolume.h&quot;
+ 
+ 
+@@ -126,6 +127,11 @@
+ 	fInitParameters(NULL),
+ 	fFS(NULL)
+ {
++	fClientFSType = CLIENT_FS_FUSE;
++
++	// FS capabilities
++	fCapabilities.ClearAll();
++	fCapabilities.Set(FS_CAPABILITY_MOUNT, true);
+ }
+ 
+ 
+@@ -155,6 +161,12 @@
+ 	if (volume == NULL)
+ 		return B_NO_MEMORY;
+ 
++	status_t error = volume-&gt;Init();
++	if (error != B_OK) {
++		delete volume;
++		return error;
++	}
++
+ 	*_volume = volume;
+ 	return B_OK;
+ }
+@@ -171,6 +183,7 @@
+ status_t
+ FUSEFileSystem::InitClientFS(const char* parameters)
+ {
++PRINT((&quot;FUSEFileSystem::InitClientFS()\n&quot;));
+ 	// create the semaphores we need
+ 	fInitSemaphore = create_sem(0, &quot;FUSE init sem&quot;);
+ 	if (fInitSemaphore &lt; 0)
+@@ -193,9 +206,11 @@
+ 	resume_thread(fInitThread);
+ 
+ 	// wait for the initialization to finish
++PRINT((&quot;  waiting for init thread...\n&quot;));
+ 	while (acquire_sem(fInitSemaphore) == B_INTERRUPTED) {
+ 	}
+ 
++PRINT((&quot;  waiting for init thread done\n&quot;));
+ 	fInitSemaphore = -1;
+ 
+ 	if (fInitStatus &gt; 0)
+@@ -215,6 +230,9 @@
+ 	fExitStatus = status;
+ 	if (fExitSemaphore &gt;= 0)
+ 		delete_sem(fExitSemaphore);
++
++	if (fInitThread &gt;= 0)
++		wait_for_thread(fInitThread, NULL);
+ }
+ 
+ 
+@@ -222,18 +240,22 @@
+ FUSEFileSystem::FinishInitClientFS(const fuse_operations* ops, size_t opSize,
+ 	void* userData)
+ {
++PRINT((&quot;FUSEFileSystem::FinishInitClientFS()\n&quot;));
+ 	fExitStatus = B_ERROR;
+ 
+ 	// do the initialization
+ 	status_t error = _InitClientFS(ops, opSize, userData);
+ 
+ 	// notify the mount thread
++PRINT((&quot;  notifying mount thread\n&quot;));
+ 	fInitStatus = error;
+ 	delete_sem(fInitSemaphore);
+ 
+ 	// loop until unmounting
++PRINT((&quot;  waiting for unmounting...\n&quot;));
+ 	while (acquire_sem(fExitSemaphore) == B_INTERRUPTED) {
+ 	}
++PRINT((&quot;  waiting for unmounting done\n&quot;));
+ 
+ 	fExitSemaphore = -1;
+ 
+@@ -287,6 +309,12 @@
+ 	if (fFS == NULL)
+ 		return B_ERROR;
+ 
++	_InitCapabilities();
++PRINT((&quot;volume capabilities:\n&quot;));
++fVolumeCapabilities.Dump();
++PRINT((&quot;node capabilities:\n&quot;));
++fNodeCapabilities.Dump();
++
+ 	// init connection info
+ 	fConnectionInfo.proto_major = 0;
+ 	fConnectionInfo.proto_minor = 0;
+@@ -300,6 +328,138 @@
+ }
+ 
+ 
++void
++FUSEFileSystem::_InitCapabilities()
++{
++	fVolumeCapabilities.ClearAll();
++	fNodeCapabilities.ClearAll();
++
++	// Volume operations
++	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_UNMOUNT, true);
++
++	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_READ_FS_INFO, fFS-&gt;ops.statfs);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_WRITE_FS_INFO,
++// 		fFS-&gt;ops.wfsstat);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_SYNC, fFS-&gt;ops.sync);
++//
++	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_GET_VNODE, true);
++		// emulated
++//
++// 	// index directory &amp; index operations
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_OPEN_INDEX_DIR,
++// 		fFS-&gt;ops.open_indexdir);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_CLOSE_INDEX_DIR,
++// 		fFS-&gt;ops.close_indexdir);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_FREE_INDEX_DIR_COOKIE,
++// 		fFS-&gt;ops.free_indexdircookie);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_READ_INDEX_DIR,
++// 		fFS-&gt;ops.read_indexdir);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_REWIND_INDEX_DIR,
++// 		fFS-&gt;ops.rewind_indexdir);
++//
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_CREATE_INDEX,
++// 		fFS-&gt;ops.create_index);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_REMOVE_INDEX,
++// 		fFS-&gt;ops.remove_index);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_READ_INDEX_STAT,
++// 		fFS-&gt;ops.stat_index);
++//
++// 	// query operations
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_OPEN_QUERY,
++// 		fFS-&gt;ops.open_query);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_CLOSE_QUERY,
++// 		fFS-&gt;ops.close_query);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_FREE_QUERY_COOKIE,
++// 		fFS-&gt;ops.free_querycookie);
++// 	fVolumeCapabilities.Set(FS_VOLUME_CAPABILITY_READ_QUERY,
++// 		fFS-&gt;ops.read_query);
++// 	// missing: FS_VOLUME_CAPABILITY_REWIND_QUERY,
++//
++// 	// vnode operations
++	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_LOOKUP, true);
++		// emulated
++	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_GET_VNODE_NAME, true);
++		// emulated
++	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_PUT_VNODE, true);
++		// emulated
++	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_REMOVE_VNODE, true);
++		// emulated
++
++// 	// VM file access
++// 	// missing: FS_VNODE_CAPABILITY_CAN_PAGE,
++// 	// missing: FS_VNODE_CAPABILITY_READ_PAGES,
++// 	// missing: FS_VNODE_CAPABILITY_WRITE_PAGES,
++//
++// 	// cache file access
++// 	// missing: FS_VNODE_CAPABILITY_GET_FILE_MAP,
++//
++// 	// common operations
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_IOCTL, fFS-&gt;ops.ioctl);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_SET_FLAGS, fFS-&gt;ops.setflags);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_SELECT, fFS-&gt;ops.select);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_DESELECT, fFS-&gt;ops.deselect);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_FSYNC, fFS-&gt;ops.fsync);
++//
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_READ_SYMLINK, fFS-&gt;ops.readlink);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_CREATE_SYMLINK, fFS-&gt;ops.symlink);
++//
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_LINK, fFS-&gt;ops.link);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_UNLINK, fFS-&gt;ops.unlink);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_RENAME, fFS-&gt;ops.rename);
++//
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_ACCESS, fFS-&gt;ops.access);
++	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_READ_STAT, fFS-&gt;ops.getattr);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_WRITE_STAT, fFS-&gt;ops.wstat);
++//
++// 	// file operations
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_CREATE, fFS-&gt;ops.create);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_OPEN, fFS-&gt;ops.open);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_CLOSE, fFS-&gt;ops.close);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_FREE_COOKIE, fFS-&gt;ops.free_cookie);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_READ, fFS-&gt;ops.read);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_WRITE, fFS-&gt;ops.write);
++//
++// 	// directory operations
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_CREATE_DIR, fFS-&gt;ops.mkdir);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_REMOVE_DIR, fFS-&gt;ops.rmdir);
++	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_OPEN_DIR, fFS-&gt;ops.opendir);
++//	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_CLOSE_DIR, true);
++		// not needed
++	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_FREE_DIR_COOKIE, true);
++	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_READ_DIR, fFS-&gt;ops.readdir);
++ 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_REWIND_DIR, fFS-&gt;ops.readdir);
++//
++// 	// attribute directory operations
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_OPEN_ATTR_DIR,
++// 		fFS-&gt;ops.open_attrdir);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_CLOSE_ATTR_DIR,
++// 		fFS-&gt;ops.close_attrdir);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_FREE_ATTR_DIR_COOKIE,
++// 		fFS-&gt;ops.free_attrdircookie);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_READ_ATTR_DIR,
++// 		fFS-&gt;ops.read_attrdir);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_REWIND_ATTR_DIR,
++// 		fFS-&gt;ops.rewind_attrdir);
++//
++// 	// attribute operations
++// 	// we emulate open_attr() and free_attr_dir_cookie() if either read_attr()
++// 	// or write_attr() is present
++// 	bool hasAttributes = (fFS-&gt;ops.read_attr || fFS-&gt;ops.write_attr);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_CREATE_ATTR, hasAttributes);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_OPEN_ATTR, hasAttributes);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_CLOSE_ATTR, false);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_FREE_ATTR_COOKIE, hasAttributes);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_READ_ATTR, fFS-&gt;ops.read_attr);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_WRITE_ATTR, fFS-&gt;ops.write_attr);
++//
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_READ_ATTR_STAT,
++// 		fFS-&gt;ops.stat_attr);
++// 	// missing: FS_VNODE_CAPABILITY_WRITE_ATTR_STAT
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_RENAME_ATTR, fFS-&gt;ops.rename_attr);
++// 	fNodeCapabilities.Set(FS_VNODE_CAPABILITY_REMOVE_ATTR, fFS-&gt;ops.remove_attr);
++}
++
++
+ // #pragma mark - bootstrapping
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.h	2009-03-20 01:18:32 UTC (rev 29618)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEFileSystem.h	2009-03-20 01:26:53 UTC (rev 29619)
+@@ -21,6 +21,17 @@
+ 
+ 	static	FUSEFileSystem*		GetInstance();
+ 
++			void				GetVolumeCapabilities(
++									FSVolumeCapabilities&amp; capabilities) const
++									{ capabilities = fVolumeCapabilities; }
++			void				GetNodeCapabilities(
++									FSVNodeCapabilities&amp; capabilities) const
++									{ capabilities = fNodeCapabilities; }
++			const FSVNodeCapabilities&amp; GetNodeCapabilities() const
++									{ return fNodeCapabilities; }
++
++			fuse_fs*			GetFS() const	{ return fFS; }
++
+ 	virtual	status_t			CreateVolume(Volume** _volume, dev_t id);
+ 	virtual	status_t			DeleteVolume(Volume* volume);
+ 
+@@ -40,6 +51,8 @@
+ 			status_t			_InitClientFS(const fuse_operations* ops,
+ 									size_t opSize, void* userData);
+ 
++			void				_InitCapabilities();
++
+ private:
+ 			int					(*fMainFunction)(int, const char* const*);
+ 			thread_id			fInitThread;
+@@ -51,6 +64,9 @@
+ 			const char*			fInitParameters;
+ 			fuse_fs*			fFS;
+ 			fuse_conn_info		fConnectionInfo;
++
++			FSVolumeCapabilities fVolumeCapabilities;
++			FSVNodeCapabilities	fNodeCapabilities;
+ };
+ 
+ }	// namespace UserlandFS
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp	2009-03-20 01:18:32 UTC (rev 29618)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/fuse/FUSEVolume.cpp	2009-03-20 01:26:53 UTC (rev 29619)
+@@ -5,9 +5,74 @@
+ 
+ #include &quot;FUSEVolume.h&quot;
+ 
++#include &lt;dirent.h&gt;
++
++#include &lt;algorithm&gt;
++
++#include &lt;fs_info.h&gt;
++
++#include &lt;AutoDeleter.h&gt;
++
+ #include &quot;FUSEFileSystem.h&quot;
+ 
++#include &quot;../kernel_emu.h&quot;
+ 
++
++static inline status_t
++from_fuse_error(int error)
++{
++	return error &lt; 0 ? error : -error;
++}
++
++
++struct FUSEVolume::DirCookie : fuse_file_info {
++	off_t		currentEntryOffset;
++
++	DirCookie()
++		:
++		currentEntryOffset(0)
++	{
++		flags = 0;
++		fh_old = 0;
++		writepage = 0;
++		direct_io = 0;
++		keep_cache = 0;
++		flush = 0;
++		fh = 0;
++		lock_owner = 0;
++	}
++};
++
++
++struct FUSEVolume::ReadDirBuffer {
++	FUSEVolume*	volume;
++	FUSENode*	directory;
++	DirCookie*	cookie;
++	void*		buffer;
++	size_t		bufferSize;
++	size_t		usedSize;
++	uint32		entriesRead;
++	uint32		maxEntries;
++	off_t		lastOffset;
++	status_t	error;
++
++	ReadDirBuffer(FUSEVolume* volume, FUSENode* directory, DirCookie* cookie,
++		void* buffer, size_t bufferSize, uint32 maxEntries)
++		:
++		directory(directory),
++		cookie(cookie),
++		buffer(buffer),
++		bufferSize(bufferSize),
++		usedSize(0),
++		entriesRead(0),
++		maxEntries(maxEntries),
++		lastOffset(0),
++		error(B_OK)
++	{
++	}
++};
++
++
+ inline FUSEFileSystem*
+ FUSEVolume::_FileSystem() const
+ {
+@@ -17,7 +82,11 @@
+ 
+ FUSEVolume::FUSEVolume(FUSEFileSystem* fileSystem, dev_t id)
+ 	:
+-	Volume(fileSystem, id)
++	Volume(fileSystem, id),
++	fFS(NULL),
++	fRootNode(NULL),
++	fNextNodeID(FUSE_ROOT_ID + 1),
++	fUseNodeIDs(false)
+ {
+ }
+ 
+@@ -27,6 +96,27 @@
+ }
+ 
+ 
++status_t
++FUSEVolume::Init()
++{
++	// init entry and node tables
++	status_t error = fEntries.Init();
++	if (error != B_OK)
++		return error;
++
++	error = fNodes.Init();
++	if (error != B_OK)
++		return error;
++
++	// check lock
++	error = fLock.InitCheck();
++	if (error != B_OK)
++		return error;
++
++	return B_OK;
++}
++
++
+ // #pragma mark - FS
+ 
+ 
+@@ -39,9 +129,47 @@
+ 	if (error != B_OK)
+ 		RETURN_ERROR(error);
+ 
+-	_FileSystem()-&gt;ExitClientFS(B_UNSUPPORTED);
++	fFS = _FileSystem()-&gt;GetFS();
++	_FileSystem()-&gt;GetVolumeCapabilities(fCapabilities);
+ 
+-	return B_UNSUPPORTED;
++	// get the root node
++	struct stat st;
++	int fuseError = fuse_fs_getattr(fFS, &quot;/&quot;, &amp;st);
++	if (fuseError != 0)
++		RETURN_ERROR(from_fuse_error(fuseError));
++
++	if (!fUseNodeIDs)
++		st.st_ino = FUSE_ROOT_ID;
++
++	// create a node and an entry object for the root node
++	AutoLocker&lt;Locker&gt; _(fLock);
++	FUSENode* node = new(std::nothrow) FUSENode(st.st_ino, st.st_mode &amp; S_IFMT);
++	FUSEEntry* entry = node != NULL ? FUSEEntry::Create(node, &quot;/&quot;, node) : NULL;
++	if (node == NULL || entry == NULL) {
++		delete node;
++		delete entry;
++		_FileSystem()-&gt;ExitClientFS(B_NO_MEMORY);
++		RETURN_ERROR(B_NO_MEMORY);
++	}
++
++	node-&gt;entries.Add(entry);
++	fRootNode = node;
++
++	// insert the node and the entry
++	fNodes.Insert(node);
++	fEntries.Insert(entry);
++
++	// publish the root node
++	error = UserlandFS::KernelEmu::publish_vnode(fID, node-&gt;id, node,
++		node-&gt;type, 0, _FileSystem()-&gt;GetNodeCapabilities());
++	if (error != B_OK) {
++		_FileSystem()-&gt;ExitClientFS(B_NO_MEMORY);
++		RETURN_ERROR(error);
++	}
++
++	*rootID = node-&gt;id;
++
++	return B_OK;
+ }
+ 
+ 
+@@ -49,13 +177,16 @@
+ FUSEVolume::Unmount()
+ {
+ printf(&quot;FUSEVolume::Unmount()\n&quot;);
+-	return B_UNSUPPORTED;
++	_FileSystem()-&gt;ExitClientFS(B_OK);
++	return B_OK;
+ }
+ 
+ 
+ status_t
+ FUSEVolume::Sync()
+ {
++	// TODO: Implement!
++	// NOTE: There's no hook for sync'ing the whole FS.
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -63,13 +194,32 @@
+ status_t
+ FUSEVolume::ReadFSInfo(fs_info* info)
+ {
+-	return B_UNSUPPORTED;
++	if (fFS-&gt;ops.statfs == NULL)
++		return B_UNSUPPORTED;
++
++	struct statvfs st;
++	int fuseError = fuse_fs_statfs(fFS, &quot;/&quot;, &amp;st);
++	if (fuseError != 0)
++		return from_fuse_error(fuseError);
++
++	info-&gt;flags = ((st.f_fsid &amp; ST_RDONLY) != 0 ? B_FS_IS_READONLY : 0)
++		| B_FS_IS_PERSISTENT;			// assume the FS is persistent
++	info-&gt;block_size = st.f_bsize;
++	info-&gt;io_size = 64 * 1024;			// some value
++	info-&gt;total_blocks = st.f_blocks;
++	info-&gt;free_blocks = st.f_bfree;
++	info-&gt;total_nodes = st.f_files;
++	info-&gt;free_nodes = st.f_favail;
++	info-&gt;volume_name[0] = '\0';		// no way to get the name (if any)
++
++	return B_OK;
+ }
+ 
+ 
+ status_t
+ FUSEVolume::WriteFSInfo(const struct fs_info* info, uint32 mask)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -78,45 +228,76 @@
+ 
+ 
+ status_t
+-FUSEVolume::Lookup(void* dir, const char* entryName, ino_t* vnid)
++FUSEVolume::Lookup(void* _dir, const char* entryName, ino_t* vnid)
+ {
+-	return B_UNSUPPORTED;
++	FUSENode* dir = (FUSENode*)_dir;
++
++	// look the node up
++	FUSENode* node;
++	status_t error = _GetNode(dir, entryName, &amp;node);
++	if (error != B_OK)
++		return error;
++
++	*vnid = node-&gt;id;
++
++	return B_OK;
+ }
+ 
+ 
+ status_t
+-FUSEVolume::GetVNodeType(void* node, int* type)
++FUSEVolume::GetVNodeName(void* _node, char* buffer, size_t bufferSize)
+ {
+-	return B_NOT_SUPPORTED;
+-}
++	FUSENode* node = (FUSENode*)_node;
+ 
++	AutoLocker&lt;Locker&gt; _(fLock);
+ 
+-status_t
+-FUSEVolume::GetVNodeName(void* node, char* buffer, size_t bufferSize)
+-{
+-	return B_NOT_SUPPORTED;
++	// get one of the node's entries and return its name
++	FUSEEntry* entry = node-&gt;entries.Head();
++	if (entry == NULL)
++		RETURN_ERROR(B_ENTRY_NOT_FOUND);
++
++	if (strlcpy(buffer, entry-&gt;name, bufferSize) &gt;= bufferSize)
++		RETURN_ERROR(B_NAME_TOO_LONG);
++
++	return B_OK;
+ }
+ 
+ 
+ status_t
+-FUSEVolume::ReadVNode(ino_t vnid, bool reenter, void** node, int* type,
++FUSEVolume::ReadVNode(ino_t vnid, bool reenter, void** _node, int* type,
+ 	uint32* flags, FSVNodeCapabilities* _capabilities)
+ {
+-	return B_UNSUPPORTED;
++	AutoLocker&lt;Locker&gt; _(fLock);
++
++	FUSENode* node = fNodes.Lookup(vnid);
++	if (node == NULL)
++		RETURN_ERROR(B_ENTRY_NOT_FOUND);
++
++	node-&gt;refCount++;
++	*_capabilities = _FileSystem()-&gt;GetNodeCapabilities();
++
++	return B_OK;
+ }
+ 
+ 
+ status_t
+-FUSEVolume::WriteVNode(void* node, bool reenter)
++FUSEVolume::WriteVNode(void* _node, bool reenter)
+ {
+-	return B_UNSUPPORTED;
++	FUSENode* node = (FUSENode*)_node;
++
++	AutoLocker&lt;Locker&gt; _(fLock);
++
++	_PutNode(node);
++
++	return B_OK;
+ }
+ 
+ 
+ status_t
+ FUSEVolume::RemoveVNode(void* node, bool reenter)
+ {
+-	return B_UNSUPPORTED;
++	// TODO: Implement for real!
++	return WriteVNode(node, reenter);
+ }
+ 
+ 
+@@ -126,6 +307,7 @@
+ status_t
+ FUSEVolume::DoIO(void* node, void* cookie, const IORequestInfo&amp; requestInfo)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -133,6 +315,7 @@
+ status_t
+ FUSEVolume::CancelIO(void* node, void* cookie, int32 ioRequestID)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -141,6 +324,7 @@
+ FUSEVolume::IterativeIOGetVecs(void* cookie, int32 requestID, off_t offset,
+ 	size_t size, struct file_io_vec* vecs, size_t* _count)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -149,6 +333,7 @@
+ FUSEVolume::IterativeIOFinished(void* cookie, int32 requestID, status_t status,
+ 	bool partialTransfer, size_t bytesTransferred)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -160,6 +345,7 @@
+ FUSEVolume::IOCtl(void* node, void* cookie, uint32 command, void *buffer,
+ 	size_t size)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -167,6 +353,7 @@
+ status_t
+ FUSEVolume::SetFlags(void* node, void* cookie, int flags)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -174,6 +361,7 @@
+ status_t
+ FUSEVolume::Select(void* node, void* cookie, uint8 event, selectsync* sync)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -181,6 +369,7 @@
+ status_t
+ FUSEVolume::Deselect(void* node, void* cookie, uint8 event, selectsync* sync)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -188,6 +377,7 @@
+ status_t
+ FUSEVolume::FSync(void* node)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -196,6 +386,7 @@
+ FUSEVolume::ReadSymlink(void* node, char* buffer, size_t bufferSize,
+ 	size_t* bytesRead)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -204,6 +395,7 @@
+ FUSEVolume::CreateSymlink(void* dir, const char* name, const char* target,
+ 	int mode)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -211,6 +403,7 @@
+ status_t
+ FUSEVolume::Link(void* dir, const char* name, void* node)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -218,6 +411,7 @@
+ status_t
+ FUSEVolume::Unlink(void* dir, const char* name)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -226,6 +420,7 @@
+ FUSEVolume::Rename(void* oldDir, const char* oldName, void* newDir,
+ 	const char* newName)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -233,20 +428,41 @@
+ status_t
+ FUSEVolume::Access(void* node, int mode)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+ 
+ status_t
+-FUSEVolume::ReadStat(void* node, struct stat* st)
++FUSEVolume::ReadStat(void* _node, struct stat* st)
+ {
+-	return B_UNSUPPORTED;
++	FUSENode* node = (FUSENode*)_node;
++PRINT((&quot;FUSEVolume::ReadStat(%p (%lld), %p)\n&quot;, node, node-&gt;id, st));
++
++	AutoLocker&lt;Locker&gt; locker(fLock);
++
++	// get a path for the node
++	char path[B_PATH_NAME_LENGTH];
++	size_t pathLen;
++	status_t error = _BuildPath(node, path, pathLen);
++	if (error != B_OK)
++		RETURN_ERROR(error);
++
++	locker.Unlock();
++
++	// stat the path
++	int fuseError = fuse_fs_getattr(fFS, path, st);
++	if (fuseError != 0)
++		return from_fuse_error(fuseError);
++
++	return B_OK;
+ }
+ 
+ 
+ status_t
+ FUSEVolume::WriteStat(void* node, const struct stat *st, uint32 mask)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -258,6 +474,7 @@
+ FUSEVolume::Create(void* dir, const char* name, int openMode, int mode,
+ 	void** cookie, ino_t* vnid)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -265,6 +482,7 @@
+ status_t
+ FUSEVolume::Open(void* node, int openMode, void** cookie)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -272,6 +490,7 @@
+ status_t
+ FUSEVolume::Close(void* node, void* cookie)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -279,6 +498,7 @@
+ status_t
+ FUSEVolume::FreeCookie(void* node, void* cookie)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -287,6 +507,7 @@
+ FUSEVolume::Read(void* node, void* cookie, off_t pos, void* buffer,
+ 	size_t bufferSize, size_t* bytesRead)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -295,6 +516,7 @@
+ FUSEVolume::Write(void* node, void* cookie, off_t pos, const void* buffer,
+ 	size_t bufferSize, size_t* bytesWritten)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -305,6 +527,7 @@
+ status_t
+ FUSEVolume::CreateDir(void* dir, const char* name, int mode, ino_t *newDir)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+@@ -312,41 +535,433 @@
+ status_t
+ FUSEVolume::RemoveDir(void* dir, const char* name)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
+ 
+ 
+ status_t
+-FUSEVolume::OpenDir(void* node, void** cookie)
++FUSEVolume::OpenDir(void* _node, void** _cookie)
+ {
+-	return B_UNSUPPORTED;
++	FUSENode* node = (FUSENode*)_node;
++PRINT((&quot;FUSEVolume::OpenDir(%p (%lld), %p)\n&quot;, node, node-&gt;id, _cookie));
++
++	// allocate a dir cookie
++	DirCookie* cookie = new(std::nothrow) DirCookie;
++	if (cookie == NULL)
++		RETURN_ERROR(B_NO_MEMORY);
++	ObjectDeleter&lt;DirCookie&gt; cookieDeleter(cookie);
++
++	AutoLocker&lt;Locker&gt; locker(fLock);
++
++	// get a path for the node
++	char path[B_PATH_NAME_LENGTH];
++	size_t pathLen;
++	status_t error = _BuildPath(node, path, pathLen);
++	if (error != B_OK)
++		RETURN_ERROR(error);
++
++	locker.Unlock();
++
++	// open the dir
++	int fuseError = fuse_fs_opendir(fFS, path, cookie);
++	if (fuseError != 0)
++		return from_fuse_error(fuseError);
++
++	cookieDeleter.Detach();
++	*_cookie = cookie;
++
++	return B_OK;
+ }
+ 
+ 
+ status_t
+-FUSEVolume::CloseDir(void* node, void* cookie)
++FUSEVolume::CloseDir(void* node, void* _cookie)
+ {
+-	return B_UNSUPPORTED;
++	return B_OK;
+ }
+ 
+ 
+ status_t
+-FUSEVolume::FreeDirCookie(void* node, void* cookie)
++FUSEVolume::FreeDirCookie(void* _node, void* _cookie)
+ {
+-	return B_UNSUPPORTED;
++	FUSENode* node = (FUSENode*)_node;
++	DirCookie* cookie = (DirCookie*)_cookie;
++
++	ObjectDeleter&lt;DirCookie&gt; cookieDeleter(cookie);
++
++	AutoLocker&lt;Locker&gt; locker(fLock);
++
++	// get a path for the node
++	char path[B_PATH_NAME_LENGTH];
++	size_t pathLen;
++	status_t error = _BuildPath(node, path, pathLen);
++	if (error != B_OK)
++		RETURN_ERROR(error);
++
++	locker.Unlock();
++
++	// release the dir
++	int fuseError = fuse_fs_releasedir(fFS, path, cookie);
++	if (fuseError != 0)
++		return from_fuse_error(fuseError);
++
++	return B_OK;
+ }
+ 
+ 
+ status_t
+-FUSEVolume::ReadDir(void* node, void* cookie, void* buffer, size_t bufferSize,
++FUSEVolume::ReadDir(void* _node, void* _cookie, void* buffer, size_t bufferSize,
+ 	uint32 count, uint32* countRead)
+ {
+-	return B_UNSUPPORTED;
++	FUSENode* node = (FUSENode*)_node;
++	DirCookie* cookie = (DirCookie*)_cookie;
++
++	AutoLocker&lt;Locker&gt; locker(fLock);
++
++	ReadDirBuffer readDirBuffer(this, node, cookie, buffer, bufferSize, count);
++
++	// get a path for the node
++	char path[B_PATH_NAME_LENGTH];
++	size_t pathLen;
++	status_t error = _BuildPath(node, path, pathLen);
++	if (error != B_OK)
++		RETURN_ERROR(error);
++
++	off_t offset = cookie-&gt;currentEntryOffset;
++
++	locker.Unlock();
++
++	// read the dir
++	int fuseError = fuse_fs_readdir(fFS, path, &amp;readDirBuffer,
++		&amp;_AddReadDirEntry, offset, cookie);
++	if (fuseError != 0)
++		return from_fuse_error(fuseError);
++
++	locker.Lock();
++
++	// everything went fine
++	cookie-&gt;currentEntryOffset = readDirBuffer.lastOffset;
++	*countRead = readDirBuffer.entriesRead;
++
++	return B_OK;
+ }
+ 
+ 
+ status_t
+ FUSEVolume::RewindDir(void* node, void* cookie)
+ {
++	// TODO: Implement!
+ 	return B_UNSUPPORTED;
+ }
++
++
++// #pragma mark -
++
++
++ino_t
++FUSEVolume::_GenerateNodeID()
++{
++	ino_t id;
++	do {
++		id = fNextNodeID++;
++	} while (fNodes.Lookup(id) != NULL);
++
++	return id;
++}
++
++
++status_t
++FUSEVolume::_GetNode(FUSENode* dir, const char* entryName, FUSENode** _node)
++{
++	while (true) {
++		AutoLocker&lt;Locker&gt; locker(fLock);
++
++		FUSENode* node;
++		status_t error = _InternalGetNode(dir, entryName, &amp;node, locker);
++		if (error != B_OK)
++			return error;
++
++		if (node == NULL)
++			continue;
++
++		ino_t nodeID = node-&gt;id;
++
++		locker.Unlock();
++
++		// get a reference for the caller
++		void* privateNode;
++		error = UserlandFS::KernelEmu::get_vnode(fID, nodeID, &amp;privateNode);
++		if (error != B_OK)
++			RETURN_ERROR(error);
++
++		locker.Lock();
++
++		if (privateNode != node) {
++			// weird, the node changed!
++			UserlandFS::KernelEmu::put_vnode(fID, nodeID);
++			_PutNode(node);
++			continue;
++		}
++
++		// Put the node reference we got from _InternalGetNode. We've now got
++		// a reference from get_vnode().
++		_PutNode(node);
++
++		*_node = node;
++		return B_OK;
++	}
++}
++
+
+[... truncated: 365 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014993.html">[Haiku-commits] r29618 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on
+</A></li>
+	<LI>Next message: <A HREF="014995.html">[Haiku-commits] r29620 - haiku/trunk/src/bin/desklink
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14994">[ date ]</a>
+              <a href="thread.html#14994">[ thread ]</a>
+              <a href="subject.html#14994">[ subject ]</a>
+              <a href="author.html#14994">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,327 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27295 - haiku/trunk/src/system/kernel/posix
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27295%20-%20haiku/trunk/src/system/kernel/posix&In-Reply-To=%3C200809030900.m8390Swp003545%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011488.html">
+   <LINK REL="Next"  HREF="011492.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27295 - haiku/trunk/src/system/kernel/posix</H1>
+    <B>sbenedetto at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27295%20-%20haiku/trunk/src/system/kernel/posix&In-Reply-To=%3C200809030900.m8390Swp003545%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27295 - haiku/trunk/src/system/kernel/posix">sbenedetto at mail.berlios.de
+       </A><BR>
+    <I>Wed Sep  3 11:00:28 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011488.html">[Haiku-commits] r27294 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="011492.html">[Haiku-commits] r27296 - haiku/trunk/src/tests/kits/game/chart
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11490">[ date ]</a>
+              <a href="thread.html#11490">[ thread ]</a>
+              <a href="subject.html#11490">[ subject ]</a>
+              <a href="author.html#11490">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: sbenedetto
+Date: 2008-09-03 11:00:27 +0200 (Wed, 03 Sep 2008)
+New Revision: 27295
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27295&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27295&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp
+Log:
+* Start implementing _kern_xsi_msgsnd().
+
+
+Modified: haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp	2008-09-03 02:15:30 UTC (rev 27294)
++++ haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp	2008-09-03 09:00:27 UTC (rev 27295)
+@@ -52,25 +52,31 @@
+ 
+ 
+ struct queued_message : DoublyLinkedListLinkImpl&lt;queued_message&gt; {
+-	queued_message(long type, char *_message, ssize_t length)
++	queued_message(const void *_message, ssize_t _length)
+ 		:
+-		init(false),
+-		length(length),
+-		type(type)
++		initOK(false),
++		length(_length)
+ 	{
+-		message = (char *)malloc(sizeof(char) * length);
+-		if (message)
+-			init = true;
+-		memcpy(_message, message, length);
++		message = (char *)malloc(sizeof(char) * _length);
++		if (message == NULL)
++			return;
++
++		if (user_memcpy(&amp;type, _message, sizeof(long)) != B_OK
++			|| user_memcpy(message, (void *)((long *)_message + sizeof(long)),
++			_length) != B_OK) {
++			free(message);
++			return;
++		}
++		initOK = true;
+ 	}
+ 
+ 	~queued_message()
+ 	{
+-		if (init)
++		if (initOK)
+ 			free(message);
+ 	}
+ 
+-	bool		init;
++	bool		initOK;
+ 	ssize_t		length;
+ 	char		*message;
+ 	long		type;
+@@ -84,6 +90,8 @@
+ class XsiMessageQueue {
+ public:
+ 	XsiMessageQueue(int flags)
++		:
++		fBytesInQueue(0)
+ 	{
+ 		mutex_init(&amp;fLock, &quot;XsiMessageQueue private mutex&quot;);
+ 		SetIpcKey((key_t)-1);
+@@ -139,6 +147,9 @@
+ 		return fID;
+ 	}
+ 
++	// Implemented after sXsiMessageCountLock is declared
++	bool Insert(queued_message *message);
++
+ 	key_t IpcKey() const
+ 	{
+ 		return fMessageQueue.msg_perm.key;
+@@ -177,12 +188,18 @@
+ 	// Implemented after sMessageQueueHashTable is declared
+ 	void UnsetID();
+ 
++	status_t Wait(queued_message *message)
++	{
++		return B_ERROR;
++	}
++
+ 	HashTableLink&lt;XsiMessageQueue&gt;* Link()
+ 	{
+ 		return &fLink;
+ 	}
+ 
+ private:
++	msglen_t			fBytesInQueue;
+ 	int					fID;
+ 	mutex				fLock;
+ 	MessageQueue		fMessage;
+@@ -282,20 +299,45 @@
+ 	}
+ };
+ 
+-// Arbitrary limit
+-#define MAX_XSI_MESSAGE_QUEUE	2048
++// Arbitrary limits
++#define MAX_XSI_MESSAGE			4096
++#define MAX_XSI_MESSAGE_QUEUE	1024
+ static OpenHashTable&lt;IpcHashTableDefinition&gt; sIpcHashTable;
+ static OpenHashTable&lt;MessageQueueHashTableDefinition&gt; sMessageQueueHashTable;
+ 
+ static mutex sIpcLock;
+ static mutex sXsiMessageQueueLock;
++static mutex sXsiMessageCountLock;
+ 
+ static vint32 sNextAvailableID = 1;
++static vint32 sXsiMessageCount = 0;
+ static vint32 sXsiMessageQueueCount = 0;
+ 
+ 
+ //	#pragma mark -
+ 
++
++bool
++XsiMessageQueue::Insert(queued_message *message)
++{
++	// The only situation that would make us (potentially) wait
++	// is that we exceed with bytes or with the total number of messages
++	MutexLocker _(sXsiMessageCountLock);
++	if (fBytesInQueue == fMessageQueue.msg_qbytes
++		|| fBytesInQueue + message-&gt;length &gt; fMessageQueue.msg_qbytes
++		|| sXsiMessageCount &lt;= MAX_XSI_MESSAGE)
++		return true;
++
++	fMessage.Add(message);
++	fMessageQueue.msg_qnum++;
++	fMessageQueue.msg_lspid = getpid();
++	fMessageQueue.msg_stime = real_time_clock();
++	fBytesInQueue += message-&gt;length;
++	sXsiMessageCount++;
++	return false;
++}
++
++
+ void
+ XsiMessageQueue::SetID()
+ {
+@@ -308,6 +350,7 @@
+ 	fID = sNextAvailableID++;
+ }
+ 
++
+ void
+ XsiMessageQueue::UnsetID()
+ {
+@@ -331,13 +374,15 @@
+ 
+ 	mutex_init(&amp;sIpcLock, &quot;global POSIX message queue IPC table&quot;);
+ 	mutex_init(&amp;sXsiMessageQueueLock, &quot;global POSIX xsi message queue table&quot;);
++	mutex_init(&amp;sXsiMessageCountLock, &quot;global POSIX xsi message count&quot;);
+ }
+ 
+ 
+ //	#pragma mark - Syscalls
+ 
+ 
+-int _user_xsi_msgctl(int messageQueueID, int command, struct msqid_ds *buffer)
++int
++_user_xsi_msgctl(int messageQueueID, int command, struct msqid_ds *buffer)
+ {
+ 	TRACE((&quot;xsi_msgctl: messageQueueID = %d, command = %d\n&quot;, messageQueueID, command));
+ 	MutexLocker ipcHashLocker(sIpcLock);
+@@ -361,7 +406,11 @@
+ 		messageQueueLocker.SetTo(&amp;messageQueue-&gt;Lock(), false);
+ 		messageQueueHashLocker.Unlock();
+ 		ipcHashLocker.Unlock();
+-	}
++	} else
++		// Since we are going to delete the message queue object
++		// along with its mutex, we can't use a MutexLocker object,
++		// as the mutex itself won't exist on function exit
++		mutex_lock(&amp;messageQueue-&gt;Lock());
+ 
+ 	switch (command) {
+ 		case IPC_STAT: {
+@@ -437,7 +486,8 @@
+ }
+ 
+ 
+-int _user_xsi_msgget(key_t key, int flags)
++int
++_user_xsi_msgget(key_t key, int flags)
+ {
+ 	TRACE((&quot;xsi_msgget: key = %d, flags = %d\n&quot;, (nt)key, flags));
+ 	XsiMessageQueue *messageQueue = NULL;
+@@ -515,7 +565,8 @@
+ }
+ 
+ 
+-ssize_t _user_xsi_msgrcv(int messageQueueID, void *messagePointer,
++ssize_t
++_user_xsi_msgrcv(int messageQueueID, void *messagePointer,
+ 	size_t messageSize, long messageType, int messageFlags)
+ {
+ 	// TODO
+@@ -523,9 +574,60 @@
+ }
+ 
+ 
+-int _user_xsi_msgsnd(int messageQueueID, const void *messagePointer,
++int
++_user_xsi_msgsnd(int messageQueueID, const void *messagePointer,
+ 	size_t messageSize, int messageFlags)
+ {
+-	// TODO
+-	return B_ERROR;
++	TRACE((&quot;xsi_msgsnd: messageQueueID = %d, messageSize = %Ld\n&quot;,
++		messageQueueID, messageSize));
++	MutexLocker messageQueueHashLocker(sXsiMessageQueueLock);
++	XsiMessageQueue *messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);
++	if (messageQueue == NULL) {
++		TRACE_ERROR((&quot;xsi_msgsnd: message queue id %d not valid\n&quot;,
++			messageQueueID));
++		return EINVAL;
++	}
++	MutexLocker messageQueueLocker(messageQueue-&gt;Lock());
++	messageQueueHashLocker.Unlock();
++
++	if (messageSize &lt; 0 || messageSize &gt; MAX_BYTES_PER_QUEUE) {
++		TRACE_ERROR((&quot;xsi_msgsnd: message size is out of range\n&quot;));
++		return EINVAL;
++	}
++	if (!messageQueue-&gt;HasPermission()) {
++		TRACE_ERROR((&quot;xsi_msgsnd: calling process has not permission &quot;
++			&quot;on message queue id %d, key %d\n&quot;, messageQueueID,
++			(int)messageQueue-&gt;IpcKey()));
++		return EACCES;
++	}
++	if (!IS_USER_ADDRESS(messagePointer)) {
++		TRACE_ERROR((&quot;xsi_msgsnd: message address is not valid\n&quot;));
++		return B_BAD_ADDRESS;
++	}
++
++	bool notSent = true;
++	while (notSent) {
++		queued_message *message
++			= new(std::nothrow) queued_message(messagePointer, messageSize);
++		if (message == NULL || message-&gt;initOK != true) {
++			TRACE_ERROR((&quot;xsi_msgsnd: failed to create new message to queue\n&quot;));
++			delete message;
++			return ENOMEM;
++		}
++		bool goToSleep = messageQueue-&gt;Insert(message);
++		if (goToSleep &amp;&amp; !(messageFlags &amp; IPC_NOWAIT)) {
++			// We are going to sleep
++			messageQueue-&gt;Wait(message);
++		} else if (goToSleep) {
++			// We did not send the message and we can't wait
++			delete message;
++			return EAGAIN;
++		} else {
++			// Message delivered correctly
++			TRACE((&quot;xsi_msgsnd: message sent correctly\n&quot;));
++			notSent = false;
++		}
++	}
++
++	return B_OK;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011488.html">[Haiku-commits] r27294 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="011492.html">[Haiku-commits] r27296 - haiku/trunk/src/tests/kits/game/chart
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11490">[ date ]</a>
+              <a href="thread.html#11490">[ thread ]</a>
+              <a href="subject.html#11490">[ subject ]</a>
+              <a href="author.html#11490">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

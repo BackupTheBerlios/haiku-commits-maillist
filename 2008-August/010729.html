@@ -1,0 +1,315 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26741 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26741%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808022024.m72KOkxl017407%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010728.html">
+   <LINK REL="Next"  HREF="010730.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26741 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26741%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808022024.m72KOkxl017407%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26741 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Aug  2 22:24:46 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010728.html">[Haiku-commits] r26740 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+        <LI>Next message: <A HREF="010730.html">[Haiku-commits] r26742 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10729">[ date ]</a>
+              <a href="thread.html#10729">[ thread ]</a>
+              <a href="subject.html#10729">[ subject ]</a>
+              <a href="author.html#10729">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-02 22:24:41 +0200 (Sat, 02 Aug 2008)
+New Revision: 26741
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26741&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26741&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+vm_create_anonymous_area():
+* Moved reservation of memory for the &quot;locked&quot; cases upfront.
+  Particularly if the would-be area is a kernel area, we don't want the
+  address space to be write locked while doing that, since that would
+  block the low memory handler.
+* For full lock areas the pages are reserved upfront, too. The reasoning
+  is similar. Reserve the pages needed by the translation map backend for
+  mapping the area pages there too.
+* Moved the cache locking/unlocking out of the individual cases. All
+  want to have the cache locked the whole time, now.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2008-08-02 20:11:11 UTC (rev 26740)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2008-08-02 20:24:41 UTC (rev 26741)
+@@ -1581,6 +1581,8 @@
+ 
+ 	TRACE((&quot;create_anonymous_area %s: size 0x%lx\n&quot;, name, size));
+ 
++	size = PAGE_ALIGN(size);
++
+ 	if (size == 0)
+ 		return B_BAD_VALUE;
+ 	if (!arch_vm_supports_protection(protection))
+@@ -1611,37 +1613,82 @@
+ 			return B_BAD_VALUE;
+ 	}
+ 
++	bool doReserveMemory = false;
+ 	switch (wiring) {
+ 		case B_NO_LOCK:
++			break;
+ 		case B_FULL_LOCK:
+ 		case B_LAZY_LOCK:
+ 		case B_CONTIGUOUS:
++			doReserveMemory = true;
++			break;
+ 		case B_ALREADY_WIRED:
+ 			break;
+ 		case B_LOMEM:
+ 		//case B_SLOWMEM:
+ 			dprintf(&quot;B_LOMEM/SLOWMEM is not yet supported!\n&quot;);
+ 			wiring = B_FULL_LOCK;
++			doReserveMemory = true;
+ 			break;
+ 		default:
+ 			return B_BAD_VALUE;
+ 	}
+ 
++	// For full lock or contiguous areas we're also going to map the pages and
++	// thus need to reserve pages for the mapping backend upfront.
++	addr_t reservedMapPages = 0;
++	if (wiring == B_FULL_LOCK || wiring == B_CONTIGUOUS) {
++		AddressSpaceWriteLocker locker;
++		status_t status = locker.SetTo(team);
++		if (status != B_OK)
++			return status;
++
++		vm_translation_map *map = &amp;locker.AddressSpace()-&gt;translation_map;
++		reservedMapPages = map-&gt;ops-&gt;map_max_pages_need(map, 0, size - 1);
++	}
++
++	// Reserve memory before acquiring the address space lock. This reduces the
++	// chances of failure, since while holding the write lock to the address
++	// space (if it is the kernel address space that is), the low memory handler
++	// won't be able to free anything for us.
++	addr_t reservedMemory = 0;
++	if (doReserveMemory) {
++		if (vm_try_reserve_memory(size, 1000000) != B_OK)
++			return B_NO_MEMORY;
++		reservedMemory = size;
++		// TODO: We don't reserve the memory for the pages for the page
++		// directories/tables. We actually need to do since we currently don't
++		// reclaim them (and probably can't reclaim all of them anyway). Thus
++		// there are actually less physical pages than there should be, which
++		// can get the VM into trouble in low memory situations.
++	}
++
++	// For full lock areas reserve the pages before locking the address
++	// space. E.g. block caches can't release their memory while we hold the
++	// address space lock.
++	page_num_t reservedPages = reservedMapPages;
++	if (wiring == B_FULL_LOCK)
++		reservedPages += size / B_PAGE_SIZE;
++	if (reservedPages &gt; 0)
++		vm_page_reserve_pages(reservedPages);
++
+ 	AddressSpaceWriteLocker locker;
++	vm_address_space *addressSpace;
+ 	status_t status = locker.SetTo(team);
+ 	if (status != B_OK)
+-		return status;
++		goto err0;
+ 
+-	vm_address_space *addressSpace = locker.AddressSpace();
+-	size = PAGE_ALIGN(size);
++	addressSpace = locker.AddressSpace();
+ 
+ 	if (wiring == B_CONTIGUOUS) {
+ 		// we try to allocate the page run here upfront as this may easily
+ 		// fail for obvious reasons
+ 		page = vm_page_allocate_page_run(PAGE_STATE_CLEAR, physicalBase,
+ 			size / B_PAGE_SIZE);
+-		if (page == NULL)
+-			return B_NO_MEMORY;
++		if (page == NULL) {
++			status = B_NO_MEMORY;
++			goto err0;
++		}
+ 	}
+ 
+ 	// create an anonymous cache
+@@ -1656,6 +1703,9 @@
+ 
+ 	cache-&gt;temporary = 1;
+ 	cache-&gt;virtual_end = size;
++	cache-&gt;committed_size = reservedMemory;
++		// TODO: This should be done via a method.
++	reservedMemory = 0;
+ 
+ 	switch (wiring) {
+ 		case B_LAZY_LOCK:
+@@ -1680,8 +1730,6 @@
+ 		goto err1;
+ 	}
+ 
+-	cache-&gt;Unlock();
+-
+ 	locker.DegradeToReadLock();
+ 
+ 	switch (wiring) {
+@@ -1692,13 +1740,7 @@
+ 
+ 		case B_FULL_LOCK:
+ 		{
+-			vm_translation_map *map = &amp;addressSpace-&gt;translation_map;
+-			size_t reservePages = map-&gt;ops-&gt;map_max_pages_need(map,
+-				area-&gt;base, area-&gt;base + (area-&gt;size - 1));
+-			vm_page_reserve_pages(reservePages);
+-
+ 			// Allocate and map all pages for this area
+-			cache-&gt;Lock();
+ 
+ 			off_t offset = 0;
+ 			for (addr_t address = area-&gt;base; address &lt; area-&gt;base + (area-&gt;size - 1);
+@@ -1713,26 +1755,19 @@
+ #	endif
+ 					continue;
+ #endif
+-				vm_page *page = vm_page_allocate_page(PAGE_STATE_CLEAR, false);
++				vm_page *page = vm_page_allocate_page(PAGE_STATE_CLEAR, true);
+ 				cache-&gt;InsertPage(page, offset);
+ 				vm_map_page(area, page, address, protection);
++
++				// Periodically unreserve pages we've already allocated, so that
++				// we don't unnecessarily increase the pressure on the VM.
++				if (offset &gt; 0 &amp;&amp; offset % (128 * B_PAGE_SIZE) == 0) {
++					page_num_t toUnreserve = 128;
++					vm_page_unreserve_pages(toUnreserve);
++					reservedPages -= toUnreserve;
++				}
+ 			}
+ 
+-			cache-&gt;Unlock();
+-// TODO: Allocating pages with the address space write locked is not a good
+-// idea, particularly if that's the kernel's address space. During that time the
+-// low memory handler will block (e.g. the block cache will try to delete
+-// areas). The cache backing our area has reserved the memory and thus there
+-// should be enough pages available (i.e. could be freed by page write/daemon),
+-// but this is not true for at least two reasons:
+-// * The pages for page directories/tables are not reserved from the available
+-//   memory (we should do that!) and currently we don't reclaim them (and
+-//   probably can't reclaim all of them anyway). Thus there are actually less
+-//   pages than there should be.
+-// * ATM we write pages back using virtual addresses. The lower I/O layers will
+-//   try to lock the memory, which will block, since that requires to read-lock
+-//   the address space.
+-			vm_page_unreserve_pages(reservePages);
+ 			break;
+ 		}
+ 
+@@ -1747,7 +1782,6 @@
+ 			if (!gKernelStartup)
+ 				panic(&quot;ALREADY_WIRED flag used outside kernel startup\n&quot;);
+ 
+-			cache-&gt;Lock();
+ 			map-&gt;ops-&gt;lock(map);
+ 
+ 			for (addr_t virtualAddress = area-&gt;base; virtualAddress &lt; area-&gt;base
+@@ -1774,7 +1808,6 @@
+ 			}
+ 
+ 			map-&gt;ops-&gt;unlock(map);
+-			cache-&gt;Unlock();
+ 			break;
+ 		}
+ 
+@@ -1785,12 +1818,8 @@
+ 			vm_translation_map *map = &amp;addressSpace-&gt;translation_map;
+ 			addr_t physicalAddress = page-&gt;physical_page_number * B_PAGE_SIZE;
+ 			addr_t virtualAddress = area-&gt;base;
+-			size_t reservePages = map-&gt;ops-&gt;map_max_pages_need(map,
+-				virtualAddress, virtualAddress + (area-&gt;size - 1));
+ 			off_t offset = 0;
+ 
+-			vm_page_reserve_pages(reservePages);
+-			cache-&gt;Lock();
+ 			map-&gt;ops-&gt;lock(map);
+ 
+ 			for (virtualAddress = area-&gt;base; virtualAddress &lt; area-&gt;base
+@@ -1812,8 +1841,6 @@
+ 			}
+ 
+ 			map-&gt;ops-&gt;unlock(map);
+-			cache-&gt;Unlock();
+-			vm_page_unreserve_pages(reservePages);
+ 			break;
+ 		}
+ 
+@@ -1821,6 +1848,11 @@
+ 			break;
+ 	}
+ 
++	cache-&gt;Unlock();
++
++	if (reservedPages &gt; 0)
++		vm_page_unreserve_pages(reservedPages);
++
+ 	TRACE((&quot;vm_create_anonymous_area: done\n&quot;));
+ 
+ 	area-&gt;cache_type = CACHE_TYPE_RAM;
+@@ -1840,6 +1872,12 @@
+ 		}
+ 	}
+ 
++err0:
++	if (reservedPages &gt; 0)
++		vm_page_unreserve_pages(reservedPages);
++	if (reservedMemory &gt; 0)
++		vm_unreserve_memory(reservedMemory);
++
+ 	return status;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010728.html">[Haiku-commits] r26740 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+	<LI>Next message: <A HREF="010730.html">[Haiku-commits] r26742 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10729">[ date ]</a>
+              <a href="thread.html#10729">[ thread ]</a>
+              <a href="subject.html#10729">[ subject ]</a>
+              <a href="author.html#10729">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

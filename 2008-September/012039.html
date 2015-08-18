@@ -1,0 +1,404 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27651 - haiku/trunk/src/bin/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27651%20-%20haiku/trunk/src/bin/debug&In-Reply-To=%3C200809201410.m8KEAvKN011347%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012038.html">
+   <LINK REL="Next"  HREF="012040.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27651 - haiku/trunk/src/bin/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27651%20-%20haiku/trunk/src/bin/debug&In-Reply-To=%3C200809201410.m8KEAvKN011347%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27651 - haiku/trunk/src/bin/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Sep 20 16:10:57 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012038.html">[Haiku-commits] r27650 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="012040.html">[Haiku-commits] r27652 - haiku/trunk/src/preferences/appearance
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12039">[ date ]</a>
+              <a href="thread.html#12039">[ thread ]</a>
+              <a href="subject.html#12039">[ subject ]</a>
+              <a href="author.html#12039">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-20 16:10:57 +0200 (Sat, 20 Sep 2008)
+New Revision: 27651
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27651&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27651&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/bin/debug/profile.cpp
+Log:
+Implemented tracking image creation/deletion. It's not fully correct
+yet, since there's no synchronization of the sample evalution with the
+image creation/deletion. That is samples taken before an exec*() could
+be evaluated after the new images have already been loaded and could
+thus be translated to the wrong functions.
+
+
+Modified: haiku/trunk/src/bin/debug/profile.cpp
+===================================================================
+--- haiku/trunk/src/bin/debug/profile.cpp	2008-09-20 13:59:41 UTC (rev 27650)
++++ haiku/trunk/src/bin/debug/profile.cpp	2008-09-20 14:10:57 UTC (rev 27651)
+@@ -18,6 +18,7 @@
+ 
+ #include &lt;debug_support.h&gt;
+ #include &lt;ObjectList.h&gt;
++#include &lt;Referenceable.h&gt;
+ 
+ #include &lt;util/DoublyLinkedList.h&gt;
+ 
+@@ -77,7 +78,7 @@
+ };
+ 
+ 
+-class Image {
++class Image : public Referenceable {
+ public:
+ 	Image(const image_info&amp; info)
+ 		:
+@@ -96,6 +97,11 @@
+ 		}
+ 	}
+ 
++	const image_id ID() const
++	{
++		return fInfo.id;
++	}
++
+ 	const image_info&amp; Info() const
+ 	{
+ 		return fInfo;
+@@ -209,8 +215,14 @@
+ 		fTotalHits(0),
+ 		fMissedTicks(0)
+ 	{
++		fImage-&gt;AddReference();
+ 	}
+ 
++	~ThreadImage()
++	{
++		fImage-&gt;RemoveReference();
++	}
++
+ 	status_t Init()
+ 	{
+ 		int32 symbolCount = fImage-&gt;SymbolCount();
+@@ -223,6 +235,11 @@
+ 		return B_OK;
+ 	}
+ 
++	image_id ID() const
++	{
++		return fImage-&gt;ID();
++	}
++
+ 	bool ContainsAddress(addr_t address) const
+ 	{
+ 		return fImage-&gt;ContainsAddress(address);
+@@ -267,7 +284,7 @@
+ };
+ 
+ 
+-class Thread {
++class Thread : public DoublyLinkedListLinkImpl&lt;Thread&gt; {
+ public:
+ 	Thread(const thread_info&amp; info, Team* team)
+ 		:
+@@ -327,6 +344,21 @@
+ 		return B_OK;
+ 	}
+ 
++	void ImageRemoved(Image* image)
++	{
++		ImageList::Iterator it = fImages.GetIterator();
++		while (ThreadImage* threadImage = it.Next()) {
++			if (threadImage-&gt;GetImage() == image) {
++				fImages.Remove(threadImage);
++				if (threadImage-&gt;TotalHits() &gt; 0)
++					fOldImages.Add(threadImage);
++				else
++					delete threadImage;
++				return;
++			}
++		}
++	}
++
+ 	ThreadImage* FindImage(addr_t address) const
+ 	{
+ 		ImageList::ConstIterator it = fImages.GetIterator();
+@@ -445,6 +477,7 @@
+ 	Team()
+ 		:
+ 		fNubPort(-1),
++		fThreads(),
+ 		fImages(20, false)
+ 	{
+ 		fInfo.team = -1;
+@@ -459,9 +492,8 @@
+ 		if (fNubPort &gt;= 0)
+ 			remove_team_debugger(fInfo.team);
+ 
+-// TODO: Just decrement ref-count!
+ 		for (int32 i = 0; Image* image = fImages.ItemAt(i); i++)
+-			delete image;
++			image-&gt;RemoveReference();
+ 	}
+ 
+ 	status_t Init(team_id teamID, port_id debuggerPort)
+@@ -504,7 +536,7 @@
+ 
+ 		// set team debugging flags
+ 		int32 teamDebugFlags = B_TEAM_DEBUG_THREADS
+-			| B_TEAM_DEBUG_TEAM_CREATION;
++			| B_TEAM_DEBUG_TEAM_CREATION | B_TEAM_DEBUG_IMAGES;
+ 		set_team_debugging_flags(fNubPort, teamDebugFlags);
+ 
+ 		return B_OK;
+@@ -565,12 +597,65 @@
+ 		thread-&gt;SetInterval(reply.interval);
+ //reply.profile_event
+ 
++		fThreads.Add(thread);
++
+ 		// resume the target thread to be sure, it's running
+ 		resume_thread(thread-&gt;ID());
+ 
+ 		return B_OK;
+ 	}
+ 
++	void RemoveThread(Thread* thread)
++	{
++		fThreads.Remove(thread);
++	}
++
++	void Exec()
++	{
++		// remove all images
++		int32 imageCount = fImages.CountItems();
++		for (int32 i = imageCount - 1; i &gt;= 0; i--)
++			_RemoveImage(i);
++	}
++
++	status_t AddImage(const image_info&amp; imageInfo)
++	{
++		// create symbol lookup context
++		debug_symbol_lookup_context* lookupContext;
++		status_t error = debug_create_symbol_lookup_context(&amp;fDebugContext,
++			&amp;lookupContext);
++		if (error != B_OK) {
++			fprintf(stderr, &quot;%s: Failed to create symbol lookup context for &quot;
++				&quot;team %ld: %s\n&quot;, kCommandName, ID(), strerror(error));
++			return error;
++		}
++
++		Image* image;
++		error = _LoadImageSymbols(lookupContext, imageInfo, &amp;image);
++		debug_delete_symbol_lookup_context(lookupContext);
++
++// TODO: Remove! The threads must be updated lazily.
++if (error == B_OK) {
++	ThreadList::Iterator it = fThreads.GetIterator();
++	while (Thread* thread = it.Next())
++		thread-&gt;AddImage(image);
++}
++
++		return error;
++	}
++
++	status_t RemoveImage(const image_info&amp; imageInfo)
++	{
++		for (int32 i = 0; Image* image = fImages.ItemAt(i); i++) {
++			if (image-&gt;ID() == imageInfo.id) {
++				_RemoveImage(i);
++				return B_OK;
++			}
++		}
++
++		return B_ENTRY_NOT_FOUND;
++	}
++
+ 	team_id ID() const
+ 	{
+ 		return fInfo.team;
+@@ -583,34 +668,59 @@
+ 		image_info imageInfo;
+ 		int32 cookie = 0;
+ 		while (get_next_image_info(fInfo.team, &amp;cookie, &amp;imageInfo) == B_OK) {
+-			printf(&quot;Loading symbols of image \&quot;%s\&quot; (%ld)...\n&quot;,
+-				imageInfo.name, imageInfo.id);
++			status_t error = _LoadImageSymbols(lookupContext, imageInfo);
++			if (error == B_NO_MEMORY)
++				return error;
++		}
+ 
+-			Image* image = new(std::nothrow) Image(imageInfo);
+-			if (image == NULL)
+-				return B_NO_MEMORY;
++		return B_OK;
++	}
+ 
+-			status_t error = image-&gt;LoadSymbols(lookupContext);
+-			if (error != B_OK) {
+-				delete image;
+-				if (error == B_NO_MEMORY)
+-					return error;
+-				continue;
+-			}
++	status_t _LoadImageSymbols(debug_symbol_lookup_context* lookupContext,
++		const image_info&amp; imageInfo, Image** _image = NULL)
++	{
++		Image* image = new(std::nothrow) Image(imageInfo);
++		if (image == NULL)
++			return B_NO_MEMORY;
+ 
+-			if (!fImages.AddItem(image)) {
+-				delete image;
+-				return B_NO_MEMORY;
+-			}
++		status_t error = image-&gt;LoadSymbols(lookupContext);
++		if (error != B_OK) {
++			delete image;
++			return error;
+ 		}
+ 
++		if (!fImages.AddItem(image)) {
++			delete image;
++			return B_NO_MEMORY;
++		}
++
++		if (_image != NULL)
++			*_image = image;
++
+ 		return B_OK;
+ 	}
+ 
++	void _RemoveImage(int32 index)
++	{
++		Image* image = fImages.RemoveItemAt(index);
++		if (image == NULL)
++			return;
++
++		// notify all threads that the image has been removed
++		ThreadList::Iterator it = fThreads.GetIterator();
++		while (Thread* thread = it.Next())
++			thread-&gt;ImageRemoved(image);
++
++		image-&gt;RemoveReference();
++	}
++
+ private:
++	typedef DoublyLinkedList&lt;Thread&gt; ThreadList;
++
+ 	team_info					fInfo;
+ 	port_id						fNubPort;
+ 	debug_context				fDebugContext;
++	ThreadList					fThreads;
+ 	BObjectList&lt;Image&gt;			fImages;
+ };
+ 
+@@ -684,8 +794,10 @@
+ 
+ 	void RemoveThread(thread_id threadID)
+ 	{
+-		if (Thread* thread = FindThread(threadID))
++		if (Thread* thread = FindThread(threadID)) {
++			thread-&gt;GetTeam()-&gt;RemoveThread(thread);
+ 			fThreads.RemoveItem(thread, true);
++		}
+ 	}
+ 
+ 	Team* FindTeam(team_id teamID) const
+@@ -856,8 +968,6 @@
+ 		switch (code) {
+ 			case B_DEBUGGER_MESSAGE_PROFILER_UPDATE:
+ 			{
+-debug_printf(&quot;B_DEBUGGER_MESSAGE_PROFILER_UPDATE: thread %ld, %ld samples\n&quot;,
+-message.profiler_update.origin.thread, message.profiler_update.sample_count);
+ 				Thread* thread = threadManager.FindThread(
+ 					message.profiler_update.origin.thread);
+ 				if (thread == NULL)
+@@ -883,6 +993,11 @@
+ 				// a debugged team is gone -- quit, if it is our team
+ 				quitLoop = message.origin.team == teamID;
+ 				break;
++			case B_DEBUGGER_MESSAGE_TEAM_EXEC:
++				if (Team* team = threadManager.FindTeam(message.origin.team))
++					team-&gt;Exec();
++				break;
++
+ 			case B_DEBUGGER_MESSAGE_THREAD_CREATED:
+ 				threadManager.AddThread(message.thread_created.new_thread);
+ 				break;
+@@ -890,6 +1005,23 @@
+ 				threadManager.RemoveThread(message.origin.thread);
+ 				break;
+ 
++			case B_DEBUGGER_MESSAGE_IMAGE_CREATED:
++{
++const image_info&amp; info = message.image_created.info;
++printf(&quot;B_DEBUGGER_MESSAGE_IMAGE_CREATED: %s (%ld)\n&quot;, info.name, info.id);
++				if (Team* team = threadManager.FindTeam(message.origin.team))
++					team-&gt;AddImage(message.image_created.info);
++				break;
++}
++			case B_DEBUGGER_MESSAGE_IMAGE_DELETED:
++{
++const image_info&amp; info = message.image_deleted.info;
++printf(&quot;B_DEBUGGER_MESSAGE_IMAGE_DELETED: %s (%ld)\n&quot;, info.name, info.id);
++				if (Team* team = threadManager.FindTeam(message.origin.team))
++					team-&gt;RemoveImage(message.image_deleted.info);
++				break;
++}
++
+ 			case B_DEBUGGER_MESSAGE_POST_SYSCALL:
+ 			case B_DEBUGGER_MESSAGE_SIGNAL_RECEIVED:
+ 			case B_DEBUGGER_MESSAGE_THREAD_DEBUGGED:
+@@ -899,8 +1031,6 @@
+ 			case B_DEBUGGER_MESSAGE_SINGLE_STEP:
+ 			case B_DEBUGGER_MESSAGE_PRE_SYSCALL:
+ 			case B_DEBUGGER_MESSAGE_EXCEPTION_OCCURRED:
+-			case B_DEBUGGER_MESSAGE_IMAGE_CREATED:
+-			case B_DEBUGGER_MESSAGE_IMAGE_DELETED:
+ 				break;
+ 		}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012038.html">[Haiku-commits] r27650 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="012040.html">[Haiku-commits] r27652 - haiku/trunk/src/preferences/appearance
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12039">[ date ]</a>
+              <a href="thread.html#12039">[ thread ]</a>
+              <a href="subject.html#12039">[ subject ]</a>
+              <a href="author.html#12039">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

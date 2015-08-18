@@ -1,0 +1,440 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27033 -	haiku/trunk/src/system/kernel/device_manager
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27033%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200808181107.m7IB7qZf006959%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011054.html">
+   <LINK REL="Next"  HREF="011057.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27033 -	haiku/trunk/src/system/kernel/device_manager</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27033%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200808181107.m7IB7qZf006959%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27033 -	haiku/trunk/src/system/kernel/device_manager">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Aug 18 13:07:52 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011054.html">[Haiku-commits] r27032 - haiku/trunk/src/kits/storage
+</A></li>
+        <LI>Next message: <A HREF="011057.html">[Haiku-commits] r27034 - haiku/trunk/src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11055">[ date ]</a>
+              <a href="thread.html#11055">[ thread ]</a>
+              <a href="subject.html#11055">[ subject ]</a>
+              <a href="author.html#11055">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-08-18 13:07:47 +0200 (Mon, 18 Aug 2008)
+New Revision: 27033
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27033&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27033&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/device_manager/BaseDevice.h
+   haiku/trunk/src/system/kernel/device_manager/devfs.cpp
+   haiku/trunk/src/system/kernel/device_manager/devfs_private.h
+   haiku/trunk/src/system/kernel/device_manager/device_manager.cpp
+   haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp
+Log:
+* Added new devfs_unpublish_device() that gets a BaseDevice instead of a path.
+* Added inode ID member to BaseDevice to make this possible.
+* Removed unused and unmaintained legacy_driver::devices_published field.
+* Implemented legacy driver's unpublish_driver().
+* Reenabled legacy driver reloading on changes.
+* Renamed devfs_driver_{added|removed}() to driver_{added|removed}(), and
+  made them private.
+* Simplified deletion of device_node lists (no need to use an iterator here),
+  added device unpublishing.
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/system/kernel/device_manager/BaseDevice.h
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/BaseDevice.h	2008-08-18 11:05:15 UTC (rev 27032)
++++ haiku/trunk/src/system/kernel/device_manager/BaseDevice.h	2008-08-18 11:07:47 UTC (rev 27033)
+@@ -14,6 +14,9 @@
+ 							BaseDevice();
+ 	virtual					~BaseDevice();
+ 
++			void			SetID(ino_t id) { fID = id; }
++			ino_t			ID() const { return fID; }
++
+ 			device_node*	Node() const { return fNode; }
+ 
+ 	virtual	status_t		InitDevice();
+@@ -50,6 +53,7 @@
+ 			status_t		Free(void* cookie);
+ 
+ protected:
++	ino_t					fID;
+ 	device_node*			fNode;
+ 	int32					fInitialized;
+ 	device_module_info*		fDeviceModule;
+
+Modified: haiku/trunk/src/system/kernel/device_manager/devfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/devfs.cpp	2008-08-18 11:05:15 UTC (rev 27032)
++++ haiku/trunk/src/system/kernel/device_manager/devfs.cpp	2008-08-18 11:07:47 UTC (rev 27033)
+@@ -483,13 +483,6 @@
+ 
+ 	status = remove_vnode(fs-&gt;volume, node-&gt;id);
+ 
+-#if 0
+-	if (status == B_OK &amp;&amp; S_ISCHR(node-&gt;stream.type)
+-		&amp;&amp; node-&gt;stream.u.dev.driver != NULL) {
+-		node-&gt;stream.u.dev.driver-&gt;devices_published--;
+-	}
+-#endif
+-
+ out:
+ 	recursive_lock_unlock(&amp;fs-&gt;lock);
+ 	return status;
+@@ -2082,6 +2075,9 @@
+ }
+ 
+ 
++//	#pragma mark - device_manager private API
++
++
+ status_t
+ devfs_publish_device(const char* path, BaseDevice* device)
+ {
+@@ -2089,6 +2085,25 @@
+ }
+ 
+ 
++status_t
++devfs_unpublish_device(BaseDevice* device, bool disconnect)
++{
++	devfs_vnode* node;
++	status_t status = get_vnode(sDeviceFileSystem-&gt;volume, device-&gt;ID(),
++		(void**)&amp;node);
++	if (status != B_OK)
++		return status;
++
++	status = unpublish_node(sDeviceFileSystem, node, S_IFCHR);
++
++	if (status == B_OK &amp;&amp; disconnect)
++		vfs_disconnect_vnode(sDeviceFileSystem-&gt;id, node-&gt;id);
++
++	put_vnode(sDeviceFileSystem-&gt;volume, node-&gt;id);
++	return status;
++}
++
++
+ //	#pragma mark - support API for legacy drivers
+ 
+ 
+
+Modified: haiku/trunk/src/system/kernel/device_manager/devfs_private.h
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/devfs_private.h	2008-08-18 11:05:15 UTC (rev 27032)
++++ haiku/trunk/src/system/kernel/device_manager/devfs_private.h	2008-08-18 11:07:47 UTC (rev 27033)
+@@ -12,6 +12,7 @@
+ class BaseDevice;
+ 
+ status_t devfs_publish_device(const char* path, BaseDevice* device);
++status_t devfs_unpublish_device(BaseDevice* device, bool disconnect);
+ status_t devfs_get_device(dev_t device, ino_t node, BaseDevice** _device);
+ 
+ #endif	/* DEVFS_PRIVATE_H */
+
+Modified: haiku/trunk/src/system/kernel/device_manager/device_manager.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/device_manager.cpp	2008-08-18 11:05:15 UTC (rev 27032)
++++ haiku/trunk/src/system/kernel/device_manager/device_manager.cpp	2008-08-18 11:07:47 UTC (rev 27033)
+@@ -1156,35 +1156,23 @@
+ 	}
+ 
+ 	// Delete children
+-	NodeList::Iterator nodeIterator = fChildren.GetIterator();
+-	while (nodeIterator.HasNext()) {
+-		device_node* child = nodeIterator.Next();
+-		nodeIterator.Remove();
++	while (device_node* child = fChildren.RemoveHead()) {
+ 		delete child;
+ 	}
+ 
+ 	// Delete devices
+-	DeviceList::Iterator deviceIterator = fDevices.GetIterator();
+-	while (deviceIterator.HasNext()) {
+-		Device* device = deviceIterator.Next();
+-		deviceIterator.Remove();
+-		// TODO: unpublish!
++	while (Device* device = fDevices.RemoveHead()) {
++		devfs_unpublish_device(device, true);
+ 		delete device;
+ 	}
+ 
+ 	// Delete attributes
+-	AttributeList::Iterator attrIterator = fAttributes.GetIterator();
+-	while (attrIterator.HasNext()) {
+-		device_attr_private* attr = attrIterator.Next();
+-		attrIterator.Remove();
++	while (device_attr_private* attr = fAttributes.RemoveHead()) {
+ 		delete attr;
+ 	}
+ 
+ 	// Delete resources
+-	ResourceList::Iterator resourceIterator = fResources.GetIterator();
+-	while (resourceIterator.HasNext()) {
+-		io_resource_private* resource = resourceIterator.Next();
+-		resourceIterator.Remove();
++	while (io_resource_private* resource = fResources.RemoveHead()) {
+ 		delete resource;
+ 	}
+ 
+
+Modified: haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp	2008-08-18 11:05:15 UTC (rev 27032)
++++ haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp	2008-08-18 11:07:47 UTC (rev 27033)
+@@ -80,7 +80,6 @@
+ 	ino_t			node;
+ 	time_t			last_modified;
+ 	image_id		image;
+-	uint32			devices_published;
+ 	uint32			devices_used;
+ 	bool			binary_updated;
+ 	int32			priority;
+@@ -454,42 +453,14 @@
+ }
+ 
+ 
+-/*!	Collects all devices belonging to the \a driver and unpublishs them.
+-*/
++/*!	Unpublishes all devices belonging to the \a driver. */
+ static void
+ unpublish_driver(legacy_driver *driver)
+ {
+-	// Iterate through all nodes until all devices of this driver have
+-	// been unpublished
+-
+-dprintf(&quot;IMPLEMENT unpublish_driver()!\n&quot;);
+-#if 0
+-	while (driver-&gt;devices_published &gt; 0) {
+-		struct hash_iterator i;
+-		hash_open(sDeviceFileSystem-&gt;vnode_hash, &amp;i);
+-
+-		while (true) {
+-			devfs_vnode *vnode = (devfs_vnode *)hash_next(
+-				sDeviceFileSystem-&gt;vnode_hash, &amp;i);
+-			if (vnode == NULL)
+-				break;
+-
+-			if (S_ISCHR(vnode-&gt;stream.type)
+-				&amp;&amp; vnode-&gt;stream.u.dev.driver == driver) {
+-				void *dummy;
+-				get_vnode(sDeviceFileSystem-&gt;volume, vnode-&gt;id, &amp;dummy);
+-					// We need to get/put the node, so that it is
+-					// actually removed
+-
+-				unpublish_node(sDeviceFileSystem, vnode, S_IFCHR);
+-				put_vnode(sDeviceFileSystem-&gt;volume, vnode-&gt;id);
+-				break;
+-			}
+-		}
+-
+-		hash_close(sDeviceFileSystem-&gt;vnode_hash, &amp;i, false);
++	while (LegacyDevice* device = driver-&gt;devices.RemoveHead()) {
++		devfs_unpublish_device(device, true);
++		delete device;
+ 	}
+-#endif
+ }
+ 
+ 
+@@ -618,7 +589,6 @@
+ 	driver-&gt;node = stat.st_ino;
+ 	driver-&gt;image = image;
+ 	driver-&gt;last_modified = stat.st_mtime;
+-	driver-&gt;devices_published = 0;
+ 	driver-&gt;devices_used = 0;
+ 	driver-&gt;binary_updated = false;
+ 	driver-&gt;priority = priority;
+@@ -708,6 +678,51 @@
+ }
+ 
+ 
++static void
++driver_added(const char *path)
++{
++	int32 priority = get_priority(path);
++	RecursiveLocker locker(sLock);
++
++	legacy_driver *driver = (legacy_driver *)hash_lookup(sDriverHash,
++		get_leaf(path));
++
++	if (driver == NULL) {
++		// Add the driver to our list
++		path_entry *entry = new(std::nothrow) path_entry;
++		if (entry == NULL)
++			return;
++
++		strlcpy(entry-&gt;path, path, sizeof(entry-&gt;path));
++		sDriversToAdd.Add(entry);
++	} else {
++		// Update the driver if it is affected by the new entry
++		if (priority &lt; driver-&gt;priority)
++			return;
++
++		driver-&gt;binary_updated = true;
++	}
++
++	atomic_add(&amp;sDriverEvents, 1);
++}
++
++
++static void
++driver_removed(const char* path)
++{
++	int32 priority = get_priority(path);
++	RecursiveLocker locker(sLock);
++
++	legacy_driver* driver = (legacy_driver*)hash_lookup(sDriverHash,
++		get_leaf(path));
++	if (driver == NULL || priority &lt; driver-&gt;priority)
++		return;
++
++	driver-&gt;binary_updated = true;
++	atomic_add(&amp;sDriverEvents, 1);
++}
++
++
+ //	#pragma mark - DriverWatcher
+ 
+ 
+@@ -737,7 +752,7 @@
+ 		return;
+ 
+ 	driver-&gt;binary_updated = true;
+-//dprintf(&quot;%s: devices published %ld, used %ld\n&quot;, driver-&gt;name, driver-&gt;devices_published, driver-&gt;devices_used);
++
+ 	if (driver-&gt;devices_used == 0) {
+ 		// trigger a reload of the driver
+ 		atomic_add(&amp;sDriverEvents, 1);
+@@ -764,7 +779,7 @@
+ 
+ 			kprintf(&quot;%p  %5ld %3ld %5ld %c %3ld %s\n&quot;, driver,
+ 				driver-&gt;image &lt; 0 ? -1 : driver-&gt;image,
+-				driver-&gt;devices_used, driver-&gt;devices_published,
++				driver-&gt;devices_used, driver-&gt;devices.Size(),
+ 				driver-&gt;binary_updated ? 'U' : ' ', driver-&gt;priority,
+ 				driver-&gt;name);
+ 		}
+@@ -792,7 +807,7 @@
+ 	kprintf(&quot; node:           %Ld\n&quot;, driver-&gt;node);
+ 	kprintf(&quot; last modified:  %ld\n&quot;, driver-&gt;last_modified);
+ 	kprintf(&quot; devs used:      %ld\n&quot;, driver-&gt;devices_used);
+-	kprintf(&quot; devs published: %ld\n&quot;, driver-&gt;devices_published);
++	kprintf(&quot; devs published: %ld\n&quot;, driver-&gt;devices.Size());
+ 	kprintf(&quot; binary updated: %d\n&quot;, driver-&gt;binary_updated);
+ 	kprintf(&quot; priority:       %ld\n&quot;, driver-&gt;priority);
+ 	kprintf(&quot; api version:    %ld\n&quot;, driver-&gt;api_version);
+@@ -988,16 +1003,14 @@
+ 	dprintf(&quot;driver \&quot;%s\&quot; %s\n&quot;, path.Leaf(),
+ 		opcode == B_ENTRY_CREATED ? &quot;added&quot; : &quot;removed&quot;);
+ 
+-#if 0
+ 	switch (opcode) {
+ 		case B_ENTRY_CREATED:
+-			devfs_driver_added(path.Path());
++			driver_added(path.Path());
+ 			break;
+ 		case B_ENTRY_REMOVED:
+-			devfs_driver_removed(path.Path());
++			driver_removed(path.Path());
+ 			break;
+ 	}
+-#endif
+ }
+ 
+ 
+@@ -1306,51 +1319,6 @@
+ }
+ 
+ 
+-extern &quot;C&quot; void
+-devfs_driver_added(const char *path)
+-{
+-	int32 priority = get_priority(path);
+-	RecursiveLocker locker(sLock);
+-
+-	legacy_driver *driver = (legacy_driver *)hash_lookup(sDriverHash,
+-		get_leaf(path));
+-
+-	if (driver == NULL) {
+-		// Add the driver to our list
+-		path_entry *entry = new(std::nothrow) path_entry;
+-		if (entry == NULL)
+-			return;
+-
+-		strlcpy(entry-&gt;path, path, sizeof(entry-&gt;path));
+-		sDriversToAdd.Add(entry);
+-	} else {
+-		// Update the driver if it is affected by the new entry
+-		if (priority &lt; driver-&gt;priority)
+-			return;
+-
+-		driver-&gt;binary_updated = true;
+-	}
+-
+-	atomic_add(&amp;sDriverEvents, 1);
+-}
+-
+-
+-extern &quot;C&quot; void
+-devfs_driver_removed(const char* path)
+-{
+-	int32 priority = get_priority(path);
+-	RecursiveLocker locker(sLock);
+-
+-	legacy_driver* driver = (legacy_driver*)hash_lookup(sDriverHash,
+-		get_leaf(path));
+-	if (driver == NULL || priority &lt; driver-&gt;priority)
+-		return;
+-
+-	driver-&gt;binary_updated = true;
+-	atomic_add(&amp;sDriverEvents, 1);
+-}
+-
+-
+ extern &quot;C&quot; status_t
+ legacy_driver_publish(const char *path, device_hooks *hooks)
+ {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011054.html">[Haiku-commits] r27032 - haiku/trunk/src/kits/storage
+</A></li>
+	<LI>Next message: <A HREF="011057.html">[Haiku-commits] r27034 - haiku/trunk/src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11055">[ date ]</a>
+              <a href="thread.html#11055">[ thread ]</a>
+              <a href="subject.html#11055">[ subject ]</a>
+              <a href="author.html#11055">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,327 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26260 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26260%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200807051758.m65HwmVM010114%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010027.html">
+   <LINK REL="Next"  HREF="010029.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26260 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26260%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200807051758.m65HwmVM010114%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26260 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sat Jul  5 19:58:48 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010027.html">[Haiku-commits] r26259 - haiku/trunk/src/system/kernel/cache
+</A></li>
+        <LI>Next message: <A HREF="010029.html">[Haiku-commits] r26261 - in haiku/trunk/src/apps/mediaplayer: .	supplier
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10028">[ date ]</a>
+              <a href="thread.html#10028">[ thread ]</a>
+              <a href="subject.html#10028">[ subject ]</a>
+              <a href="author.html#10028">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-07-05 19:58:47 +0200 (Sat, 05 Jul 2008)
+New Revision: 26260
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26260&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26260&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_map.cpp
+Log:
+Vastly improved the file map implementation:
+* adjacent vecs are now joined.
+* partial invalidation no longer frees all cached extents.
+* the array can now be larger than the needed number of entries, allowing
+  for a saner array allocation policy.
+* it does no longer read the whole file map when the first translation is
+  requested, but only as much as required (it will still ask the file system
+  for the maximum file size, but it won't traverse further as long as the
+  initial request is fulfilled).
+* This should help a lot with the ext2 file system that doesn't support real
+  file extents (but keeps a list of blocks).
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_map.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_map.cpp	2008-07-05 13:38:38 UTC (rev 26259)
++++ haiku/trunk/src/system/kernel/cache/file_map.cpp	2008-07-05 17:58:47 UTC (rev 26260)
+@@ -55,6 +55,8 @@
+ 	void Invalidate(off_t offset, off_t size);
+ 	void Free();
+ 
++	status_t _MakeSpace(size_t amount);
++
+ 	union {
+ 		file_extent	direct[CACHED_FILE_EXTENTS];
+ 		file_extent_array indirect;
+@@ -129,47 +131,94 @@
+ 
+ 
+ status_t
++file_map::_MakeSpace(size_t amount)
++{
++	if (amount &lt;= CACHED_FILE_EXTENTS) {
++		// just use the reserved area in the file_cache_ref structure
++		if (amount &lt;= CACHED_FILE_EXTENTS &amp;&amp; count &gt; CACHED_FILE_EXTENTS) {
++			// the new size is smaller than the minimal array size
++			file_extent *array = indirect.array;
++			memcpy(direct, array, sizeof(file_extent) * amount);
++			free(array);
++		}
++	} else {
++		// resize array if needed
++		file_extent *oldArray = NULL;
++		size_t maxCount = CACHED_FILE_EXTENTS;
++		if (count &gt; CACHED_FILE_EXTENTS) {
++			oldArray = indirect.array;
++			maxCount = indirect.max_count;
++		}
++
++		if (amount &gt; maxCount) {
++			// allocate new array
++			while (maxCount &lt; amount) {
++				if (maxCount &lt; 32768)
++					maxCount &lt;&lt;= 1;
++				else
++					maxCount += 32768;
++			}
++
++			file_extent *newArray = (file_extent *)realloc(oldArray,
++				maxCount * sizeof(file_extent));
++			if (newArray == NULL)
++				return B_NO_MEMORY;
++
++			if (count &gt; 0 &amp;&amp; count &lt;= CACHED_FILE_EXTENTS)
++				memcpy(newArray, direct, sizeof(file_extent) * count);
++
++			indirect.array = newArray;
++			indirect.max_count = maxCount;
++		}
++	}
++
++	count = amount;
++	return B_OK;
++}
++
++
++status_t
+ file_map::Add(file_io_vec *vecs, size_t vecCount, off_t &amp;lastOffset)
+ {
+ 	TRACE((&quot;file_map@%p::Add(vecCount = %ld)\n&quot;, this, vecCount));
+ 
++	uint32 start = count;
+ 	off_t offset = 0;
+ 
+-	if (vecCount &lt;= CACHED_FILE_EXTENTS &amp;&amp; count == 0) {
+-		// just use the reserved area in the file_cache_ref structure
+-	} else {
+-		// TODO: once we can invalidate only parts of the file map,
+-		//	we might need to copy the previously cached file extends
+-		//	from the direct range
+-		file_extent *newMap = (file_extent *)realloc(indirect.array,
+-			(count + vecCount) * sizeof(file_extent));
+-		if (newMap == NULL)
+-			return B_NO_MEMORY;
++	status_t status = _MakeSpace(count + vecCount);
++	if (status != B_OK)
++		return status;
+ 
+-		indirect.array = newMap;
++	file_extent *lastExtent = NULL;
++	if (start != 0) {
++		lastExtent = ExtentAt(start - 1);
++		offset = lastExtent-&gt;offset + lastExtent-&gt;disk.length;
++	}
+ 
+-		if (count != 0) {
+-			file_extent *extent = ExtentAt(count - 1);
+-			offset = extent-&gt;offset + extent-&gt;disk.length;
++	for (uint32 i = 0; i &lt; vecCount; i++) {
++		if (lastExtent != NULL) {
++			if (lastExtent-&gt;disk.offset + lastExtent-&gt;disk.length
++					== vecs[i].offset) {
++				lastExtent-&gt;disk.length += vecs[i].length;
++				offset += vecs[i].length;
++				start--;
++				_MakeSpace(count - 1);
++				continue;
++			}
+ 		}
+-	}
+ 
+-	int32 start = count;
+-	count += vecCount;
+-
+-	for (uint32 i = 0; i &lt; vecCount; i++) {
+ 		file_extent *extent = ExtentAt(start + i);
+-
+ 		extent-&gt;offset = offset;
+ 		extent-&gt;disk = vecs[i];
+ 
+ 		offset += extent-&gt;disk.length;
++		lastExtent = extent;
+ 	}
+ 
+ #ifdef TRACE_FILE_MAP
+-	for (uint32 i = start; i &lt; count; i++) {
++	for (uint32 i = 0; i &lt; count; i++) {
+ 		file_extent *extent = ExtentAt(i);
+-		dprintf(&quot;[%ld] extend offset %Ld, disk offset %Ld, length %Ld\n&quot;,
++		dprintf(&quot;[%ld] extent offset %Ld, disk offset %Ld, length %Ld\n&quot;,
+ 			i, extent-&gt;offset, extent-&gt;disk.offset, extent-&gt;disk.length);
+ 	}
+ #endif
+@@ -179,11 +228,25 @@
+ }
+ 
+ 
++/*!	Invalidates or removes the specified part of the file map.
++*/
+ void
+ file_map::Invalidate(off_t offset, off_t size)
+ {
+-	// TODO: honour offset/size parameters
+-	Free();
++	// TODO: honour size, we currently always remove everything after &quot;offset&quot;
++	if (offset == 0) {
++		Free();
++		return;
++	}
++
++	uint32 index;
++	file_extent *extent = FindExtent(offset, &amp;index);
++	if (extent != NULL) {
++		_MakeSpace(index);
++
++		if (extent-&gt;offset + extent-&gt;disk.length &gt; offset)
++			extent-&gt;disk.length = offset - extent-&gt;offset;
++	}
+ }
+ 
+ 
+@@ -193,7 +256,6 @@
+ 	if (count &gt; CACHED_FILE_EXTENTS)
+ 		free(indirect.array);
+ 
+-	indirect.array = NULL;
+ 	count = 0;
+ }
+ 
+@@ -281,50 +343,45 @@
+ 	if (offset + size &gt; map.size)
+ 		size = map.size - offset;
+ 
+-	if (map.count == 0) {
+-		// we don't yet have the map of this file, so let's grab it
+-		// (ordered by offset, so that we can do a binary search on them)
+-		size_t vecCount = maxVecs;
+-		off_t mapOffset = 0;
++	// First, we need to make sure that we have already cached all file
++	// extents needed for this request.
+ 
+-		while (true) {
+-			status = vfs_get_file_map(map.vnode, mapOffset, ~0UL, vecs,
+-				&amp;vecCount);
+-			if (status &lt; B_OK &amp;&amp; status != B_BUFFER_OVERFLOW)
+-				return status;
++	file_extent *lastExtent = NULL;
++	if (map.count &gt; 0)
++		lastExtent = map.ExtentAt(map.count - 1);
+ 
+-			status_t addStatus = map.Add(vecs, vecCount, mapOffset);
+-			if (addStatus != B_OK) {
+-				// only clobber the status in case of failure
+-				status = addStatus;
+-			}
++	off_t mapOffset = 0;
++	if (lastExtent != NULL)
++		mapOffset = lastExtent-&gt;offset + lastExtent-&gt;disk.length;
+ 
+-			if (status != B_BUFFER_OVERFLOW)
+-				break;
++	off_t end = offset + size;
+ 
+-			// when we are here, the map has been stored in the array, and
+-			// the array size was still too small to cover the whole file
+-			vecCount = maxVecs;
++	while (mapOffset &lt; end) {
++		// We don't have the requested extents yet, retrieve them
++		size_t vecCount = maxVecs;
++		status = vfs_get_file_map(map.vnode, mapOffset, ~0UL, vecs,
++			&amp;vecCount);
++		if (status &lt; B_OK &amp;&amp; status != B_BUFFER_OVERFLOW)
++			return status;
++
++		status_t addStatus = map.Add(vecs, vecCount, mapOffset);
++		if (addStatus != B_OK) {
++			// only clobber the status in case of failure
++			status = addStatus;
+ 		}
++
++		if (status != B_BUFFER_OVERFLOW)
++			break;
+ 	}
+ 
+-	if (status != B_OK) {
+-		// We must invalidate the (part of the) map we already
+-		// have, as we cannot know if it's complete or not
+-		map.Free();
++	if (status != B_OK)
+ 		return status;
+-	}
+ 
+-	// We now have cached the map of this file, we now need to
+-	// translate it for the requested access.
++	// We now have cached the map of this file as far as we need it, now
++	// we need to translate it for the requested access.
+ 
+ 	uint32 index;
+ 	file_extent *fileExtent = map.FindExtent(offset, &amp;index);
+-	if (fileExtent == NULL) {
+-		// access outside file bounds? But that's not our problem
+-		*_count = 0;
+-		return B_OK;
+-	}
+ 
+ 	offset -= fileExtent-&gt;offset;
+ 	vecs[0].offset = fileExtent-&gt;disk.offset + offset;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010027.html">[Haiku-commits] r26259 - haiku/trunk/src/system/kernel/cache
+</A></li>
+	<LI>Next message: <A HREF="010029.html">[Haiku-commits] r26261 - in haiku/trunk/src/apps/mediaplayer: .	supplier
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10028">[ date ]</a>
+              <a href="thread.html#10028">[ thread ]</a>
+              <a href="subject.html#10028">[ subject ]</a>
+              <a href="author.html#10028">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

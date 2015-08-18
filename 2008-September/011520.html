@@ -1,0 +1,333 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27313 - haiku/trunk/src/tests/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27313%20-%20haiku/trunk/src/tests/system/kernel&In-Reply-To=%3C200809040013.m840DsaX006474%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011519.html">
+   <LINK REL="Next"  HREF="011521.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27313 - haiku/trunk/src/tests/system/kernel</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27313%20-%20haiku/trunk/src/tests/system/kernel&In-Reply-To=%3C200809040013.m840DsaX006474%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27313 - haiku/trunk/src/tests/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Sep  4 02:13:54 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011519.html">[Haiku-commits] r27312 - in haiku/trunk: headers/private/system	src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="011521.html">[Haiku-commits] r27314 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11520">[ date ]</a>
+              <a href="thread.html#11520">[ thread ]</a>
+              <a href="subject.html#11520">[ subject ]</a>
+              <a href="author.html#11520">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-04 02:13:53 +0200 (Thu, 04 Sep 2008)
+New Revision: 27313
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27313&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27313&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/tests/system/kernel/time_stats.cpp
+Log:
+* In the timing table user and kernel time were swapped.
+* Scheduling analysis output:
+  - Sort the threads by total run time.
+  - Group the locking primitives a thread has waited on by common type
+    and name. E.g. all &quot;I/O request finished&quot; condition variables are
+    put in a single group. The sum wait time and wait count is printed
+    for the group, so it is easy to see how often and how long the
+    thread had waited for I/O.
+  - Both the groups and their elements are sorted by wait time.
+
+
+Modified: haiku/trunk/src/tests/system/kernel/time_stats.cpp
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/time_stats.cpp	2008-09-04 00:07:11 UTC (rev 27312)
++++ haiku/trunk/src/tests/system/kernel/time_stats.cpp	2008-09-04 00:13:53 UTC (rev 27313)
+@@ -60,6 +60,51 @@
+ };
+ 
+ 
++struct wait_object_group {
++	scheduling_analysis_thread_wait_object**	objects;
++	int32										count;
++	bigtime_t									wait_time;
++	int64										waits;
++};
++
++struct ThreadRunTimeComparator {
++	inline bool operator()(const scheduling_analysis_thread* a,
++		const scheduling_analysis_thread* b)
++	{
++		return a-&gt;total_run_time &gt; b-&gt;total_run_time;
++	}
++};
++
++
++struct WaitObjectGroupingComparator {
++	inline bool operator()(const scheduling_analysis_thread_wait_object* a,
++		const scheduling_analysis_thread_wait_object* b)
++	{
++		return a-&gt;wait_object-&gt;type &lt; b-&gt;wait_object-&gt;type
++			|| a-&gt;wait_object-&gt;type == b-&gt;wait_object-&gt;type
++				&amp;&amp; strcmp(a-&gt;wait_object-&gt;name, b-&gt;wait_object-&gt;name) &lt; 0;
++	}
++};
++
++
++struct WaitObjectTimeComparator {
++	inline bool operator()(const scheduling_analysis_thread_wait_object* a,
++		const scheduling_analysis_thread_wait_object* b)
++	{
++		return a-&gt;wait_time &gt; b-&gt;wait_time;
++	}
++};
++
++
++struct WaitObjectGroupTimeComparator {
++	inline bool operator()(const wait_object_group&amp; a,
++		const wait_object_group&amp; b)
++	{
++		return a.wait_time &gt; b.wait_time;
++	}
++};
++
++
+ static int32
+ get_usage_infos(thread_info* infos)
+ {
+@@ -104,19 +149,28 @@
+ 
+ 
+ static const char*
+-wait_object_to_string(scheduling_analysis_wait_object* waitObject, char* buffer)
++wait_object_to_string(scheduling_analysis_wait_object* waitObject, char* buffer,
++	bool nameOnly = false)
+ {
+ 	uint32 type = waitObject-&gt;type;
+ 	void* object = waitObject-&gt;object;
+ 
+ 	switch (type) {
+ 		case THREAD_BLOCK_TYPE_SEMAPHORE:
+-			sprintf(buffer, &quot;sem %ld (%s)&quot;, (sem_id)(addr_t)object,
+-				waitObject-&gt;name);
++			if (nameOnly) {
++				sprintf(buffer, &quot;sem \&quot;%s\&quot;&quot;, waitObject-&gt;name);
++			} else {
++				sprintf(buffer, &quot;sem %ld (%s)&quot;, (sem_id)(addr_t)object,
++					waitObject-&gt;name);
++			}
+ 			break;
+ 		case THREAD_BLOCK_TYPE_CONDITION_VARIABLE:
+-			sprintf(buffer, &quot;cvar %p (%s %p)&quot;, object, waitObject-&gt;name,
+-				waitObject-&gt;referenced_object);
++			if (nameOnly) {
++				sprintf(buffer, &quot;cvar \&quot;%s\&quot;&quot;, waitObject-&gt;name);
++			} else {
++				sprintf(buffer, &quot;cvar %p (%s %p)&quot;, object, waitObject-&gt;name,
++					waitObject-&gt;referenced_object);
++			}
+ 			break;
+ 		case THREAD_BLOCK_TYPE_SNOOZE:
+ 			strcpy(buffer, &quot;snooze&quot;);
+@@ -125,13 +179,19 @@
+ 			strcpy(buffer, &quot;signal&quot;);
+ 			break;
+ 		case THREAD_BLOCK_TYPE_MUTEX:
+-			sprintf(buffer, &quot;mutex %p (%s)&quot;, object, waitObject-&gt;name);
++			if (nameOnly)
++				sprintf(buffer, &quot;mutex \&quot;%s\&quot;&quot;, waitObject-&gt;name);
++			else
++				sprintf(buffer, &quot;mutex %p (%s)&quot;, object, waitObject-&gt;name);
+ 			break;
+ 		case THREAD_BLOCK_TYPE_RW_LOCK:
+-			sprintf(buffer, &quot;rwlock %p (%s)&quot;, object, waitObject-&gt;name);
++			if (nameOnly)
++				sprintf(buffer, &quot;rwlock \&quot;%s\&quot;&quot;, waitObject-&gt;name);
++			else
++				sprintf(buffer, &quot;rwlock %p (%s)&quot;, object, waitObject-&gt;name);
+ 			break;
+ 		case THREAD_BLOCK_TYPE_OTHER:
+-			sprintf(buffer, &quot;other %p&quot;, object);
++			sprintf(buffer, &quot;other %p (%s)&quot;, object, waitObject-&gt;name);
+ 			break;
+ 		default:
+ 			sprintf(buffer, &quot;unknown %p&quot;, object);
+@@ -166,22 +226,77 @@
+ 		exit(1);
+ 	}
+ 
++	// allocate arrays for grouping and sorting the wait objects
++	scheduling_analysis_thread_wait_object** waitObjects
++		= new(std::nothrow) scheduling_analysis_thread_wait_object*[
++			analysis.thread_wait_object_count];
++	ArrayDeleter&lt;scheduling_analysis_thread_wait_object*&gt; _2(waitObjects);
++
++	wait_object_group* waitObjectGroups = new(std::nothrow) wait_object_group[
++		analysis.thread_wait_object_count];
++	ArrayDeleter&lt;wait_object_group&gt; _3(waitObjectGroups);
++
++	if (waitObjects == NULL || waitObjectGroups == NULL) {
++		fprintf(stderr, &quot;Error: Out of memory\n&quot;);
++		exit(1);
++	}
++
+ 	printf(&quot;scheduling analysis: %lu threads, %llu wait objects, &quot;
+ 		&quot;%llu thread wait objects\n&quot;, analysis.thread_count,
+ 		analysis.wait_object_count, analysis.thread_wait_object_count);
+ 
++	// sort the thread by run time
++	std::sort(analysis.threads, analysis.threads + analysis.thread_count,
++		ThreadRunTimeComparator());
++
+ 	for (uint32 i = 0; i &lt; analysis.thread_count; i++) {
+ 		scheduling_analysis_thread* thread = analysis.threads[i];
+ 
+-		// compute total wait time
++		// compute total wait time and prepare the objects for sorting
++		int32 waitObjectCount = 0;
+ 		bigtime_t waitTime = 0;
+ 		scheduling_analysis_thread_wait_object* threadWaitObject
+ 			= thread-&gt;wait_objects;
+ 		while (threadWaitObject != NULL) {
++			waitObjects[waitObjectCount++] = threadWaitObject;
+ 			waitTime += threadWaitObject-&gt;wait_time;
+ 			threadWaitObject = threadWaitObject-&gt;next_in_list;
+ 		}
+ 
++		// sort the wait objects by type + name
++		std::sort(waitObjects, waitObjects + waitObjectCount,
++			WaitObjectGroupingComparator());
++
++		// create the groups
++		wait_object_group* group = NULL;
++		int32 groupCount = 0;
++		for (int32 i = 0; i &lt; waitObjectCount; i++) {
++			scheduling_analysis_thread_wait_object* threadWaitObject
++				= waitObjects[i];
++			scheduling_analysis_wait_object* waitObject
++				= threadWaitObject-&gt;wait_object;
++
++			if (groupCount == 0 || strcmp(waitObject-&gt;name, &quot;?&quot;) == 0
++				|| waitObject-&gt;type != group-&gt;objects[0]-&gt;wait_object-&gt;type
++				|| strcmp(waitObject-&gt;name,
++						group-&gt;objects[0]-&gt;wait_object-&gt;name) != 0) {
++				// create a new group
++				group = &amp;waitObjectGroups[groupCount++];
++				group-&gt;objects = waitObjects + i;
++				group-&gt;count = 0;
++				group-&gt;wait_time = 0;
++				group-&gt;waits = 0;
++			}
++
++			group-&gt;count++;
++			group-&gt;wait_time += threadWaitObject-&gt;wait_time;
++			group-&gt;waits += threadWaitObject-&gt;waits;
++		}
++
++		// sort the groups by wait time
++		std::sort(waitObjectGroups, waitObjectGroups + groupCount,
++			WaitObjectGroupTimeComparator());
++
+ 		printf(&quot;\nthread %ld \&quot;%s\&quot;:\n&quot;, thread-&gt;id, thread-&gt;name);
+ 		printf(&quot;  run time:    %lld us (%lld runs)\n&quot;, thread-&gt;total_run_time,
+ 			thread-&gt;runs);
+@@ -191,16 +306,43 @@
+ 		printf(&quot;  preemptions: %lld us (%lld)\n&quot;, thread-&gt;total_rerun_time,
+ 			thread-&gt;reruns);
+ 		printf(&quot;  unspecified: %lld us\n&quot;, thread-&gt;unspecified_wait_time);
++
+ 		printf(&quot;  waited on:\n&quot;);
+-		threadWaitObject = thread-&gt;wait_objects;
+-		while (threadWaitObject != NULL) {
+-			scheduling_analysis_wait_object* waitObject
+-				= threadWaitObject-&gt;wait_object;
++		for (int32 i = 0; i &lt; groupCount; i++) {
++			wait_object_group&amp; group = waitObjectGroups[i];
+ 			char buffer[1024];
+-			wait_object_to_string(waitObject, buffer);
+-			printf(&quot;    %s: %lld us\n&quot;, buffer, threadWaitObject-&gt;wait_time);
+ 
+-			threadWaitObject = threadWaitObject-&gt;next_in_list;
++			if (group.count == 1) {
++				// only one element -- just print it
++				scheduling_analysis_thread_wait_object* threadWaitObject
++					= group.objects[0];
++				scheduling_analysis_wait_object* waitObject
++					= threadWaitObject-&gt;wait_object;
++				wait_object_to_string(waitObject, buffer);
++				printf(&quot;    %s: %lld us (%lld)\n&quot;, buffer,
++					threadWaitObject-&gt;wait_time, threadWaitObject-&gt;waits);
++			} else {
++				// sort the wait objects by wait time
++				std::sort(group.objects, group.objects + group.count,
++					WaitObjectTimeComparator());
++
++				// print the group line
++				wait_object_to_string(group.objects[0]-&gt;wait_object, buffer,
++					true);
++				printf(&quot;    group %s: %lld us (%lld)\n&quot;, buffer,
++					group.wait_time, group.waits);
++
++				// print the wait objects
++				for (int32 k = 0; k &lt; group.count; k++) {
++					scheduling_analysis_thread_wait_object* threadWaitObject
++						= group.objects[k];
++					scheduling_analysis_wait_object* waitObject
++						= threadWaitObject-&gt;wait_object;
++					wait_object_to_string(waitObject, buffer);
++					printf(&quot;      %s: %lld us (%lld)\n&quot;, buffer,
++						threadWaitObject-&gt;wait_time, threadWaitObject-&gt;waits);
++				}
++			}
+ 		}
+ 	}
+ }
+@@ -314,7 +456,7 @@
+ 
+ 		bigtime_t total = info.user_time + info.kernel_time;
+ 		printf(&quot;%7ld  %-32s  %10lld  %10lld  %10lld  %6.2f\n&quot;, info.thread,
+-			info.name, info.user_time, info.kernel_time, total,
++			info.name, info.kernel_time, info.user_time, total,
+ 			(double)total / runTime * 100);
+ 
+ 		if (highlight)
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011519.html">[Haiku-commits] r27312 - in haiku/trunk: headers/private/system	src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="011521.html">[Haiku-commits] r27314 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11520">[ date ]</a>
+              <a href="thread.html#11520">[ thread ]</a>
+              <a href="subject.html#11520">[ subject ]</a>
+              <a href="author.html#11520">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

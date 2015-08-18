@@ -1,0 +1,180 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24332 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24332%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200803091744.m29Hivks010469%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006698.html">
+   <LINK REL="Next"  HREF="006706.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24332 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24332%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200803091744.m29Hivks010469%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24332 - in haiku/trunk: headers/private/kernel	src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Mar  9 18:44:57 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006698.html">[Haiku-commits] r24331 - haiku/trunk/src/tools/fs_shell
+</A></li>
+        <LI>Next message: <A HREF="006706.html">[Haiku-commits] r24332 - in haiku/trunk: headers/private/kernel src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6700">[ date ]</a>
+              <a href="thread.html#6700">[ thread ]</a>
+              <a href="subject.html#6700">[ subject ]</a>
+              <a href="author.html#6700">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-03-09 18:44:55 +0100 (Sun, 09 Mar 2008)
+New Revision: 24332
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24332&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24332&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/heap.h
+   haiku/trunk/src/system/kernel/heap.cpp
+Log:
+Added deferred_free() function, that can be used to free allocations
+in code that has interrupts disabled. The chunks of memories are queued
+and free()d periodically by a kernel daemon.
+
+
+Modified: haiku/trunk/headers/private/kernel/heap.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/heap.h	2008-03-09 17:41:42 UTC (rev 24331)
++++ haiku/trunk/headers/private/kernel/heap.h	2008-03-09 17:44:55 UTC (rev 24332)
+@@ -24,6 +24,8 @@
+ 
+ void *memalign(size_t alignment, size_t size);
+ 
++void deferred_free(void* block);
++
+ status_t heap_init(addr_t heapBase, size_t heapSize);
+ status_t heap_init_post_sem();
+ status_t heap_init_post_thread();
+
+Modified: haiku/trunk/src/system/kernel/heap.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/heap.cpp	2008-03-09 17:41:42 UTC (rev 24331)
++++ haiku/trunk/src/system/kernel/heap.cpp	2008-03-09 17:44:55 UTC (rev 24332)
+@@ -19,6 +19,8 @@
+ #include &lt;team.h&gt;
+ #include &lt;thread.h&gt;
+ #include &lt;tracing.h&gt;
++#include &lt;util/AutoLock.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
+ #include &lt;vm.h&gt;
+ 
+ //#define TRACE_HEAP
+@@ -81,6 +83,10 @@
+ 	heap_allocator_s *	next;
+ } heap_allocator;
+ 
++struct DeferredFreeListEntry : DoublyLinkedListLinkImpl&lt;DeferredFreeListEntry&gt; {
++};
++typedef DoublyLinkedList&lt;DeferredFreeListEntry&gt; DeferredFreeList;
++
+ static heap_allocator *sHeapList = NULL;
+ static heap_allocator *sLastGrowRequest = NULL;
+ static heap_allocator *sGrowHeap = NULL;
+@@ -88,7 +94,11 @@
+ static sem_id sHeapGrowSem = -1;
+ static sem_id sHeapGrownNotify = -1;
+ 
++static DeferredFreeList sDeferredFreeList;
++static spinlock sDeferredFreeListLock;
+ 
++
++
+ // #pragma mark - Tracing
+ 
+ #ifdef KERNEL_HEAP_TRACING
+@@ -962,6 +972,25 @@
+ }
+ 
+ 
++static void
++deferred_deleter(void *arg, int iteration)
++{
++	// move entries to on-stack list
++	InterruptsSpinLocker locker(sDeferredFreeListLock);
++	if (sDeferredFreeList.IsEmpty())
++		return;
++
++	DeferredFreeList entries;
++	entries.MoveFrom(&amp;sDeferredFreeList);
++
++	locker.Unlock();
++
++	// free the entries
++	while (DeferredFreeListEntry* entry = entries.RemoveHead())
++		free(entry);
++}
++
++
+ //	#pragma mark -
+ 
+ 
+@@ -1092,6 +1121,9 @@
+ 		return sHeapGrowThread;
+ 	}
+ 
++	if (register_kernel_daemon(deferred_deleter, NULL, 50) != B_OK)
++		panic(&quot;heap_init_post_thread(): failed to init deferred deleter&quot;);
++
+ 	send_signal_etc(sHeapGrowThread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 	return B_OK;
+ }
+@@ -1236,3 +1268,17 @@
+ 
+ 	return address;
+ }
++
++
++void
++deferred_free(void* block)
++{
++	if (block == NULL)
++		return;
++
++	// TODO: Use SinglyLinkedList, so that we only need sizeof(void*).
++	DeferredFreeListEntry* entry = new(block) DeferredFreeListEntry;
++
++	InterruptsSpinLocker _(sDeferredFreeListLock);
++	sDeferredFreeList.Add(entry);
++}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006698.html">[Haiku-commits] r24331 - haiku/trunk/src/tools/fs_shell
+</A></li>
+	<LI>Next message: <A HREF="006706.html">[Haiku-commits] r24332 - in haiku/trunk: headers/private/kernel src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6700">[ date ]</a>
+              <a href="thread.html#6700">[ thread ]</a>
+              <a href="subject.html#6700">[ subject ]</a>
+              <a href="author.html#6700">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

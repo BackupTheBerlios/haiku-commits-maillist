@@ -1,0 +1,140 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29481 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29481%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200903121424.n2CEObnb028468%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014797.html">
+   <LINK REL="Next"  HREF="014799.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29481 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29481%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200903121424.n2CEObnb028468%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29481 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Mar 12 15:24:37 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014797.html">[Haiku-commits] r29480 - haiku/trunk/src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="014799.html">[Haiku-commits] r29482 - haiku/trunk/src/bin/screen_blanker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14798">[ date ]</a>
+              <a href="thread.html#14798">[ thread ]</a>
+              <a href="subject.html#14798">[ subject ]</a>
+              <a href="author.html#14798">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-03-12 15:24:36 +0100 (Thu, 12 Mar 2009)
+New Revision: 29481
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29481&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29481&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h
+Log:
+* The InodeAllocator must remove the inode from the transaction before deleting
+  it, otherwise the transaction would access already freed memory when trying
+  to release its write lock of the inode.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2009-03-12 14:22:05 UTC (rev 29480)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2009-03-12 14:24:36 UTC (rev 29481)
+@@ -175,6 +175,8 @@
+ 			fInode-&gt;Node().flags &amp;= ~HOST_ENDIAN_TO_BFS_INT32(INODE_IN_USE);
+ 				// this unblocks any pending bfs_read_vnode() calls
+ 			fInode-&gt;Free(*fTransaction);
++			fTransaction-&gt;RemoveInode(fInode);
++
+ 			remove_vnode(volume-&gt;FSVolume(), fInode-&gt;ID());
+ 		} else
+ 			volume-&gt;Free(*fTransaction, fRun);
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2009-03-12 14:22:05 UTC (rev 29480)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2009-03-12 14:24:36 UTC (rev 29481)
+@@ -1080,6 +1080,11 @@
+ }
+ 
+ 
++/*!	Adds an inode to this transaction. This means that the inode will be write
++	locked until the transaction ended.
++	To ensure that the inode will stay valid until that point, an extra reference
++	is acquired to it as long as this transaction stays active.
++*/
+ void
+ Transaction::AddInode(Inode* inode)
+ {
+@@ -1102,6 +1107,19 @@
+ 
+ 
+ void
++Transaction::RemoveInode(Inode* inode)
++{
++	if (fJournal == NULL)
++		panic(&quot;Transaction is not running!&quot;);
++
++	fLockedInodes.Remove(inode);
++	rw_lock_write_unlock(&amp;inode-&gt;fLock);
++	if (!GetVolume()-&gt;IsInitializing())
++		put_vnode(GetVolume()-&gt;FSVolume(), inode-&gt;ID());
++}
++
++
++void
+ Transaction::_UnlockInodes()
+ {
+ 	while (Inode* inode = fLockedInodes.RemoveHead()) {
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h	2009-03-12 14:22:05 UTC (rev 29480)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h	2009-03-12 14:24:36 UTC (rev 29481)
+@@ -163,6 +163,7 @@
+ 		{ return fJournal-&gt;TransactionID(); }
+ 
+ 	void AddInode(Inode* inode);
++	void RemoveInode(Inode* inode);
+ 
+ private:
+ 	Transaction(const Transaction&amp; other);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014797.html">[Haiku-commits] r29480 - haiku/trunk/src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="014799.html">[Haiku-commits] r29482 - haiku/trunk/src/bin/screen_blanker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14798">[ date ]</a>
+              <a href="thread.html#14798">[ thread ]</a>
+              <a href="subject.html#14798">[ subject ]</a>
+              <a href="author.html#14798">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

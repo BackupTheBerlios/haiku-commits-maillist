@@ -1,0 +1,461 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26428 -	haiku/branches/developer/bonefish/vm/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26428%20-%0A%09haiku/branches/developer/bonefish/vm/src/system/kernel/vm&In-Reply-To=%3C200807151541.m6FFfugB000645%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010272.html">
+   <LINK REL="Next"  HREF="010274.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26428 -	haiku/branches/developer/bonefish/vm/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26428%20-%0A%09haiku/branches/developer/bonefish/vm/src/system/kernel/vm&In-Reply-To=%3C200807151541.m6FFfugB000645%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26428 -	haiku/branches/developer/bonefish/vm/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Jul 15 17:41:56 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010272.html">[Haiku-commits] r26427 - haiku/trunk/src/servers/app/drawing/Painter
+</A></li>
+        <LI>Next message: <A HREF="010274.html">[Haiku-commits] r26429 - haiku/trunk/src/apps/activitymonitor
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10273">[ date ]</a>
+              <a href="thread.html#10273">[ thread ]</a>
+              <a href="subject.html#10273">[ subject ]</a>
+              <a href="author.html#10273">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-07-15 17:41:54 +0200 (Tue, 15 Jul 2008)
+New Revision: 26428
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26428&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26428&amp;view=rev</A>
+
+Modified:
+   haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.cpp
+   haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.h
+Log:
+Patch by Zhao Shuai:
+* Added reservation of swap space in Commit().
+* Coding style improvements.
+
+
+Modified: haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.cpp
+===================================================================
+--- haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.cpp	2008-07-15 15:41:03 UTC (rev 26427)
++++ haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.cpp	2008-07-15 15:41:54 UTC (rev 26428)
+@@ -76,9 +76,11 @@
+ };
+ 
+ 
+-static int32 swap_space_alloc(int32);
+-static void swap_space_dealloc(int32, int32);
++static int32 swap_page_alloc(int32);
++static void swap_page_dealloc(int32, int32);
+ static struct swap_file *find_swap_file(int32);
++static status_t swap_space_reserve(size_t);
++static void swap_space_unreserve(size_t);
+ 
+ static object_cache * sSwapBlockCache;
+ 
+@@ -88,12 +90,16 @@
+ 
+ static struct swap_file *sSwapFileList = NULL;
+ static mutex sSwapFileListLock;
+-static int sSwapFileCount = 0;
+ static struct swap_file *sSwapFileAlloc = NULL; //allocate from here
++static int32 sSwapFileCount = 0;
+ 
++static off_t sAvailSwapSpace = 0; 
++static mutex sAvailSwapSpaceLock;
+ 
++
+ VMAnonymousCache::~VMAnonymousCache()
+ {
++	swap_space_unreserve(fCommittedSwapSize);
+ 	vm_unreserve_memory(committed_size);
+ }
+ 
+@@ -113,6 +119,7 @@
+ 	fHasPrecommitted = false;
+ 	fPrecommittedPages = min_c(numPrecommittedPages, 255);
+ 	fGuardedSize = numGuardPages * B_PAGE_SIZE;
++	fCommittedSwapSize = 0;
+ 
+ 	return B_OK;
+ }
+@@ -133,6 +140,13 @@
+ 			size = precommitted;
+ 	}
+ 
++	// reserve swap space first, only when running out of swap space,
++	// reserve real memory
++	if (swap_space_reserve(size) == B_OK) {
++		fCommittedSwapSize = size;
++		return B_OK;
++	}
++
+ 	// Check to see how much we could commit - we need real memory
+ 
+ 	if (size &gt; committed_size) {
+@@ -160,12 +174,9 @@
+ VMAnonymousCache::Read(off_t offset, const iovec *vecs, size_t count,
+ 	size_t *_numBytes, bool fsReenter)
+ {
+-	iovec iov;
+-	int32 i, j;
+-
+ 	off_t cacheOffset = offset &gt;&gt; PAGE_SHIFT;
+ 
+-	for (i = 0; i &lt; (int)count; i = j) {
++	for (int32 i = 0, j = 0; i &lt; (int)count; i = j) {
+ 		int32 startPageIndex = _SwapBlockGetAddress(cacheOffset + i);
+ 		for (j = i + 1; j &lt;(int)count; j++) {
+ 			int32 pageIndex = _SwapBlockGetAddress(cacheOffset + j);
+@@ -180,18 +191,19 @@
+ 		}
+ 
+ 		off_t pos = (startPageIndex - swapFile-&gt;first_page) * PAGE_SIZE;
++		iovec iov;
+ 		iov.iov_base = (void *)((int)vecs-&gt;iov_base + i * PAGE_SIZE);
+ 		iov.iov_len = (j - i) * PAGE_SIZE;
+ 
+-		status_t status = vfs_read_pages(swapFile-&gt;vnode, NULL, pos, &amp;iov, j - i,
+-				_numBytes, fsReenter);
++		status_t status = vfs_read_pages(swapFile-&gt;vnode, NULL, pos, &amp;iov, 
++				j - i, _numBytes, fsReenter);
+ 		if(status != B_OK)
+ 			return status;
+ 
+ 		for (int32 k = i; k &lt; j - i; k++)
+ 			_SwapBlockFree(cacheOffset + k);
+ 
+-		swap_space_dealloc(startPageIndex, j - i);
++		swap_page_dealloc(startPageIndex, j - i);
+ 	}
+ 
+ 	return B_OK;
+@@ -202,17 +214,12 @@
+ VMAnonymousCache::Write(off_t offset, const iovec *vecs, size_t count,
+ 	size_t *_numBytes, bool fsReenter)
+ {
+-	iovec iov;
+-	int32 pageIndex;
+-
+ 	offset &gt;&gt;= PAGE_SHIFT;
+-	iov.iov_base = vecs-&gt;iov_base;
+-	iov.iov_len = vecs-&gt;iov_len;
+-
+ 	int32 n = count;
+ 	for (int32 i = 0; i &lt; (int)count; i += n) {
++		int32 pageIndex;
+ 		//try to allocate n pages, if fail, try to allocate n/2 
+-		while ((pageIndex = swap_space_alloc(n)) == SWAP_PAGE_NONE	
++		while ((pageIndex = swap_page_alloc(n)) == SWAP_PAGE_NONE	
+ 				&amp;&amp; n &gt;= 2)
+ 			n &gt;&gt;= 1;
+ 		if (pageIndex == SWAP_PAGE_NONE)
+@@ -228,11 +235,12 @@
+ 		}
+ 
+ 		off_t pos = (pageIndex - swapFile-&gt;first_page) * PAGE_SIZE;
++		iovec iov;
+ 		iov.iov_base = (void *)((int)vecs-&gt;iov_base + i * PAGE_SIZE);
+ 		iov.iov_len = n * PAGE_SIZE;
+ 
+-		status_t status = vfs_write_pages(swapFile-&gt;vnode, NULL, pos, &amp;iov, n, 
+-			_numBytes, fsReenter);
++		status_t status = vfs_write_pages(swapFile-&gt;vnode, NULL, pos, &amp;iov, 
++				n, _numBytes, fsReenter);
+ 		if (status != B_OK)
+ 			return status;
+ 	}
+@@ -298,28 +306,32 @@
+ 		committed_size = actualSize;
+ 	}
+ 
+-	int32 sourceSwapIndex = SWAP_PAGE_NONE;  // page index in the swap file
+-
+ 	for (off_t offset = source-&gt;virtual_base; offset &lt; source-&gt;virtual_end;
+ 			offset += PAGE_SIZE) {
+-		sourceSwapIndex = source-&gt;_SwapBlockGetAddress(offset);
+-		if (sourceSwapIndex == SWAP_PAGE_NONE) // this page is not swapped out
++		int32 sourceSwapIndex = source-&gt;_SwapBlockGetAddress(offset);
++
++		if (sourceSwapIndex == SWAP_PAGE_NONE) 
++			// this page is not swapped out
+ 			continue;
+-		else if (LookupPage(offset)) { 
+-	 	// this page is shadowed and we can find it in the new cache,
+-		// free the swap block and swap space
+-			source-&gt;_SwapBlockFree(offset);
+-			swap_space_dealloc(sourceSwapIndex, 1);
+-		}
++
++		if (LookupPage(offset))  
++			// this page is shadowed and we can find it in the new cache,
++			// free the swap space
++			swap_page_dealloc(sourceSwapIndex, 1);
+ 		else { 
+ 			int32 swapIndex = _SwapBlockGetAddress(offset);
+-			if (swapIndex == SWAP_PAGE_NONE) 
+-			// the page is not shadowed, assign the swap address to the new cache
++
++			if (swapIndex == SWAP_PAGE_NONE) { 
++				// the page is not shadowed, 
++				// assign the swap address to the new cache
+ 				_SwapBlockBuild(offset, sourceSwapIndex);
+-			else // the page is shadowed but is also swapped out
+-				swap_space_dealloc(sourceSwapIndex, 1);
+-			source-&gt;_SwapBlockFree(offset);
++			} else {
++				// the page is shadowed and is also swapped out
++				swap_page_dealloc(sourceSwapIndex, 1);
++			}
+ 		}
++
++		source-&gt;_SwapBlockFree(offset);
+ 	}
+ }
+ 
+@@ -327,10 +339,10 @@
+ swap_block**
+ VMAnonymousCache::_SwapHash(off_t cacheOffset)
+ {
+-	cacheOffset &amp;= ~(off_t)(SWAP_BLOCK_MASK);
++	cacheOffset &amp;= ~(off_t)SWAP_BLOCK_MASK;
+ 
+-	struct swap_block **pswap = 
+-			&amp;sSwapHash[(cacheOffset ^ (int)(int *)this) &amp; sSwapHashMask];
++	struct swap_block **pswap 
++		= &amp;sSwapHash[(cacheOffset ^ (int)(int *)this) &amp; sSwapHashMask];
+ 	struct swap_block *swap = *pswap;
+ 
+     while (swap != NULL) {
+@@ -351,19 +363,20 @@
+ 	struct swap_block **pswap = _SwapHash(cacheOffset);
+ 	struct swap_block *swap = *pswap;
+ 	if (swap == NULL) {
+-		swap = *pswap = (struct swap_block *)object_cache_alloc(sSwapBlockCache, CACHE_DONT_SLEEP);
++		swap = *pswap = (struct swap_block *)
++			object_cache_alloc(sSwapBlockCache, CACHE_DONT_SLEEP);
+ 		if (swap == NULL) {
+ 			mutex_unlock(&amp;sSwapHashLock);
+ 			panic(&quot;swap block cache allocation error\n&quot;);
+ 		}
+ 
+-	swap-&gt;hash_next = NULL;
+-	swap-&gt;cache = this;
+-	swap-&gt;cache_offset = cacheOffset &amp; ~(off_t)SWAP_BLOCK_MASK;
+-	swap-&gt;used = 0;
++		swap-&gt;hash_next = NULL;
++		swap-&gt;cache = this;
++		swap-&gt;cache_offset = cacheOffset &amp; ~(off_t)SWAP_BLOCK_MASK;
++		swap-&gt;used = 0;
+ 
+-	for (int32 i = 0; i &lt; SWAP_BLOCK_PAGES; i++)
+-		swap-&gt;swap_pages[i] = SWAP_PAGE_NONE;
++		for (int32 i = 0; i &lt; SWAP_BLOCK_PAGES; i++)
++			swap-&gt;swap_pages[i] = SWAP_PAGE_NONE;
+ 	}
+ 
+ 	int32 blockIndex = cacheOffset &amp; SWAP_BLOCK_MASK;
+@@ -401,12 +414,12 @@
+ int32
+ VMAnonymousCache::_SwapBlockGetAddress(off_t cacheOffset)
+ {
+-	int32 pageIndex = SWAP_PAGE_NONE;
+-
+ 	mutex_lock(&amp;sSwapHashLock);
+ 
+ 	struct swap_block **pswap = _SwapHash(cacheOffset);
+ 	struct swap_block *swap = *pswap;
++
++	int32 pageIndex = SWAP_PAGE_NONE;
+ 	if (swap != NULL) {
+ 		int32 blockIndex = cacheOffset &amp; SWAP_BLOCK_MASK;
+ 		pageIndex = swap-&gt;swap_pages[blockIndex];
+@@ -424,8 +437,8 @@
+ 	struct swap_file *swapFile = sSwapFileList;
+ 
+ 	while (swapFile != NULL) {
+-		if (pageIndex &gt;= swapFile-&gt;first_page &amp;&amp; 
+-				pageIndex &lt; swapFile-&gt;last_page)
++		if (pageIndex &gt;= swapFile-&gt;first_page 
++				&amp;&amp; pageIndex &lt; swapFile-&gt;last_page)
+ 			break;
+ 		else
+ 			swapFile = swapFile-&gt;next;
+@@ -436,7 +449,7 @@
+ 
+ 
+ static int32 
+-swap_space_alloc(int32 npages)
++swap_page_alloc(int32 npages)
+ {
+ 	int32 hint, j;
+ 
+@@ -449,7 +462,8 @@
+ 
+ 		mutex_lock(&amp;sSwapFileAlloc-&gt;lock);
+ 		hint = sSwapFileAlloc-&gt;hint;
+-		int32 pageCount = sSwapFileAlloc-&gt;last_page - sSwapFileAlloc-&gt;first_page;
++		int32 pageCount = sSwapFileAlloc-&gt;last_page 
++			- sSwapFileAlloc-&gt;first_page;
+ 
+ 		int32 i = 0;
+ 		while (i &lt; npages &amp;&amp; (hint + npages) &lt; pageCount) {
+@@ -485,8 +499,8 @@
+ 
+ 	// if this swap file has used more than 90% percent of its pages
+ 	// switch to another
+-    if (sSwapFileAlloc-&gt;used &gt; 
+-			9 * (sSwapFileAlloc-&gt;last_page - sSwapFileAlloc-&gt;first_page) / 10)
++    if (sSwapFileAlloc-&gt;used 
++			&gt; 9 * (sSwapFileAlloc-&gt;last_page - sSwapFileAlloc-&gt;first_page) / 10)
+ 		sSwapFileAlloc = sSwapFileAlloc-&gt;next;
+ 
+ 	mutex_unlock(&amp;sSwapFileAlloc-&gt;lock);
+@@ -496,7 +510,7 @@
+ 
+ 
+ static void
+-swap_space_dealloc(int32 pageIndex, int32 npages)
++swap_page_dealloc(int32 pageIndex, int32 npages)
+ {
+ 	struct swap_file *swapFile = find_swap_file(pageIndex);
+ 
+@@ -516,6 +530,29 @@
+ }
+ 
+ 
++static status_t
++swap_space_reserve(size_t amount)
++{
++	mutex_lock(&amp;sAvailSwapSpaceLock);
++	if (sAvailSwapSpace &gt;= amount) {
++		sAvailSwapSpace -= amount;
++		return B_OK;
++	}
++	mutex_unlock(&amp;sAvailSwapSpaceLock);
++
++	return B_ERROR;
++}
++
++
++static void
++swap_space_unreserve(size_t amount)
++{
++	mutex_lock(&amp;sAvailSwapSpaceLock);
++	sAvailSwapSpace += amount;
++	mutex_unlock(&amp;sAvailSwapSpaceLock);
++}
++
++
+ status_t
+ swap_file_add(char *path)
+ {
+@@ -524,7 +561,8 @@
+ 	if (status != B_OK)
+ 		return status;
+ 
+-	struct swap_file *swap = (struct swap_file *)malloc(sizeof(struct swap_file));
++	struct swap_file *swap 
++		= (struct swap_file *)malloc(sizeof(struct swap_file));
+ 	if (swap == NULL)
+ 		return B_NO_MEMORY;
+ 
+@@ -569,8 +607,11 @@
+ 	}
+ 
+ 	sSwapFileCount++;
++	mutex_unlock(&amp;sSwapFileListLock);
+ 	
+-	mutex_unlock(&amp;sSwapFileListLock);
++	mutex_lock(&amp;sAvailSwapSpaceLock);
++	sAvailSwapSpace += pageCount * PAGE_SIZE;
++	mutex_unlock(&amp;sAvailSwapSpaceLock);
+ 
+ 	return B_OK;
+ }
+@@ -612,9 +653,12 @@
+ 	}
+ 
+ 	sSwapFileCount--;
+-
+ 	mutex_unlock(&amp;sSwapFileListLock);
+ 
++	mutex_lock(&amp;sAvailSwapSpaceLock);
++	sAvailSwapSpace -= (swapFile-&gt;last_page - swapFile-&gt;first_page) * PAGE_SIZE;
++	mutex_unlock(&amp;sAvailSwapSpaceLock);
++
+ 	mutex_destroy(&amp;swapFile-&gt;lock);
+ 	free(swapFile-&gt;maps);
+ 	free(swapFile);
+@@ -633,8 +677,8 @@
+ 		panic(&quot;can't create object cache for swap blocks\n&quot;);
+ 
+ 	// init swap hash table
+-	sSwapHash = (struct swap_block **)malloc(sizeof(struct swap_block *) * 
+-			SWAP_HASH_SIZE);
++	sSwapHash = (struct swap_block **)malloc(sizeof(struct swap_block *) 
++			* SWAP_HASH_SIZE);
+ 	if (sSwapHash == NULL)
+ 		panic(&quot;swap hash table allocation error\n&quot;);
+ 	sSwapHashMask = SWAP_HASH_SIZE - 1;
+@@ -644,4 +688,8 @@
+ 	mutex_init(&amp;sSwapFileListLock, &quot;swaplist&quot;);
+ 	sSwapFileAlloc = sSwapFileList;
+ 	sSwapFileCount = 0;
++
++	// init available swap space 
++	mutex_init(&amp;sAvailSwapSpaceLock, &quot;avail swap page&quot;);
++	sAvailSwapSpace = 0;
+ }
+
+Modified: haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.h
+===================================================================
+--- haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.h	2008-07-15 15:41:03 UTC (rev 26427)
++++ haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.h	2008-07-15 15:41:54 UTC (rev 26428)
+@@ -44,6 +44,7 @@
+ 	bool	fHasPrecommitted;
+ 	uint8	fPrecommittedPages;
+ 	int32	fGuardedSize;
++	off_t   fCommittedSwapSize;
+ };
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010272.html">[Haiku-commits] r26427 - haiku/trunk/src/servers/app/drawing/Painter
+</A></li>
+	<LI>Next message: <A HREF="010274.html">[Haiku-commits] r26429 - haiku/trunk/src/apps/activitymonitor
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10273">[ date ]</a>
+              <a href="thread.html#10273">[ thread ]</a>
+              <a href="subject.html#10273">[ subject ]</a>
+              <a href="author.html#10273">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

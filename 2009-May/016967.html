@@ -1,0 +1,367 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30886 -	haiku/trunk/src/add-ons/kernel/file_systems/iso9660
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30886%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/iso9660&In-Reply-To=%3C200905280039.n4S0dbCt025114%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016966.html">
+   <LINK REL="Next"  HREF="016969.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30886 -	haiku/trunk/src/add-ons/kernel/file_systems/iso9660</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30886%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/iso9660&In-Reply-To=%3C200905280039.n4S0dbCt025114%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30886 -	haiku/trunk/src/add-ons/kernel/file_systems/iso9660">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Thu May 28 02:39:37 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016966.html">[Haiku-commits] r30885 - haiku/trunk/data/system/boot
+</A></li>
+        <LI>Next message: <A HREF="016969.html">[Haiku-commits] r30887 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/attribute_overlay
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16967">[ date ]</a>
+              <a href="thread.html#16967">[ thread ]</a>
+              <a href="subject.html#16967">[ subject ]</a>
+              <a href="author.html#16967">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-05-28 02:39:33 +0200 (Thu, 28 May 2009)
+New Revision: 30886
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30886&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30886&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/iso9660/iso9660.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/iso9660/iso9660.h
+   haiku/trunk/src/add-ons/kernel/file_systems/iso9660/kernel_interface.cpp
+Log:
+Add actual support for relocated directories. In case we hit a placeholder file
+pointing to a relocated directory, we now re-initialize the node we are
+initializing with the first entry of the pointed at directory. This ought to be
+the &quot;.&quot; entry containing the proper flags, start block number and data length.
+As per the specs we do only keep the file id or alternate name of the
+placeholder and take everything else from the relocated directory.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/iso9660/iso9660.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/iso9660/iso9660.cpp	2009-05-27 23:55:35 UTC (rev 30885)
++++ haiku/trunk/src/add-ons/kernel/file_systems/iso9660/iso9660.cpp	2009-05-28 00:39:33 UTC (rev 30886)
+@@ -227,7 +227,8 @@
+ 	buffer += 2;
+ 
+ 	// Fill in directory record.
+-	InitNode(&amp;volume-&gt;rootDirRec, buffer, NULL, 0);
++	volume-&gt;joliet_level = 0;
++	InitNode(volume, &amp;volume-&gt;rootDirRec, buffer, NULL);
+ 
+ 	volume-&gt;rootDirRec.id = ISO_ROOTNODE_ID;
+ 	buffer += 34;
+@@ -283,7 +284,8 @@
+ 
+ 
+ static status_t
+-parse_rock_ridge(iso9660_inode* node, char* buffer, char* end)
++parse_rock_ridge(iso9660_volume* volume, iso9660_inode* node, char* buffer,
++	char* end, bool relocated)
+ {
+ 	// Now we're at the start of the rock ridge stuff
+ 	char* altName = NULL;
+@@ -497,11 +499,23 @@
+ 
+ 			// Deep directory record masquerading as a file.
+ 			case 'CL':
++			{
+ 				TRACE((&quot;RR: found CL, length %u\n&quot;, length));
+-				node-&gt;flags |= ISO_IS_DIR;
++				// Reinitialize the node with the information at the
++				// &quot;.&quot; entry of the pointed to directory data
+ 				node-&gt;startLBN[LSB_DATA] = *(uint32*)(buffer+4);
+ 				node-&gt;startLBN[MSB_DATA] = *(uint32*)(buffer+8);
++
++				char* buffer = (char*)block_cache_get(volume-&gt;fBlockCache,
++					node-&gt;startLBN[FS_DATA_FORMAT]);
++				if (buffer == NULL)
++					break;
++
++				InitNode(volume, node, buffer, NULL, true);
++				block_cache_put(volume-&gt;fBlockCache,
++					node-&gt;startLBN[FS_DATA_FORMAT]);
+ 				break;
++			}
+ 
+ 			case 'PL':
+ 				TRACE((&quot;RR: found PL, length %u\n&quot;, length));
+@@ -510,8 +524,9 @@
+ 			case 'RE':
+ 				// Relocated directory, we should skip.
+ 				TRACE((&quot;RR: found RE, length %u\n&quot;, length));
+-				// TODO: support relocated directories
+-				return B_NOT_SUPPORTED;
++				if (!relocated)
++					return B_NOT_SUPPORTED;
++				break;
+ 
+ 			case 'TF':
+ 				TRACE((&quot;RR: found TF, length %u\n&quot;, length));
+@@ -657,8 +672,10 @@
+ 
+ 					// Because Joliet-stuff starts at other sector,
+ 					// update root directory record.
+-					if (volume-&gt;joliet_level &gt; 0)
+-						InitNode(&amp;volume-&gt;rootDirRec, &amp;buffer[156], NULL, 0);
++					if (volume-&gt;joliet_level &gt; 0) {
++						InitNode(volume, &amp;volume-&gt;rootDirRec, &amp;buffer[156],
++							NULL);
++					}
+ 				}
+ 			} else if (*(unsigned char *)buffer == 0xff) {
+ 				// ISO_VD_END
+@@ -728,8 +745,8 @@
+ 		if (blockData != NULL &amp;&amp; totalRead &lt; cookie-&gt;totalSize) {
+ 			iso9660_inode node;
+ 			size_t bytesRead = 0;
+-			result = InitNode(&amp;node, blockData + cookie-&gt;pos, &amp;bytesRead,
+-				volume-&gt;joliet_level);
++			result = InitNode(volume, &amp;node, blockData + cookie-&gt;pos,
++				&amp;bytesRead);
+ 
+ 			// if we hit an entry that we don't support, we just skip it
+ 			if (result != B_OK &amp;&amp; result != B_NOT_SUPPORTED)
+@@ -786,8 +803,8 @@
+ 
+ 
+ status_t
+-InitNode(iso9660_inode* node, char* buffer, size_t* _bytesRead,
+-	uint8 jolietLevel)
++InitNode(iso9660_volume* volume, iso9660_inode* node, char* buffer,
++	size_t* _bytesRead, bool relocated)
+ {
+ 	uint8 recordLength = *(uint8*)buffer++;
+ 	size_t nameLength;
+@@ -802,10 +819,13 @@
+ 
+ 	char* end = buffer + recordLength;
+ 
+-	node-&gt;cache = NULL;
+-	node-&gt;name = NULL;
+-	node-&gt;attr.slName = NULL;
+-	memset(node-&gt;attr.stat, 0, sizeof(node-&gt;attr.stat));
++	if (!relocated) {
++		node-&gt;cache = NULL;
++		node-&gt;name = NULL;
++		node-&gt;attr.slName = NULL;
++		memset(node-&gt;attr.stat, 0, sizeof(node-&gt;attr.stat));
++	} else
++		free(node-&gt;attr.slName);
+ 
+ 	node-&gt;extAttrRecLen = *(uint8*)buffer++;
+ 	TRACE((&quot;InitNode - ext attr length is %d\n&quot;, (int)node-&gt;extAttrRecLen));
+@@ -843,10 +863,15 @@
+ 	buffer += 4;
+ 	TRACE((&quot;InitNode - volume seq num is %d\n&quot;, (int)node-&gt;volSeqNum));
+ 
+-	node-&gt;name_length = *(uint8*)buffer;
++	nameLength = *(uint8*)buffer;
+ 	buffer++;
+-	TRACE((&quot;InitNode - file id length is %u\n&quot;, node-&gt;name_length));
+ 
++	// for relocated directories we take the name from the placeholder entry
++	if (!relocated) {
++		node-&gt;name_length = nameLength;
++		TRACE((&quot;InitNode - file id length is %u\n&quot;, node-&gt;name_length));
++	}
++
+ 	// Set defaults, in case there is no RockRidge stuff.
+ 	node-&gt;attr.stat[FS_DATA_FORMAT].st_mode |= (node-&gt;flags &amp; ISO_IS_DIR) != 0
+ 		? S_IFDIR | S_IXUSR | S_IRUSR | S_IXGRP | S_IRGRP | S_IXOTH | S_IROTH
+@@ -857,68 +882,68 @@
+ 		return B_ENTRY_NOT_FOUND;
+ 	}
+ 
+-	nameLength = node-&gt;name_length;
++	if (!relocated) {
++		// JOLIET extension:
++		// on joliet discs, buffer[0] can be 0 for Unicoded filenames,
++		// so I've added a check here to test explicitely for
++		// directories (which have length 1)
++		// Take care of &quot;.&quot; and &quot;..&quot;, the first two dirents are
++		// these in iso.
++		if (node-&gt;name_length == 1 &amp;&amp; buffer[0] == 0) {
++			node-&gt;name = strdup(&quot;.&quot;);
++			node-&gt;name_length = 1;
++		} else if (node-&gt;name_length == 1 &amp;&amp; buffer[0] == 1) {
++			node-&gt;name = strdup(&quot;..&quot;);
++			node-&gt;name_length = 2;
++		} else if (volume-&gt;joliet_level &gt; 0) {
++			// JOLIET extension: convert Unicode16 string to UTF8
++			// Assume that the unicode-&gt;utf8 conversion produces 4 byte
++			// utf8 characters, and allocate that much space
++			node-&gt;name = (char*)malloc(node-&gt;name_length * 2 + 1);
++			if (node-&gt;name == NULL)
++				return B_NO_MEMORY;
+ 
+-	// JOLIET extension:
+-	// on joliet discs, buffer[0] can be 0 for Unicoded filenames,
+-	// so I've added a check here to test explicitely for
+-	// directories (which have length 1)
+-	// Take care of &quot;.&quot; and &quot;..&quot;, the first two dirents are
+-	// these in iso.
+-	if (node-&gt;name_length == 1 &amp;&amp; buffer[0] == 0) {
+-		node-&gt;name = strdup(&quot;.&quot;);
+-		node-&gt;name_length = 1;
+-	} else if (node-&gt;name_length == 1 &amp;&amp; buffer[0] == 1) {
+-		node-&gt;name = strdup(&quot;..&quot;);
+-		node-&gt;name_length = 2;
+-	} else if (jolietLevel &gt; 0) {
+-		// JOLIET extension: convert Unicode16 string to UTF8
+-		// Assume that the unicode-&gt;utf8 conversion produces 4 byte
+-		// utf8 characters, and allocate that much space
+-		node-&gt;name = (char*)malloc(node-&gt;name_length * 2 + 1);
+-		if (node-&gt;name == NULL)
+-			return B_NO_MEMORY;
++			int32 sourceLength = node-&gt;name_length;
++			int32 destLength = node-&gt;name_length * 2;
+ 
+-		int32 sourceLength = node-&gt;name_length;
+-		int32 destLength = node-&gt;name_length * 2;
++			status_t status = unicode_to_utf8(buffer, &amp;sourceLength,
++				node-&gt;name, &amp;destLength);
++			if (status &lt; B_OK) {
++				dprintf(&quot;iso9660: error converting unicode-&gt;utf8\n&quot;);
++				return status;
++			}
+ 
+-		status_t status = unicode_to_utf8(buffer, &amp;sourceLength,
+-			node-&gt;name, &amp;destLength);
+-		if (status &lt; B_OK) {
+-			dprintf(&quot;iso9660: error converting unicode-&gt;utf8\n&quot;);
+-			return status;
+-		}
++			node-&gt;name[destLength] = '\0';
++			node-&gt;name_length = destLength;
+ 
+-		node-&gt;name[destLength] = '\0';
+-		node-&gt;name_length = destLength;
++			sanitize_iso_name(node, false);
++		} else {
++			node-&gt;name = (char*)malloc(node-&gt;name_length + 1);
++			if (node-&gt;name == NULL)
++				return B_NO_MEMORY;
+ 
+-		sanitize_iso_name(node, false);
+-	} else {
+-		node-&gt;name = (char*)malloc(node-&gt;name_length + 1);
+-		if (node-&gt;name == NULL)
+-			return B_NO_MEMORY;
++			// convert all characters to lower case
++			for (uint32 i = 0; i &lt; node-&gt;name_length; i++)
++				node-&gt;name[i] = tolower(buffer[i]);
+ 
+-		// convert all characters to lower case
+-		for (uint32 i = 0; i &lt; node-&gt;name_length; i++) {
+-			node-&gt;name[i] = tolower(buffer[i]);
++			node-&gt;name[node-&gt;name_length] = '\0';
++
++			sanitize_iso_name(node, true);
+ 		}
+-		node-&gt;name[node-&gt;name_length] = '\0';
+ 
+-		sanitize_iso_name(node, true);
++		if (node-&gt;name == NULL) {
++			TRACE((&quot;InitNode - unable to allocate memory!\n&quot;));
++			return B_NO_MEMORY;
++		}
+ 	}
+ 
+-	if (node-&gt;name == NULL) {
+-		TRACE((&quot;InitNode - unable to allocate memory!\n&quot;));
+-		return B_NO_MEMORY;
+-	}
+-
+ 	buffer += nameLength;
+ 	if (nameLength % 2 == 0)
+ 		buffer++;
+ 
+ 	TRACE((&quot;DirRec ID String is: %s\n&quot;, node-&gt;name));
+ 
+-	return parse_rock_ridge(node, buffer, end);
++	return parse_rock_ridge(volume, node, buffer, end, relocated);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/iso9660/iso9660.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/iso9660/iso9660.h	2009-05-27 23:55:35 UTC (rev 30885)
++++ haiku/trunk/src/add-ons/kernel/file_systems/iso9660/iso9660.h	2009-05-28 00:39:33 UTC (rev 30886)
+@@ -216,8 +216,8 @@
+ 	bool allowJoliet);
+ status_t ISOReadDirEnt(iso9660_volume* ns, dircookie* cookie,
+ 	struct dirent* buffer, size_t bufferSize);
+-status_t InitNode(iso9660_inode* rec, char* buf, size_t* bytesRead,
+-	uint8 jolietLevel);
++status_t InitNode(iso9660_volume* volume, iso9660_inode* rec, char* buf,
++	size_t* bytesRead, bool relocated = false);
+ status_t ConvertRecDate(ISORecDate* inDate, time_t* outDate);
+ 
+ #endif	/* ISO_9660_H */
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/iso9660/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/iso9660/kernel_interface.cpp	2009-05-27 23:55:35 UTC (rev 30885)
++++ haiku/trunk/src/add-ons/kernel/file_systems/iso9660/kernel_interface.cpp	2009-05-28 00:39:33 UTC (rev 30886)
+@@ -264,8 +264,7 @@
+ 			&amp;&amp; totalRead + blockBytesRead &lt; dataLength
+ 			&amp;&amp; blockData[0] != 0
+ 			&amp;&amp; !done) {
+-			initResult = InitNode(&amp;node, blockData, &amp;bytesRead,
+-				ns-&gt;joliet_level);
++			initResult = InitNode(ns, &amp;node, blockData, &amp;bytesRead);
+ 			TRACE((&quot;fs_walk - InitNode returned %s, filename %s, %u bytes &quot;
+ 				&quot;read\n&quot;, strerror(initResult), node.name, (unsigned)bytesRead));
+ 
+@@ -341,7 +340,7 @@
+ 		return B_IO_ERROR;
+ 	}
+ 
+-	status_t result = InitNode(newNode, data + pos, NULL, ns-&gt;joliet_level);
++	status_t result = InitNode(ns, newNode, data + pos, NULL);
+ 	block_cache_put(ns-&gt;fBlockCache, block);
+ 
+ 	if (result &lt; B_OK) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016966.html">[Haiku-commits] r30885 - haiku/trunk/data/system/boot
+</A></li>
+	<LI>Next message: <A HREF="016969.html">[Haiku-commits] r30887 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/attribute_overlay
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16967">[ date ]</a>
+              <a href="thread.html#16967">[ thread ]</a>
+              <a href="subject.html#16967">[ subject ]</a>
+              <a href="author.html#16967">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

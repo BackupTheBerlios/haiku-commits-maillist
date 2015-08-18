@@ -1,0 +1,514 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27670 - in haiku/trunk: headers/os/interface	src/kits/interface
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27670%20-%20in%20haiku/trunk%3A%20headers/os/interface%0A%09src/kits/interface&In-Reply-To=%3C200809211536.m8LFar9B006368%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012072.html">
+   <LINK REL="Next"  HREF="012074.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27670 - in haiku/trunk: headers/os/interface	src/kits/interface</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27670%20-%20in%20haiku/trunk%3A%20headers/os/interface%0A%09src/kits/interface&In-Reply-To=%3C200809211536.m8LFar9B006368%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27670 - in haiku/trunk: headers/os/interface	src/kits/interface">stippi at mail.berlios.de
+       </A><BR>
+    <I>Sun Sep 21 17:36:53 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012072.html">[Haiku-commits] r27669 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="012074.html">[Haiku-commits] r27670 - in haiku/trunk: headers/os/interface	src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12073">[ date ]</a>
+              <a href="thread.html#12073">[ thread ]</a>
+              <a href="subject.html#12073">[ subject ]</a>
+              <a href="author.html#12073">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2008-09-21 17:36:44 +0200 (Sun, 21 Sep 2008)
+New Revision: 27670
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27670&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27670&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/os/interface/TextView.h
+   haiku/trunk/src/kits/interface/TextView.cpp
+Log:
+* First steps towards making BTextView behave well within the layout management.
+* The class calculates a minimum width now, which is based on the line height,
+  this may also fix the bug with the small text inputs in the Pe Find window.
+* Added TODOs about implementing GetHeightForWidth(), which may be a good idea
+  when a BTextView is used as non-editable informative text in an interface,
+  and one wants to make sure that the entire text is shown.
+* Replaced the call to _Refresh() in Draw(), which recalculates all the line
+  breaks for no reason with _DrawLines() again. The TODO mentioned that text
+  will be drawn without drawing the background first, but maybe this is a
+  relict from times where Draw() was invoked directly? At least I cannot see
+  any negative consequences, and this should be much more efficient.
+  (Other than that, this patch should hopefully have no potential negative
+  side effects...&lt;crosses fingers&gt;)
+
+
+Modified: haiku/trunk/headers/os/interface/TextView.h
+===================================================================
+--- haiku/trunk/headers/os/interface/TextView.h	2008-09-21 15:29:02 UTC (rev 27669)
++++ haiku/trunk/headers/os/interface/TextView.h	2008-09-21 15:36:44 UTC (rev 27670)
+@@ -210,6 +210,24 @@
+ 
+ 	virtual	void				ResizeToPreferred();
+ 	virtual	void				GetPreferredSize(float* _width, float* _height);
++
++	virtual	BSize				MinSize();
++	virtual	BSize				MaxSize();
++	virtual	BSize				PreferredSize();
++
++	virtual	bool				HasHeightForWidth();
++	virtual	void				GetHeightForWidth(float width, float* min,
++									float* max, float* preferred);
++
++	virtual	void				InvalidateLayout(bool descendants = false);
++
++protected:
++	virtual	void				DoLayout();
++
++private:
++			void				_ValidateLayoutData();
++
++public:
+ 	virtual	void				AllAttached();
+ 	virtual	void				AllDetached();
+ 
+
+Modified: haiku/trunk/src/kits/interface/TextView.cpp
+===================================================================
+--- haiku/trunk/src/kits/interface/TextView.cpp	2008-09-21 15:29:02 UTC (rev 27669)
++++ haiku/trunk/src/kits/interface/TextView.cpp	2008-09-21 15:36:44 UTC (rev 27670)
+@@ -32,6 +32,7 @@
+ #include &lt;Clipboard.h&gt;
+ #include &lt;Debug.h&gt;
+ #include &lt;Input.h&gt;
++#include &lt;LayoutUtils.h&gt;
+ #include &lt;MessageRunner.h&gt;
+ #include &lt;PropertyInfo.h&gt;
+ #include &lt;Region.h&gt;
+@@ -48,13 +49,23 @@
+ 
+ using namespace std;
+ 
+-//#define TRACE_TEXTVIEW
+-#ifdef TRACE_TEXTVIEW
+-#	define CALLED() printf(&quot;%s\n&quot;, __PRETTY_FUNCTION__)
++#undef TRACE
++#undef CALLED
++//#define TRACE_TEXT_VIEW
++#ifdef TRACE_TEXT_VIEW
++#	include &lt;FunctionTracer.h&gt;
++	static int32 sFunctionDepth = -1;
++#	define CALLED(x...)	FunctionTracer _ft(&quot;BTextView&quot;, __FUNCTION__, \
++							sFunctionDepth)
++#	define TRACE(x...)	{ BString _to; \
++							_to.Append(' ', (sFunctionDepth + 1) * 2); \
++							printf(&quot;%s&quot;, _to.String()); printf(x); }
+ #else
+-#	define CALLED()
++#	define CALLED(x...)
++#	define TRACE(x...)
+ #endif
+ 
++
+ #define USE_WIDTHBUFFER 1
+ #define USE_DOUBLEBUFFERING 0
+ 
+@@ -111,22 +122,30 @@
+ 
+ 
+ struct BTextView::LayoutData {
+-	LayoutData(float leftInset, float topInset, float rightInset,
+-			float bottomInset)
+-		: leftInset(leftInset),
+-		  topInset(topInset),
+-		  rightInset(rightInset),
+-		  bottomInset(bottomInset),
++	LayoutData()
++		: leftInset(0),
++		  topInset(0),
++		  rightInset(0),
++		  bottomInset(0),
+ 		  valid(false)
+ 	{
+ 	}
+ 
++	void UpdateInsets(const BRect&amp; bounds, const BRect&amp; textRect)
++	{
++		leftInset = textRect.left - bounds.left;
++		topInset = textRect.top - bounds.top;
++		rightInset = bounds.right - textRect.right;
++		bottomInset = bounds.bottom - textRect.bottom;
++	}
++
+ 	float				leftInset;
+ 	float				topInset;
+ 	float				rightInset;
+ 	float				bottomInset;
+ 
+ 	BSize				min;
++	BSize				preferred;
+ 	bool				valid;
+ };
+ 
+@@ -242,7 +261,7 @@
+ 	: BView(name, flags | B_FRAME_EVENTS | B_PULSE_NEEDED
+ 		| B_INPUT_METHOD_AWARE)
+ {
+-	// TODO: ...
++	_InitObject(Bounds(), NULL, NULL);
+ }
+ 
+ 
+@@ -259,7 +278,7 @@
+ 	: BView(name, flags | B_FRAME_EVENTS | B_PULSE_NEEDED
+ 		| B_INPUT_METHOD_AWARE)
+ {
+-	// TODO: ...
++	_InitObject(Bounds(), initialFont, initialColor);
+ }
+ 
+ 
+@@ -362,6 +381,7 @@
+ 	delete fUndo;
+ 	delete fClickRunner;
+ 	delete fDragRunner;	
++	delete fLayoutData;
+ }
+ 
+ 
+@@ -487,14 +507,10 @@
+ BTextView::Draw(BRect updateRect)
+ {
+ 	// what lines need to be drawn?
+-	int32 startLine = LineAt(BPoint(0.0f, updateRect.top));
+-	int32 endLine = LineAt(BPoint(0.0f, updateRect.bottom));
++	int32 startLine = LineAt(BPoint(0.0, updateRect.top));
++	int32 endLine = LineAt(BPoint(0.0, updateRect.bottom));
+ 
+-	// TODO: _DrawLines draw the text over and over, causing the text to
+-	// antialias against itself. In theory we should use an offscreen bitmap
+-	// to draw the text which would eliminate the problem.
+-	//_DrawLines(startLine, endLine);
+-	_Refresh(OffsetAt(startLine), OffsetAt(endLine + 1), false, false);
++	_DrawLines(startLine, endLine);
+ }
+ 
+ 
+@@ -1555,7 +1571,10 @@
+ 	fStyles-&gt;SetStyleRange(startOffset, endOffset, fText-&gt;Length(),
+ 		fontMode, &amp;newFont, color);
+ 
+-	if (fontMode &amp; B_FONT_FAMILY_AND_STYLE || fontMode &amp; B_FONT_SIZE) {
++	if ((fontMode &amp; (B_FONT_FAMILY_AND_STYLE | B_FONT_SIZE)) != 0) {
++		// TODO: maybe only invalidate the layout (depending on
++		// B_SUPPORTS_LAYOUT) and have it _Refresh() automatically?
++		InvalidateLayout();
+ 		// recalc the line breaks and redraw with new style
+ 		_Refresh(startOffset, endOffset, startOffset != endOffset, false);
+ 	} else {
+@@ -2052,6 +2071,9 @@
+ }
+ 
+ 
++// #pragma mark - configuration
++
++
+ /*! \brief Sets the BTextView's text rectangle to be the same as the passed
+ 		rect.
+ 	\param rect A BRect.
+@@ -2064,7 +2086,11 @@
+ 		
+ 	fTextRect = rect;
+ 	fMinTextRectWidth = fTextRect.Width();
++		// used in auto-resizing mode to keep the text rect from
++		// shrinking below a certain value.
+ 
++	fLayoutData-&gt;UpdateInsets(Bounds(), fTextRect);
++
+ 	if (Window() != NULL)
+ 		Invalidate();		
+ }
+@@ -2085,10 +2111,19 @@
+ void
+ BTextView::SetInsets(float left, float top, float right, float bottom)
+ {
+-	// TODO:
+-	// * store in layout data
+-	// * invalidate layout
+-	// * invalidate view
++	if (fLayoutData-&gt;leftInset == left
++		&amp;&amp; fLayoutData-&gt;topInset == top
++		&amp;&amp; fLayoutData-&gt;rightInset == right
++		&amp;&amp; fLayoutData-&gt;bottomInset == bottom)
++		return;
++
++	fLayoutData-&gt;leftInset = left;
++	fLayoutData-&gt;topInset = top;
++	fLayoutData-&gt;rightInset = right;
++	fLayoutData-&gt;bottomInset = bottom;
++
++	InvalidateLayout();
++	Invalidate();
+ }
+ 
+ 
+@@ -2497,23 +2532,171 @@
+ }
+ 
+ 
++// #pragma mark -
++
++
+ void
+ BTextView::ResizeToPreferred()
+ {
+-	float widht, height;
+-	GetPreferredSize(&amp;widht, &amp;height);
+-	BView::ResizeTo(widht, height);
++	BView::ResizeToPreferred();
+ }
+ 
+ 
+ void
+-BTextView::GetPreferredSize(float *width, float *height)
++BTextView::GetPreferredSize(float* _width, float* _height)
+ {
+-	BView::GetPreferredSize(width, height);
++	CALLED();
++
++	_ValidateLayoutData();
++
++	if (_width)
++		*_width = fLayoutData-&gt;min.width;
++
++	if (_height)
++		*_height = fLayoutData-&gt;min.height;
+ }
+ 
+ 
++BSize
++BTextView::MinSize()
++{
++	CALLED();
++
++	_ValidateLayoutData();
++	return BLayoutUtils::ComposeSize(ExplicitMinSize(), fLayoutData-&gt;min);
++}
++
++
++BSize
++BTextView::MaxSize()
++{
++	CALLED();
++
++	return BLayoutUtils::ComposeSize(ExplicitMaxSize(),
++		BSize(B_SIZE_UNLIMITED, B_SIZE_UNLIMITED));
++}
++
++
++BSize
++BTextView::PreferredSize()
++{
++	CALLED();
++
++	_ValidateLayoutData();
++	return BLayoutUtils::ComposeSize(ExplicitPreferredSize(),
++		fLayoutData-&gt;preferred);
++}
++
++
++bool
++BTextView::HasHeightForWidth()
++{
++	// TODO: When not editable and not embedded in a scroll view, we should
++	// assume that all text is supposed to be visible.
++	return BView::HasHeightForWidth();
++}
++
++
+ void
++BTextView::GetHeightForWidth(float width, float* min, float* max,
++	float* preferred)
++{
++	// TODO: See above and implement.
++	BView::GetHeightForWidth(width, min, max, preferred);
++}
++
++									
++void
++BTextView::InvalidateLayout(bool descendants)
++{
++	CALLED();
++
++	fLayoutData-&gt;valid = false;
++
++	BView::InvalidateLayout(descendants);
++}
++
++
++void
++BTextView::DoLayout()
++{
++	// Bail out, if we shan't do layout.
++	if (!(Flags() &amp; B_SUPPORTS_LAYOUT))
++		return;
++
++	CALLED();
++
++	// If the user set a layout, we let the base class version call its
++	// hook.
++	if (GetLayout()) {
++		BView::DoLayout();
++		return;
++	}
++
++	_ValidateLayoutData();
++
++	// validate current size
++	BSize size(Bounds().Size());
++	if (size.width &lt; fLayoutData-&gt;min.width)
++		size.width = fLayoutData-&gt;min.width;
++	if (size.height &lt; fLayoutData-&gt;min.height)
++		size.height = fLayoutData-&gt;min.height;
++
++	// layout text rect
++	BPoint previousLocation = fTextRect.LeftTop();
++	float previousTextWidth = fTextRect.Width();
++
++	fTextRect = Bounds();
++	fTextRect.left += fLayoutData-&gt;leftInset;
++	fTextRect.top += fLayoutData-&gt;topInset;
++	fTextRect.right -= fLayoutData-&gt;rightInset;
++	fTextRect.bottom -= fLayoutData-&gt;bottomInset;
++
++	// recalculate linebreaks and invalidate if necessary
++	if (previousTextWidth != fTextRect.Width()
++		|| previousLocation != fTextRect.LeftTop()) {
++		int32 startLine = 0;
++		int32 endLine = fLines-&gt;NumLines() - 1;
++		_RecalculateLineBreaks(&amp;startLine, &amp;endLine);
++	}
++
++	Invalidate();
++}
++
++
++void
++BTextView::_ValidateLayoutData()
++{
++	if (fLayoutData-&gt;valid)
++		return;
++
++	CALLED();
++
++	float lineHeight = ceilf(LineHeight(0));
++	TRACE(&quot;line height: %.2f\n&quot;, lineHeight);
++
++	// compute our minimal size
++	BSize min(lineHeight * 3, lineHeight);
++	min.width += fLayoutData-&gt;leftInset + fLayoutData-&gt;rightInset;
++	min.height += fLayoutData-&gt;topInset + fLayoutData-&gt;bottomInset;
++
++	fLayoutData-&gt;min = min;
++
++	// compute our preferred size
++	fLayoutData-&gt;preferred = min;
++	fLayoutData-&gt;preferred.width += lineHeight * 6;
++	fLayoutData-&gt;preferred.height += lineHeight * 2;
++
++	fLayoutData-&gt;valid = true;
++
++	TRACE(&quot;width: %.2f, height: %.2f\n&quot;, min.width, min.height);
++}
++
++
++// #pragma mark -
++
++
++void
+ BTextView::AllAttached()
+ {
+ 	BView::AllAttached();
+@@ -2840,6 +3023,7 @@
+ 		// When used within the layout management framework, the
+ 		// text rect is changed to maintain constant insets.
+ 	fMinTextRectWidth = fTextRect.Width();
++		// see SetTextRect()
+ 	fSelStart = fSelEnd = 0;
+ 	fCaretVisible = false;
+ 	fCaretTime = 0;
+@@ -2867,6 +3051,9 @@
+ 	fDragRunner = NULL;
+ 	fClickRunner = NULL;
+ 	fTrackingMouse = NULL;
++
++	fLayoutData = new LayoutData;
++	fLayoutData-&gt;UpdateInsets(Bounds(), fTextRect);
+ }
+ 
+ 
+@@ -3275,6 +3462,8 @@
+ void
+ BTextView::_RecalculateLineBreaks(int32 *startLine, int32 *endLine)
+ {
++	CALLED();
++
+ 	// are we insane?
+ 	*startLine = (*startLine &lt; 0) ? 0 : *startLine;
+ 	*endLine = (*endLine &gt; fLines-&gt;NumLines() - 1) ? fLines-&gt;NumLines() - 1
+@@ -3283,7 +3472,13 @@
+ 	int32 textLength = fText-&gt;Length();
+ 	int32 lineIndex = (*startLine &gt; 0) ? *startLine - 1 : 0;
+ 	int32 recalThreshold = (*fLines)[*endLine + 1]-&gt;offset;
+-	float width = fTextRect.Width();
++	float width = max_c(fTextRect.Width(), 10);
++		// TODO: The minimum width of 10 is a work around for the following
++		// problem: If the text rect is too small, we are not calculating any
++		// line heights, not even for the first line. Maybe this is a bug
++		// in the algorithm, but other places in the class rely on at least
++		// the first line to return a valid height. Maybe &quot;10&quot; should really
++		// be the width of the very first glyph instead.
+ 	STELine* curLine = (*fLines)[lineIndex];
+ 	STELine* nextLine = curLine + 1;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012072.html">[Haiku-commits] r27669 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="012074.html">[Haiku-commits] r27670 - in haiku/trunk: headers/os/interface	src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12073">[ date ]</a>
+              <a href="thread.html#12073">[ thread ]</a>
+              <a href="subject.html#12073">[ subject ]</a>
+              <a href="author.html#12073">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

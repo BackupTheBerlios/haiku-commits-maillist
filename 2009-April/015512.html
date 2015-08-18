@@ -1,0 +1,991 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29981 -	haiku/trunk/src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29981%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200904062118.n36LIU9r026187%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015511.html">
+   <LINK REL="Next"  HREF="015514.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29981 -	haiku/trunk/src/add-ons/kernel/network/stack</H1>
+    <B>axeld at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29981%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200904062118.n36LIU9r026187%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29981 -	haiku/trunk/src/add-ons/kernel/network/stack">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Apr  6 23:18:30 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015511.html">[Haiku-commits] r29980 - haiku/trunk/headers/private/kernel/util
+</A></li>
+        <LI>Next message: <A HREF="015514.html">[Haiku-commits] r29982 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15512">[ date ]</a>
+              <a href="thread.html#15512">[ thread ]</a>
+              <a href="subject.html#15512">[ subject ]</a>
+              <a href="author.html#15512">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-04-06 23:18:29 +0200 (Mon, 06 Apr 2009)
+New Revision: 29981
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29981&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29981&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp
+Log:
+* Now uses DoublyLinkedList instead of the struct list C stuff.
+* Cleanup.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp	2009-04-06 21:13:06 UTC (rev 29980)
++++ haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp	2009-04-06 21:18:29 UTC (rev 29981)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2006-2008, Haiku, Inc. All Rights Reserved.
++ * Copyright 2006-2009, Haiku, Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -35,32 +35,35 @@
+ #include &quot;utility.h&quot;
+ 
+ 
+-struct net_socket_private : net_socket {
+-	struct list_link		link;
+-	team_id					owner;
+-	uint32					max_backlog;
+-	uint32					child_count;
+-	struct list				pending_children;
+-	struct list				connected_children;
++struct net_socket_private;
++typedef DoublyLinkedList&lt;net_socket_private&gt; SocketList;
+ 
+-	struct select_sync_pool	*select_pool;
+-	mutex					lock;
++struct net_socket_private
++		: net_socket, DoublyLinkedListLinkImpl&lt;net_socket_private&gt; {
++	team_id						owner;
++	uint32						max_backlog;
++	uint32						child_count;
++	SocketList					pending_children;
++	SocketList					connected_children;
++
++	struct select_sync_pool*	select_pool;
++	mutex						lock;
+ };
+ 
+ 
+-void socket_delete(net_socket *socket);
+-int socket_bind(net_socket *socket, const struct sockaddr *address,
++void socket_delete(net_socket* socket);
++int socket_bind(net_socket* socket, const struct sockaddr* address,
+ 	socklen_t addressLength);
+-int socket_setsockopt(net_socket *socket, int level, int option,
+-	const void *value, int length);
++int socket_setsockopt(net_socket* socket, int level, int option,
++	const void* value, int length);
+ 
+ 
+-struct list sSocketList;
+-mutex sSocketLock;
++static SocketList sSocketList;
++static mutex sSocketLock;
+ 
+ 
+ static size_t
+-compute_user_iovec_length(iovec *userVec, uint32 count)
++compute_user_iovec_length(iovec* userVec, uint32 count)
+ {
+ 	size_t length = 0;
+ 
+@@ -77,14 +80,9 @@
+ 
+ 
+ static void
+-delete_children(struct list *list)
++delete_children(SocketList&amp; list)
+ {
+-	while (true) {
+-		net_socket_private *child
+-			= (net_socket_private *)list_remove_head_item(list);
+-		if (child == NULL)
+-			break;
+-
++	while (net_socket_private* child = list.RemoveHead()) {
+ 		child-&gt;parent = NULL;
+ 		socket_delete(child);
+ 	}
+@@ -92,9 +90,9 @@
+ 
+ 
+ static status_t
+-create_socket(int family, int type, int protocol, net_socket_private **_socket)
++create_socket(int family, int type, int protocol, net_socket_private** _socket)
+ {
+-	struct net_socket_private *socket = new (std::nothrow) net_socket_private;
++	struct net_socket_private* socket = new(std::nothrow) net_socket_private;
+ 	if (socket == NULL)
+ 		return B_NO_MEMORY;
+ 
+@@ -113,11 +111,6 @@
+ 	socket-&gt;receive.low_water_mark = 1;
+ 	socket-&gt;receive.timeout = B_INFINITE_TIMEOUT;
+ 
+-	list_init_etc(&amp;socket-&gt;pending_children, offsetof(net_socket_private,
+-		link));
+-	list_init_etc(&amp;socket-&gt;connected_children, offsetof(net_socket_private,
+-		link));
+-
+ 	status_t status = get_domain_protocols(socket);
+ 	if (status &lt; B_OK) {
+ 		mutex_destroy(&amp;socket-&gt;lock);
+@@ -131,10 +124,10 @@
+ 
+ 
+ static status_t
+-add_ancillary_data(net_socket *socket, ancillary_data_container* container,
+-	void *data, size_t dataLen)
++add_ancillary_data(net_socket* socket, ancillary_data_container* container,
++	void* data, size_t dataLen)
+ {
+-	cmsghdr *header = (cmsghdr*)data;
++	cmsghdr* header = (cmsghdr*)data;
+ 
+ 	while (dataLen &gt; 0) {
+ 		if (header-&gt;cmsg_len &lt; sizeof(cmsghdr) || header-&gt;cmsg_len &gt; dataLen)
+@@ -157,10 +150,10 @@
+ 
+ 
+ static status_t
+-process_ancillary_data(net_socket *socket, ancillary_data_container* container,
+-	msghdr *messageHeader)
++process_ancillary_data(net_socket* socket, ancillary_data_container* container,
++	msghdr* messageHeader)
+ {
+-	uint8 *dataBuffer = (uint8*)messageHeader-&gt;msg_control;
++	uint8* dataBuffer = (uint8*)messageHeader-&gt;msg_control;
+ 	int dataBufferLen = messageHeader-&gt;msg_controllen;
+ 
+ 	if (container == NULL || dataBuffer == NULL) {
+@@ -169,7 +162,7 @@
+ 	}
+ 
+ 	ancillary_data_header header;
+-	void *data = NULL;
++	void* data = NULL;
+ 
+ 	while ((data = next_ancillary_data(container, data, &amp;header)) != NULL) {
+ 		if (socket-&gt;first_info-&gt;process_ancillary_data == NULL)
+@@ -191,7 +184,7 @@
+ 
+ 
+ static ssize_t
+-socket_receive_no_buffer(net_socket *socket, msghdr *header, void *data,
++socket_receive_no_buffer(net_socket* socket, msghdr* header, void* data,
+ 	size_t length, int flags)
+ {
+ 	iovec stackVec = { data, length };
+@@ -227,9 +220,9 @@
+ 
+ 
+ status_t
+-socket_open(int family, int type, int protocol, net_socket **_socket)
++socket_open(int family, int type, int protocol, net_socket** _socket)
+ {
+-	net_socket_private *socket;
++	net_socket_private* socket;
+ 	status_t status = create_socket(family, type, protocol, &amp;socket);
+ 	if (status &lt; B_OK)
+ 		return status;
+@@ -243,7 +236,7 @@
+ 	socket-&gt;owner = team_get_current_team_id();
+ 
+ 	mutex_lock(&amp;sSocketLock);
+-	list_add_item(&amp;sSocketList, socket);
++	sSocketList.Add(socket);
+ 	mutex_unlock(&amp;sSocketLock);
+ 
+ 	*_socket = socket;
+@@ -252,15 +245,15 @@
+ 
+ 
+ status_t
+-socket_close(net_socket *_socket)
++socket_close(net_socket* _socket)
+ {
+-	net_socket_private *socket = (net_socket_private *)_socket;
++	net_socket_private* socket = (net_socket_private*)_socket;
+ 	return socket-&gt;first_info-&gt;close(socket-&gt;first_protocol);
+ }
+ 
+ 
+ status_t
+-socket_free(net_socket *socket)
++socket_free(net_socket* socket)
+ {
+ 	status_t status = socket-&gt;first_info-&gt;free(socket-&gt;first_protocol);
+ 	if (status == B_BUSY)
+@@ -272,16 +265,16 @@
+ 
+ 
+ status_t
+-socket_readv(net_socket *socket, const iovec *vecs, size_t vecCount,
+-	size_t *_length)
++socket_readv(net_socket* socket, const iovec* vecs, size_t vecCount,
++	size_t* _length)
+ {
+ 	return -1;
+ }
+ 
+ 
+ status_t
+-socket_writev(net_socket *socket, const iovec *vecs, size_t vecCount,
+-	size_t *_length)
++socket_writev(net_socket* socket, const iovec* vecs, size_t vecCount,
++	size_t* _length)
+ {
+ 	if (socket-&gt;peer.ss_len == 0)
+ 		return ECONNRESET;
+@@ -294,7 +287,7 @@
+ 	}
+ 
+ 	// TODO: useful, maybe even computed header space!
+-	net_buffer *buffer = gNetBufferModule.create(256);
++	net_buffer* buffer = gNetBufferModule.create(256);
+ 	if (buffer == NULL)
+ 		return ENOBUFS;
+ 
+@@ -329,7 +322,7 @@
+ 
+ 
+ status_t
+-socket_control(net_socket *socket, int32 op, void *data, size_t length)
++socket_control(net_socket* socket, int32 op, void* data, size_t length)
+ {
+ 	switch (op) {
+ 		case FIONBIO:
+@@ -365,21 +358,21 @@
+ 
+ 
+ ssize_t
+-socket_read_avail(net_socket *socket)
++socket_read_avail(net_socket* socket)
+ {
+ 	return socket-&gt;first_info-&gt;read_avail(socket-&gt;first_protocol);
+ }
+ 
+ 
+ ssize_t
+-socket_send_avail(net_socket *socket)
++socket_send_avail(net_socket* socket)
+ {
+ 	return socket-&gt;first_info-&gt;send_avail(socket-&gt;first_protocol);
+ }
+ 
+ 
+ status_t
+-socket_send_data(net_socket *socket, net_buffer *buffer)
++socket_send_data(net_socket* socket, net_buffer* buffer)
+ {
+ 	return socket-&gt;first_info-&gt;send_data(socket-&gt;first_protocol,
+ 		buffer);
+@@ -387,8 +380,8 @@
+ 
+ 
+ status_t
+-socket_receive_data(net_socket *socket, size_t length, uint32 flags,
+-	net_buffer **_buffer)
++socket_receive_data(net_socket* socket, size_t length, uint32 flags,
++	net_buffer** _buffer)
+ {
+ 	status_t status = socket-&gt;first_info-&gt;read_data(socket-&gt;first_protocol,
+ 		length, flags, _buffer);
+@@ -406,15 +399,17 @@
+ 
+ 
+ status_t
+-socket_get_next_stat(uint32 *_cookie, int family, struct net_stat *stat)
++socket_get_next_stat(uint32* _cookie, int family, struct net_stat* stat)
+ {
+ 	MutexLocker locker(sSocketLock);
+ 
+-	net_socket_private *socket = NULL;
++	net_socket_private* socket = NULL;
++	SocketList::Iterator iterator = sSocketList.GetIterator();
+ 	uint32 cookie = *_cookie;
+ 	uint32 count = 0;
+-	while ((socket = (net_socket_private *)list_get_next_item(&amp;sSocketList,
+-			socket)) != NULL) {
++	while (iterator.HasNext()) {
++		socket = iterator.Next();
++
+ 		// TODO: also traverse the pending connections
+ 		if (count == cookie)
+ 			break;
+@@ -451,9 +446,9 @@
+ 
+ 
+ status_t
+-socket_spawn_pending(net_socket *_parent, net_socket **_socket)
++socket_spawn_pending(net_socket* _parent, net_socket** _socket)
+ {
+-	net_socket_private *parent = (net_socket_private *)_parent;
++	net_socket_private* parent = (net_socket_private*)_parent;
+ 
+ 	MutexLocker locker(parent-&gt;lock);
+ 
+@@ -463,7 +458,7 @@
+ 	if (parent-&gt;child_count &gt; 3 * parent-&gt;max_backlog / 2)
+ 		return ENOBUFS;
+ 
+-	net_socket_private *socket;
++	net_socket_private* socket;
+ 	status_t status = create_socket(parent-&gt;family, parent-&gt;type,
+ 		parent-&gt;protocol, &amp;socket);
+ 	if (status &lt; B_OK)
+@@ -479,7 +474,7 @@
+ 	memcpy(&amp;socket-&gt;peer, &amp;parent-&gt;peer, parent-&gt;peer.ss_len);
+ 
+ 	// add to the parent's list of pending connections
+-	list_add_item(&amp;parent-&gt;pending_children, socket);
++	parent-&gt;pending_children.Add(socket);
+ 	socket-&gt;parent = parent;
+ 	parent-&gt;child_count++;
+ 
+@@ -489,20 +484,20 @@
+ 
+ 
+ void
+-socket_delete(net_socket *_socket)
++socket_delete(net_socket* _socket)
+ {
+-	net_socket_private *socket = (net_socket_private *)_socket;
++	net_socket_private* socket = (net_socket_private*)_socket;
+ 
+ 	if (socket-&gt;parent != NULL)
+ 		panic(&quot;socket still has a parent!&quot;);
+ 
+ 	mutex_lock(&amp;sSocketLock);
+-	list_remove_item(&amp;sSocketList, socket);
++	sSocketList.Remove(socket);
+ 	mutex_unlock(&amp;sSocketLock);
+ 
+ 	// also delete all children of this socket
+-	delete_children(&amp;socket-&gt;pending_children);
+-	delete_children(&amp;socket-&gt;connected_children);
++	delete_children(socket-&gt;pending_children);
++	delete_children(socket-&gt;connected_children);
+ 
+ 	put_domain_protocols(socket);
+ 	mutex_destroy(&amp;socket-&gt;lock);
+@@ -511,14 +506,13 @@
+ 
+ 
+ status_t
+-socket_dequeue_connected(net_socket *_parent, net_socket **_socket)
++socket_dequeue_connected(net_socket* _parent, net_socket** _socket)
+ {
+-	net_socket_private *parent = (net_socket_private *)_parent;
++	net_socket_private* parent = (net_socket_private*)_parent;
+ 
+ 	mutex_lock(&amp;parent-&gt;lock);
+ 
+-	net_socket_private *socket = (net_socket_private *)list_remove_head_item(
+-		&amp;parent-&gt;connected_children);
++	net_socket_private* socket = parent-&gt;connected_children.RemoveHead();
+ 	if (socket != NULL) {
+ 		socket-&gt;parent = NULL;
+ 		parent-&gt;child_count--;
+@@ -531,7 +525,7 @@
+ 		return B_ENTRY_NOT_FOUND;
+ 
+ 	mutex_lock(&amp;sSocketLock);
+-	list_add_item(&amp;sSocketList, socket);
++	sSocketList.Add(socket);
+ 	mutex_unlock(&amp;sSocketLock);
+ 
+ 	return B_OK;
+@@ -539,78 +533,65 @@
+ 
+ 
+ ssize_t
+-socket_count_connected(net_socket *_parent)
++socket_count_connected(net_socket* _parent)
+ {
+-	net_socket_private *parent = (net_socket_private *)_parent;
++	net_socket_private* parent = (net_socket_private*)_parent;
+ 
+ 	MutexLocker _(parent-&gt;lock);
+-
+-	ssize_t count = 0;
+-	void *item = NULL;
+-	while ((item = list_get_next_item(&amp;parent-&gt;connected_children,
+-			item)) != NULL) {
+-		count++;
+-	}
+-
+-	return count;
++	return parent-&gt;connected_children.Count();
+ }
+ 
+ 
+ status_t
+-socket_set_max_backlog(net_socket *_socket, uint32 backlog)
++socket_set_max_backlog(net_socket* _socket, uint32 backlog)
+ {
+-	net_socket_private *socket = (net_socket_private *)_socket;
++	net_socket_private* socket = (net_socket_private*)_socket;
+ 
+ 	// we enforce an upper limit of connections waiting to be accepted
+ 	if (backlog &gt; 256)
+ 		backlog = 256;
+ 
+-	mutex_lock(&amp;socket-&gt;lock);
++	MutexLocker _(socket-&gt;lock);
+ 
+ 	// first remove the pending connections, then the already connected
+ 	// ones as needed
+-	net_socket_private *child;
++	net_socket_private* child;
+ 	while (socket-&gt;child_count &gt; backlog
+-		&amp;&amp; (child = (net_socket_private *)list_remove_tail_item(
+-				&amp;socket-&gt;pending_children)) != NULL) {
++		&amp;&amp; (child = socket-&gt;pending_children.RemoveTail()) != NULL) {
+ 		child-&gt;parent = NULL;
+ 		socket-&gt;child_count--;
+ 	}
+ 	while (socket-&gt;child_count &gt; backlog
+-		&amp;&amp; (child = (net_socket_private *)list_remove_tail_item(
+-				&amp;socket-&gt;connected_children)) != NULL) {
++		&amp;&amp; (child = socket-&gt;connected_children.RemoveTail()) != NULL) {
+ 		child-&gt;parent = NULL;
+ 		socket_delete(child);
+ 		socket-&gt;child_count--;
+ 	}
+ 
+ 	socket-&gt;max_backlog = backlog;
+-	mutex_unlock(&amp;socket-&gt;lock);
+ 	return B_OK;
+ }
+ 
+ 
+-/*!
+-	The socket has been connected. It will be moved to the connected queue
++/*!	The socket has been connected. It will be moved to the connected queue
+ 	of its parent socket.
+ */
+ status_t
+-socket_connected(net_socket *socket)
++socket_connected(net_socket* socket)
+ {
+-	net_socket_private *parent = (net_socket_private *)socket-&gt;parent;
++	net_socket_private* parent = (net_socket_private*)socket-&gt;parent;
+ 	if (parent == NULL)
+ 		return B_BAD_VALUE;
+ 
+-	mutex_lock(&amp;parent-&gt;lock);
++	MutexLocker _(&amp;parent-&gt;lock);
+ 
+-	list_remove_item(&amp;parent-&gt;pending_children, socket);
+-	list_add_item(&amp;parent-&gt;connected_children, socket);
++	parent-&gt;pending_children.Remove((net_socket_private*)socket);
++	parent-&gt;connected_children.Add((net_socket_private*)socket);
+ 
+ 	// notify parent
+ 	if (parent-&gt;select_pool)
+ 		notify_select_event_pool(parent-&gt;select_pool, B_SELECT_READ);
+ 
+-	mutex_unlock(&amp;parent-&gt;lock);
+ 	return B_OK;
+ }
+ 
+@@ -619,9 +600,9 @@
+ 
+ 
+ status_t
+-socket_request_notification(net_socket *_socket, uint8 event, selectsync *sync)
++socket_request_notification(net_socket* _socket, uint8 event, selectsync* sync)
+ {
+-	net_socket_private *socket = (net_socket_private *)_socket;
++	net_socket_private* socket = (net_socket_private*)_socket;
+ 
+ 	mutex_lock(&amp;socket-&gt;lock);
+ 
+@@ -663,36 +644,29 @@
+ 
+ 
+ status_t
+-socket_cancel_notification(net_socket *_socket, uint8 event, selectsync *sync)
++socket_cancel_notification(net_socket* _socket, uint8 event, selectsync* sync)
+ {
+-	net_socket_private *socket = (net_socket_private *)_socket;
++	net_socket_private* socket = (net_socket_private*)_socket;
+ 
+-	mutex_lock(&amp;socket-&gt;lock);
+-
+-	status_t status = remove_select_sync_pool_entry(&amp;socket-&gt;select_pool,
+-		sync, event);
+-
+-	mutex_unlock(&amp;socket-&gt;lock);
+-	return status;
++	MutexLocker _(socket-&gt;lock);
++	return remove_select_sync_pool_entry(&amp;socket-&gt;select_pool, sync, event);
+ }
+ 
+ 
+ status_t
+-socket_notify(net_socket *_socket, uint8 event, int32 value)
++socket_notify(net_socket* _socket, uint8 event, int32 value)
+ {
+-	net_socket_private *socket = (net_socket_private *)_socket;
++	net_socket_private* socket = (net_socket_private*)_socket;
+ 	bool notify = true;
+ 
+ 	switch (event) {
+ 		case B_SELECT_READ:
+-			if ((ssize_t)socket-&gt;receive.low_water_mark &gt; value
+-				&amp;&amp; value &gt;= B_OK)
++			if ((ssize_t)socket-&gt;receive.low_water_mark &gt; value &amp;&amp; value &gt;= B_OK)
+ 				notify = false;
+ 			break;
+ 
+ 		case B_SELECT_WRITE:
+-			if ((ssize_t)socket-&gt;send.low_water_mark &gt; value
+-				&amp;&amp; value &gt;= B_OK)
++			if ((ssize_t)socket-&gt;send.low_water_mark &gt; value &amp;&amp; value &gt;= B_OK)
+ 				notify = false;
+ 			break;
+ 
+@@ -701,12 +675,11 @@
+ 			break;
+ 	}
+ 
+-	mutex_lock(&amp;socket-&gt;lock);
++	MutexLocker _(socket-&gt;lock);
+ 
+ 	if (notify &amp;&amp; socket-&gt;select_pool)
+ 		notify_select_event_pool(socket-&gt;select_pool, event);
+ 
+-	mutex_unlock(&amp;socket-&gt;lock);
+ 	return B_OK;
+ }
+ 
+@@ -715,13 +688,13 @@
+ 
+ 
+ int
+-socket_accept(net_socket *socket, struct sockaddr *address,
+-	socklen_t *_addressLength, net_socket **_acceptedSocket)
++socket_accept(net_socket* socket, struct sockaddr* address,
++	socklen_t* _addressLength, net_socket** _acceptedSocket)
+ {
+ 	if ((socket-&gt;options &amp; SO_ACCEPTCONN) == 0)
+ 		return B_BAD_VALUE;
+ 
+-	net_socket *accepted;
++	net_socket* accepted;
+ 	status_t status = socket-&gt;first_info-&gt;accept(socket-&gt;first_protocol,
+ 		&amp;accepted);
+ 	if (status &lt; B_OK)
+@@ -739,7 +712,7 @@
+ 
+ 
+ int
+-socket_bind(net_socket *socket, const struct sockaddr *address,
++socket_bind(net_socket* socket, const struct sockaddr* address,
+ 	socklen_t addressLength)
+ {
+ 	sockaddr empty;
+@@ -755,7 +728,7 @@
+ 
+ 	if (socket-&gt;address.ss_len != 0) {
+ 		status_t status = socket-&gt;first_info-&gt;unbind(socket-&gt;first_protocol,
+-			(sockaddr *)&amp;socket-&gt;address);
++			(sockaddr*)&amp;socket-&gt;address);
+ 		if (status &lt; B_OK)
+ 			return status;
+ 	}
+@@ -763,7 +736,7 @@
+ 	memcpy(&amp;socket-&gt;address, address, sizeof(sockaddr));
+ 
+ 	status_t status = socket-&gt;first_info-&gt;bind(socket-&gt;first_protocol,
+-		(sockaddr *)address);
++		(sockaddr*)address);
+ 	if (status &lt; B_OK) {
+ 		// clear address again, as binding failed
+ 		socket-&gt;address.ss_len = 0;
+@@ -774,7 +747,7 @@
+ 
+ 
+ int
+-socket_connect(net_socket *socket, const struct sockaddr *address,
++socket_connect(net_socket* socket, const struct sockaddr* address,
+ 	socklen_t addressLength)
+ {
+ 	if (address == NULL || addressLength == 0)
+@@ -792,8 +765,8 @@
+ 
+ 
+ int
+-socket_getpeername(net_socket *socket, struct sockaddr *address,
+-	socklen_t *_addressLength)
++socket_getpeername(net_socket* socket, struct sockaddr* address,
++	socklen_t* _addressLength)
+ {
+ 	if (socket-&gt;peer.ss_len == 0)
+ 		return ENOTCONN;
+@@ -805,8 +778,8 @@
+ 
+ 
+ int
+-socket_getsockname(net_socket *socket, struct sockaddr *address,
+-	socklen_t *_addressLength)
++socket_getsockname(net_socket* socket, struct sockaddr* address,
++	socklen_t* _addressLength)
+ {
+ 	if (socket-&gt;address.ss_len == 0)
+ 		return ENOTCONN;
+@@ -819,8 +792,8 @@
+ 
+ 
+ status_t
+-socket_get_option(net_socket *socket, int level, int option, void *value,
+-	int *_length)
++socket_get_option(net_socket* socket, int level, int option, void* value,
++	int* _length)
+ {
+ 	if (level != SOL_SOCKET)
+ 		return ENOPROTOOPT;
+@@ -828,7 +801,7 @@
+ 	switch (option) {
+ 		case SO_SNDBUF:
+ 		{
+-			uint32 *size = (uint32 *)value;
++			uint32* size = (uint32*)value;
+ 			*size = socket-&gt;send.buffer_size;
+ 			*_length = sizeof(uint32);
+ 			return B_OK;
+@@ -836,7 +809,7 @@
+ 
+ 		case SO_RCVBUF:
+ 		{
+-			uint32 *size = (uint32 *)value;
++			uint32* size = (uint32*)value;
+ 			*size = socket-&gt;receive.buffer_size;
+ 			*_length = sizeof(uint32);
+ 			return B_OK;
+@@ -844,7 +817,7 @@
+ 
+ 		case SO_SNDLOWAT:
+ 		{
+-			uint32 *size = (uint32 *)value;
++			uint32* size = (uint32*)value;
+ 			*size = socket-&gt;send.low_water_mark;
+ 			*_length = sizeof(uint32);
+ 			return B_OK;
+@@ -852,7 +825,7 @@
+ 
+ 		case SO_RCVLOWAT:
+ 		{
+-			uint32 *size = (uint32 *)value;
++			uint32* size = (uint32*)value;
+ 			*size = socket-&gt;receive.low_water_mark;
+ 			*_length = sizeof(uint32);
+ 			return B_OK;
+@@ -872,7 +845,7 @@
+ 			if (timeout == B_INFINITE_TIMEOUT)
+ 				timeout = 0;
+ 
+-			struct timeval *timeval = (struct timeval *)value;
++			struct timeval* timeval = (struct timeval*)value;
+ 			timeval-&gt;tv_sec = timeout / 1000000LL;
+ 			timeval-&gt;tv_usec = timeout % 1000000LL;
+ 
+@@ -882,7 +855,7 @@
+ 
+ 		case SO_NONBLOCK:
+ 		{
+-			int32 *_set = (int32 *)value;
++			int32* _set = (int32*)value;
+ 			*_set = socket-&gt;receive.timeout == 0 &amp;&amp; socket-&gt;send.timeout == 0;
+ 			*_length = sizeof(int32);
+ 			return B_OK;
+@@ -898,7 +871,7 @@
+ 		case SO_REUSEPORT:
+ 		case SO_USELOOPBACK:
+ 		{
+-			int32 *_set = (int32 *)value;
++			int32* _set = (int32*)value;
+ 			*_set = (socket-&gt;options &amp; option) != 0;
+ 			*_length = sizeof(int32);
+ 			return B_OK;
+@@ -906,7 +879,7 @@
+ 
+ 		case SO_ERROR:
+ 		{
+-			int32 *_set = (int32 *)value;
++			int32* _set = (int32*)value;
+ 			*_set = socket-&gt;error;
+ 			*_length = sizeof(int32);
+ 
+@@ -925,8 +898,8 @@
+ 
+ 
+ int
+-socket_getsockopt(net_socket *socket, int level, int option, void *value,
+-	int *_length)
++socket_getsockopt(net_socket* socket, int level, int option, void* value,
++	int* _length)
+ {
+ 	return socket-&gt;first_protocol-&gt;module-&gt;getsockopt(socket-&gt;first_protocol,
+ 		level, option, value, _length);
+@@ -934,7 +907,7 @@
+ 
+ 
+ int
+-socket_listen(net_socket *socket, int backlog)
++socket_listen(net_socket* socket, int backlog)
+ {
+ 	status_t status = socket-&gt;first_info-&gt;listen(socket-&gt;first_protocol,
+ 		backlog);
+@@ -946,7 +919,7 @@
+ 
+ 
+ ssize_t
+-socket_receive(net_socket *socket, msghdr *header, void *data, size_t length,
++socket_receive(net_socket* socket, msghdr* header, void* data, size_t length,
+ 	int flags)
+ {
+ 	// If the protocol sports read_data_no_buffer() we use it.
+@@ -954,7 +927,7 @@
+ 		return socket_receive_no_buffer(socket, header, data, length, flags);
+ 
+ 	size_t totalLength = length;
+-	net_buffer *buffer;
++	net_buffer* buffer;
+ 	int i;
+ 
+ 	// the convention to this function is that have header been
+@@ -1048,22 +1021,22 @@
+ 
+ 
+ ssize_t
+-socket_send(net_socket *socket, msghdr *header, const void *data, size_t length,
++socket_send(net_socket* socket, msghdr* header, const void* data, size_t length,
+ 	int flags)
+ {
+-	const sockaddr *address = NULL;
++	const sockaddr* address = NULL;
+ 	socklen_t addressLength = 0;
+ 	size_t bytesLeft = length;
+ 
+ 	if (length &gt; SSIZE_MAX)
+ 		return B_BAD_VALUE;
+ 
+-	ancillary_data_container *ancillaryData = NULL;
++	ancillary_data_container* ancillaryData = NULL;
+ 	CObjectDeleter&lt;ancillary_data_container&gt; ancillaryDataDeleter(NULL,
+ 		&amp;delete_ancillary_data_container);
+ 
+ 	if (header != NULL) {
+-		address = (const sockaddr *)header-&gt;msg_name;
++		address = (const sockaddr*)header-&gt;msg_name;
+ 		addressLength = header-&gt;msg_namelen;
+ 
+ 		// get the ancillary data
+@@ -1074,7 +1047,7 @@
+ 			ancillaryDataDeleter.SetTo(ancillaryData);
+ 
+ 			status_t status = add_ancillary_data(socket, ancillaryData,
+-				(cmsghdr *)header-&gt;msg_control, header-&gt;msg_controllen);
++				(cmsghdr*)header-&gt;msg_control, header-&gt;msg_controllen);
+ 			if (status != B_OK)
+ 				return status;
+ 		}
+@@ -1090,7 +1063,7 @@
+ 			return EISCONN;
+ 
+ 		// socket is connected, we use that address
+-		address = (struct sockaddr *)&amp;socket-&gt;peer;
++		address = (struct sockaddr*)&amp;socket-&gt;peer;
+ 		addressLength = socket-&gt;peer.ss_len;
+ 	}
+ 
+@@ -1143,7 +1116,7 @@
+ 
+ 	while (bytesLeft &gt; 0) {
+ 		// TODO: useful, maybe even computed header space!
+-		net_buffer *buffer = gNetBufferModule.create(256);
++		net_buffer* buffer = gNetBufferModule.create(256);
+ 		if (buffer == NULL)
+ 			return ENOBUFS;
+ 
+@@ -1175,7 +1148,7 @@
+ 				// partial send
+ 				vecOffset = bytes;
+ 				length -= vecOffset;
+-				data = (uint8 *)data + vecOffset;
++				data = (uint8*)data + vecOffset;
+ 			} else if (header != NULL) {
+ 				// proceed with next buffer, if any
+ 				vecOffset = 0;
+@@ -1224,7 +1197,7 @@
+ 
+ 
+ status_t
+-socket_set_option(net_socket *socket, int level, int option, const void *value,
++socket_set_option(net_socket* socket, int level, int option, const void* value,
+ 	int length)
+ {
+ 	if (level != SOL_SOCKET)
+@@ -1237,7 +1210,7 @@
+ 			if (length &lt; (int)sizeof(struct linger))
+ 				return B_BAD_VALUE;
+ 
+-			struct linger *linger = (struct linger *)value;
++			struct linger* linger = (struct linger*)value;
+ 			if (linger-&gt;l_onoff) {
+ 				socket-&gt;options |= SO_LINGER;
+ 				socket-&gt;linger = linger-&gt;l_linger;
+@@ -1252,28 +1225,28 @@
+ 			if (length != sizeof(uint32))
+ 				return B_BAD_VALUE;
+ 
+-			socket-&gt;send.buffer_size = *(const uint32 *)value;
++			socket-&gt;send.buffer_size = *(const uint32*)value;
+ 			return B_OK;
+ 
+ 		case SO_RCVBUF:
+ 			if (length != sizeof(uint32))
+ 				return B_BAD_VALUE;
+ 
+-			socket-&gt;receive.buffer_size = *(const uint32 *)value;
++			socket-&gt;receive.buffer_size = *(const uint32*)value;
+ 			return B_OK;
+ 
+ 		case SO_SNDLOWAT:
+ 			if (length != sizeof(uint32))
+ 				return B_BAD_VALUE;
+ 
+-			socket-&gt;send.low_water_mark = *(const uint32 *)value;
++			socket-&gt;send.low_water_mark = *(const uint32*)value;
+ 			return B_OK;
+ 
+ 		case SO_RCVLOWAT:
+ 			if (length != sizeof(uint32))
+ 				return B_BAD_VALUE;
+ 
+-			socket-&gt;receive.low_water_mark = *(const uint32 *)value;
++			socket-&gt;receive.low_water_mark = *(const uint32*)value;
+ 			return B_OK;
+ 
+ 		case SO_RCVTIMEO:
+@@ -1282,7 +1255,7 @@
+ 			if (length != sizeof(struct timeval))
+ 				return B_BAD_VALUE;
+ 
+-			const struct timeval *timeval = (const struct timeval *)value;
++			const struct timeval* timeval = (const struct timeval*)value;
+ 			bigtime_t timeout = timeval-&gt;tv_sec * 1000000LL + timeval-&gt;tv_usec;
+ 			if (timeout == 0)
+ 				timeout = B_INFINITE_TIMEOUT;
+@@ -1298,7 +1271,7 @@
+ 			if (length != sizeof(int32))
+ 				return B_BAD_VALUE;
+ 
+-			if (*(const int32 *)value) {
++			if (*(const int32*)value) {
+ 				socket-&gt;send.timeout = 0;
+ 				socket-&gt;receive.timeout = 0;
+ 			} else {
+@@ -1318,7 +1291,7 @@
+ 			if (length != sizeof(int32))
+ 				return B_BAD_VALUE;
+ 
+-			if (*(const int32 *)value)
++			if (*(const int32*)value)
+ 				socket-&gt;options |= option;
+ 			else
+ 				socket-&gt;options &amp;= ~option;
+@@ -1329,7 +1302,7 @@
+ 			if (length != sizeof(int32))
+ 				return B_BAD_VALUE;
+ 
+-			int index = *(const int32 *)value;
++			int index = *(const int32*)value;
+ 			if (index &lt; 0)
+ 				return B_BAD_VALUE;
+ 
+@@ -1349,7 +1322,7 @@
+ 
+ 
+ int
+-socket_setsockopt(net_socket *socket, int level, int option, const void *value,
++socket_setsockopt(net_socket* socket, int level, int option, const void* value,
+ 	int length)
+ {
+ 	return socket-&gt;first_protocol-&gt;module-&gt;setsockopt(socket-&gt;first_protocol,
+@@ -1358,7 +1331,7 @@
+ 
+ 
+ int
+-socket_shutdown(net_socket *socket, int direction)
++socket_shutdown(net_socket* socket, int direction)
+ {
+ 	return socket-&gt;first_info-&gt;shutdown(socket-&gt;first_protocol, direction);
+ }
+@@ -1426,16 +1399,11 @@
+ 	switch (op) {
+ 		case B_MODULE_INIT:
+ 		{
+-			// TODO: this is currently done in the net_stack driver
+-			// initialize the main stack if not done so already
+-			//module_info *module;
+-			//return get_module(NET_STARTER_MODULE_NAME, &amp;module);
+-			list_init_etc(&amp;sSocketList, offsetof(net_socket_private, link));
++			new (&amp;sSocketList) SocketList;
+ 			mutex_init(&amp;sSocketLock, &quot;socket list&quot;);
+ 			return B_OK;
+ 		}
+ 		case B_MODULE_UNINIT:
+-			//return put_module(NET_STARTER_MODULE_NAME);
+ 			mutex_destroy(&amp;sSocketLock);
+ 			return B_OK;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015511.html">[Haiku-commits] r29980 - haiku/trunk/headers/private/kernel/util
+</A></li>
+	<LI>Next message: <A HREF="015514.html">[Haiku-commits] r29982 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15512">[ date ]</a>
+              <a href="thread.html#15512">[ thread ]</a>
+              <a href="subject.html#15512">[ subject ]</a>
+              <a href="author.html#15512">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

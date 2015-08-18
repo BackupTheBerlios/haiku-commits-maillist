@@ -1,0 +1,319 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22382 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22382%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200709300936.l8U9aU9x032704%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004069.html">
+   <LINK REL="Next"  HREF="004071.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22382 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22382%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200709300936.l8U9aU9x032704%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22382 - haiku/trunk/src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sun Sep 30 11:36:30 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004069.html">[Haiku-commits] r22381 - in haiku/trunk/data/artwork: . icons
+</A></li>
+        <LI>Next message: <A HREF="004071.html">[Haiku-commits] r22383 - haiku/trunk/data/artwork/icons
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4070">[ date ]</a>
+              <a href="thread.html#4070">[ thread ]</a>
+              <a href="subject.html#4070">[ subject ]</a>
+              <a href="author.html#4070">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-09-30 11:36:28 +0200 (Sun, 30 Sep 2007)
+New Revision: 22382
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22382&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22382&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* Decoupled the page_thief() from the low memory handler chain. This is
+  necessary because low memory handlers might need to wait for other services
+  while we need to make sure the page thief can always steal pages.
+* Made the page thief more aggressive when memory is critical: added a third
+  run where it will also steal a small amount of active pages to keep things
+  going.
+* The page thief did not maintain the cache's reference correctly in all
+  situations.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-09-30 09:34:20 UTC (rev 22381)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-09-30 09:36:28 UTC (rev 22382)
+@@ -61,6 +61,7 @@
+ static ConditionVariable&lt;page_queue&gt; sFreePageCondition;
+ static spinlock sPageLock;
+ 
++static sem_id sThiefWaitSem;
+ static sem_id sWriterWaitSem;
+ 
+ 
+@@ -713,7 +714,7 @@
+ 
+ 			locker.Unlock();
+ 
+-			//dprintf(&quot;write page %p\n&quot;, page);
++			//dprintf(&quot;write page %p, cache %p (%ld)\n&quot;, page, page-&gt;cache, page-&gt;cache-&gt;ref_count);
+ 			vm_clear_map_flags(page, PAGE_MODIFIED);
+ 			vm_cache_acquire_ref(page-&gt;cache);
+ 			pages[numPages++] = page;
+@@ -759,79 +760,123 @@
+ }
+ 
+ 
+-static void
+-page_thief(void* /*unused*/, int32 level)
++static status_t
++page_thief(void* /*unused*/)
+ {
+-	uint32 steal;
+-	int32 score;
++	bigtime_t timeout = B_INFINITE_TIMEOUT;
+ 
+-	switch (level) {
+-		default:
+-		case B_LOW_MEMORY_NOTE:
+-			steal = 10;
+-			score = -20;
+-			break;
+-		case B_LOW_MEMORY_WARNING:
+-			steal = 50;
+-			score = -5;
+-			break;
+-		case B_LOW_MEMORY_CRITICAL:
+-			steal = 500;
+-			score = -1;
+-			break;
+-	}
++	while (true) {
++		acquire_sem_etc(sThiefWaitSem, 1, B_RELATIVE_TIMEOUT, timeout);
+ 
+-	vm_page* page = NULL;
+-	InterruptsSpinLocker locker(sPageLock);
++		int32 state = vm_low_memory_state();
++		uint32 steal;
++		int32 score;
++		switch (state) {
++			default:
++				timeout = B_INFINITE_TIMEOUT;
++				continue;
+ 
+-	while (steal &gt; 0) {
+-		if (!locker.IsLocked())
+-			locker.Lock();
++			case B_LOW_MEMORY_NOTE:
++				steal = 10;
++				score = -20;
++				timeout = 1000000;
++				break;
++			case B_LOW_MEMORY_WARNING:
++				steal = 50;
++				score = -5;
++				timeout = 1000000;
++				break;
++			case B_LOW_MEMORY_CRITICAL:
++				steal = 500;
++				score = -1;
++				timeout = 100000;
++				break;
++		}
++		//dprintf(&quot;page thief running - target %ld...\n&quot;, steal);
+ 
+-		// find a candidate to steal from the inactive queue
++		vm_page* page = NULL;
++		bool stealActive = false;
++		InterruptsSpinLocker locker(sPageLock);
+ 
+-		for (int32 i = sActivePageQueue.count; i-- &gt; 0;) {
+-			// move page to the tail of the queue so that we don't
+-			// scan it again directly
+-			page = dequeue_page(&amp;sActivePageQueue);
+-			enqueue_page(&amp;sActivePageQueue, page);
++		while (steal &gt; 0) {
++			if (!locker.IsLocked())
++				locker.Lock();
+ 
+-			if (page-&gt;state == PAGE_STATE_INACTIVE
+-				&amp;&amp; page-&gt;usage_count &lt;= score)
+-				break;
+-		}
++			// find a candidate to steal from the inactive queue
+ 
+-		if (page == NULL) {
+-			if (score == 0)
+-				break;
++			for (int32 i = sActivePageQueue.count; i-- &gt; 0;) {
++				// move page to the tail of the queue so that we don't
++				// scan it again directly
++				page = dequeue_page(&amp;sActivePageQueue);
++				enqueue_page(&amp;sActivePageQueue, page);
+ 
+-			score = 0;
+-			continue;
+-		}
++				if ((page-&gt;state == PAGE_STATE_INACTIVE
++						|| stealActive &amp;&amp; page-&gt;state == PAGE_STATE_ACTIVE)
++					&amp;&amp; page-&gt;usage_count &lt;= score)
++					break;
++			}
+ 
+-		locker.Unlock();
++			if (page == NULL) {
++				if (score == 0) {
++					if (state != B_LOW_MEMORY_CRITICAL)
++						break;
++					if (stealActive &amp;&amp; score &gt; 5)
++						break;
+ 
+-		// try to lock the page's cache
++					// when memory is really low, we really want pages
++					if (stealActive)
++						score = 127;
++					else {
++						stealActive = true;
++						score = 5;
++						steal = 5;
++					}
++					continue;
++				}
+ 
+-		vm_cache* cache = vm_cache_acquire_page_cache_ref(page);
+-		if (cache == NULL)
+-			continue;
++				score = 0;
++				continue;
++			}
+ 
+-		if (mutex_trylock(&amp;cache-&gt;lock) != B_OK
+-			|| page-&gt;state != PAGE_STATE_INACTIVE) {
++			locker.Unlock();
++
++			// try to lock the page's cache
++
++			vm_cache* cache = vm_cache_acquire_page_cache_ref(page);
++			if (cache == NULL)
++				continue;
++
++			if (mutex_trylock(&amp;cache-&gt;lock) != B_OK) {
++				vm_cache_release_ref(cache);
++				continue;
++			}
++			if (page-&gt;state != PAGE_STATE_INACTIVE) {
++				mutex_unlock(&amp;cache-&gt;lock);
++				vm_cache_release_ref(cache);
++				continue;
++			}
++
++			// we can now steal this page
++
++			//dprintf(&quot;  steal page %p from cache %p\n&quot;, page, cache);
++			vm_remove_all_page_mappings(page);
++			vm_cache_remove_page(cache, page);
++			vm_page_set_state(page, PAGE_STATE_FREE);
++			steal--;
++
++			mutex_unlock(&amp;cache-&gt;lock);
+ 			vm_cache_release_ref(cache);
+-			continue;
+ 		}
++	}
+ 
+-		// we can now steal this page
++	return B_OK;
++}
+ 
+-		vm_cache_remove_page(cache, page);
+-		vm_page_set_state(page, PAGE_STATE_FREE);
+-		steal--;
+ 
+-		mutex_unlock(&amp;cache-&gt;lock);
+-		vm_cache_release_ref(cache);
+-	}
++static void
++schedule_page_thief(void* /*unused*/, int32 level)
++{
++	release_sem(sThiefWaitSem);
+ }
+ 
+ 
+@@ -878,9 +923,7 @@
+ 		vm_clear_map_flags(page, PAGE_MODIFIED);
+ 
+ 		mutex_unlock(&amp;cache-&gt;lock);
+-
+ 		status_t status = write_page(page, fsReenter);
+-
+ 		mutex_lock(&amp;cache-&gt;lock);
+ 
+ 		InterruptsSpinLocker locker(&amp;sPageLock);
+@@ -1032,20 +1075,25 @@
+ 	thread_id thread;
+ 
+ 	// create a kernel thread to clear out pages
+-	thread = spawn_kernel_thread(&amp;page_scrubber, &quot;page scrubber&quot;, B_LOWEST_ACTIVE_PRIORITY, NULL);
++	thread = spawn_kernel_thread(&amp;page_scrubber, &quot;page scrubber&quot;,
++		B_LOWEST_ACTIVE_PRIORITY, NULL);
+ 	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 
+ 	new (&amp;sFreePageCondition) ConditionVariable&lt;page_queue&gt;;
+ 	sFreePageCondition.Publish(&amp;sFreePageQueue, &quot;free page&quot;);
+ 
+-	register_low_memory_handler(page_thief, NULL, 0);
+-
+ 	sWriterWaitSem = create_sem(0, &quot;page writer&quot;);
++	sThiefWaitSem = create_sem(0, &quot;page thief&quot;);
+ 
+ 	thread = spawn_kernel_thread(&amp;page_writer, &quot;page writer&quot;,
+ 		B_LOW_PRIORITY, NULL);
+ 	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 
++	thread = spawn_kernel_thread(&amp;page_thief, &quot;page thief&quot;,
++		B_LOW_PRIORITY, NULL);
++	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
++
++	register_low_memory_handler(schedule_page_thief, NULL, 100);
+ 	return B_OK;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004069.html">[Haiku-commits] r22381 - in haiku/trunk/data/artwork: . icons
+</A></li>
+	<LI>Next message: <A HREF="004071.html">[Haiku-commits] r22383 - haiku/trunk/data/artwork/icons
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4070">[ date ]</a>
+              <a href="thread.html#4070">[ thread ]</a>
+              <a href="subject.html#4070">[ subject ]</a>
+              <a href="author.html#4070">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,750 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27017 -	haiku/trunk/src/add-ons/kernel/file_systems/udf
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27017%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/udf&In-Reply-To=%3C200808180940.m7I9ek2n021585%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011038.html">
+   <LINK REL="Next"  HREF="011040.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27017 -	haiku/trunk/src/add-ons/kernel/file_systems/udf</H1>
+    <B>sbenedetto at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27017%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/udf&In-Reply-To=%3C200808180940.m7I9ek2n021585%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27017 -	haiku/trunk/src/add-ons/kernel/file_systems/udf">sbenedetto at mail.berlios.de
+       </A><BR>
+    <I>Mon Aug 18 11:40:46 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011038.html">[Haiku-commits] r27016 - haiku/trunk/build/scripts
+</A></li>
+        <LI>Next message: <A HREF="011040.html">[Haiku-commits] r27018 -	haiku/trunk/src/add-ons/kernel/file_systems/udf
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11039">[ date ]</a>
+              <a href="thread.html#11039">[ thread ]</a>
+              <a href="subject.html#11039">[ subject ]</a>
+              <a href="author.html#11039">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: sbenedetto
+Date: 2008-08-18 11:40:42 +0200 (Mon, 18 Aug 2008)
+New Revision: 27017
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27017&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27017&amp;view=rev</A>
+
+Removed:
+   haiku/trunk/src/add-ons/kernel/file_systems/udf/DirectoryIterator.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/udf/DirectoryIterator.h
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/udf/Icb.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/udf/Icb.h
+   haiku/trunk/src/add-ons/kernel/file_systems/udf/kernel_interface.cpp
+Log:
+* Removed DirectoryIterator.{h,cpp} and included them in Icp.{h,cpp}
+* Porting Icb to new file cache system
+
+
+Deleted: haiku/trunk/src/add-ons/kernel/file_systems/udf/DirectoryIterator.cpp
+
+Deleted: haiku/trunk/src/add-ons/kernel/file_systems/udf/DirectoryIterator.h
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/udf/Icb.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/udf/Icb.cpp	2008-08-18 08:39:46 UTC (rev 27016)
++++ haiku/trunk/src/add-ons/kernel/file_systems/udf/Icb.cpp	2008-08-18 09:40:42 UTC (rev 27017)
+@@ -9,19 +9,98 @@
+ #include &quot;time.h&quot;
+ 
+ #include &quot;AllocationDescriptorList.h&quot;
+-#include &quot;DirectoryIterator.h&quot;
+ #include &quot;Utils.h&quot;
+ #include &quot;Volume.h&quot;
+ 
+-using namespace Udf;
+ 
++status_t
++DirectoryIterator::GetNextEntry(char *name, uint32 *length, ino_t *id)
++{
++	DEBUG_INIT_ETC(&quot;DirectoryIterator&quot;,
++	               (&quot;name: %p, length: %p, id: %p&quot;, name, length, id));
++
++	if (!id || !name || !length)
++		return B_BAD_VALUE;
++
++	PRINT((&quot;fPosition:          %Ld\n&quot;, fPosition));
++	PRINT((&quot;Parent()-&gt;Length(): %Ld\n&quot;, Parent()-&gt;Length()));
++
++	status_t error = B_OK;
++	if (fAtBeginning) {
++		sprintf(name, &quot;.&quot;);
++		*length = 2;
++		*id = Parent()-&gt;Id();
++		fAtBeginning = false;
++	} else {
++
++		if (uint64(fPosition) &gt;= Parent()-&gt;Length()) 
++			RETURN(B_ENTRY_NOT_FOUND);
++
++		uint8 data[kMaxFileIdSize];
++		file_id_descriptor *entry = reinterpret_cast&lt;file_id_descriptor*&gt;(data);
++
++		uint32 block = 0;
++		off_t offset = fPosition;
++
++		size_t entryLength = kMaxFileIdSize;
++		// First read in the static portion of the file id descriptor,
++		// then, based on the information therein, read in the variable
++		// length tail portion as well.
++		error = Parent()-&gt;Read(offset, entry, &amp;entryLength, &amp;block);
++		if (!error &amp;&amp; entryLength &gt;= sizeof(file_id_descriptor)
++			&amp;&amp; entry-&gt;tag().init_check(block) == B_OK) {
++			PDUMP(entry);
++			offset += entry-&gt;total_length();
++
++			if (entry-&gt;is_parent()) {
++				sprintf(name, &quot;..&quot;);
++				*length = 3;
++			} else {
++				UdfString string(entry-&gt;id(), entry-&gt;id_length());
++				PRINT((&quot;id == `%s'\n&quot;, string.Utf8()));
++				DUMP(entry-&gt;icb());
++				sprintf(name, &quot;%s&quot;, string.Utf8());
++				*length = string.Utf8Length();
++			}
++			*id = to_vnode_id(entry-&gt;icb());
++		}
++
++		if (!error)
++			fPosition = offset;
++	}
++
++ 	RETURN(error);
++}
++
++
++/*	\brief Rewinds the iterator to point to the first entry in the directory. */
++void
++DirectoryIterator::Rewind()
++{
++	fAtBeginning = true;
++	fPosition = 0;
++}
++
++
++//	#pragma - Private methods
++
++
++DirectoryIterator::DirectoryIterator(Icb *parent)
++	:
++	fAtBeginning(true),
++	fParent(parent),
++	fPosition(0)
++{
++}
++
+ Icb::Icb(Volume *volume, long_address address)
+-	: fVolume(volume)
+-	, fData(volume)
+-	, fInitStatus(B_NO_INIT)
+-	, fId(to_vnode_id(address))
+-	, fFileEntry(&amp;fData)
+-	, fExtendedEntry(&amp;fData)
++	:
++	fVolume(volume),
++	fData(volume),
++	fInitStatus(B_NO_INIT),
++	fId(to_vnode_id(address)),
++	fFileEntry(&amp;fData),
++	fExtendedEntry(&amp;fData)
+ {
+ 	DEBUG_INIT_ETC(&quot;Icb&quot;, (&quot;volume: %p, address(block: %ld, &quot;
+ 	               &quot;partition: %d, length: %ld)&quot;, volume, address.block(),
+@@ -31,7 +110,7 @@
+ 		off_t block;
+ 		error = fVolume-&gt;MapBlock(address, &amp;block);
+ 		if (!error) {
+-			icb_header *header = reinterpret_cast&lt;icb_header*&gt;(fData.SetTo(block));
++			icb_header *header = (icb_header *)fData.SetTo(block);
+ 			if (header-&gt;tag().id() == TAGID_FILE_ENTRY) {
+ 				file_icb_entry *entry = reinterpret_cast&lt;file_icb_entry*&gt;(header);
+ 				PDUMP(entry);
+@@ -49,25 +128,46 @@
+ 	fInitStatus = error;
+ 	PRINT((&quot;result: 0x%lx, `%s'\n&quot;, error, strerror(error)));
+ }
+-	
++
++
+ status_t
++Icb::GetDirectoryIterator(DirectoryIterator **iterator)
++{
++	status_t error = iterator ? B_OK : B_BAD_VALUE;
++
++	if (!error) {
++		*iterator = new(std::nothrow) DirectoryIterator(this);
++		if (*iterator)
++		 	fIteratorList.Add(*iterator);
++		else
++			error = B_NO_MEMORY;
++	}
++
++	return error;
++}
++
++
++status_t
+ Icb::InitCheck()
+ {
+ 	return fInitStatus;
+ }
+ 
++
+ time_t
+ Icb::AccessTime()
+ {
+-	return make_time(FileEntry()-&gt;access_date_and_time());
++	return make_time(_FileEntry()-&gt;access_date_and_time());
+ }
+ 
++
+ time_t
+ Icb::ModificationTime()
+ {
+-	return make_time(FileEntry()-&gt;modification_date_and_time());
++	return make_time(_FileEntry()-&gt;modification_date_and_time());
+ }
+ 
++
+ status_t
+ Icb::Read(off_t pos, void *buffer, size_t *length, uint32 *block)
+ {
+@@ -82,7 +182,7 @@
+ 		return B_OK;
+ 	}
+ 
+-	switch (IcbTag().descriptor_flags()) {
++	switch (_IcbTag().descriptor_flags()) {
+ 		case ICB_DESCRIPTOR_TYPE_SHORT: {
+ 			PRINT((&quot;descriptor type: short\n&quot;));
+ 			AllocationDescriptorList&lt;ShortDescriptorAccessor&gt; list(this, ShortDescriptorAccessor(0));
+@@ -96,7 +196,7 @@
+ 			RETURN(_Read(list, pos, buffer, length, block));
+ 			break;
+ 		}
+-		
++
+ 		case ICB_DESCRIPTOR_TYPE_EXTENDED: {
+ 			PRINT((&quot;descriptor type: extended\n&quot;));
+ //			AllocationDescriptorList&lt;ExtendedDescriptorAccessor&gt; list(this, ExtendedDescriptorAccessor(0));
+@@ -112,29 +212,13 @@
+ 		}
+ 		
+ 		default:
+-			PRINT((&quot;Invalid icb descriptor flags! (flags = %d)\n&quot;, IcbTag().descriptor_flags()));
++			PRINT((&quot;Invalid icb descriptor flags! (flags = %d)\n&quot;, _IcbTag().descriptor_flags()));
+ 			RETURN(B_BAD_VALUE);
+ 			break;		
+ 	}
+ }
+ 
+-status_t
+-Icb::GetDirectoryIterator(DirectoryIterator **iterator)
+-{
+-	status_t error = iterator ? B_OK : B_BAD_VALUE;
+ 
+-	if (!error) {
+-		*iterator = new(nothrow) DirectoryIterator(this);
+-		if (*iterator) {
+-			error = fIteratorList.PushBack(*iterator);
+-		} else {
+-			error = B_NO_MEMORY;
+-		}
+-	}
+-	
+-	return error;
+-}
+-
+ status_t
+ Icb::Find(const char *filename, ino_t *id)
+ {
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/udf/Icb.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/udf/Icb.h	2008-08-18 08:39:46 UTC (rev 27016)
++++ haiku/trunk/src/add-ons/kernel/file_systems/udf/Icb.h	2008-08-18 09:40:42 UTC (rev 27017)
+@@ -1,41 +1,27 @@
+-//----------------------------------------------------------------------
+-//  This software is part of the Haiku distribution and is covered 
+-//  by the MIT license.
+-//
+-//  Copyright (c) 2003 Tyler Dauwalder, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">tyler at dauwalder.net</A>
+-//---------------------------------------------------------------------
++/*
++ * Copyright 2008, Salvatore Benedetto, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">salvatore.benedetto at gmail.com.</A>
++ * Copyright 2003, Tyler Dauwalder, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">tyler at dauwalder.net.</A>
++ * Distributed under the terms of the MIT License.
++ */
+ #ifndef _UDF_ICB_H
+ #define _UDF_ICB_H
+ 
+-/*! \file Icb.h
+-*/
++/*! \file Icb.h */
+ 
+-#ifndef _IMPEXP_KERNEL
+-#	define _IMPEXP_KERNEL
+-#endif
+-#ifdef COMPILE_FOR_R5
+-extern &quot;C&quot; {
+-#endif
+-	#include &quot;fsproto.h&quot;
+-#ifdef COMPILE_FOR_R5
+-}
+-#endif
++#include &quot;UdfStructures.h&quot;
+ 
+-#include &quot;kernel_cpp.h&quot;
+-#include &quot;UdfDebug.h&quot;
++#include &lt;util/kernel_cpp.h&gt;
++#include &lt;util/SinglyLinkedList.h&gt;
+ 
+ #include &quot;CachedBlock.h&quot;
+-#include &quot;UdfStructures.h&quot;
+-#include &quot;SinglyLinkedList.h&quot;
+ 
+-namespace Udf {
+-
+ class DirectoryIterator;
++class Icb;
+ class Volume;
+ 
+ /*! \brief Abstract interface to file entry structure members
+ 	that are not commonly accessible through file_icb_entry().
+-	
++
+ 	This is necessary, since we can't use virtual functions in
+ 	the disk structure structs themselves, since we generally
+ 	don't create disk structure objects by calling new, but
+@@ -46,86 +32,110 @@
+ */
+ class AbstractFileEntry {
+ public:
+-	virtual uint8* AllocationDescriptors() = 0;
+-	virtual uint32 AllocationDescriptorsLength() = 0;
++	virtual uint8* 		AllocationDescriptors() = 0;
++	virtual uint32		AllocationDescriptorsLength() = 0;
+ };
+ 
++
+ template &lt;class Descriptor&gt;
+ class FileEntry : public AbstractFileEntry {
+ public:
+-	FileEntry(CachedBlock *descriptorBlock = NULL);
+-	void SetTo(CachedBlock *descriptorBlock);
+-	virtual uint8* AllocationDescriptors();
+-	virtual uint32 AllocationDescriptorsLength();
++								FileEntry(CachedBlock *descriptorBlock = NULL);
++	void						SetTo(CachedBlock *descriptorBlock);
++	virtual uint8*				AllocationDescriptors();
++	virtual uint32				AllocationDescriptorsLength();
++
+ private:
+-	Descriptor* _Descriptor();
+-	
+-	CachedBlock *fDescriptorBlock;
++	Descriptor					*_Descriptor();
++	CachedBlock					*fDescriptorBlock;
+ };
+ 
++
++class DirectoryIterator : public SinglyLinkedListLinkImpl&lt;DirectoryIterator&gt; {
++public:
++
++	status_t						GetNextEntry(char *name, uint32 *length,
++										ino_t *id);
++
++	Icb								*Parent() { return fParent; }
++	const Icb						*Parent() const { return fParent; }
++
++	void							Rewind();
++
++private:
++friend class 						Icb;
++
++	/* The following is called by Icb::GetDirectoryIterator() */
++									DirectoryIterator(Icb *parent);
++	/* The following is called by Icb::~Icb() */
++	void							_Invalidate() { fParent = NULL; }
++
++	bool							fAtBeginning;
++	Icb								*fParent;
++	off_t							fPosition;
++};
++
++
+ class Icb {
+ public:
+-	Icb(Volume *volume, long_address address);
+-	status_t InitCheck();
+-	ino_t Id() { return fId; }
+-	
++								Icb(Volume *volume, long_address address);
++	status_t					InitCheck();
++	ino_t						Id() { return fId; }
++
+ 	// categorization
+-	uint8 Type() { return IcbTag().file_type(); }
+-	bool IsFile() { return InitCheck() == B_OK &amp;&amp; Type() == ICB_TYPE_REGULAR_FILE; }
+-	bool IsDirectory() { return InitCheck() == B_OK
+-	                     &amp;&amp; (Type() == ICB_TYPE_DIRECTORY || Type() == ICB_TYPE_STREAM_DIRECTORY); }
+-	
+-	uint32 Uid() { return 0; }//FileEntry()-&gt;uid(); }
+-	uint32 Gid() { return 0; }
+-	uint16 FileLinkCount() { return FileEntry()-&gt;file_link_count(); }
+-	uint64 Length() { return FileEntry()-&gt;information_length(); }
+-	mode_t Mode() { return (IsDirectory() ? S_IFDIR : S_IFREG) | S_IRUSR | S_IRGRP | S_IROTH; }
+-	time_t AccessTime();
+-	time_t ModificationTime();
+-	
+-	uint8 *AllocationDescriptors() { return AbstractEntry()-&gt;AllocationDescriptors(); }
+-	uint32 AllocationDescriptorsSize() { return AbstractEntry()-&gt;AllocationDescriptorsLength(); }
+-	
+-	status_t Read(off_t pos, void *buffer, size_t *length, uint32 *block = NULL);
+-	
++	uint8						Type() { return _IcbTag().file_type(); }
++	bool						IsFile() { return Type() == ICB_TYPE_REGULAR_FILE; }
++	bool						IsDirectory() { return (Type() == ICB_TYPE_DIRECTORY
++									|| Type() == ICB_TYPE_STREAM_DIRECTORY); }
++
++	uint32						Uid() { return _FileEntry()-&gt;uid(); }
++	uint32						Gid() { return 0; }
++	uint16						FileLinkCount() { return _FileEntry()-&gt;file_link_count(); }
++	uint64						Length() { return _FileEntry()-&gt;information_length(); }
++	mode_t						Mode() { return (IsDirectory() ? S_IFDIR : S_IFREG)
++									| S_IRUSR | S_IRGRP | S_IROTH; }
++	time_t						AccessTime();
++	time_t						ModificationTime();
++
++	uint8						*AllocationDescriptors()
++									{ return _AbstractEntry()-&gt;AllocationDescriptors(); }
++	uint32						AllocationDescriptorsSize()
++									{ return _AbstractEntry()-&gt;AllocationDescriptorsLength(); }
++
++	status_t					Read(off_t pos, void *buffer, size_t *length,
++									uint32 *block = NULL);
++
+ 	// for directories only
+-	status_t GetDirectoryIterator(DirectoryIterator **iterator);
+-	status_t Find(const char *filename, ino_t *id);
+-	
+-	Volume* GetVolume() const { return fVolume; }
+-	
++	status_t					GetDirectoryIterator(DirectoryIterator **iterator);
++	status_t					Find(const char *filename, ino_t *id);
++
++	Volume						*GetVolume() const { return fVolume; }
++
+ private:
+-	Icb();	// unimplemented
+-		
+-	descriptor_tag &amp; Tag() { return (reinterpret_cast&lt;icb_header*&gt;(fData.Block()))-&gt;tag(); }
+-	icb_entry_tag&amp; IcbTag() { return (reinterpret_cast&lt;icb_header*&gt;(fData.Block()))-&gt;icb_tag(); }
+-	AbstractFileEntry* AbstractEntry() {
+-		DEBUG_INIT(&quot;Icb&quot;);
+-		return (Tag().id() == TAGID_EXTENDED_FILE_ENTRY)
+-//	             ? reinterpret_cast&lt;extended_file_icb_entry*&gt;(fData.Block())
+-//	             : reinterpret_cast&lt;file_icb_entry*&gt;(fData.Block()));
+-	             ? &amp;fExtendedEntry
+-	             : &fFileEntry;
+-	}
+-	file_icb_entry* FileEntry() { return (reinterpret_cast&lt;file_icb_entry*&gt;(fData.Block())); }
+-	extended_file_icb_entry&amp; ExtendedEntry() { return *(reinterpret_cast&lt;extended_file_icb_entry*&gt;(fData.Block())); }
++	AbstractFileEntry			*_AbstractEntry() { return (_Tag().id()
++									== TAGID_EXTENDED_FILE_ENTRY)
++									? &amp;fExtendedEntry : &fFileEntry; }
+ 
++	descriptor_tag				&amp;_Tag() { return ((icb_header *)fData.Block())-&gt;tag(); }
++	icb_entry_tag				&amp;_IcbTag() { return ((icb_header *)fData.Block())-&gt;icb_tag(); }
++	file_icb_entry				*_FileEntry() { return (file_icb_entry *)fData.Block(); }
++	extended_file_icb_entry		&amp;_ExtendedEntry() { return *(extended_file_icb_entry *)fData.Block(); }
++
+ 	template &lt;class DescriptorList&gt;
+-	status_t _Read(DescriptorList &amp;list, off_t pos, void *buffer, size_t *length, uint32 *block);
++	status_t					_Read(DescriptorList &amp;list, off_t pos,
++									void *buffer, size_t *length, uint32 *block);
+ 
+-	
+ private:
+-	Volume *fVolume;
+-	CachedBlock fData;
+-	status_t fInitStatus;
+-	ino_t fId;
+-	SinglyLinkedList&lt;DirectoryIterator*&gt; fIteratorList;
+-	/* [zooey]: gcc-2.95.3 requires the explicit namespace here, otherwise
+-	   it complains about a syntax error(!). This is most probably a bug. */
+-	Udf::FileEntry&lt;file_icb_entry&gt; fFileEntry;
+-	Udf::FileEntry&lt;extended_file_icb_entry&gt; fExtendedEntry;	
++	Volume						*fVolume;
++	CachedBlock					fData;
++	status_t					fInitStatus;
++	ino_t						fId;
++	SinglyLinkedList&lt;DirectoryIterator&gt;		fIteratorList;
++	FileEntry&lt;file_icb_entry&gt; 				fFileEntry;
++	FileEntry&lt;extended_file_icb_entry&gt;		fExtendedEntry;	
+ };
+ 
++
+ /*! \brief Does the dirty work of reading using the given DescriptorList object
+ 	to access the allocation descriptors properly.
+ */
+@@ -133,48 +143,47 @@
+ status_t
+ Icb::_Read(DescriptorList &amp;list, off_t pos, void *_buffer, size_t *length, uint32 *block)
+ {
+-	DEBUG_INIT_ETC(&quot;Icb&quot;, (&quot;list: %p, pos: %Ld, buffer: %p, length: (%p)-&gt;%ld&quot;,
+-	               &amp;list, pos, _buffer, length, (length ? *length : 0))); 
+-	if (!_buffer || !length)
+-		RETURN(B_BAD_VALUE);
+-		
++	TRACE((&quot;Icb::_Read(): list: %p, pos: %Ld, buffer: %p, length: (%p)-&gt;%ld&quot;,
++		&amp;list, pos, _buffer, length, (length ? *length : 0)));
++
+ 	uint64 bytesLeftInFile = uint64(pos) &gt; Length() ? 0 : Length() - pos;
+ 	size_t bytesLeft = (*length &gt;= bytesLeftInFile) ? bytesLeftInFile : *length;
+ 	size_t bytesRead = 0;
+-	
+-	Volume *volume = GetVolume();		
+-	status_t error = B_OK;		
+-	uint8 *buffer = reinterpret_cast&lt;uint8*&gt;(_buffer);
++
++	Volume *volume = GetVolume();
++	status_t error = B_OK;
++	uint8 *buffer = (uint8 *)_buffer;
+ 	bool isFirstBlock = true;
+-	
++
+ 	while (bytesLeft &gt; 0 &amp;&amp; !error) {
+-		
+-		PRINT((&quot;pos: %Ld\n&quot;, pos));
+-		PRINT((&quot;bytesLeft: %ld\n&quot;, bytesLeft));
+-		
++
++		TRACE((&quot;Icb::_Read(): pos: %Ld\n, bytesLeft: %ld\n&quot;, pos, bytesLeft));
++
+ 		long_address extent;
+ 		bool isEmpty = false;
+ 		error = list.FindExtent(pos, &amp;extent, &amp;isEmpty);
+ 		if (!error) {
+-			PRINT((&quot;found extent for offset %Ld: (block: %ld, partition: %d, length: %ld, type: %d)\n&quot;,
+-			       pos, extent.block(), extent.partition(), extent.length(), extent.type()));
+-			       
++			TRACE((&quot;Icb::_Read(): found extent for offset %Ld: (block: %ld, &quot;
++				&quot;partition: %d, length: %ld, type: %d)\n&quot;, pos, extent.block(),
++				extent.partition(), extent.length(), extent.type()));
++
+ 			switch (extent.type()) {
+ 				case EXTENT_TYPE_RECORDED:
+ 					isEmpty = false;
+ 					break;
+-				
++
+ 				case EXTENT_TYPE_ALLOCATED:
+ 				case EXTENT_TYPE_UNALLOCATED:
+ 					isEmpty = true;
+ 					break;
+-				
++
+ 				default:
+-					PRINT((&quot;Invalid extent type found: %d\n&quot;, extent.type()));
++					TRACE_ERROR((&quot;Icb::_Read(): Invalid extent type &quot;
++						&quot;found: %d\n&quot;, extent.type()));
+ 					error = B_ERROR;
+-					break;			
++					break;
+ 			}
+-			
++
+ 			if (!error) {
+ 				// Note the unmapped first block of the total read in
+ 				// the block output parameter if provided
+@@ -183,37 +192,40 @@
+ 					if (block)
+ 						*block = extent.block();
+ 				}
+-							
+-				off_t blockOffset = pos - off_t((pos &gt;&gt; volume-&gt;BlockShift()) &lt;&lt; volume-&gt;BlockShift());
++
++				off_t blockOffset = pos - off_t((pos &gt;&gt; volume-&gt;BlockShift())
++					&lt;&lt; volume-&gt;BlockShift());
+ 				size_t fullBlocksLeft = bytesLeft &gt;&gt; volume-&gt;BlockShift();
+ 				
+ 				if (fullBlocksLeft &gt; 0 &amp;&amp; blockOffset == 0) {
+-					PRINT((&quot;reading full block (or more)\n&quot;));				
+-					// Block aligned and at least one full block left. Read in using
+-					// cached_read() calls.
++					TRACE((&quot;Icb::_Read(): reading full block (or more)\n&quot;));
++					// Block aligned and at least one full block left. Read
++					// in using cached_read() calls.
+ 					off_t diskBlock;
+ 					error = volume-&gt;MapBlock(extent, &amp;diskBlock);
+ 					if (!error) {
+-						size_t fullBlockBytesLeft = fullBlocksLeft &lt;&lt; volume-&gt;BlockShift();
++						size_t fullBlockBytesLeft =
++							fullBlocksLeft &lt;&lt; volume-&gt;BlockShift();
+ 						size_t readLength = fullBlockBytesLeft &lt; extent.length()
+-						                      ? fullBlockBytesLeft
+-						                      : extent.length();					
+-					
++							? fullBlockBytesLeft : extent.length();
++
+ 						if (isEmpty) {
+-							PRINT((&quot;reading %ld empty bytes as zeros\n&quot;, readLength));
++							TRACE((&quot;Icb::_Read(): reading %ld empty bytes &quot;
++								&quot;as zeros\n&quot;, readLength));
+ 							memset(buffer, 0, readLength);
+ 						} else {
+ 							off_t diskBlock;
+ 							error = volume-&gt;MapBlock(extent, &amp;diskBlock);
+-							if (!error) {							
+-								PRINT((&quot;reading %ld bytes from disk block %Ld using cached_read()\n&quot;,
+-								       readLength, diskBlock));
+-								error = cached_read(volume-&gt;Device(), diskBlock, buffer,
+-								                  readLength &gt;&gt; volume-&gt;BlockShift(),
+-								                  volume-&gt;BlockSize());
+-							} 
++							if (!error) {
++								TRACE((&quot;Icb::_Read(): reading %ld bytes from &quot;
++									&quot;disk block %Ld using cached_read()\n&quot;,
++									readLength, diskBlock));
++								size_t length = readLength &gt;&gt; volume-&gt;BlockShift();
++								error = file_cache_read(volume-&gt;BlockCache(),
++											NULL, pos, buffer, &amp;length);
++							}
+ 						}
+-						
++
+ 						if (!error) {
+ 							bytesLeft -= readLength;
+ 							bytesRead += readLength;
+@@ -221,7 +233,7 @@
+ 							buffer += readLength;
+ 						}					
+ 					}
+-					
++
+ 				} else {
+ 					PRINT((&quot;partial block\n&quot;));
+ 					off_t partialOffset;
+@@ -251,15 +263,15 @@
+ 						if (!error) {
+ 							PRINT((&quot;reading %ld bytes from disk block %Ld using get_block()\n&quot;,
+ 							       partialLength, diskBlock));
+-							uint8 *data = (uint8*)get_block(volume-&gt;Device(), diskBlock, volume-&gt;BlockSize());
++							uint8 *data = (uint8*)block_cache_get_etc((void*)volume-&gt;BlockCache(), diskBlock, 0, partialLength);
+ 							error = data ? B_OK : B_BAD_DATA;
+ 							if (!error) {
+ 								memcpy(buffer, data+partialOffset, partialLength);
+-								release_block(volume-&gt;Device(), diskBlock);
++								block_cache_put(volume-&gt;BlockCache(), diskBlock);
+ 							}
+ 						}
+ 					}
+-					
++
+ 					if (!error) {
+ 						bytesLeft -= partialLength;
+ 						bytesRead += partialLength;
+@@ -280,12 +292,14 @@
+ 	RETURN(error);
+ }
+ 
++
+ template &lt;class Descriptor&gt;
+ FileEntry&lt;Descriptor&gt;::FileEntry(CachedBlock *descriptorBlock)
+ 	: fDescriptorBlock(descriptorBlock)
+ {
+ }
+ 
++
+ template &lt;class Descriptor&gt;
+ void
+ FileEntry&lt;Descriptor&gt;::SetTo(CachedBlock *descriptorBlock)
+@@ -293,6 +307,7 @@
+ 	fDescriptorBlock = descriptorBlock;
+ }
+ 
++
+ template &lt;class Descriptor&gt;
+ uint8*
+ FileEntry&lt;Descriptor&gt;::AllocationDescriptors()
+@@ -301,6 +316,7 @@
+ 	return descriptor ? descriptor-&gt;allocation_descriptors() : NULL;
+ }
+ 
++
+ template &lt;class Descriptor&gt;
+ uint32
+ FileEntry&lt;Descriptor&gt;::AllocationDescriptorsLength()
+@@ -309,13 +325,13 @@
+ 	return descriptor ? descriptor-&gt;allocation_descriptors_length() : 0;
+ }
+ 
++
+ template &lt;class Descriptor&gt;
+ Descriptor*
+ FileEntry&lt;Descriptor&gt;::_Descriptor()
+ {
+-	return fDescriptorBlock ? reinterpret_cast&lt;Descriptor*&gt;(fDescriptorBlock-&gt;Block()) : NULL;
++	return fDescriptorBlock
++		? (Descriptor *)fDescriptorBlock-&gt;Block() : NULL;
+ }
+ 
+-};	// namespace Udf
+-
+ #endif	// _UDF_ICB_H
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/udf/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/udf/kernel_interface.cpp	2008-08-18 08:39:46 UTC (rev 27016)
++++ haiku/trunk/src/add-ons/kernel/file_systems/udf/kernel_interface.cpp	2008-08-18 09:40:42 UTC (rev 27017)
+@@ -16,7 +16,6 @@
+ #include &lt;KernelExport.h&gt;
+ #include &lt;util/kernel_cpp.h&gt;
+ 
+-#include &quot;DirectoryIterator.h&quot;
+ #include &quot;Icb.h&quot;
+ #include &quot;Recognition.h&quot;
+ #include &quot;Utils.h&quot;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011038.html">[Haiku-commits] r27016 - haiku/trunk/build/scripts
+</A></li>
+	<LI>Next message: <A HREF="011040.html">[Haiku-commits] r27018 -	haiku/trunk/src/add-ons/kernel/file_systems/udf
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11039">[ date ]</a>
+              <a href="thread.html#11039">[ thread ]</a>
+              <a href="subject.html#11039">[ subject ]</a>
+              <a href="author.html#11039">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

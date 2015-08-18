@@ -1,0 +1,218 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25613 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25613%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/usb&In-Reply-To=%3C200805221640.m4MGeY7p018206%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009032.html">
+   <LINK REL="Next"  HREF="009034.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25613 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25613%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/usb&In-Reply-To=%3C200805221640.m4MGeY7p018206%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25613 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Thu May 22 18:40:34 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009032.html">[Haiku-commits] r25612 - haiku/trunk/src/apps/deskbar
+</A></li>
+        <LI>Next message: <A HREF="009034.html">[Haiku-commits] r25614 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9033">[ date ]</a>
+              <a href="thread.html#9033">[ thread ]</a>
+              <a href="subject.html#9033">[ subject ]</a>
+              <a href="author.html#9033">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-05-22 18:40:33 +0200 (Thu, 22 May 2008)
+New Revision: 25613
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25613&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25613&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h
+Log:
+* Use a lazily initialized notification sem for all SendRequest() calls.
+* Also use member variables to transport the status information from the
+  callback instead of allocating a dedicated structure each time.
+* Remove the now unused transfer_result_data struct.
+
+This should bring down some overhead otherwise involved with sending requests
+over control pipes. As this is heavily used in updating for example the hub
+status (also on roothubs), this change should make the polling loop a lot
+cheaper. Note that this makes SendRequest() non-thread safe, but as it is a
+synchronous function (as opposed to QueueRequest) and since the underlying
+architecture is not thread safe either this shouldn't be a problem (drivers
+doing a SendRequest from two different threads would have failed previously
+anyway). A benaphore or mutex could be employed to fix that if the need really
+arises.
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp	2008-05-22 16:13:09 UTC (rev 25612)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp	2008-05-22 16:40:33 UTC (rev 25613)
+@@ -289,16 +289,17 @@
+ //
+ 
+ 
+-typedef struct transfer_result_data_s {
+-	sem_id		notify_sem;
+-	status_t	status;
+-	size_t		actual_length;
+-} transfer_result_data;
++ControlPipe::ControlPipe(Object *parent)
++	:	Pipe(parent),
++		fNotifySem(-1)
++{
++}
+ 
+ 
+-ControlPipe::ControlPipe(Object *parent)
+-	:	Pipe(parent)
++ControlPipe::~ControlPipe()
+ {
++	if (fNotifySem &gt;= 0)
++		delete_sem(fNotifySem);
+ }
+ 
+ 
+@@ -307,40 +308,39 @@
+ 	uint16 index, uint16 length, void *data, size_t dataLength,
+ 	size_t *actualLength)
+ {
+-	transfer_result_data *transferResult
+-		= new(std::nothrow) transfer_result_data;
++	if (fNotifySem &lt; 0) {
++		fNotifySem = create_sem(0, &quot;usb send request notify&quot;);
++		if (fNotifySem &lt; 0)
++			return B_NO_MORE_SEMS;
++	}
+ 
+-	transferResult-&gt;notify_sem = create_sem(0, &quot;usb send request notify&quot;);
+-	if (transferResult-&gt;notify_sem &lt; B_OK)
+-		return B_NO_MORE_SEMS;
+-
+ 	status_t result = QueueRequest(requestType, request, value, index, length,
+-		data, dataLength, SendRequestCallback, transferResult);
+-	if (result &lt; B_OK) {
+-		delete_sem(transferResult-&gt;notify_sem);
++		data, dataLength, SendRequestCallback, this);
++	if (result &lt; B_OK)
+ 		return result;
+-	}
+ 
+-	// the sem will be released in the callback after the result data was
+-	// filled into the provided struct. use a 1 second timeout to avoid
+-	// hanging applications.
+-	if (acquire_sem_etc(transferResult-&gt;notify_sem, 1, B_RELATIVE_TIMEOUT, 1000000) &lt; B_OK) {
++	// The sem will be released unconditionally in the callback after the
++	// result data was filled in. Use a 1 second timeout for control transfers.
++	if (acquire_sem_etc(fNotifySem, 1, B_RELATIVE_TIMEOUT, 1000000) &lt; B_OK) {
+ 		TRACE_ERROR((&quot;USB ControlPipe: timeout waiting for queued request to complete\n&quot;));
+ 
+-		delete_sem(transferResult-&gt;notify_sem);
++		CancelQueuedTransfers(false);
++
++		// After the above cancel returns it is guaranteed that the callback
++		// has been invoked. Therefore we can simply grab that released
++		// semaphore again to clean up.
++		acquire_sem_etc(fNotifySem, 1, B_RELATIVE_TIMEOUT, 0);
++
+ 		if (actualLength)
+ 			*actualLength = 0;
+ 
+-		CancelQueuedTransfers(false);
+ 		return B_TIMED_OUT;
+ 	}
+ 
+-	delete_sem(transferResult-&gt;notify_sem);
+ 	if (actualLength)
+-		*actualLength = transferResult-&gt;actual_length;
++		*actualLength = fActualLength;
+ 
+-	result = transferResult-&gt;status;
+-	delete transferResult;
++	result = fTransferStatus;
+ 	return result;
+ }
+ 
+@@ -349,13 +349,10 @@
+ ControlPipe::SendRequestCallback(void *cookie, status_t status, void *data,
+ 	size_t actualLength)
+ {
+-	transfer_result_data *transferResult = (transfer_result_data *)cookie;
+-	transferResult-&gt;status = status;
+-	transferResult-&gt;actual_length = actualLength;
+-	if (release_sem(transferResult-&gt;notify_sem) &lt; B_OK) {
+-		// the request has timed out already - cleanup after us
+-		delete transferResult;
+-	}
++	ControlPipe *pipe = (ControlPipe *)cookie;
++	pipe-&gt;fTransferStatus = status;
++	pipe-&gt;fActualLength = actualLength;
++	release_sem(pipe-&gt;fNotifySem);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h	2008-05-22 16:13:09 UTC (rev 25612)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h	2008-05-22 16:40:33 UTC (rev 25613)
+@@ -305,6 +305,7 @@
+ class ControlPipe : public Pipe {
+ public:
+ 										ControlPipe(Object *parent);
++virtual									~ControlPipe();
+ 
+ virtual	uint32							Type() { return USB_OBJECT_PIPE | USB_OBJECT_CONTROL_PIPE; };
+ 
+@@ -331,6 +332,11 @@
+ 											void *data, size_t dataLength,
+ 											usb_callback_func callback,
+ 											void *callbackCookie);
++
++private:
++		sem_id							fNotifySem;
++		status_t						fTransferStatus;
++		size_t							fActualLength;
+ };
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009032.html">[Haiku-commits] r25612 - haiku/trunk/src/apps/deskbar
+</A></li>
+	<LI>Next message: <A HREF="009034.html">[Haiku-commits] r25614 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9033">[ date ]</a>
+              <a href="thread.html#9033">[ thread ]</a>
+              <a href="subject.html#9033">[ subject ]</a>
+              <a href="author.html#9033">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

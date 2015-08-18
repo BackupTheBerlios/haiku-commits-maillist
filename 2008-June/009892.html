@@ -1,0 +1,718 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26160 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/fs src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26160%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/cache%20src/system/kernel/fs%20src/system/kernel/vm&In-Reply-To=%3C200806282342.m5SNgk5L014141%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009891.html">
+   <LINK REL="Next"  HREF="009893.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26160 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/fs src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26160%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/cache%20src/system/kernel/fs%20src/system/kernel/vm&In-Reply-To=%3C200806282342.m5SNgk5L014141%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26160 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/fs src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Jun 29 01:42:46 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009891.html">[Haiku-commits] r26159 - haiku/trunk/headers/private/kernel/util
+</A></li>
+        <LI>Next message: <A HREF="009893.html">[Haiku-commits] r26161 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9892">[ date ]</a>
+              <a href="thread.html#9892">[ thread ]</a>
+              <a href="subject.html#9892">[ subject ]</a>
+              <a href="author.html#9892">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-06-29 01:42:41 +0200 (Sun, 29 Jun 2008)
+New Revision: 26160
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26160&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26160&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* Replaced the global cache pages hash table by an IteratableSplayTree
+  per cache.
+* Changed the strategy vm_cache_acquire_page_cache_ref() uses to ensure
+  that the cache isn't deleted while trying to get a reference. Instead
+  of the global cache pages hash table lock, it holds the global cache
+  list lock now. We acquire + release this lock in delete_cache() after
+  removing all pages and just before deleting the object.
+* Some small optimizations using the property that the cache's pages are
+  ordered, now (vm_cache_resize(), vm_page_write_modified_page_range(),
+  vm_page_schedule_write_page_range()).
+* Replaced some code counting a cache's pages by simply using
+  vm_cache::page_count.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2008-06-28 23:22:43 UTC (rev 26159)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2008-06-28 23:42:41 UTC (rev 26160)
+@@ -30,6 +30,9 @@
+ //#define DEBUG_CACHE_LIST 1
+ 
+ #ifdef __cplusplus
++
++#include &lt;util/SplayTree.h&gt;
++
+ struct vm_page_mapping;
+ typedef DoublyLinkedListLink&lt;vm_page_mapping&gt; vm_page_mapping_link;
+ 
+@@ -69,20 +72,20 @@
+ typedef class DoublyLinkedQueue&lt;vm_page_mapping, DoublyLinkedPageLink&gt; vm_page_mappings;
+ typedef class DoublyLinkedQueue&lt;vm_page_mapping, DoublyLinkedAreaLink&gt; vm_area_mappings;
+ 
++typedef uint32 page_num_t;
++
+ struct vm_page {
+ 	struct vm_page		*queue_prev;
+ 	struct vm_page		*queue_next;
+ 
+-	struct vm_page		*hash_next;
+-
+ 	addr_t				physical_page_number;
+ 
+ 	struct vm_cache		*cache;
+-	uint32				cache_offset;
++	page_num_t			cache_offset;
+ 							// in page size units
+ 
+-	struct vm_page		*cache_prev;
+-	struct vm_page		*cache_next;
++	SplayTreeLink&lt;vm_page&gt;	cache_link;
++	vm_page					*cache_next;
+ 
+ 	vm_page_mappings	mappings;
+ 
+@@ -134,6 +137,34 @@
+ 	ConditionVariable	busy_condition;
+ };
+ 
++struct VMCachePagesTreeDefinition {
++	typedef page_num_t KeyType;
++	typedef	vm_page NodeType;
++
++	static page_num_t GetKey(const NodeType* node)
++	{
++		return node-&gt;cache_offset;
++	}
++
++	static SplayTreeLink&lt;NodeType&gt;* GetLink(NodeType* node)
++	{
++		return &amp;node-&gt;cache_link;
++	}
++
++	static int Compare(page_num_t key, const NodeType* node)
++	{
++		return key == node-&gt;cache_offset ? 0
++			: (key &lt; node-&gt;cache_offset ? -1 : 1);
++	}
++
++	static NodeType** GetListLink(NodeType* node)
++	{
++		return &amp;node-&gt;cache_next;
++	}
++};
++
++typedef IteratableSplayTree&lt;VMCachePagesTreeDefinition&gt; VMCachePagesTree;
++
+ struct vm_cache {
+ 	mutex				lock;
+ 	struct vm_area		*areas;
+@@ -141,7 +172,7 @@
+ 	struct list_link	consumer_link;
+ 	struct list			consumers;
+ 		// list of caches that use this cache as a source
+-	vm_page				*page_list;
++	VMCachePagesTree	pages;
+ 	struct vm_cache		*source;
+ 	struct vm_store		*store;
+ 	off_t				virtual_base;
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2008-06-28 23:22:43 UTC (rev 26159)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2008-06-28 23:42:41 UTC (rev 26160)
+@@ -127,8 +127,8 @@
+ 
+ 			if (isWrite) {
+ 				// just schedule some pages to be written back
+-				for (vm_page *page = cache-&gt;page_list; page != NULL;
+-						page = page-&gt;cache_next) {
++				for (VMCachePagesTree::Iterator it = cache-&gt;pages.GetIterator();
++						vm_page* page = it.Next();) {
+ 					if (page-&gt;state == PAGE_STATE_MODIFIED) {
+ 						// TODO: for now, we only schedule one
+ 						vm_page_schedule_write_page(page);
+@@ -137,13 +137,11 @@
+ 				}
+ 			} else {
+ 				// free some pages from our cache
+-				// TODO: start with oldest (requires the page list to be a real list)!
++				// TODO: start with oldest
+ 				uint32 left = reservePages;
+-				vm_page *next;
+-				for (vm_page *page = cache-&gt;page_list;
+-						page != NULL &amp;&amp; left &gt; 0; page = next) {
+-					next = page-&gt;cache_next;
+-
++				vm_page *page;
++				for (VMCachePagesTree::Iterator it = cache-&gt;pages.GetIterator();
++						(page = it.Next()) != NULL &amp;&amp; left &gt; 0;) {
+ 					if (page-&gt;state != PAGE_STATE_MODIFIED
+ 						&amp;&amp; page-&gt;state != PAGE_STATE_BUSY) {
+ 						vm_cache_remove_page(cache, page);
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-06-28 23:22:43 UTC (rev 26159)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-06-28 23:42:41 UTC (rev 26160)
+@@ -2793,16 +2793,9 @@
+ 		if (device != -1 &amp;&amp; vnode-&gt;device != device)
+ 			continue;
+ 
+-		// count pages in cache
+-		size_t numPages = 0;
+-		for (struct vm_page *page = vnode-&gt;cache-&gt;page_list;
+-				page != NULL; page = page-&gt;cache_next) {
+-			numPages++;
+-		}
+-
+ 		kprintf(&quot;%p%4ld%10Ld %p %8Ld%8ld\n&quot;, vnode, vnode-&gt;device, vnode-&gt;id,
+ 			vnode-&gt;cache, (vnode-&gt;cache-&gt;virtual_size + B_PAGE_SIZE - 1)
+-				/ B_PAGE_SIZE, numPages);
++				/ B_PAGE_SIZE, vnode-&gt;cache-&gt;page_count);
+ 	}
+ 
+ 	hash_close(sVnodeTable, &amp;iterator, false);
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2008-06-28 23:22:43 UTC (rev 26159)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2008-06-28 23:42:41 UTC (rev 26160)
+@@ -2226,11 +2226,11 @@
+ 			vm_page_reserve_pages(reservePages);
+ 
+ 			// map in all pages from source
+-			for (vm_page *page = cache-&gt;page_list; page != NULL;
+-					page = page-&gt;cache_next) {
++			for (VMCachePagesTree::Iterator it = cache-&gt;pages.GetIterator();
++					vm_page* page  = it.Next();) {
+ 				vm_map_page(newArea, page, newArea-&gt;base
+-					+ ((page-&gt;cache_offset &lt;&lt; PAGE_SHIFT) - newArea-&gt;cache_offset),
+-					protection);
++					+ ((page-&gt;cache_offset &lt;&lt; PAGE_SHIFT)
++					- newArea-&gt;cache_offset), protection);
+ 			}
+ 
+ 			vm_page_unreserve_pages(reservePages);
+@@ -2532,16 +2532,8 @@
+ 				// we can change the cache's commitment to take only those pages
+ 				// into account that really are in this cache.
+ 
+-				// count existing pages in this cache
+-				struct vm_page *page = cache-&gt;page_list;
+-				uint32 count = 0;
+-
+-				for (; page != NULL; page = page-&gt;cache_next) {
+-					count++;
+-				}
+-
+ 				status = cache-&gt;store-&gt;ops-&gt;commit(cache-&gt;store,
+-					cache-&gt;virtual_base + count * B_PAGE_SIZE);
++					cache-&gt;virtual_base + cache-&gt;page_count * B_PAGE_SIZE);
+ 
+ 				// ToDo: we may be able to join with our source cache, if count == 0
+ 			}
+@@ -2573,13 +2565,12 @@
+ 					= &amp;area-&gt;address_space-&gt;translation_map;
+ 				map-&gt;ops-&gt;lock(map);
+ 
+-				vm_page* page = cache-&gt;page_list;
+-				while (page) {
++				for (VMCachePagesTree::Iterator it = cache-&gt;pages.GetIterator();
++						vm_page* page = it.Next();) {
+ 					addr_t address = area-&gt;base
+ 						+ (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+ 					map-&gt;ops-&gt;protect(map, address, address - 1 + B_PAGE_SIZE,
+ 						newProtection);
+-					page = page-&gt;cache_next;
+ 				}
+ 
+ 				map-&gt;ops-&gt;unlock(map);
+@@ -3324,26 +3315,23 @@
+ 	}
+ 
+ 	kprintf(&quot;  pages:\n&quot;);
+-	int32 count = 0;
+-	for (vm_page *page = cache-&gt;page_list; page != NULL; page = page-&gt;cache_next) {
+-		count++;
+-		if (!showPages)
+-			continue;
++	if (showPages) {
++		for (VMCachePagesTree::Iterator it = cache-&gt;pages.GetIterator();
++				vm_page *page = it.Next();) {
++			if (page-&gt;type == PAGE_TYPE_PHYSICAL) {
++				kprintf(&quot;\t%p ppn 0x%lx offset 0x%lx type %u state %u (%s) &quot;
++					&quot;wired_count %u\n&quot;, page, page-&gt;physical_page_number,
++					page-&gt;cache_offset, page-&gt;type, page-&gt;state,
++					page_state_to_string(page-&gt;state), page-&gt;wired_count);
++			} else if(page-&gt;type == PAGE_TYPE_DUMMY) {
++				kprintf(&quot;\t%p DUMMY PAGE state %u (%s)\n&quot;,
++					page, page-&gt;state, page_state_to_string(page-&gt;state));
++			} else
++				kprintf(&quot;\t%p UNKNOWN PAGE type %u\n&quot;, page, page-&gt;type);
++		}
++	} else
++		kprintf(&quot;\t%ld in cache\n&quot;, cache-&gt;page_count);
+ 
+-		if (page-&gt;type == PAGE_TYPE_PHYSICAL) {
+-			kprintf(&quot;\t%p ppn 0x%lx offset 0x%lx type %u state %u (%s) wired_count %u\n&quot;,
+-				page, page-&gt;physical_page_number, page-&gt;cache_offset, page-&gt;type, page-&gt;state,
+-				page_state_to_string(page-&gt;state), page-&gt;wired_count);
+-		} else if(page-&gt;type == PAGE_TYPE_DUMMY) {
+-			kprintf(&quot;\t%p DUMMY PAGE state %u (%s)\n&quot;,
+-				page, page-&gt;state, page_state_to_string(page-&gt;state));
+-		} else
+-			kprintf(&quot;\t%p UNKNOWN PAGE type %u\n&quot;, page, page-&gt;type);
+-	}
+-
+-	if (!showPages)
+-		kprintf(&quot;\t%ld in cache\n&quot;, count);
+-
+ 	return 0;
+ }
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-06-28 23:22:43 UTC (rev 26159)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-06-28 23:42:41 UTC (rev 26160)
+@@ -36,13 +36,11 @@
+ #endif
+ 
+ 
+-static hash_table* sPageCacheTable;
+-static spinlock sPageCacheTableLock;
+-
+ #if DEBUG_CACHE_LIST
+ vm_cache* gDebugCacheList;
+-static spinlock sDebugCacheListLock;
+ #endif
++static mutex sCacheListLock = MUTEX_INITIALIZER(&quot;global vm_cache list&quot;);
++	// The lock is also needed when the debug feature is disabled.
+ 
+ 
+ struct page_lookup_key {
+@@ -352,8 +350,7 @@
+ 
+ /*!	Acquires a reference to a cache yet unreferenced by the caller. The
+ 	caller must make sure, that the cache is not deleted, e.g. by holding the
+-	cache's source cache lock or by holding the page cache table lock while the
+-	cache is still referred to by a page.
++	cache's source cache lock or by holding the global cache list lock.
+ 	Returns \c true, if the reference could be acquired.
+ */
+ static inline bool
+@@ -380,57 +377,46 @@
+ 
+ 	T(Delete(cache));
+ 
+-#if DEBUG_CACHE_LIST
+-	int state = disable_interrupts();
+-	acquire_spinlock(&amp;sDebugCacheListLock);
+-
+-	if (cache-&gt;debug_previous)
+-		cache-&gt;debug_previous-&gt;debug_next = cache-&gt;debug_next;
+-	if (cache-&gt;debug_next)
+-		cache-&gt;debug_next-&gt;debug_previous = cache-&gt;debug_previous;
+-	if (cache == gDebugCacheList)
+-		gDebugCacheList = cache-&gt;debug_next;
+-
+-	release_spinlock(&amp;sDebugCacheListLock);
+-	restore_interrupts(state);
+-#endif
+-
+ 	// delete the cache's backing store
+ 	cache-&gt;store-&gt;ops-&gt;destroy(cache-&gt;store);
+ 
+ 	// free all of the pages in the cache
+-	vm_page* page = cache-&gt;page_list;
+-	while (page) {
+-		vm_page* oldPage = page;
+-		int state;
+-
+-		page = page-&gt;cache_next;
+-
+-		if (!oldPage-&gt;mappings.IsEmpty() || oldPage-&gt;wired_count != 0) {
++	while (vm_page* page = cache-&gt;pages.Root()) {
++		if (!page-&gt;mappings.IsEmpty() || page-&gt;wired_count != 0) {
+ 			panic(&quot;remove page %p from cache %p: page still has mappings!\n&quot;,
+-				oldPage, cache);
++				page, cache);
+ 		}
+ 
+-		// remove it from the hash table
+-		state = disable_interrupts();
+-		acquire_spinlock(&amp;sPageCacheTableLock);
+-
+-		hash_remove(sPageCacheTable, oldPage);
+-		oldPage-&gt;cache = NULL;
++		// remove it
++		cache-&gt;pages.Remove(page);
++		page-&gt;cache = NULL;
+ 		// TODO: we also need to remove all of the page's mappings!
+ 
+-		release_spinlock(&amp;sPageCacheTableLock);
+-		restore_interrupts(state);
+-
+ 		TRACE((&quot;vm_cache_release_ref: freeing page 0x%lx\n&quot;,
+ 			oldPage-&gt;physical_page_number));
+-		vm_page_free(cache, oldPage);
++		vm_page_free(cache, page);
+ 	}
+ 
+ 	// remove the ref to the source
+ 	if (cache-&gt;source)
+ 		vm_cache_remove_consumer(cache-&gt;source, cache);
+ 
++	// We lock and unlock the sCacheListLock, even if the DEBUG_CACHE_LIST is
++	// not enabled. This synchronization point is needed for
++	// vm_cache_acquire_page_cache_ref().
++	mutex_lock(&amp;sCacheListLock);
++
++#if DEBUG_CACHE_LIST
++	if (cache-&gt;debug_previous)
++		cache-&gt;debug_previous-&gt;debug_next = cache-&gt;debug_next;
++	if (cache-&gt;debug_next)
++		cache-&gt;debug_next-&gt;debug_previous = cache-&gt;debug_previous;
++	if (cache == gDebugCacheList)
++		gDebugCacheList = cache-&gt;debug_next;
++#endif
++
++	mutex_unlock(&amp;sCacheListLock);
++
+ 	mutex_destroy(&amp;cache-&gt;lock);
+ 	free(cache);
+ }
+@@ -505,13 +491,11 @@
+ 
+ 	T(Merge(cache, consumer));
+ 
+-	vm_page* nextPage;
+-	for (vm_page* page = cache-&gt;page_list; page != NULL;
+-			page = nextPage) {
+-		vm_page* consumerPage;
+-		nextPage = page-&gt;cache_next;
+-
+-		consumerPage = vm_cache_lookup_page(consumer,
++	for (VMCachePagesTree::Iterator it = cache-&gt;pages.GetIterator();
++			vm_page* page = it.Next();) {
++		// Note: Removing the current node while iterating through a
++		// IteratableSplayTree is safe.
++		vm_page* consumerPage = vm_cache_lookup_page(consumer,
+ 			(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+ 		if (consumerPage == NULL) {
+ 			// the page is not yet in the consumer cache - move it upwards
+@@ -583,12 +567,6 @@
+ status_t
+ vm_cache_init(kernel_args* args)
+ {
+-	// TODO: The table should grow/shrink dynamically.
+-	sPageCacheTable = hash_init(vm_page_num_pages() / 2,
+-		offsetof(vm_page, hash_next), &amp;page_compare_func, &amp;page_hash_func);
+-	if (sPageCacheTable == NULL)
+-		panic(&quot;vm_cache_init: no memory\n&quot;);
+-
+ 	return B_OK;
+ }
+ 
+@@ -609,7 +587,7 @@
+ 
+ 	mutex_init(&amp;cache-&gt;lock, &quot;vm_cache&quot;);
+ 	list_init_etc(&amp;cache-&gt;consumers, offsetof(vm_cache, consumer_link));
+-	cache-&gt;page_list = NULL;
++	new(&amp;cache-&gt;pages) VMCachePagesTree;
+ 	cache-&gt;areas = NULL;
+ 	cache-&gt;ref_count = 1;
+ 	cache-&gt;source = NULL;
+@@ -622,8 +600,7 @@
+ 
+ 
+ #if DEBUG_CACHE_LIST
+-	int state = disable_interrupts();
+-	acquire_spinlock(&amp;sDebugCacheListLock);
++	mutex_lock(&amp;sCacheListLock);
+ 
+ 	if (gDebugCacheList)
+ 		gDebugCacheList-&gt;debug_previous = cache;
+@@ -631,8 +608,7 @@
+ 	cache-&gt;debug_next = gDebugCacheList;
+ 	gDebugCacheList = cache;
+ 
+-	release_spinlock(&amp;sDebugCacheListLock);
+-	restore_interrupts(state);
++	mutex_unlock(&amp;sCacheListLock);
+ #endif
+ 
+ 	// connect the store to its cache
+@@ -708,9 +684,10 @@
+ vm_cache*
+ vm_cache_acquire_page_cache_ref(vm_page* page)
+ {
+-	InterruptsSpinLocker locker(sPageCacheTableLock);
++	MutexLocker locker(sCacheListLock);
+ 
+ 	vm_cache* cache = page-&gt;cache;
++		// Getting/setting the pointer must be atomic on all architectures.
+ 	if (cache == NULL)
+ 		return NULL;
+ 
+@@ -727,18 +704,8 @@
+ {
+ 	ASSERT_LOCKED_MUTEX(&amp;cache-&gt;lock);
+ 
+-	struct page_lookup_key key;
+-	key.offset = (uint32)(offset &gt;&gt; PAGE_SHIFT);
+-	key.cache = cache;
++	vm_page* page = cache-&gt;pages.Lookup((page_num_t)(offset &gt;&gt; PAGE_SHIFT));
+ 
+-	cpu_status state = disable_interrupts();
+-	acquire_spinlock(&amp;sPageCacheTableLock);
+-
+-	vm_page* page = (vm_page*)hash_lookup(sPageCacheTable, &amp;key);
+-
+-	release_spinlock(&amp;sPageCacheTableLock);
+-	restore_interrupts(state);
+-
+ 	if (page != NULL &amp;&amp; cache != page-&gt;cache)
+ 		panic(&quot;page %p not in cache %p\n&quot;, page, cache);
+ 
+@@ -760,27 +727,13 @@
+ 
+ 	T2(InsertPage(cache, page, offset));
+ 
+-	page-&gt;cache_offset = (uint32)(offset &gt;&gt; PAGE_SHIFT);
+-
+-	if (cache-&gt;page_list != NULL)
+-		cache-&gt;page_list-&gt;cache_prev = page;
+-
+-	page-&gt;cache_next = cache-&gt;page_list;
+-	page-&gt;cache_prev = NULL;
+-	cache-&gt;page_list = page;
++	page-&gt;cache_offset = (page_num_t)(offset &gt;&gt; PAGE_SHIFT);
+ 	cache-&gt;page_count++;
+-
+ 	page-&gt;usage_count = 2;
+-
+-	InterruptsSpinLocker locker(sPageCacheTableLock);
+-
+ 	page-&gt;cache = cache;
+ 
+ #if KDEBUG
+-	struct page_lookup_key key;
+-	key.offset = (uint32)(offset &gt;&gt; PAGE_SHIFT);
+-	key.cache = cache;
+-	vm_page* otherPage = (vm_page*)hash_lookup(sPageCacheTable, &amp;key);
++	vm_page* otherPage = cache-&gt;pages.Lookup(page-&gt;cache_offset);
+ 	if (otherPage != NULL) {
+ 		panic(&quot;vm_cache_insert_page(): there's already page %p with cache &quot;
+ 			&quot;offset %lu in cache %p; inserting page %p&quot;, otherPage,
+@@ -788,7 +741,7 @@
+ 	}
+ #endif	// KDEBUG
+ 
+-	hash_insert(sPageCacheTable, page);
++	cache-&gt;pages.Insert(page);
+ }
+ 
+ 
+@@ -809,25 +762,8 @@
+ 
+ 	T2(RemovePage(cache, page));
+ 
+-	cpu_status state = disable_interrupts();
+-	acquire_spinlock(&amp;sPageCacheTableLock);
+-
+-	hash_remove(sPageCacheTable, page);
++	cache-&gt;pages.Remove(page);
+ 	page-&gt;cache = NULL;
+-
+-	release_spinlock(&amp;sPageCacheTableLock);
+-	restore_interrupts(state);
+-
+-	if (cache-&gt;page_list == page) {
+-		if (page-&gt;cache_next != NULL)
+-			page-&gt;cache_next-&gt;cache_prev = NULL;
+-		cache-&gt;page_list = page-&gt;cache_next;
+-	} else {
+-		if (page-&gt;cache_prev != NULL)
+-			page-&gt;cache_prev-&gt;cache_next = page-&gt;cache_next;
+-		if (page-&gt;cache_next != NULL)
+-			page-&gt;cache_next-&gt;cache_prev = page-&gt;cache_prev;
+-	}
+ 	cache-&gt;page_count--;
+ }
+ 
+@@ -907,40 +843,34 @@
+ 	if (newPageCount &lt; oldPageCount) {
+ 		// we need to remove all pages in the cache outside of the new virtual
+ 		// size
+-		vm_page* page = cache-&gt;page_list;
+-		vm_page* next;
++		for (VMCachePagesTree::Iterator it
++					= cache-&gt;pages.GetIterator(newPageCount, true, true);
++				vm_page* page = it.Next();) {
++			if (page-&gt;state == PAGE_STATE_BUSY) {
++				if (page-&gt;busy_writing) {
++					// We cannot wait for the page to become available
++					// as we might cause a deadlock this way
++					page-&gt;busy_writing = false;
++						// this will notify the writer to free the page
++				} else {
++					// wait for page to become unbusy
++					ConditionVariableEntry entry;
++					entry.Add(page);
++					mutex_unlock(&amp;cache-&gt;lock);
++					entry.Wait();
++					mutex_lock(&amp;cache-&gt;lock);
+ 
+-		while (page != NULL) {
+-			next = page-&gt;cache_next;
+-
+-			if (page-&gt;cache_offset &gt;= newPageCount) {
+-				if (page-&gt;state == PAGE_STATE_BUSY) {
+-					if (page-&gt;busy_writing) {
+-						// We cannot wait for the page to become available
+-						// as we might cause a deadlock this way
+-						page-&gt;busy_writing = false;
+-							// this will notify the writer to free the page
+-						page = next;
+-					} else {
+-						// wait for page to become unbusy
+-						ConditionVariableEntry entry;
+-						entry.Add(page);
+-						mutex_unlock(&amp;cache-&gt;lock);
+-						entry.Wait();
+-						mutex_lock(&amp;cache-&gt;lock);
+-
+-						// restart from the start of the list
+-						page = cache-&gt;page_list;
+-					}
+-					continue;
++					// restart from the start of the list
++					it = cache-&gt;pages.GetIterator(newPageCount, true, true);
+ 				}
+-
+-				// remove the page and put it into the free queue
+-				vm_cache_remove_page(cache, page);
+-				vm_page_free(cache, page);
++				continue;
+ 			}
+ 
+-			page = next;
++			// remove the page and put it into the free queue
++			vm_cache_remove_page(cache, page);
++			vm_page_free(cache, page);
++				// Note: When iterating through a IteratableSplayTree
++				// removing the current node is safe.
+ 		}
+ 	}
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2008-06-28 23:22:43 UTC (rev 26159)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2008-06-28 23:42:41 UTC (rev 26160)
+@@ -497,11 +497,10 @@
+ 
+ 	kprintf(&quot;PAGE: %p\n&quot;, page);
+ 	kprintf(&quot;queue_next,prev: %p, %p\n&quot;, page-&gt;queue_next, page-&gt;queue_prev);
+-	kprintf(&quot;hash_next:       %p\n&quot;, page-&gt;hash_next);
+ 	kprintf(&quot;physical_number: %lx\n&quot;, page-&gt;physical_page_number);
+ 	kprintf(&quot;cache:           %p\n&quot;, page-&gt;cache);
+ 	kprintf(&quot;cache_offset:    %ld\n&quot;, page-&gt;cache_offset);
+-	kprintf(&quot;cache_next,prev: %p, %p\n&quot;, page-&gt;cache_next, page-&gt;cache_prev);
++	kprintf(&quot;cache_next:      %p\n&quot;, page-&gt;cache_next);
+ 	kprintf(&quot;type:            %d\n&quot;, page-&gt;type);
+ 	kprintf(&quot;state:           %s\n&quot;, page_state_to_string(page-&gt;state));
+ 	kprintf(&quot;wired_count:     %d\n&quot;, page-&gt;wired_count);
+@@ -1324,11 +1323,13 @@
+ {
+ 	// TODO: join adjacent pages into one vec list
+ 
+-	for (vm_page *page = cache-&gt;page_list; page; page = page-&gt;cache_next) {
++	for (VMCachePagesTree::Iterator it
++				= cache-&gt;pages.GetIterator(firstPage, true, true);
++			vm_page *page = it.Next();) {
+ 		bool dequeuedPage = false;
+ 
+-		if (page-&gt;cache_offset &lt; firstPage || page-&gt;cache_offset &gt;= endPage)
+-			continue;
++		if (page-&gt;cache_offset &gt;= endPage)
++			break;
+ 
+ 		if (page-&gt;state == PAGE_STATE_MODIFIED) {
+ 			InterruptsSpinLocker locker(&amp;sPageLock);
+@@ -1428,11 +1429,15 @@
+ 	uint32 endPage)
+ {
+ 	uint32 modified = 0;
+-	for (vm_page *page = cache-&gt;page_list; page; page = page-&gt;cache_next) {
++	for (VMCachePagesTree::Iterator it
++				= cache-&gt;pages.GetIterator(firstPage, true, true);
++			vm_page *page = it.Next();) {
+ 		bool dequeuedPage = false;
+ 
+-		if (page-&gt;cache_offset &gt;= firstPage &amp;&amp; page-&gt;cache_offset &lt; endPage
+-			&amp;&amp; page-&gt;state == PAGE_STATE_MODIFIED) {
++		if (page-&gt;cache_offset &gt;= endPage)
++			break;
++
++		if (page-&gt;state == PAGE_STATE_MODIFIED) {
+ 			vm_page_requeue(page, false);
+ 			modified++;
+ 		}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009891.html">[Haiku-commits] r26159 - haiku/trunk/headers/private/kernel/util
+</A></li>
+	<LI>Next message: <A HREF="009893.html">[Haiku-commits] r26161 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9892">[ date ]</a>
+              <a href="thread.html#9892">[ thread ]</a>
+              <a href="subject.html#9892">[ subject ]</a>
+              <a href="author.html#9892">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

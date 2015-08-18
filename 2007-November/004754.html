@@ -1,0 +1,659 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22927 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22927%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200711141337.lAEDbfnW013967%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004753.html">
+   <LINK REL="Next"  HREF="004755.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22927 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>sbenedetto at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22927%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200711141337.lAEDbfnW013967%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22927 - haiku/trunk/src/add-ons/kernel/busses/usb">sbenedetto at mail.berlios.de
+       </A><BR>
+    <I>Wed Nov 14 14:37:41 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004753.html">[Haiku-commits] r22926 - in haiku/trunk: headers/private/app	src/servers/debug src/servers/registrar
+</A></li>
+        <LI>Next message: <A HREF="004755.html">[Haiku-commits] r22927 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4754">[ date ]</a>
+              <a href="thread.html#4754">[ thread ]</a>
+              <a href="subject.html#4754">[ subject ]</a>
+              <a href="author.html#4754">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: sbenedetto
+Date: 2007-11-14 14:37:41 +0100 (Wed, 14 Nov 2007)
+New Revision: 22927
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22927&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22927&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+Log:
+* Renamed some variables
+* Reworking the interrupts endpoints tree parts
+* Added spin_locker, semaphore, finisher thread and interrupt handler (not implemented)
+* Made fInterruptEndpoints allocation dynamic instead of static
+* Fixed Start method (it should be correct now)
+
+
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2007-11-14 01:28:47 UTC (rev 22926)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2007-11-14 13:37:41 UTC (rev 22927)
+@@ -66,13 +66,18 @@
+ 		fPCIInfo(info),
+ 		fStack(stack),
+ 		fRegisterArea(-1),
++		fSpinLock(0),
+ 		fHccaArea(-1),
+ 		fDummyControl(NULL),
+ 		fDummyBulk(NULL),
+ 		fDummyIsochronous(NULL),
++		fFirstTransfer(NULL),
++		fFinishTransfer(NULL),
++		fFinishThread(-1),
++		fStopFinishThread(false),
+ 		fRootHub(NULL),
+ 		fRootHubAddress(0),
+-		fNumPorts(0)
++		fPortCount(0)
+ {
+ 	if (!fInitOK) {
+ 		TRACE_ERROR((&quot;usb_ohci: bus manager failed to init\n&quot;));
+@@ -119,12 +124,13 @@
+ 	}
+ 
+ 	// Set up the Host Controller Communications Area
++	// which is 256 bytes (2048 bits) and must be aligned
+ 	void *hccaPhysicalAddress;
+ 	fHccaArea = fStack-&gt;AllocateArea((void **)&amp;fHcca, &amp;hccaPhysicalAddress,
+ 		2048, &quot;USB OHCI Host Controller Communication Area&quot;);
+ 
+ 	if (fHccaArea &lt; B_OK) {
+-		TRACE((&quot;usb_ohci: unable to create the HCCA block area\n&quot;));
++		TRACE_ERROR((&quot;usb_ohci: unable to create the HCCA block area\n&quot;));
+ 		return;
+ 	}
+ 
+@@ -153,9 +159,35 @@
+ 	fDummyIsochronous-&gt;flags |= OHCI_ENDPOINT_SKIP;
+ 
+ 	// Create the interrupt tree
+-	// Algorithm kindly borrowed from NetBSD code
+-	// TODO: Check it once again
+-	ohci_endpoint_descriptor *current, *previous;
++	fInterruptEndpoints = new(std::nothrow)
++		ohci_endpoint_descriptor *[OHCI_NUMBER_OF_INTERRUPTS];
++	if (!fInterruptEndpoints) {
++		TRACE_ERROR((&quot;ohci_usb: cannot allocate memory for&quot;
++			&quot; fInterruptEndpoints array\n&quot;));
++		_FreeEndpoint(fDummyControl);
++		_FreeEndpoint(fDummyBulk);
++		_FreeEndpoint(fDummyIsochronous);
++		return;
++	}
++
++	// Static endpoints that get linked in the HCCA
++	for (uint32 i = 0; i &lt; OHCI_NUMBER_OF_INTERRUPTS; i++) {
++		fInterruptEndpoints[i] = _AllocateEndpoint();
++		if (!fInterruptEndpoints[i]) {
++			while (--i &gt;= 0)
++				_FreeEndpoint(fInterruptEndpoints[i]);
++			_FreeEndpoint(fDummyBulk);
++			_FreeEndpoint(fDummyControl);
++			_FreeEndpoint(fDummyIsochronous);
++			return;
++		}
++		fInterruptEndpoints[i]-&gt;flags |= OHCI_ENDPOINT_SKIP;
++		fInterruptEndpoints[i]-&gt;next_physical_endpoint
++			= fDummyIsochronous-&gt;physical_address;
++	}
++
++#if 0
++	ohci_endpoint_descriptor *current;
+ 	for( uint32 i = 0; i &lt; OHCI_NUMBER_OF_ENDPOINTS; i++) {
+ 		current = _AllocateEndpoint();
+ 		if (!current) {
+@@ -174,13 +206,14 @@
+ 		else
+ 			previous = fDummyIsochronous;
+ 		current-&gt;next_logical_endpoint = previous;
+-		current-&gt;next_physical_endpoint = previous-&gt;this_physical;
++		current-&gt;next_physical_endpoint = previous-&gt;physical_address;
+ 	}
++#endif
+ 
+ 	// Fill HCCA interrupt table. The bit reversal is to get
+ 	// the tree set up properly to spread the interrupts.
+ 	for (uint32 i = 0; i &lt; OHCI_NUMBER_OF_INTERRUPTS; i++)
+-		fHcca-&gt;hcca_interrupt_table[revbits[i]] =
++		fHcca-&gt;interrupt_table[revbits[i]] =
+ 			fInterruptEndpoints[OHCI_NUMBER_OF_ENDPOINTS - OHCI_NUMBER_OF_INTERRUPTS + i]-&gt;physical_address;
+ 
+ 
+@@ -230,8 +263,12 @@
+ 		return;
+ 	}
+ 
+-	// The controller is now in SUSPEND state, we have 2ms to finish
+-	// TODO: maybe add spinlock protection???
++	// The controller is now in SUSPEND state, we have 2ms to go OPERATIONAL.
++	// In order to do so we need a spinlock
++
++	cpu_status former = disable_interrupts();
++	acquire_spinlock(&amp;fSpinLock);
++
+ 	// Set up host controller register
+ 	_WriteReg(OHCI_HCCA, (uint32)hccaPhysicalAddress);
+ 	_WriteReg(OHCI_CONTROL_HEAD_ED, (uint32)fDummyControl-&gt;physical_address);
+@@ -248,7 +285,10 @@
+ 		| OHCI_HC_FUNCTIONAL_STATE_OPERATIONAL;
+ 	// And finally start the controller
+ 	_WriteReg(OHCI_CONTROL, control);
+-	
++
++	release_spinlock(&amp;fSpinLock);
++	restore_interrupts(former);
++
+ 	// The controller is now OPERATIONAL.
+ 	frameInterval = (_ReadReg(OHCI_FRAME_INTERVAL) &amp; OHCI_FRAME_INTERVAL_TOGGLE)
+ 		^ OHCI_FRAME_INTERVAL_TOGGLE;
+@@ -273,11 +313,28 @@
+ 		uint32 descriptor = _ReadReg(OHCI_RH_DESCRIPTOR_A);
+ 		numberOfPorts = OHCI_RH_GET_PORT_COUNT(descriptor);
+ 	}
++	fPortCount = numberOfPorts;
+ 
+-	// TODO: Add Finisher Thread.
++	// Create semaphore the finisher thread will wait for
++	fFinishTransfersSem = create_sem(0, &quot;OHCI Finish Transfers&quot;);
++	if (fFinishTransfersSem &lt; B_OK) {
++		TRACE_ERROR((&quot;usb_ohci: failed to create semaphore\n&quot;));
++		return;
++	}
+ 
++	// Create the finisher service thread
++	fFinishThread = spawn_kernel_thread(_FinishThread, &quot;ohci finish thread&quot;,
++		B_URGENT_DISPLAY_PRIORITY, (void *)this);
++	resume_thread(fFinishThread);
++
++	// Install the interrupt handler
++	TRACE((&quot;usb_ohci: installing interrupt handler\n&quot;));
++	install_io_interrupt_handler(fPCIInfo-&gt;u.h0.interrupt_line,
++		_InterruptHandler, (void *)this, 0);
++
++	// TODO: Enable interrupts. Maybe disable first somewhere before :)
++
+ 	TRACE((&quot;usb_ohci: OHCI Host Controller Driver constructed\n&quot;)); 
+-
+ 	fInitOK = true;
+ }
+ 
+@@ -296,41 +353,73 @@
+ 		_FreeEndpoint(fDummyIsochronous);
+ 	if (fRootHub)
+ 		delete fRootHub;
+-	for (int i = 0; i &lt; OHCI_NO_EDS; i++)
++	for (int i = 0; i &lt; OHCI_NUMBER_OF_INTERRUPTS; i++)
+ 		if (fInterruptEndpoints[i])
+ 			_FreeEndpoint(fInterruptEndpoints[i]);
++	delete [] fInterruptEndpoints;
+ }
+ 
+ 
++int32
++OHCI::_InterruptHandler(void *data)
++{
++	return ((OHCI *)data)-&gt;_Interrupt();
++}
++
++
++int32
++OHCI::_Interrupt()
++{
++	static spinlock lock = 0;
++	acquire_spinlock(&amp;lock);
++
++	int32 result = B_UNHANDLED_INTERRUPT;
++
++	release_spinlock(&amp;lock);
++
++	return result;
++}
++
++
++int32
++OHCI::_FinishThread(void *data)
++{
++	((OHCI *)data)-&gt;_FinishTransfer();
++	return B_OK;
++}
++
++
++void
++OHCI::_FinishTransfer()
++{
++	// TODO: block on the semaphore
++}
++
+ status_t
+ OHCI::Start()
+ {
+-	TRACE((&quot;usb_ohci::%s()\n&quot;, __FUNCTION__));
+-	if (InitCheck())
+-		return B_ERROR;
+-	
++	TRACE((&quot;usb_ohci: starting OHCI Host Controller\n&quot;));
++
+ 	if (!(_ReadReg(OHCI_CONTROL) &amp; OHCI_HC_FUNCTIONAL_STATE_OPERATIONAL)) {
+-		TRACE((&quot;usb_ohci::Start(): Controller not started. TODO: find out what happens.\n&quot;));
++		TRACE_ERROR((&quot;usb_ohci: Controller not started!\n&quot;));
+ 		return B_ERROR;
+ 	}
+-	
++
+ 	fRootHubAddress = AllocateAddress();
+-	fNumPorts = OHCI_RH_GET_PORT_COUNT(_ReadReg(OHCI_RH_DESCRIPTOR_A));
+-	
+ 	fRootHub = new(std::nothrow) OHCIRootHub(RootObject(), fRootHubAddress);
+ 	if (!fRootHub) {
+-		TRACE_ERROR((&quot;usb_ohci::Start(): no memory to allocate root hub\n&quot;));
++		TRACE_ERROR((&quot;usb_ohci: no memory to allocate root hub\n&quot;));
+ 		return B_NO_MEMORY;
+ 	}
+ 
+ 	if (fRootHub-&gt;InitCheck() &lt; B_OK) {
+-		TRACE_ERROR((&quot;usb_ohci::Start(): root hub failed init check\n&quot;));
++		TRACE_ERROR((&quot;usb_ohci: root hub failed init check\n&quot;));
+ 		return B_ERROR;
+ 	}
+ 
+ 	SetRootHub(fRootHub);
+-	TRACE((&quot;usb_ohci::Start(): Succesful start\n&quot;));
+-	return B_OK;
++	TRACE((&quot;usb_ohci: Host Controller started\n&quot;));
++	return BusManager::Start();
+ }
+ 
+ 
+@@ -445,7 +534,7 @@
+ OHCI::GetPortStatus(uint8 index, usb_port_status *status)
+ {
+ 	TRACE((&quot;usb_ohci::%s(%ud, )\n&quot;, __FUNCTION__, index));
+-	if (index &gt;= fNumPorts)
++	if (index &gt;= fPortCount)
+ 		return B_BAD_INDEX;
+ 	
+ 	status-&gt;status = status-&gt;change = 0;
+@@ -490,7 +579,7 @@
+ OHCI::SetPortFeature(uint8 index, uint16 feature)
+ {
+ 	TRACE((&quot;OHCI::%s(%ud, %ud)\n&quot;, __FUNCTION__, index, feature));
+-	if (index &gt; fNumPorts)
++	if (index &gt; fPortCount)
+ 		return B_BAD_INDEX;
+ 	
+ 	switch (feature) {
+@@ -511,7 +600,7 @@
+ OHCI::ClearPortFeature(uint8 index, uint16 feature)
+ {
+ 	TRACE((&quot;OHCI::%s(%ud, %ud)\n&quot;, __FUNCTION__, index, feature));
+-	if (index &gt; fNumPorts)
++	if (index &gt; fPortCount)
+ 		return B_BAD_INDEX;
+ 	
+ 	switch (feature) {
+@@ -534,22 +623,20 @@
+ 	ohci_endpoint_descriptor *endpoint;
+ 	void* physicalAddress;
+ 
+-	//Allocate memory chunk
++	// Allocate memory chunk
+ 	if (fStack-&gt;AllocateChunk((void **)&amp;endpoint, &amp;physicalAddress,
+ 		sizeof(ohci_endpoint_descriptor)) &lt; B_OK) {
+ 		TRACE_ERROR((&quot;usb_ohci: failed to allocate endpoint descriptor\n&quot;));
+ 		return NULL;
+ 	}
+ 
+-	endpoint-&gt;this_physical = (addr_t)physicalAddress;
++	endpoint-&gt;physical_address = (addr_t)physicalAddress;
+ 
+-	// Add an empty list by creating a general descriptor
+-	ohci_general_transfer_descriptor *descriptor = _CreateGeneralDescriptor();
+-	endpoint-&gt;head_physical_descriptor = descriptor-&gt;this_physical;
+-	endpoint-&gt;tail_physical_descriptor = descriptor-&gt;this_physical;
++	endpoint-&gt;head_physical_descriptor = NULL;
++	endpoint-&gt;tail_physical_descriptor = NULL;
+ 
+-	endpoint-&gt;head_logical_descriptor = descriptor;
+-	endpoint-&gt;tail_logical_descriptor = descriptor;
++	endpoint-&gt;head_logical_descriptor = NULL;
++	endpoint-&gt;tail_logical_descriptor = NULL;
+ 
+ 	return endpoint;
+ }
+@@ -558,46 +645,53 @@
+ void
+ OHCI::_FreeEndpoint(ohci_endpoint_descriptor *endpoint)
+ {
+-	TRACE((&quot;OHCI::%s(%p)\n&quot;, __FUNCTION__, end));
+-	fStack-&gt;FreeChunk((void *)end-&gt;ed, (void *) end-&gt;physical_address, sizeof(ohci_endpoint_descriptor));
+-	delete end;
++	fStack-&gt;FreeChunk((void *)endpoint, (void *)endpoint-&gt;physical_address,
++		sizeof(ohci_endpoint_descriptor));
+ }
+ 
+ 
+-TransferDescriptor *
+-OHCI::_AllocateTransfer()
++ohci_general_descriptor*
++OHCI::_CreateGeneralDescriptor()
+ {
+-	TRACE((&quot;OHCI::%s()\n&quot;, __FUNCTION__));
+-	TransferDescriptor *transfer = new TransferDescriptor;
+-	void *phy;
+-	if (fStack-&gt;AllocateChunk((void **)&amp;transfer-&gt;td, &amp;phy, sizeof(ohci_general_transfer_descriptor)) != B_OK) {
+-		TRACE((&quot;OHCI::AllocateTransfer(): Error Allocating Transfer\n&quot;));
+-		return 0;
++	ohci_general_descriptor *descriptor;
++	void *physicalAddress;
++
++	if (fStack-&gt;AllocateChunk((void **)&amp;descriptor, &amp;physicalAddress,
++		sizeof(ohci_general_descriptor)) != B_OK) {
++		TRACE_ERROR((&quot;usb_ohci: failed to allocate general descriptor\n&quot;));
++		return NULL;
+ 	}
+-	transfer-&gt;physical_address = (addr_t)phy;
+-	memset((void *)transfer-&gt;td, 0, sizeof(ohci_general_transfer_descriptor));
+-	return transfer;
++
++	// TODO: Finish methods
++	memset((void *)descriptor, 0, sizeof(ohci_general_descriptor));
++	descriptor-&gt;physical_address = (addr_t)physicalAddress;
++
++	return descriptor;
+ }	
+ 
+ 
+ void
+-OHCI::_FreeTransfer(TransferDescriptor *trans)
++OHCI::_FreeGeneralDescriptor(ohci_general_descriptor *descriptor)
+ {
+-	TRACE((&quot;OHCI::%s(%p)\n&quot;, __FUNCTION__, trans));
+-	fStack-&gt;FreeChunk((void *)trans-&gt;td, (void *) trans-&gt;physical_address, sizeof(ohci_general_transfer_descriptor));
+-	delete trans;
++	if (!descriptor)
++		return;
++
++	fStack-&gt;FreeChunk((void *)descriptor, (void *)descriptor-&gt;physical_address,
++		sizeof(ohci_general_descriptor));
+ }
+ 
+ 
+ status_t
+ OHCI::_InsertEndpointForPipe(Pipe *p)
+ {
++#if 0
+ 	TRACE((&quot;OHCI: Inserting Endpoint for device %u function %u\n&quot;, p-&gt;DeviceAddress(), p-&gt;EndpointAddress()));
+ 
+ 	if (InitCheck())
+ 		return B_ERROR;
+ 	
+-	Endpoint *endpoint = _AllocateEndpoint();
++	//Endpoint *endpoint = _AllocateEndpoint();
++	ohci_endpoint_descriptor *endpoint = _AllocateEndpoint();
+ 	if (!endpoint)
+ 		return B_NO_MEMORY;
+ 	
+@@ -677,7 +771,7 @@
+ 			tail = tail-&gt;next;
+ 		tail-&gt;SetNext(endpoint);
+ 	}
+-
++#endif
+ 	return B_OK;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2007-11-14 01:28:47 UTC (rev 22926)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2007-11-14 13:37:41 UTC (rev 22927)
+@@ -18,13 +18,20 @@
+ struct pci_module_info;
+ class OHCIRootHub;
+ 
++typedef struct transfer_data_s {
++	Transfer		*transfer;
++	bool			incoming;
++	bool			canceled;
++	transfer_data_s	*link;
++} transfer_data;
++
+ // --------------------------------------
+ //	OHCI:: 	Software isonchronous 
+ //			transfer descriptor
+ // --------------------------------------
+ typedef struct hcd_soft_itransfer
+ {
+-	ohci_isochronous_transfer_descriptor	itd;
++	ohci_isochronous_descriptor	itd;
+ 	struct hcd_soft_itransfer			*nextitd; 	// mirrors nexttd in ITD
+ 	struct hcd_soft_itransfer			*dnext; 	// next in done list
+ 	addr_t 								physaddr;	// physical address to the host controller isonchronous transfer
+@@ -51,6 +58,7 @@
+ 		status_t					Start();
+ virtual	status_t 					SubmitTransfer(Transfer *transfer);
+ virtual status_t					CancelQueuedTransfers(Pipe *pipe);
++		status_t					SubmitRequest(Transfer *transfer);
+ 
+ virtual	status_t					NotifyPipeChange(Pipe *pipe,
+ 										usb_change change);
+@@ -58,48 +66,73 @@
+ static	status_t					AddTo(Stack *stack);
+ 
+ 		// Port operations
++		uint8 						PortCount() { return fPortCount; };
+ 		status_t 					GetPortStatus(uint8 index, usb_port_status *status);
+ 		status_t					SetPortFeature(uint8 index, uint16 feature);
+ 		status_t					ClearPortFeature(uint8 index, uint16 feature);
+ 
+-		uint8 						PortCount() { return fNumPorts; };
++		status_t					ResetPort(uint8 index);
+ 
++
+ private:
++		// Interrupt functions
++static	int32						_InterruptHandler(void *data);
++		int32						_Interrupt();
++
++static	int32						_FinishThread(void *data);
++		void						_FinishTransfer();
++		
++		// Endpoint related methods
++		status_t					_CreateEndpoint(Pipe *pipe, bool isIsochronous);
++		ohci_endpoint_descriptor	*_AllocateEndpoint();
++		void						_FreeEndpoint(
++										ohci_endpoint_descriptor *endpoint);
++		status_t					_InsertEndpointForPipe(Pipe *pipe);
++
++		// Transfer descriptor related methods
++		ohci_general_descriptor		*_CreateGeneralDescriptor();
++		void						_FreeGeneralDescriptor(
++										ohci_general_descriptor *descriptor);
++		ohci_isochronous_descriptor	*_CreateIsochronousDescriptor();
++		void						_FreeIsochronousDescriptor(
++										ohci_isochronous_descriptor *descriptor);
++
+ 		// Register functions
+ inline	void						_WriteReg(uint32 reg, uint32 value);
+ inline	uint32						_ReadReg(uint32 reg);
+ 
+-		// Global
+ static	pci_module_info				*sPCIModule;
+-
+-		uint32						*fOperationalRegisters;
+ 		pci_info 					*fPCIInfo;
+ 		Stack						*fStack;
+ 
++		uint32						*fOperationalRegisters;
+ 		area_id						fRegisterArea;
+ 
++		spinlock					fSpinLock;
++
+ 		// Host Controller Communication Area related stuff
+ 		area_id						fHccaArea;
+-		struct ohci_hcca			*fHcca;
+-		ohci_endpoint_descriptor	*fInterruptEndpoints[OHCI_NUMBER_OF_ENDPOINTS];
++		ohci_hcca					*fHcca;
++		ohci_endpoint_descriptor	**fInterruptEndpoints;
+ 
+ 		// Dummy endpoints
+ 		ohci_endpoint_descriptor	*fDummyControl;
+ 		ohci_endpoint_descriptor	*fDummyBulk;
+ 		ohci_endpoint_descriptor	*fDummyIsochronous;
+ 
+-		// Endpoint related methods
+-		ohci_endpoint_descriptor	*_AllocateEndpoint(); 
+-		void						_FreeEndpoint(Endpoint *end);
+-		TransferDescriptor			*_AllocateTransfer();
+-		void						_FreeTransfer(TransferDescriptor *trans);
+-		status_t					_InsertEndpointForPipe(Pipe *p);
+-		void						_SetNext(ohci_endpoint_descriptor *endpoint);
++		// Maintain a linked list of transfer
++		transfer_data				*fFirstTransfer;
++		transfer_data				*fFinishTransfer;
++		sem_id						fFinishTransfersSem;
++		thread_id					fFinishThread;
++		bool						fStopFinishThread;
+ 
+ 		// Root Hub
+ 		OHCIRootHub 				*fRootHub;
+ 		uint8						fRootHubAddress;
+-		uint8						fNumPorts;
++
++		// Port management
++		uint8						fPortCount;
+ };
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2007-11-14 01:28:47 UTC (rev 22926)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2007-11-14 13:37:41 UTC (rev 22927)
+@@ -265,26 +265,23 @@
+ #define	OHCI_PERIODIC(i)			((i) * 9 / 10)
+ 
+ // --------------------------------
+-//	OHCI physical address
+-// --------------------------------
+-
+-typedef uint32 ohci_physaddr_t;
+-
+-// --------------------------------
+ //	HCCA structure (section 4.4)
++//	256 bytes aligned
+ // --------------------------------
+ 
+ #define OHCI_NUMBER_OF_INTERRUPTS	32
+ 
+ typedef struct ohci_hcca 
+ {
+-	uint32		hcca_interrupt_table[OHCI_NUMBER_OF_INTERRUPTS];
+-	uint16		hcca_frame_number;
+-	uint32		hcca_done_head;
+-	uint8		hcca_reserved_for_hc[116];
++	uint32		interrupt_table[OHCI_NUMBER_OF_INTERRUPTS];
++	uint32		current_frame_number;
++	uint32		done_head;
++	// The following is 120 instead of 116 because the spec
++	// only specifies 252 bytes
++	uint8		reserved_for_hc[120];
+ };
+ 
+-#define OHCI_DONE_INTRS				1
++#define OHCI_DONE_INTERRUPTS		1
+ #define OHCI_HCCA_SIZE				256
+ #define OHCI_HCCA_ALIGN				256
+ #define OHCI_PAGE_SIZE				0x1000
+@@ -303,7 +300,8 @@
+ 	uint32	head_physical_descriptor;	// Queue head physical pointer
+ 	uint32	next_physical_endpoint;		// Physical pointer to the next endpoint
+ 	// Software part
+-	addr_t	this_physical;				// Physical pointer to this address
++	// TODO: What about type, state and interval (only interrupts) ?
++	addr_t	physical_address;			// Physical pointer to this address
+ 	void	*tail_logical_descriptor;	// Queue tail logical pointer
+ 	void	*head_logical_descriptor;	// Queue head logical pointer
+ 	void	*next_logical_endpoint;		// Logical pointer to the next endpoint
+@@ -334,7 +332,7 @@
+ //	General transfer descriptor structure (section 4.3.1)
+ // --------------------------------
+ 
+-typedef struct ohci_general_transfer_descriptor
++typedef struct ohci_general_descriptor
+ {
+ 	// Hardware part
+ 	uint32	flags;						// Flags field
+@@ -342,7 +340,7 @@
+ 	uint32 	next_physical_descriptor;	// Physical pointer next descriptor
+ 	uint32 	last_physical_byte_address;	// Physical pointer to buffer end
+ 	// Software part
+-	addr_t	this_physical;				// Physical pointer to this address
++	addr_t	physical_address;			// Physical pointer to this address
+ 	void	*buffer_logical;			// Logical pointer to the buffer
+ 	void	*next_logical_descriptor;	// Logical pointer next descriptor
+ 	void	*last_logical_byte_address;	// Logical pointer buffer end
+@@ -372,7 +370,7 @@
+ // --------------------------------
+ 
+ #define OHCI_ITD_NOFFSET 8
+-typedef struct ohci_isochronous_transfer_descriptor
++typedef struct ohci_isochronous_descriptor
+ {
+ 	uint32		flags;
+ 	uint32		buffer_page_byte_0;			// Physical page number of byte 0
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004753.html">[Haiku-commits] r22926 - in haiku/trunk: headers/private/app	src/servers/debug src/servers/registrar
+</A></li>
+	<LI>Next message: <A HREF="004755.html">[Haiku-commits] r22927 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4754">[ date ]</a>
+              <a href="thread.html#4754">[ thread ]</a>
+              <a href="subject.html#4754">[ subject ]</a>
+              <a href="author.html#4754">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

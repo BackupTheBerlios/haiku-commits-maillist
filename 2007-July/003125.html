@@ -1,0 +1,359 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21672 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21672%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200707192252.l6JMqR0S032626%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003124.html">
+   <LINK REL="Next"  HREF="003130.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21672 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21672%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200707192252.l6JMqR0S032626%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21672 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Jul 20 00:52:27 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003124.html">[Haiku-commits] r21671 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+        <LI>Next message: <A HREF="003130.html">[Haiku-commits] r21672 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3125">[ date ]</a>
+              <a href="thread.html#3125">[ thread ]</a>
+              <a href="subject.html#3125">[ subject ]</a>
+              <a href="author.html#3125">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-07-20 00:52:23 +0200 (Fri, 20 Jul 2007)
+New Revision: 21672
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21672&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21672&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.c
+Log:
+axeld + bonefish:
+* More conditional debug code (wrt page transitions between caches).
+* Replaced debugger command cache_chain by a nicer cache_tree.
+* While handling a soft fault: When we temporarily unlock a cache, it
+  can theoretically become busy. One such occurrence is now handled
+  properly, two more panic() ATM, though should be fixed.
+* When merging caches, we do now always replace a dummy page in the
+  upper cache, not only when the concurrent page fault is a read fault.
+  This prevents a page from the lower (to be discarded) cache from still
+  remaining mapped (causing a panic).
+* When merging caches and replacing a dummy page, we were trying to
+  remove the dummy page from the wrong cache (causing a panic).
+
+The Haiku kernel seems now to run shockingly stable. ATM, we have more
+than two hours uptime of a system booted and running over network. We
+didn't manage to get it down by fully building Pe, downloading, unzipping,
+and playing with various stuff. Someone should finally fix all those app
+server drawing bugs, though (hint, hint! ;-)).
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2007-07-19 21:55:05 UTC (rev 21671)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2007-07-19 22:52:23 UTC (rev 21672)
+@@ -21,6 +21,9 @@
+ // be in.
+ //#define DEBUG_PAGE_QUEUE	1
+ 
++// Enables extra debug fields in the vm_page used to track page transitions
++// between caches.
++//#define DEBUG_PAGE_CACHE_TRANSITIONS	1
+ 
+ #ifdef __cplusplus
+ struct vm_page_mapping;
+@@ -92,6 +95,11 @@
+ 	void*				queue;
+ 	#endif
+ 
++	#ifdef DEBUG_PAGE_CACHE_TRANSITIONS
++	uint32	debug_flags;
++	struct vm_page *collided_page;
++	#endif
++
+ 	uint8				type : 2;
+ 	uint8				state : 3;
+ 	uint8				busy_reading : 1;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-07-19 21:55:05 UTC (rev 21671)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-07-19 22:52:23 UTC (rev 21672)
+@@ -2195,8 +2195,29 @@
+ }
+ 
+ 
++static void
++dump_cache_tree_recursively(vm_cache* cache, int level,
++	vm_cache* highlightCache)
++{
++	// print this cache
++	for (int i = 0; i &lt; level; i++)
++		kprintf(&quot;  &quot;);
++	if (cache == highlightCache)
++		kprintf(&quot;%p &lt;--\n&quot;, cache);
++	else
++		kprintf(&quot;%p\n&quot;, cache);
++
++	// recursively print its consumers
++	vm_cache* consumer = NULL;
++	while ((consumer = (vm_cache *)list_get_next_item(&amp;cache-&gt;consumers,
++			consumer)) != NULL) {
++		dump_cache_tree_recursively(consumer, level + 1, highlightCache);
++	}
++}
++
++
+ static int
+-dump_cache_chain(int argc, char **argv)
++dump_cache_tree(int argc, char **argv)
+ {
+ 	if (argc &lt; 2 || strlen(argv[1]) &lt; 2
+ 		|| argv[1][0] != '0'
+@@ -2210,11 +2231,14 @@
+ 		return 0;
+ 
+ 	vm_cache *cache = (vm_cache *)address;
+-	while (cache != NULL) {
+-		dprintf(&quot;%p\n&quot;, cache);
+-		cache = cache-&gt;source;
+-	}
++	vm_cache *root = cache;
+ 
++	// find the root cache (the transitive source)
++	while (root-&gt;source != NULL)
++		root = root-&gt;source;
++
++	dump_cache_tree_recursively(root, 0, cache);
++
+ 	return 0;
+ }
+ 
+@@ -2914,7 +2938,7 @@
+ 	add_debugger_command(&quot;areas&quot;, &amp;dump_area_list, &quot;Dump a list of all areas&quot;);
+ 	add_debugger_command(&quot;area&quot;, &amp;dump_area, &quot;Dump info about a particular area&quot;);
+ 	add_debugger_command(&quot;cache&quot;, &amp;dump_cache, &quot;Dump vm_cache&quot;);
+-	add_debugger_command(&quot;cache_chain&quot;, &amp;dump_cache_chain, &quot;Dump vm_cache chain&quot;);
++	add_debugger_command(&quot;cache_tree&quot;, &amp;dump_cache_tree, &quot;Dump vm_cache tree&quot;);
+ 	add_debugger_command(&quot;avail&quot;, &amp;dump_available_memory, &quot;Dump available memory&quot;);
+ 	add_debugger_command(&quot;dl&quot;, &amp;display_mem, &quot;dump memory long words (64-bit)&quot;);
+ 	add_debugger_command(&quot;dw&quot;, &amp;display_mem, &quot;dump memory words (32-bit)&quot;);
+@@ -3197,8 +3221,22 @@
+ 			// page must be busy
+ 			// ToDo: don't wait forever!
+ 			mutex_unlock(&amp;cache-&gt;lock);
+-			snooze(20000);
++			thread_yield();
+ 			mutex_lock(&amp;cache-&gt;lock);
++
++			if (cache-&gt;busy) {
++				// The cache became busy, which means, it is about to be
++				// removed by vm_cache_remove_consumer(). We start again with
++				// the top cache.
++				mutex_unlock(&amp;cache-&gt;lock);
++				vm_cache_release_ref(cache);
++
++				cache = topCache;
++				lastCache = cache;
++				
++				vm_cache_acquire_ref(cache);
++				mutex_lock(&amp;cache-&gt;lock);
++			}
+ 		}
+ 
+ 		if (page != NULL &amp;&amp; page != &amp;dummyPage)
+@@ -3267,6 +3305,9 @@
+ 			// upwards, too, we try this cache again
+ 			mutex_unlock(&amp;cache-&gt;lock);
+ 			mutex_lock(&amp;cache-&gt;lock);
++			if (cache-&gt;busy)
++				panic(&quot;fault_find_page(): cache became busy: %p\n&quot;, cache);
++					// TODO: Don't panic()!
+ 			lastCache = NULL;
+ 			continue;
+ 		} else if (status &lt; B_OK)
+@@ -3288,6 +3329,9 @@
+ 				// top most cache may have direct write access.
+ 			vm_cache_acquire_ref(cache);
+ 			mutex_lock(&amp;cache-&gt;lock);
++			if (cache-&gt;busy)
++				panic(&quot;fault_find_page(): 2. cache became busy: %p\n&quot;, cache);
++					// TOOD: Don't panic()!
+ 		}
+ 
+ 		// release the reference of the last vm_cache we still have from the loop above
+@@ -3324,12 +3368,29 @@
+ 		// Insert the new page into our cache, and replace it with the dummy page if necessary
+ 
+ 		// if we inserted a dummy page into this cache, we have to remove it now
+-		if (dummyPage.state == PAGE_STATE_BUSY &amp;&amp; dummyPage.cache == cache)
++		if (dummyPage.state == PAGE_STATE_BUSY &amp;&amp; dummyPage.cache == cache) {
++#ifdef DEBUG_PAGE_CACHE_TRANSITIONS
++			page-&gt;debug_flags = dummyPage.debug_flags | 0x8;
++			if (dummyPage.collided_page != NULL) {
++				dummyPage.collided_page-&gt;collided_page = page;
++				page-&gt;collided_page = dummyPage.collided_page;
++			}
++#endif	// DEBUG_PAGE_CACHE_TRANSITIONS
++
+ 			fault_remove_dummy_page(dummyPage, true);
++		}
+ 
+ 		vm_cache_insert_page(cache, page, cacheOffset);
+ 
+ 		if (dummyPage.state == PAGE_STATE_BUSY) {
++#ifdef DEBUG_PAGE_CACHE_TRANSITIONS
++			page-&gt;debug_flags = dummyPage.debug_flags | 0x10;
++			if (dummyPage.collided_page != NULL) {
++				dummyPage.collided_page-&gt;collided_page = page;
++				page-&gt;collided_page = dummyPage.collided_page;
++			}
++#endif	// DEBUG_PAGE_CACHE_TRANSITIONS
++
+ 			// we had inserted the dummy cache in another cache, so let's remove it from there
+ 			fault_remove_dummy_page(dummyPage, false);
+ 		}
+@@ -3502,6 +3563,10 @@
+ 	dummyPage.type = PAGE_TYPE_DUMMY;
+ 	dummyPage.busy_writing = isWrite;
+ 	dummyPage.wired_count = 0;
++#ifdef DEBUG_PAGE_CACHE_TRANSITIONS
++	dummyPage.debug_flags = 0;
++	dummyPage.collided_page = NULL;
++#endif	// DEBUG_PAGE_CACHE_TRANSITIONS
+ 
+ 	vm_cache *copiedPageSource = NULL;
+ 	vm_cache *pageSource;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-07-19 21:55:05 UTC (rev 21671)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-07-19 22:52:23 UTC (rev 21672)
+@@ -314,8 +314,10 @@
+ 	TRACE((&quot;vm_cache_remove_page: cache %p, page %p\n&quot;, cache, page));
+ 	ASSERT_LOCKED_MUTEX(&amp;cache-&gt;lock);
+ 
+-	if (page-&gt;cache != cache)
+-		panic(&quot;remove page from %p: page cache is set to %p\n&quot;, cache, page-&gt;cache);
++	if (page-&gt;cache != cache) {
++		panic(&quot;remove page %p from cache %p: page cache is set to %p\n&quot;, page,
++			cache, page-&gt;cache);
++	}
+ 
+ 	state = disable_interrupts();
+ 	acquire_spinlock(&amp;sPageCacheTableLock);
+@@ -478,6 +480,8 @@
+ 				|| list_is_empty(&amp;cache-&gt;consumers)
+ 				|| cache-&gt;consumers.link.next != cache-&gt;consumers.link.prev
+ 				|| consumer != list_get_first_item(&amp;cache-&gt;consumers)) {
++				dprintf(&quot;vm_cache_remove_consumer(): cache %p was modified; &quot;
++					&quot;not merging it\n&quot;);
+ 				merge = false;
+ 				cache-&gt;busy = false;
+ 				mutex_unlock(&amp;consumer-&gt;lock);
+@@ -512,18 +516,29 @@
+ 					vm_cache_insert_page(consumer, page,
+ 						(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+ 				} else if (consumerPage-&gt;state == PAGE_STATE_BUSY
+-					&amp;&amp; consumerPage-&gt;type == PAGE_TYPE_DUMMY
+-					&amp;&amp; !consumerPage-&gt;busy_writing) {
++					&amp;&amp; consumerPage-&gt;type == PAGE_TYPE_DUMMY) {
+ 					// the page is currently busy taking a read fault - IOW,
+ 					// vm_soft_fault() has mapped our page so we can just
+ 					// move it up
+ //dprintf(&quot;%ld: merged busy page %p, cache %p, offset %ld\n&quot;, find_thread(NULL), page, cacheRef-&gt;cache, page-&gt;cache_offset);
+-					vm_cache_remove_page(cache, consumerPage);
++					vm_cache_remove_page(consumer, consumerPage);
+ 					consumerPage-&gt;state = PAGE_STATE_INACTIVE;
+ 
+ 					vm_cache_remove_page(cache, page);
+ 					vm_cache_insert_page(consumer, page,
+ 						(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++#ifdef DEBUG_PAGE_CACHE_TRANSITIONS
++				} else {
++					page-&gt;debug_flags = 0;
++					if (consumerPage-&gt;state == PAGE_STATE_BUSY)
++						page-&gt;debug_flags |= 0x1;
++					if (consumerPage-&gt;type == PAGE_TYPE_DUMMY)
++						page-&gt;debug_flags |= 0x2;
++					if (!consumerPage-&gt;busy_writing)
++						page-&gt;debug_flags |= 0x4;
++					page-&gt;collided_page = consumerPage;
++					consumerPage-&gt;collided_page = page;
++#endif	// DEBUG_PAGE_CACHE_TRANSITIONS
+ 				}
+ #if 0
+ else if (consumer-&gt;virtual_base == 0x11000)
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.c	2007-07-19 21:55:05 UTC (rev 21671)
++++ haiku/trunk/src/system/kernel/vm/vm_page.c	2007-07-19 22:52:23 UTC (rev 21672)
+@@ -269,8 +269,12 @@
+ 	kprintf(&quot;wired_count:     %u\n&quot;, page-&gt;wired_count);
+ 	kprintf(&quot;usage_count:     %u\n&quot;, page-&gt;usage_count);
+ 	#ifdef DEBUG_PAGE_QUEUE
+-	kprintf(&quot;queue:           %p\n&quot;, page-&gt;queue);
++		kprintf(&quot;queue:           %p\n&quot;, page-&gt;queue);
+ 	#endif
++	#ifdef DEBUG_PAGE_CACHE_TRANSITIONS
++		kprintf(&quot;debug_flags:     0x%lx\n&quot;, page-&gt;debug_flags);
++		kprintf(&quot;collided page:   %p\n&quot;, page-&gt;collided_page);
++	#endif	// DEBUG_PAGE_CACHE_TRANSITIONS
+ 	kprintf(&quot;area mappings:\n&quot;);
+ 
+ 	mapping = page-&gt;mappings;
+@@ -831,6 +835,10 @@
+ 		#ifdef DEBUG_PAGE_QUEUE
+ 			sPages[i].queue = NULL;
+ 		#endif
++		#ifdef DEBUG_PAGE_CACHE_TRANSITIONS
++			sPages[i].debug_flags = 0;
++			sPages[i].collided_page = NULL;
++		#endif	// DEBUG_PAGE_CACHE_TRANSITIONS
+ 		enqueue_page(&amp;page_free_queue, &amp;sPages[i]);
+ 	}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003124.html">[Haiku-commits] r21671 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+	<LI>Next message: <A HREF="003130.html">[Haiku-commits] r21672 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3125">[ date ]</a>
+              <a href="thread.html#3125">[ thread ]</a>
+              <a href="subject.html#3125">[ subject ]</a>
+              <a href="author.html#3125">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

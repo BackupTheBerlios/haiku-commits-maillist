@@ -1,0 +1,159 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r19808 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19808%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200701151241.l0FCf8p6003795%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000216.html">
+   <LINK REL="Next"  HREF="000218.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r19808 - haiku/trunk/src/system/kernel</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19808%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200701151241.l0FCf8p6003795%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r19808 - haiku/trunk/src/system/kernel">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Jan 15 13:41:08 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000216.html">[Haiku-commits] r19807 - haiku/trunk/src/kits/network
+</A></li>
+        <LI>Next message: <A HREF="000218.html">[Haiku-commits] r19809 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#217">[ date ]</a>
+              <a href="thread.html#217">[ thread ]</a>
+              <a href="subject.html#217">[ subject ]</a>
+              <a href="author.html#217">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-01-15 13:41:08 +0100 (Mon, 15 Jan 2007)
+New Revision: 19808
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=19808&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=19808&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/thread.c
+Log:
+There was a race condition between removing the thread from the hash and putting
+its death entry into the parent team's queue - we need to do this atomically.
+As an effect, wait_for_thread() sometimes failed with B_BAD_THREAD_ID.
+
+
+Modified: haiku/trunk/src/system/kernel/thread.c
+===================================================================
+--- haiku/trunk/src/system/kernel/thread.c	2007-01-15 12:37:08 UTC (rev 19807)
++++ haiku/trunk/src/system/kernel/thread.c	2007-01-15 12:41:08 UTC (rev 19808)
+@@ -925,15 +925,12 @@
+ 	// boost our priority to get this over with
+ 	thread-&gt;priority = thread-&gt;next_priority = B_URGENT_DISPLAY_PRIORITY;
+ 
+-	// Stop debugging for this thread, and remove it from the hashtable, so it
+-	// cannot be found afterwards anymore
++	// Stop debugging for this thread
+ 	state = disable_interrupts();
+ 	GRAB_THREAD_LOCK();
+ 
+ 	debugInfo = thread-&gt;debug_info;
+ 	clear_thread_debug_info(&amp;thread-&gt;debug_info, true);
+-	hash_remove(sThreadHash, thread);
+-	sUsedThreads--;
+ 
+ 	RELEASE_THREAD_LOCK();
+ 	restore_interrupts(state);
+@@ -987,6 +984,9 @@
+ 		// put the thread into the kernel team until it dies
+ 		state = disable_interrupts();
+ 		GRAB_TEAM_LOCK();
++		GRAB_THREAD_LOCK();
++			// removing the thread and putting its death entry to the parent
++			// team needs to be an atomic operation
+ 
+ 		// remember how long this thread lasted
+ 		team-&gt;dead_threads_kernel_time += thread-&gt;kernel_time;
+@@ -997,6 +997,10 @@
+ 
+ 		cachedDeathSem = team-&gt;death_sem;
+ 
++		// remove thread from hash, so it's no longer accessible
++		hash_remove(sThreadHash, thread);
++		sUsedThreads--;
++
+ 		if (deleteTeam) {
+ 			struct team *parent = team-&gt;parent;
+ 
+@@ -1013,6 +1017,8 @@
+ 				} else
+ 					death = NULL;
+ 
++				RELEASE_THREAD_LOCK();
++
+ 				// notify listeners that a new death entry is available
+ 				// TODO: should that be moved to handle_signal() (for SIGCHLD)?
+ 				release_sem_etc(parent-&gt;dead_children.sem,
+@@ -1022,16 +1028,30 @@
+ 
+ 				parent-&gt;dead_children.waiters = 0;
+ 				team-&gt;group-&gt;dead_child_waiters = 0;
+-			}
++			} else
++				RELEASE_THREAD_LOCK();
+ 
+ 			team_remove_team(team, &amp;freeGroup);
+-		}
++		} else
++			RELEASE_THREAD_LOCK();
++
+ 		RELEASE_TEAM_LOCK();
++
+ 		// swap address spaces, to make sure we're running on the kernel's pgdir
+ 		vm_swap_address_space(vm_kernel_address_space());
+ 		restore_interrupts(state);
+ 
+ 		TRACE((&quot;thread_exit: thread 0x%lx now a kernel thread!\n&quot;, thread-&gt;id));
++	} else {
++		// for kernel threads, we don't need to care about their death entries
++		state = disable_interrupts();
++		GRAB_THREAD_LOCK();
++
++		hash_remove(sThreadHash, thread);
++		sUsedThreads--;
++
++		RELEASE_THREAD_LOCK();
++		restore_interrupts(state);
+ 	}
+ 
+ 	// delete the team if we're its main thread
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000216.html">[Haiku-commits] r19807 - haiku/trunk/src/kits/network
+</A></li>
+	<LI>Next message: <A HREF="000218.html">[Haiku-commits] r19809 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#217">[ date ]</a>
+              <a href="thread.html#217">[ thread ]</a>
+              <a href="subject.html#217">[ subject ]</a>
+              <a href="author.html#217">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

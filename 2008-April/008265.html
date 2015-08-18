@@ -1,0 +1,267 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25219 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25219%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200804271821.m3RILHN1030348%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008274.html">
+   <LINK REL="Next"  HREF="008267.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25219 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25219%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200804271821.m3RILHN1030348%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25219 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sun Apr 27 20:21:17 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008274.html">[Haiku-commits] r25218 - haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+        <LI>Next message: <A HREF="008267.html">[Haiku-commits] r25220 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8265">[ date ]</a>
+              <a href="thread.html#8265">[ thread ]</a>
+              <a href="subject.html#8265">[ subject ]</a>
+              <a href="author.html#8265">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-04-27 20:21:16 +0200 (Sun, 27 Apr 2008)
+New Revision: 25219
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25219&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25219&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+Log:
+* Added _CancelConnectionTimers() that does what its name suggests, and is
+  now used from various places that previously did not cancel all timers
+  they should have.
+* When a connection moves to the CLOSED state, it should cancel all timers;
+  this prevents from sending a reset at the end of a connection.
+* If the persist/delayed acknowledge timers were canceled too late, they might
+  still have tried to send something (which would eventually cause a reset
+  sent to the peer).
+* Follow RFC 1337 with respect to time wait assassination prevention (ie.
+  we now ignore resets from peers in time wait state).
+* _SegmentReceived() must not check the sequence of a time wait connection;
+  it prevented sending a reset when that was due (a new connection request
+  would time out, instead of fail immediately).
+* Also, that method must never be called in the LISTEN or SYNCHRONIZE_SENT
+  states, so we don't need to check for those.
+* We don't have to wait in Close() until the connection is actually closed -
+  removed a TODO. TCP should handle this internally.
+* Renamed _ShutdownEgress() to _Shutdown().
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2008-04-27 18:14:03 UTC (rev 25218)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2008-04-27 18:21:16 UTC (rev 25219)
+@@ -56,8 +56,9 @@
+ 
+ #ifdef TRACE_TCP
+ // the space before ', ##args' is important in order for this to work with cpp 2.95
+-#	define TRACE(format, args...)	dprintf(&quot;TCP [%llu] %p (%12s) &quot; format &quot;\n&quot;, \
+-		system_time(), this, name_for_state(fState) , ##args)
++#	define TRACE(format, args...)	dprintf(&quot;%ld: TCP [%llu] %p (%12s) &quot; \
++		format &quot;\n&quot;, find_thread(NULL), system_time(), this, \
++		name_for_state(fState) , ##args)
+ #else
+ #	define TRACE(args...)			do { } while (0)
+ #endif
+@@ -280,9 +281,7 @@
+ {
+ 	mutex_lock(&amp;fLock);
+ 
+-	gStackModule-&gt;cancel_timer(&amp;fRetransmitTimer);
+-	gStackModule-&gt;cancel_timer(&amp;fPersistTimer);
+-	gStackModule-&gt;cancel_timer(&amp;fDelayedAcknowledgeTimer);
++	_CancelConnectionTimers();
+ 	gStackModule-&gt;cancel_timer(&amp;fTimeWaitTimer);
+ 
+ 	if (fManager) {
+@@ -345,7 +344,7 @@
+ 		return B_OK;
+ 	}
+ 
+-	status_t status = _ShutdownEgress(true);
++	status_t status = _Shutdown(true);
+ 	if (status != B_OK)
+ 		return status;
+ 
+@@ -366,7 +365,6 @@
+ 			fSendQueue.Used());
+ 	}
+ 
+-	// TODO: do i need to wait until fState returns to CLOSED?
+ 	return B_OK;
+ }
+ 
+@@ -564,7 +562,7 @@
+ 		fFlags |= FLAG_NO_RECEIVE;
+ 
+ 	if (direction == SHUT_WR || direction == SHUT_RDWR)
+-		_ShutdownEgress(false);
++		_Shutdown(false);
+ 
+ 	return B_OK;
+ }
+@@ -848,6 +846,15 @@
+ }
+ 
+ 
++void
++TCPEndpoint::_CancelConnectionTimers()
++{
++	gStackModule-&gt;cancel_timer(&amp;fRetransmitTimer);
++	gStackModule-&gt;cancel_timer(&amp;fPersistTimer);
++	gStackModule-&gt;cancel_timer(&amp;fDelayedAcknowledgeTimer);
++}
++
++
+ //	#pragma mark - receive
+ 
+ 
+@@ -955,7 +962,7 @@
+ void
+ TCPEndpoint::_HandleReset(status_t error)
+ {
+-	gStackModule-&gt;cancel_timer(&amp;fRetransmitTimer);
++	_CancelConnectionTimers();
+ 
+ 	socket-&gt;error = error;
+ 	fState = CLOSED;
+@@ -1088,8 +1095,10 @@
+ 	// The fast path was not applicable, so we continue with the standard
+ 	// processing of the incoming segment
+ 
+-	if (fState != SYNCHRONIZE_SENT &amp;&amp; fState != LISTEN &amp;&amp; fState != CLOSED) {
+-		// 1. check sequence number
++	ASSERT(fState != SYNCHRONIZE_SENT &amp;&amp; fState != LISTEN);
++
++	if (fState != CLOSED &amp;&amp; fState != TIME_WAIT) {
++		// Check sequence number
+ 		if (!segment_in_sequence(segment, buffer-&gt;size, fReceiveNext,
+ 				fReceiveWindow)) {
+ 			TRACE(&quot;  Receive(): segment out of window, next: %lu wnd: %lu&quot;,
+@@ -1382,8 +1391,11 @@
+ }
+ 
+ 
++/*!	Sends the FIN flag to the peer when the connection is still open.
++	Moves the endpoint to the next state depending on where it was.
++*/
+ status_t
+-TCPEndpoint::_ShutdownEgress(bool closing)
++TCPEndpoint::_Shutdown(bool closing)
+ {
+ 	tcp_state previousState = fState;
+ 
+@@ -1452,15 +1464,16 @@
+ 	size_t segmentLength = buffer-&gt;size;
+ 
+ 	if (segment.flags &amp; TCP_FLAG_RESET) {
+-		// is this a valid reset?
++		// Is this a valid reset?
++		// We generally ignore resets in time wait state (see RFC 1337)
+ 		if (fLastAcknowledgeSent &lt;= segment.sequence
+ 			&amp;&amp; tcp_sequence(segment.sequence) &lt; (fLastAcknowledgeSent
+-				+ fReceiveWindow)) {
++				+ fReceiveWindow)
++			&amp;&amp; fState != TIME_WAIT) {
+ 			status_t error;
+ 			if (fState == SYNCHRONIZE_RECEIVED)
+ 				error = ECONNREFUSED;
+-			else if (fState == CLOSING || fState == TIME_WAIT
+-				|| fState == WAIT_FOR_FINISH_ACKNOWLEDGE)
++			else if (fState == CLOSING || fState == WAIT_FOR_FINISH_ACKNOWLEDGE)
+ 				error = ENOTCONN;
+ 			else
+ 				error = ECONNRESET;
+@@ -1582,6 +1595,7 @@
+ 						_EnterTimeWait();
+ 						return DROP;
+ 					case WAIT_FOR_FINISH_ACKNOWLEDGE:
++						_CancelConnectionTimers();
+ 						fState = CLOSED;
+ 						break;
+ 
+@@ -1924,6 +1938,10 @@
+ 	if (!locker.IsLocked())
+ 		return;
+ 
++	// the timer might not have been canceled early enough
++	if (endpoint-&gt;State() == CLOSED)
++		return;
++
+ 	endpoint-&gt;_SendQueued(true);
+ }
+ 
+@@ -1937,6 +1955,10 @@
+ 	if (!locker.IsLocked())
+ 		return;
+ 
++	// the timer might not have been canceled early enough
++	if (endpoint-&gt;State() == CLOSED)
++		return;
++
+ 	endpoint-&gt;SendAcknowledge(true);
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2008-04-27 18:14:03 UTC (rev 25218)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2008-04-27 18:21:16 UTC (rev 25219)
+@@ -87,13 +87,14 @@
+ 
+ 	void _StartPersistTimer();
+ 	void _EnterTimeWait();
++	void _CancelConnectionTimers();
+ 	uint8 _CurrentFlags();
+ 	bool _ShouldSendSegment(tcp_segment_header &amp;segment, uint32 length,
+ 		uint32 segmentMaxSize, uint32 flightSize);
+ 	status_t _SendQueued(bool force = false);
+ 	status_t _SendQueued(bool force, uint32 sendWindow);
+ 	int _MaxSegmentSize(const struct sockaddr *) const;
+-	status_t _ShutdownEgress(bool closing);
++	status_t _Shutdown(bool closing);
+ 	ssize_t _AvailableData() const;
+ 	void _NotifyReader();
+ 	bool _ShouldReceive() const;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008274.html">[Haiku-commits] r25218 - haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+	<LI>Next message: <A HREF="008267.html">[Haiku-commits] r25220 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8265">[ date ]</a>
+              <a href="thread.html#8265">[ thread ]</a>
+              <a href="subject.html#8265">[ subject ]</a>
+              <a href="author.html#8265">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

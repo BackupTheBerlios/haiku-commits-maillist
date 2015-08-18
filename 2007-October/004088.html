@@ -1,0 +1,271 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22400 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22400%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200710011848.l91Imr1n009652%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004087.html">
+   <LINK REL="Next"  HREF="004089.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22400 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22400%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200710011848.l91Imr1n009652%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22400 - haiku/trunk/src/system/kernel/fs">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Oct  1 20:48:53 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004087.html">[Haiku-commits] r22399 - haiku/trunk/headers/private/shared
+</A></li>
+        <LI>Next message: <A HREF="004089.html">[Haiku-commits] r22401 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4088">[ date ]</a>
+              <a href="thread.html#4088">[ thread ]</a>
+              <a href="subject.html#4088">[ subject ]</a>
+              <a href="author.html#4088">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-10-01 20:48:52 +0200 (Mon, 01 Oct 2007)
+New Revision: 22400
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22400&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22400&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/fd.cpp
+   haiku/trunk/src/system/kernel/fs/vfs_select.cpp
+Log:
+* Added a handy FDGetter AutoLocker-style class.
+* In select_fd(): First get the file descriptor, then check whether any
+  events have to be selected at all. This has the advantage that the
+  caller can interpret an error return code as invalid FD. Consequently
+  common_poll() no longer checks FD validity separately -- this was a
+  race condition.
+* common_poll() always selects POLLERR and POLLHUP now, which it has to
+  do according to the specs.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/fd.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/fd.cpp	2007-10-01 18:39:02 UTC (rev 22399)
++++ haiku/trunk/src/system/kernel/fs/fd.cpp	2007-10-01 18:48:52 UTC (rev 22400)
+@@ -27,10 +27,53 @@
+ #endif
+ 
+ 
++static struct file_descriptor* get_fd_locked(struct io_context* context,
++	int fd);
+ static void deselect_select_infos(file_descriptor* descriptor,
+ 	select_info* infos);
+ 
+ 
++struct FDGetterLocking {
++	inline bool Lock(file_descriptor* /*lockable*/)
++	{
++		return false;
++	}
++
++	inline void Unlock(file_descriptor* lockable)
++	{
++		put_fd(lockable);
++	}
++};
++
++class FDGetter : public AutoLocker&lt;file_descriptor, FDGetterLocking&gt; {
++public:
++	inline FDGetter()
++		: AutoLocker&lt;file_descriptor, FDGetterLocking&gt;()
++	{
++	}
++
++	inline FDGetter(io_context* context, int fd, bool contextLocked = false)
++		: AutoLocker&lt;file_descriptor, FDGetterLocking&gt;(
++			contextLocked ? get_fd_locked(context, fd) : get_fd(context, fd))
++	{
++	}
++
++	inline file_descriptor* SetTo(io_context* context, int fd,
++		bool contextLocked = false)
++	{
++		file_descriptor* descriptor
++			= contextLocked ? get_fd_locked(context, fd) : get_fd(context, fd);
++		AutoLocker&lt;file_descriptor, FDGetterLocking&gt;::SetTo(descriptor, true);
++		return descriptor;
++	}
++
++	inline file_descriptor* FD() const
++	{
++		return fLockable;
++	}
++};
++
++
+ /*** General fd routines ***/
+ 
+ 
+@@ -416,22 +459,23 @@
+ {
+ 	TRACE((&quot;select_fd(fd = %d, selectsync = %p, ref = %lu, 0x%x)\n&quot;, fd, sync, ref, sync-&gt;set[ref].selected_events));
+ 
+-	select_info* info = &amp;sync-&gt;set[ref];
+-	if (info-&gt;selected_events == 0)
+-		return B_OK;
++	FDGetter fdGetter;
++		// define before the context locker, so it will be destroyed after it
+ 
+ 	io_context* context = get_current_io_context(kernel);
+ 	MutexLocker locker(context-&gt;io_mutex);
+ 
+-	struct file_descriptor* descriptor = get_fd_locked(context, fd);
++	struct file_descriptor* descriptor = fdGetter.SetTo(context, fd, true);
+ 	if (descriptor == NULL)
+ 		return B_FILE_ERROR;
+ 
++	select_info* info = &amp;sync-&gt;set[ref];
++	if (info-&gt;selected_events == 0)
++		return B_OK;
++
+ 	if (!descriptor-&gt;ops-&gt;fd_select) {
+ 		// if the I/O subsystem doesn't support select(), we will
+ 		// immediately notify the select call
+-		locker.Unlock();
+-		put_fd(descriptor);
+ 		return notify_select_events(info, info-&gt;selected_events);
+ 	}
+ 
+@@ -461,7 +505,6 @@
+ 	if (selectedEvents == 0)
+ 		deselect_fd(fd, sync, ref, kernel);
+ 
+-	put_fd(descriptor);
+ 	return B_OK;
+ }
+ 
+@@ -475,10 +518,13 @@
+ 	if (info-&gt;selected_events == 0)
+ 		return B_OK;
+ 
++	FDGetter fdGetter;
++		// define before the context locker, so it will be destroyed after it
++
+ 	io_context* context = get_current_io_context(kernel);
+ 	MutexLocker locker(context-&gt;io_mutex);
+ 
+-	struct file_descriptor* descriptor = get_fd_locked(context, fd);
++	struct file_descriptor* descriptor = fdGetter.SetTo(context, fd, true);
+ 	if (descriptor == NULL)
+ 		return B_FILE_ERROR;
+ 
+@@ -489,11 +535,8 @@
+ 		infoLocation = &amp;(*infoLocation)-&gt;next;
+ 
+ 	// If not found, someone else beat us to it.
+-	if (*infoLocation != info) {
+-		locker.Unlock();
+-		put_fd(descriptor);
++	if (*infoLocation != info)
+ 		return B_OK;
+-	}
+ 
+ 	*infoLocation = info-&gt;next;
+ 
+@@ -511,7 +554,6 @@
+ 
+ 	put_select_sync(sync);
+ 
+-	put_fd(descriptor);
+ 	return B_OK;
+ }
+ 
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs_select.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs_select.cpp	2007-10-01 18:39:02 UTC (rev 22399)
++++ haiku/trunk/src/system/kernel/fs/vfs_select.cpp	2007-10-01 18:48:52 UTC (rev 22400)
+@@ -149,8 +149,10 @@
+ 		if (errorSet &amp;&amp; FD_ISSET(fd, errorSet))
+ 			sync-&gt;set[fd].selected_events |= SELECT_FLAG(B_SELECT_ERROR);
+ 
+-		select_fd(fd, sync, fd, kernel);
+-			// array position is the same as the fd for select()
++		if (sync-&gt;set[fd].selected_events != 0) {
++			select_fd(fd, sync, fd, kernel);
++				// array position is the same as the fd for select()
++		}
+ 	}
+ 
+ 	locker.Unlock();
+@@ -246,21 +248,17 @@
+ 	for (i = 0; i &lt; numFDs; i++) {
+ 		int fd = fds[i].fd;
+ 
+-		// check if fds are valid
+-		if (!fd_is_valid(fd, kernel)) {
+-			fds[i].revents = POLLNVAL;
+-			continue;
+-		}
+-
+ 		// initialize events masks
+-		fds[i].events &amp;= ~POLLNVAL;
+-		fds[i].revents = 0;
+-		sync-&gt;set[i].selected_events = fds[i].events;
++		sync-&gt;set[i].selected_events = fds[i].events &amp; ~POLLNVAL
++			| POLLERR | POLLHUP;
+ 		sync-&gt;set[i].events = 0;
+ 
+-		select_fd(fd, sync, i, kernel);
+-		if (sync-&gt;set[i].selected_events != 0)
+-			count++;
++		if (select_fd(fd, sync, i, kernel) == B_OK) {
++			fds[i].revents = 0;
++			if (sync-&gt;set[i].selected_events != 0)
++				count++;
++		} else
++			fds[i].revents = POLLNVAL;
+ 	}
+ 
+ 	if (count &lt; 1) {
+@@ -289,7 +287,8 @@
+ 					continue;
+ 
+ 				// POLLxxx flags and B_SELECT_xxx flags are compatible
+-				fds[i].revents = sync-&gt;set[i].events;
++				fds[i].revents = sync-&gt;set[i].events
++					&amp; sync-&gt;set[i].selected_events;
+ 				if (fds[i].revents != 0)
+ 					count++;
+ 			}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004087.html">[Haiku-commits] r22399 - haiku/trunk/headers/private/shared
+</A></li>
+	<LI>Next message: <A HREF="004089.html">[Haiku-commits] r22401 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4088">[ date ]</a>
+              <a href="thread.html#4088">[ thread ]</a>
+              <a href="subject.html#4088">[ subject ]</a>
+              <a href="author.html#4088">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

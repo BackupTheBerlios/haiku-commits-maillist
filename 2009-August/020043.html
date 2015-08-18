@@ -1,0 +1,1097 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32742 - haiku/trunk/src/servers/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32742%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200908270850.n7R8onqF007961%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020042.html">
+   <LINK REL="Next"  HREF="020044.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32742 - haiku/trunk/src/servers/app</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32742%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200908270850.n7R8onqF007961%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32742 - haiku/trunk/src/servers/app">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug 27 10:50:49 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020042.html">[Haiku-commits] r32741 - haiku/trunk/headers/build/os
+</A></li>
+        <LI>Next message: <A HREF="020044.html">[Haiku-commits] r32742 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20043">[ date ]</a>
+              <a href="thread.html#20043">[ thread ]</a>
+              <a href="subject.html#20043">[ subject ]</a>
+              <a href="author.html#20043">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-08-27 10:50:46 +0200 (Thu, 27 Aug 2009)
+New Revision: 32742
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32742&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32742&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/Desktop.cpp
+   haiku/trunk/src/servers/app/Desktop.h
+   haiku/trunk/src/servers/app/DirectWindowSupport.cpp
+   haiku/trunk/src/servers/app/DirectWindowSupport.h
+   haiku/trunk/src/servers/app/MultiLocker.h
+   haiku/trunk/src/servers/app/ServerApp.cpp
+   haiku/trunk/src/servers/app/ServerWindow.cpp
+   haiku/trunk/src/servers/app/ServerWindow.h
+   haiku/trunk/src/servers/app/Window.cpp
+   haiku/trunk/src/servers/app/Window.h
+Log:
+* Changed AS_GET_SCREEN_ID_FROM_WINDOW as well as AS_SCREEN_GET_MODE to no
+  longer hold the window lock. There is now a lock that guards screen changes
+  in particular. This fixes the deadlocks seen in apps using BDirectWindow.
+* All direct window handling now sits in the Desktop class -
+  ServerWindow::HandleDirectConnection() is never called from anywhere else
+  anymore. Furthermore, it's now only called when actually needed.
+* Resize/move actions now always send a B_CLIPPING_MODIFIED flag, too.
+* When the screen changed, the driver state is supposed to be B_MODE_CHANGED,
+  not B_SCREEN_CHANGED (which is a message constant).
+* Direct windows are no longer suspended too late on screen changes.
+* Removed unused members of DirectWindowData, and cleaned it up a bit.
+* Made MultiLocker's default, and copy constructors private - I accidently
+  used them, causing the ASSERT_MULTI_*LOCKED() macros to fail.
+* Added Unlock() to AutoWriteLocker as well.
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/servers/app/Desktop.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/Desktop.cpp	2009-08-27 08:42:31 UTC (rev 32741)
++++ haiku/trunk/src/servers/app/Desktop.cpp	2009-08-27 08:50:46 UTC (rev 32742)
+@@ -289,13 +289,15 @@
+ 
+ 
+ Desktop::Desktop(uid_t userID)
+-	: MessageLooper(&quot;desktop&quot;),
++	:
++	MessageLooper(&quot;desktop&quot;),
+ 
+ 	fUserID(userID),
+ 	fSettings(NULL),
+ 	fSharedReadOnlyArea(-1),
+ 	fApplicationsLock(&quot;application list&quot;),
+ 	fShutdownSemaphore(-1),
++	fScreenLock(&quot;screen lock&quot;),
+ 	fCurrentWorkspace(0),
+ 	fPreviousWorkspace(0),
+ 	fAllWindows(kAllWindowList),
+@@ -492,14 +494,14 @@
+ Desktop::SetScreenMode(int32 workspace, int32 id, const display_mode&amp; mode,
+ 	bool makeDefault)
+ {
++	AutoWriteLocker _(fWindowLock);
++
+ 	if (workspace == B_CURRENT_WORKSPACE_INDEX)
+ 		workspace = fCurrentWorkspace;
+ 
+ 	if (workspace &lt; 0 || workspace &gt; kMaxWorkspaces)
+ 		return B_BAD_VALUE;
+ 
+-	AutoWriteLocker _(fWindowLock);
+-
+ 	Screen* screen = fVirtualScreen.ScreenByID(id);
+ 	if (screen == NULL)
+ 		return B_NAME_NOT_FOUND;
+@@ -516,9 +518,17 @@
+ 
+ 		// Set the new one
+ 
++		_SuspendDirectFrameBufferAccess();
++
++		AutoWriteLocker locker(fScreenLock);
++
+ 		status_t status = screen-&gt;SetMode(mode);
+-		if (status != B_OK)
++		if (status != B_OK) {
++			locker.Unlock();
++
++			_ResumeDirectFrameBufferAccess();
+ 			return status;
++		}
+ 	} else {
+ 		// retrieve from settings
+ 		screen_configuration* configuration
+@@ -543,6 +553,9 @@
+ 	}
+ 
+ 	_ScreenChanged(screen);
++	if (workspace == fCurrentWorkspace)
++		_ResumeDirectFrameBufferAccess();
++
+ 	return B_OK;
+ }
+ 
+@@ -550,14 +563,14 @@
+ status_t
+ Desktop::GetScreenMode(int32 workspace, int32 id, display_mode&amp; mode)
+ {
++	AutoReadLocker _(fScreenLock);
++
+ 	if (workspace == B_CURRENT_WORKSPACE_INDEX)
+ 		workspace = fCurrentWorkspace;
+ 
+ 	if (workspace &lt; 0 || workspace &gt; kMaxWorkspaces)
+ 		return B_BAD_VALUE;
+ 
+-	AutoReadLocker _(fWindowLock);
+-
+ 	if (workspace == fCurrentWorkspace) {
+ 		// retrieve from current screen
+ 		Screen* screen = fVirtualScreen.ScreenByID(id);
+@@ -582,14 +595,14 @@
+ status_t
+ Desktop::GetScreenFrame(int32 workspace, int32 id, BRect&amp; frame)
+ {
++	AutoReadLocker _(fScreenLock);
++
+ 	if (workspace == B_CURRENT_WORKSPACE_INDEX)
+ 		workspace = fCurrentWorkspace;
+ 
+ 	if (workspace &lt; 0 || workspace &gt; kMaxWorkspaces)
+ 		return B_BAD_VALUE;
+ 
+-	AutoReadLocker _(fWindowLock);
+-
+ 	if (workspace == fCurrentWorkspace) {
+ 		// retrieve from current screen
+ 		Screen* screen = fVirtualScreen.ScreenByID(id);
+@@ -647,8 +660,11 @@
+ 				fWorkspaces[workspace].CurrentScreenConfiguration()
+ 					.Remove(current);
+ 
+-				if (workspace == fCurrentWorkspace)
++				if (workspace == fCurrentWorkspace) {
++					_SuspendDirectFrameBufferAccess();
+ 					_SetCurrentWorkspaceConfiguration();
++					_ResumeDirectFrameBufferAccess();
++				}
+ 			} else
+ 				SetScreenMode(workspace, screen-&gt;ID(), stored-&gt;mode, false);
+ 		}
+@@ -1078,8 +1094,12 @@
+ 	// the dirty region starts with the visible area of the window being moved
+ 	BRegion newDirtyRegion(window-&gt;VisibleRegion());
+ 
+-	// no more drawing for DirectWindows
+-	window-&gt;ServerWindow()-&gt;HandleDirectConnection(B_DIRECT_STOP);
++	// stop direct frame buffer access
++	bool direct = false;
++	if (window-&gt;ServerWindow()-&gt;IsDirectlyAccessing()) {
++		window-&gt;ServerWindow()-&gt;HandleDirectConnection(B_DIRECT_STOP);
++		direct = true;
++	}
+ 
+ 	window-&gt;MoveBy((int32)x, (int32)y);
+ 
+@@ -1108,9 +1128,13 @@
+ 	_SetBackground(background);
+ 	_WindowChanged(window);
+ 
+-	// allow DirectWindows to draw again after the visual
+-	// content is at the new location
+-	window-&gt;ServerWindow()-&gt;HandleDirectConnection(B_DIRECT_START | B_BUFFER_MOVED);
++	// resume direct frame buffer access
++	if (direct) {
++		// TODO: the clipping actually only changes when we move our window
++		// off screen, or behind some other window
++		window-&gt;ServerWindow()-&gt;HandleDirectConnection(
++			B_DIRECT_START | B_BUFFER_MOVED | B_CLIPPING_MODIFIED);
++	}
+ 
+ 	UnlockAllWindows();
+ }
+@@ -1135,7 +1159,12 @@
+ 	// it is shrunk in &quot;previouslyOccupiedRegion&quot;
+ 	BRegion previouslyOccupiedRegion(window-&gt;VisibleRegion());
+ 
+-	window-&gt;ServerWindow()-&gt;HandleDirectConnection(B_DIRECT_STOP);
++	// stop direct frame buffer access
++	bool direct = false;
++	if (window-&gt;ServerWindow()-&gt;IsDirectlyAccessing()) {
++		window-&gt;ServerWindow()-&gt;HandleDirectConnection(B_DIRECT_STOP);
++		direct = true;
++	}
+ 
+ 	window-&gt;ResizeBy((int32)x, (int32)y, &amp;newDirtyRegion);
+ 
+@@ -1155,7 +1184,11 @@
+ 	_SetBackground(background);
+ 	_WindowChanged(window);
+ 
+-	window-&gt;ServerWindow()-&gt;HandleDirectConnection(B_DIRECT_START | B_BUFFER_RESIZED);
++	// resume direct frame buffer access
++	if (direct) {
++		window-&gt;ServerWindow()-&gt;HandleDirectConnection(
++			B_DIRECT_START | B_BUFFER_RESIZED | B_CLIPPING_MODIFIED);
++	}
+ 
+ 	UnlockAllWindows();
+ }
+@@ -2428,8 +2461,10 @@
+ 	} else
+ 		MarkDirty(dirty);
+ 
+-	window-&gt;ServerWindow()-&gt;HandleDirectConnection(
+-		B_DIRECT_START | B_BUFFER_RESET);
++	if (window-&gt;ServerWindow()-&gt;HasDirectFrameBufferAccess()) {
++		window-&gt;ServerWindow()-&gt;HandleDirectConnection(
++			B_DIRECT_START | B_BUFFER_RESET);
++	}
+ }
+ 
+ 
+@@ -2439,7 +2474,8 @@
+ void
+ Desktop::_HideWindow(Window* window)
+ {
+-	window-&gt;ServerWindow()-&gt;HandleDirectConnection(B_DIRECT_STOP);
++	if (window-&gt;ServerWindow()-&gt;IsDirectlyAccessing())
++		window-&gt;ServerWindow()-&gt;HandleDirectConnection(B_DIRECT_STOP);
+ 
+ 	// after rebuilding the clipping,
+ 	// this window will not have a visible
+@@ -2540,8 +2576,9 @@
+ 					window-&gt;SetCurrentWorkspace(fCurrentWorkspace);
+ 
+ 					if (!window-&gt;IsHidden()) {
+-						// this only affects other windows if this windows has floating or
+-						// modal windows that need to be shown as well
++						// This only affects other windows if this window has
++						// floating or modal windows that need to be shown as
++						// well
+ 						// TODO: take care of this
+ 						_ShowWindow(window, FrontWindow() == window);
+ 					}
+@@ -2674,6 +2711,16 @@
+ }
+ 
+ 
++Screen*
++Desktop::_DetermineScreenFor(BRect frame)
++{
++	AutoReadLocker _(fScreenLock);
++
++	// TODO: choose the screen depending on where most of the area is
++	return fVirtualScreen.ScreenAt(0);
++}
++
++
+ void
+ Desktop::_RebuildClippingForAllWindows(BRegion&amp; stillAvailableOnScreen)
+ {
+@@ -2688,6 +2735,13 @@
+ 			window = window-&gt;PreviousWindow(fCurrentWorkspace)) {
+ 		if (!window-&gt;IsHidden()) {
+ 			window-&gt;SetClipping(&amp;stillAvailableOnScreen);
++			window-&gt;SetScreen(_DetermineScreenFor(window-&gt;Frame()));
++
++			if (window-&gt;ServerWindow()-&gt;IsDirectlyAccessing()) {
++				window-&gt;ServerWindow()-&gt;HandleDirectConnection(
++					B_DIRECT_MODIFY | B_CLIPPING_MODIFIED);
++			}
++
+ 			// that windows region is not available on screen anymore
+ 			stillAvailableOnScreen.Exclude(&amp;window-&gt;VisibleRegion());
+ 		}
+@@ -2756,6 +2810,13 @@
+ 				dirty.IntersectWith(&amp;stillAvailableOnScreen);
+ 
+ 			window-&gt;SetClipping(&amp;stillAvailableOnScreen);
++			window-&gt;SetScreen(_DetermineScreenFor(window-&gt;Frame()));
++
++			if (window-&gt;ServerWindow()-&gt;IsDirectlyAccessing()) {
++				window-&gt;ServerWindow()-&gt;HandleDirectConnection(
++					B_DIRECT_MODIFY | B_CLIPPING_MODIFIED);
++			}
++
+ 			// that windows region is not available on screen anymore
+ 			stillAvailableOnScreen.Exclude(&amp;window-&gt;VisibleRegion());
+ 		}
+@@ -2768,7 +2829,40 @@
+ }
+ 
+ 
++//! Suspend all windows with direct access to the frame buffer
+ void
++Desktop::_SuspendDirectFrameBufferAccess()
++{
++	ASSERT_MULTI_LOCKED(fWindowLock);
++
++	for (Window* window = fAllWindows.FirstWindow(); window != NULL;
++			window = window-&gt;NextWindow(kAllWindowList)) {
++		if (window-&gt;ServerWindow()-&gt;IsDirectlyAccessing())
++			window-&gt;ServerWindow()-&gt;HandleDirectConnection(B_DIRECT_STOP);
++	}
++}
++
++
++//! Resume all windows with direct access to the frame buffer
++void
++Desktop::_ResumeDirectFrameBufferAccess()
++{
++	ASSERT_MULTI_LOCKED(fWindowLock);
++
++	for (Window* window = fAllWindows.FirstWindow(); window != NULL;
++			window = window-&gt;NextWindow(kAllWindowList)) {
++		if (window-&gt;IsHidden() || !window-&gt;InWorkspace(fCurrentWorkspace))
++			continue;
++
++		if (window-&gt;ServerWindow()-&gt;HasDirectFrameBufferAccess()) {
++			window-&gt;ServerWindow()-&gt;HandleDirectConnection(
++				B_DIRECT_START | B_BUFFER_RESET, B_MODE_CHANGED);
++		}
++	}
++}
++
++
++void
+ Desktop::_ScreenChanged(Screen* screen)
+ {
+ 	ASSERT_MULTI_WRITE_LOCKED(fWindowLock);
+@@ -2800,10 +2894,10 @@
+ 
+ 	fVirtualScreen.UpdateFrame();
+ 
+-	// TODO: currently ignores the screen argument!
+ 	for (Window* window = fAllWindows.FirstWindow(); window != NULL;
+ 			window = window-&gt;NextWindow(kAllWindowList)) {
+-		window-&gt;ServerWindow()-&gt;ScreenChanged(&amp;update);
++		if (window-&gt;Screen() == screen)
++			window-&gt;ServerWindow()-&gt;ScreenChanged(&amp;update);
+ 	}
+ }
+ 
+@@ -2852,6 +2946,8 @@
+ {
+ 	ASSERT_MULTI_WRITE_LOCKED(fWindowLock);
+ 
++	AutoWriteLocker _(fScreenLock);
++
+ 	uint32 changedScreens;
+ 	fVirtualScreen.SetConfiguration(*this,
+ 		fWorkspaces[fCurrentWorkspace].CurrentScreenConfiguration(),
+@@ -2870,6 +2966,8 @@
+ void
+ Desktop::_SetWorkspace(int32 index)
+ {
++	ASSERT_MULTI_WRITE_LOCKED(fWindowLock);
++
+ 	int32 previousIndex = fCurrentWorkspace;
+ 	rgb_color previousColor = fWorkspaces[fCurrentWorkspace].Color();
+ 	bool movedMouseEventWindow = false;
+@@ -2914,6 +3012,10 @@
+ 		// store current position in Workspace anchor
+ 		window-&gt;Anchor(previousIndex).position = window-&gt;Frame().LeftTop();
+ 
++		if (!window-&gt;IsHidden()
++			&amp;&amp; window-&gt;ServerWindow()-&gt;IsDirectlyAccessing())
++			window-&gt;ServerWindow()-&gt;HandleDirectConnection(B_DIRECT_STOP);
++
+ 		window-&gt;WorkspaceActivated(previousIndex, false);
+ 
+ 		if (window-&gt;InWorkspace(index))
+@@ -2998,6 +3100,12 @@
+ 		// send B_WORKSPACE_ACTIVATED message
+ 		window-&gt;WorkspaceActivated(index, true);
+ 
++		if (!window-&gt;IsHidden()
++			&amp;&amp; window-&gt;ServerWindow()-&gt;HasDirectFrameBufferAccess()) {
++			window-&gt;ServerWindow()-&gt;HandleDirectConnection(
++				B_DIRECT_START | B_BUFFER_RESET, B_MODE_CHANGED);
++		}
++
+ 		if (window-&gt;InWorkspace(previousIndex) || window-&gt;IsHidden()
+ 			|| (window == fMouseEventWindow &amp;&amp; fMouseEventWindow-&gt;IsNormal())
+ 			|| (!window-&gt;IsNormal()
+
+Modified: haiku/trunk/src/servers/app/Desktop.h
+===================================================================
+--- haiku/trunk/src/servers/app/Desktop.h	2009-08-27 08:42:31 UTC (rev 32741)
++++ haiku/trunk/src/servers/app/Desktop.h	2009-08-27 08:50:46 UTC (rev 32742)
+@@ -86,7 +86,7 @@
+ 			void				UnlockAllWindows()
+ 									{ fWindowLock.WriteUnlock(); }
+ 
+-			MultiLocker			WindowLocker() { return fWindowLock; }
++			const MultiLocker&amp;	WindowLocker() { return fWindowLock; }
+ #else // USE_MULTI_LOCKER
+ 			bool				LockSingleWindow()
+ 									{ return fWindowLock.Lock(); }
+@@ -125,6 +125,8 @@
+ 									BRect&amp; frame);
+ 			void				RevertScreenModes(uint32 workspaces);
+ 
++			MultiLocker&amp;		ScreenLocker() { return fScreenLock; }
++
+ 			const ::VirtualScreen&amp; VirtualScreen() const
+ 									{ return fVirtualScreen; }
+ 			DrawingEngine*		GetDrawingEngine() const
+@@ -268,6 +270,7 @@
+ 			Window*				_LastFocusSubsetWindow(Window* window);
+ 			void				_SendFakeMouseMoved(Window* window = NULL);
+ 
++			Screen*				_DetermineScreenFor(BRect frame);
+ 			void				_RebuildClippingForAllWindows(
+ 									BRegion&amp; stillAvailableOnScreen);
+ 			void				_TriggerWindowRedrawing(
+@@ -278,6 +281,9 @@
+ 
+ 			status_t			_ActivateApp(team_id team);
+ 
++			void				_SuspendDirectFrameBufferAccess();
++			void				_ResumeDirectFrameBufferAccess();
++
+ 			void				_ScreenChanged(Screen* screen);
+ 			void				_SetCurrentWorkspaceConfiguration();
+ 			void				_SetWorkspace(int32 index);
+@@ -302,6 +308,7 @@
+ 			int32				fShutdownCount;
+ 
+ 			::Workspace::Private fWorkspaces[kMaxWorkspaces];
++			MultiLocker			fScreenLock;
+ 			int32				fCurrentWorkspace;
+ 			int32				fPreviousWorkspace;
+ 
+
+Modified: haiku/trunk/src/servers/app/DirectWindowSupport.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/DirectWindowSupport.cpp	2009-08-27 08:42:31 UTC (rev 32741)
++++ haiku/trunk/src/servers/app/DirectWindowSupport.cpp	2009-08-27 08:50:46 UTC (rev 32742)
+@@ -7,27 +7,26 @@
+  *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
+  */
+ 
++
+ #include &quot;DirectWindowSupport.h&quot;
+ 
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;syslog.h&gt;
++
+ #include &lt;Autolock.h&gt;
+ 
+ #include &quot;RenderingBuffer.h&quot;
+ #include &quot;clipping.h&quot;
+ 
+-#include &lt;stdio.h&gt;
+-#include &lt;string.h&gt;
+-#include &lt;syslog.h&gt;
+ 
+-
+ DirectWindowData::DirectWindowData()
+ 	:
+ 	full_screen(false),
+ 	fBufferInfo(NULL),
+ 	fSem(-1),
+ 	fAcknowledgeSem(-1),
+-	fBufferArea(-1),
+-	fTransition(0),
+-	fStarted(false)
++	fBufferArea(-1)
+ {
+ 	fBufferArea = create_area(&quot;direct area&quot;, (void**)&amp;fBufferInfo,
+ 		B_ANY_ADDRESS, DIRECT_BUFFER_INFO_AREA_SIZE,
+@@ -87,46 +86,31 @@
+ 	if (status != B_OK)
+ 		return status;
+ 
+-	//syslog(LOG_INFO, &quot;Syncronize: released sem&quot;);
+ 	// Wait with a timeout of half a second until the client exits
+ 	// from its DirectConnected() implementation
+ 	do {
+ #if 0
+ 		status = acquire_sem(fAcknowledgeSem);
+-#else	
++#else
+ 		status = acquire_sem_etc(fAcknowledgeSem, 1, B_TIMEOUT, 500000);
+ #endif
+ 	} while (status == B_INTERRUPTED);
+ 
+-	//syslog(LOG_INFO, &quot;Syncronize: acquired sem&quot;);
+ 	return status;
+ }
+ 
+ 
+ status_t
+-DirectWindowData::SetState(const direct_buffer_state&amp; bufferState,
+-	const direct_driver_state&amp; driverState, RenderingBuffer *buffer,
++DirectWindowData::SetState(direct_buffer_state bufferState,
++	direct_driver_state driverState, RenderingBuffer* buffer,
+ 	const BRect&amp; windowFrame, const BRegion&amp; clipRegion)
+-{	
+-	if (!fStarted &amp;&amp; (bufferState &amp; B_DIRECT_MODE_MASK)
+-			!= B_DIRECT_START)
+-		return B_OK; 
+-	
++{
+ 	if ((fBufferInfo-&gt;buffer_state &amp; B_DIRECT_MODE_MASK) == B_DIRECT_STOP
+ 		&amp;&amp; (bufferState &amp; B_DIRECT_MODE_MASK) != B_DIRECT_START)
+ 		return B_OK;
+-#if 0
+-	if ((bufferState &amp; B_DIRECT_MODE_MASK) == B_DIRECT_MODIFY)
+-		syslog(LOG_INFO, &quot;direct_modify&quot;);
+-#endif
+-	fStarted = true;
+-#if 0						
+-	char string[256];
+-	snprintf(string, sizeof(string), &quot;bufferState: 0x%x\n&quot;, (int)bufferState);
+-	syslog(LOG_INFO, string);
+-#endif
++
+ 	fBufferInfo-&gt;buffer_state = bufferState;
+-		
++
+ 	if (driverState != -1)
+ 		fBufferInfo-&gt;driver_state = driverState;
+ 
+@@ -180,6 +164,6 @@
+ 		for (uint32 i = 0; i &lt; fBufferInfo-&gt;clip_list_count; i++)
+ 			fBufferInfo-&gt;clip_list[i] = clipRegion.RectAtInt(i);
+ 	}
+-	
++
+ 	return _SyncronizeWithClient();
+ }
+
+Modified: haiku/trunk/src/servers/app/DirectWindowSupport.h
+===================================================================
+--- haiku/trunk/src/servers/app/DirectWindowSupport.h	2009-08-27 08:42:31 UTC (rev 32741)
++++ haiku/trunk/src/servers/app/DirectWindowSupport.h	2009-08-27 08:50:46 UTC (rev 32742)
+@@ -3,7 +3,10 @@
+  * Distributed under the terms of the MIT License.
+  *
+  */
++#ifndef DIRECT_WINDOW_SUPPORT_H
++#define DIRECT_WINDOW_SUPPORT_H
+ 
++
+ #include &lt;Autolock.h&gt;
+ #include &lt;DirectWindow.h&gt;
+ 
+@@ -11,27 +14,7 @@
+ 
+ class RenderingBuffer;
+ 
+-struct BufferState {
+-	BufferState(const direct_buffer_state&amp; state)
+-		:
+-		fState(state)
+-	{
+-	}
+ 
+-	inline direct_buffer_state Action() const
+-	{
+-		return (direct_buffer_state)(fState &amp; B_DIRECT_MODE_MASK);
+-	}
+-
+-	inline direct_buffer_state Reason() const
+-	{
+-		return (direct_buffer_state)(fState &amp; ~B_DIRECT_MODE_MASK);
+-	}
+-
+-	direct_buffer_state fState;
+-};
+-
+-
+ class DirectWindowData {
+ public:
+ 								DirectWindowData();
+@@ -43,24 +26,23 @@
+ 									direct_window_sync_data&amp; data) const;
+ 			status_t			SyncronizeWithClient();
+ 
+-			status_t			SetState(const direct_buffer_state&amp; bufferState,
+-									const direct_driver_state&amp; driverState,
+-									RenderingBuffer *renderingBuffer,
++			status_t			SetState(direct_buffer_state bufferState,
++									direct_driver_state driverState,
++									RenderingBuffer* renderingBuffer,
+ 									const BRect&amp; windowFrame,
+ 									const BRegion&amp; clipRegion);
+-			
++
+ 			BRect				old_window_frame;
+ 			bool				full_screen;
+ 
+ private:
+ 			status_t			_SyncronizeWithClient();
+ 
+-			direct_buffer_info*		fBufferInfo;
++			direct_buffer_info*	fBufferInfo;
+ 			sem_id				fSem;
+ 			sem_id				fAcknowledgeSem;
+ 			area_id				fBufferArea;
+-			direct_buffer_state		fPreviousState;
+-			int32				fTransition;
+-			bool				fStarted;
+ };
+ 
++
++#endif	// DIRECT_WINDOW_SUPPORT_H
+
+Modified: haiku/trunk/src/servers/app/MultiLocker.h
+===================================================================
+--- haiku/trunk/src/servers/app/MultiLocker.h	2009-08-27 08:42:31 UTC (rev 32741)
++++ haiku/trunk/src/servers/app/MultiLocker.h	2009-08-27 08:50:46 UTC (rev 32742)
+@@ -2,7 +2,7 @@
+  * Copyright 2005-2009, Haiku, Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT license.
+  *
+- * Copyright 1999, Be Incorporated.   All Rights Reserved.
++ * Copyright 1999, Be Incorporated. All Rights Reserved.
+  * This file may be used under the terms of the Be Sample Code License.
+  */
+ #ifndef MULTI_LOCKER_H
+@@ -66,6 +66,11 @@
+ #endif
+ 
+ private:
++								MultiLocker();
++								MultiLocker(const MultiLocker&amp; other);
++			MultiLocker&amp;		operator=(const MultiLocker&amp; other);
++									// not implemented
++
+ #if MULTI_LOCKER_DEBUG
+ 			// functions for managing the DEBUG reader array
+ 			void				_RegisterThread();
+@@ -114,28 +119,38 @@
+ 		:
+ 		fLock(*lock)
+ 	{
+-		fLock.WriteLock();
++		fLocked = fLock.WriteLock();
+ 	}
+ 
+ 	AutoWriteLocker(MultiLocker&amp; lock)
+ 		:
+ 		fLock(lock)
+ 	{
+-		fLock.WriteLock();
++		fLocked = fLock.WriteLock();
+ 	}
+ 
++	~AutoWriteLocker()
++	{
++		if (fLocked)
++			fLock.WriteUnlock();
++	}
++
+ 	bool IsLocked() const
+ 	{
+ 		return fLock.IsWriteLocked();
+ 	}
+ 
+-	~AutoWriteLocker()
++	void Unlock()
+ 	{
+-		fLock.WriteUnlock();
++		if (fLocked) {
++			fLock.WriteUnlock();
++			fLocked = false;
++		}
+ 	}
+ 
+ private:
+  	MultiLocker&amp;	fLock;
++	bool			fLocked;
+ };
+ 
+ 
+@@ -160,8 +175,7 @@
+ 		Unlock();
+ 	}
+ 
+-	void
+-	Unlock()
++	void Unlock()
+ 	{
+ 		if (fLocked) {
+ 			fLock.ReadUnlock();
+
+Modified: haiku/trunk/src/servers/app/ServerApp.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ServerApp.cpp	2009-08-27 08:42:31 UTC (rev 32741)
++++ haiku/trunk/src/servers/app/ServerApp.cpp	2009-08-27 08:50:46 UTC (rev 32742)
+@@ -2252,36 +2252,41 @@
+ 
+ 		case AS_GET_SCREEN_ID_FROM_WINDOW:
+ 		{
+-			status_t status = B_ENTRY_NOT_FOUND;
++			status_t status = B_BAD_VALUE;
+ 
+ 			// Attached data
+ 			// 1) int32 - window client token
+ 			int32 clientToken;
+ 			if (link.Read&lt;int32&gt;(&amp;clientToken) != B_OK)
+ 				status = B_BAD_DATA;
+-			else if (fDesktop-&gt;LockAllWindows()) {
++			else {
+ 				BAutolock locker(fWindowListLock);
+ 
+ 				for (int32 i = fWindowList.CountItems(); i-- &gt; 0;) {
+-					ServerWindow* window = fWindowList.ItemAt(i);
++					ServerWindow* serverWindow = fWindowList.ItemAt(i);
+ 
+-					if (window-&gt;ClientToken() == clientToken) {
++					if (serverWindow-&gt;ClientToken() == clientToken) {
++						AutoReadLocker _(fDesktop-&gt;ScreenLocker());
++
+ 						// found it!
+-						if (window-&gt;Window() == NULL) {
++						Window* window = serverWindow-&gt;Window();
++						const Screen* screen = NULL;
++						if (window != NULL)
++							screen = window-&gt;Screen();
++
++						if (screen == NULL) {
+ 							// The window hasn't been added to the desktop yet,
+ 							// or it's an offscreen window
+ 							break;
+ 						}
+ 
+ 						fLink.StartMessage(B_OK);
+-						fLink.Attach&lt;int32&gt;(window-&gt;Window()-&gt;Screen()-&gt;ID());
++						fLink.Attach&lt;int32&gt;(screen-&gt;ID());
+ 						status = B_OK;
+ 						break;
+ 					}
+ 				}
+-				fDesktop-&gt;UnlockAllWindows();
+-			} else
+-				status = B_ERROR;
++			}
+ 
+ 			if (status != B_OK)
+ 				fLink.StartMessage(status);
+
+Modified: haiku/trunk/src/servers/app/ServerWindow.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ServerWindow.cpp	2009-08-27 08:42:31 UTC (rev 32741)
++++ haiku/trunk/src/servers/app/ServerWindow.cpp	2009-08-27 08:50:46 UTC (rev 32742)
+@@ -167,6 +167,7 @@
+ 	fCurrentDrawingRegionValid(false),
+ 
+ 	fDirectWindowData(NULL),
++	fIsDirectlyAccessing(false),
+ 	fDirectWindowFeel(B_NORMAL_WINDOW_FEEL)
+ {
+ 	STRACE((&quot;ServerWindow(%s)::ServerWindow()\n&quot;, title));
+@@ -3401,8 +3402,6 @@
+ void
+ ServerWindow::ScreenChanged(const BMessage* message)
+ {
+-	// TODO: execute the stop notification earlier
+-	HandleDirectConnection(B_DIRECT_STOP);
+ 	SendMessageToClient(message);
+ 
+ 	if (fDirectWindowData != NULL &amp;&amp; fDirectWindowData-&gt;full_screen) {
+@@ -3411,9 +3410,6 @@
+ 			screenFrame.Width() - fWindow-&gt;Frame().Width(),
+ 			screenFrame.Height() - fWindow-&gt;Frame().Height());
+ 	}
+-
+-	HandleDirectConnection(B_DIRECT_START | B_BUFFER_RESET,
+-		B_SCREEN_CHANGED);
+ }
+ 
+ 
+@@ -3441,15 +3437,6 @@
+ }
+ 
+ 
+-/* static */
+-bool
+-ServerWindow::_SupportsDirectMode()
+-{
+-	return false;
+-	// TODO: For now, since it's broken
+-}
+-
+-
+ status_t
+ ServerWindow::_EnableDirectWindowMode()
+ {
+@@ -3458,9 +3445,6 @@
+ 		return B_ERROR;
+ 	}
+ 
+-	if (!ServerWindow::_SupportsDirectMode())
+-		return B_ERROR;
+-
+ 	fDirectWindowData = new (nothrow) DirectWindowData;
+ 	if (fDirectWindowData == NULL)
+ 		return B_NO_MEMORY;
+@@ -3480,34 +3464,35 @@
+ void
+ ServerWindow::HandleDirectConnection(int32 bufferState, int32 driverState)
+ {
+-	STRACE((&quot;HandleDirectConnection(bufferState = %ld, driverState = %ld)\n&quot;,
+-		bufferState, driverState));
++	ASSERT_MULTI_LOCKED(fDesktop-&gt;WindowLocker());
+ 
+ 	if (fDirectWindowData == NULL)
+ 		return;
+ 
+-	if (fDesktop-&gt;LockSingleWindow()) {
+-		status_t status = fDirectWindowData-&gt;SetState(
+-			(direct_buffer_state)bufferState,
+-			(direct_driver_state)driverState,
+-			fDesktop-&gt;HWInterface()-&gt;FrontBuffer(), fWindow-&gt;Frame(),
+-				fWindow-&gt;VisibleContentRegion());
++	STRACE((&quot;HandleDirectConnection(bufferState = %ld, driverState = %ld)\n&quot;,
++		bufferState, driverState));
+ 
+-		if (status != B_OK) {
+-			char errorString[256];
+-			snprintf(errorString, sizeof(errorString),
+-				&quot;%s killed for a problem in DirectConnected(): %s&quot;,
+-				App()-&gt;Signature(), strerror(status));
+-			syslog(LOG_ERR, errorString);
++	status_t status = fDirectWindowData-&gt;SetState(
++		(direct_buffer_state)bufferState, (direct_driver_state)driverState,
++		fDesktop-&gt;HWInterface()-&gt;FrontBuffer(), fWindow-&gt;Frame(),
++		fWindow-&gt;VisibleContentRegion());
+ 
+-			// The client application didn't release the semaphore
+-			// within the given timeout. Or something else went wrong.
+-			// Deleting this member should make it crash.
+-			delete fDirectWindowData;
+-			fDirectWindowData = NULL;
+-		}
+-		fDesktop-&gt;UnlockSingleWindow();
+-	}
++	if (status != B_OK) {
++		char errorString[256];
++		snprintf(errorString, sizeof(errorString),
++			&quot;%s killed for a problem in DirectConnected(): %s&quot;,
++			App()-&gt;Signature(), strerror(status));
++		syslog(LOG_ERR, errorString);
++
++		// The client application didn't release the semaphore
++		// within the given timeout. Or something else went wrong.
++		// Deleting this member should make it crash.
++		delete fDirectWindowData;
++		fDirectWindowData = NULL;
++	} else if ((bufferState &amp; B_DIRECT_MODE_MASK) == B_DIRECT_START)
++		fIsDirectlyAccessing = true;
++	else if ((bufferState &amp; B_DIRECT_MODE_MASK) == B_DIRECT_STOP)
++		fIsDirectlyAccessing = false;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/servers/app/ServerWindow.h
+===================================================================
+--- haiku/trunk/src/servers/app/ServerWindow.h	2009-08-27 08:42:31 UTC (rev 32741)
++++ haiku/trunk/src/servers/app/ServerWindow.h	2009-08-27 08:50:46 UTC (rev 32742)
+@@ -13,12 +13,6 @@
+ #define SERVER_WINDOW_H
+ 
+ 
+-#include &quot;EventDispatcher.h&quot;
+-#include &quot;MessageLooper.h&quot;
+-
+-#include &lt;PortLink.h&gt;
+-#include &lt;TokenSpace.h&gt;
+-
+ #include &lt;GraphicsDefs.h&gt;
+ #include &lt;Locker.h&gt;
+ #include &lt;Message.h&gt;
+@@ -28,6 +22,13 @@
+ #include &lt;String.h&gt;
+ #include &lt;Window.h&gt;
+ 
++#include &lt;PortLink.h&gt;
++#include &lt;TokenSpace.h&gt;
++
++#include &quot;EventDispatcher.h&quot;
++#include &quot;MessageLooper.h&quot;
++
++
+ class BString;
+ class BMessenger;
+ class BPoint;
+@@ -47,6 +48,7 @@
+ #define AS_UPDATE_COLORS 'asuc'
+ #define AS_UPDATE_FONTS 'asuf'
+ 
++
+ class ServerWindow : public MessageLooper {
+ public:
+ 								ServerWindow(const char *title, ServerApp *app,
+@@ -77,8 +79,8 @@
+ 			const BMessenger&amp;	HandlerMessenger() const
+ 									{ return fHandlerMessenger; }
+ 
+-			void			ScreenChanged(const BMessage *screenChangedMessage);
+-			status_t			SendMessageToClient(const BMessage* msg,
++			void				ScreenChanged(const BMessage* message);
++			status_t			SendMessageToClient(const BMessage* message,
+ 									int32 target = B_NULL_TOKEN) const;
+ 
+ 	virtual	::Window*			MakeWindow(BRect frame, const char* name,
+@@ -91,9 +93,6 @@
+ 			// related thread/team_id(s).
+ 	inline	team_id				ClientTeam() const { return fClientTeam; }
+ 
+-			void				HandleDirectConnection(int32 bufferState,
+-									int32 driverState = -1);
+-
+ 	inline	int32				ClientToken() const { return fClientToken; }
+ 	inline	int32				ServerToken() const { return fServerToken; }
+ 
+@@ -101,6 +100,13 @@
+ 
+ 			void				GetInfo(window_info&amp; info);
+ 
++			void				HandleDirectConnection(int32 bufferState,
++									int32 driverState = 0);
++			bool				HasDirectFrameBufferAccess() const
++									{ return fDirectWindowData != NULL; }
++			bool				IsDirectlyAccessing() const
++									{ return fIsDirectlyAccessing; }
++
+ 			void				ResyncDrawState();
+ 
+ 						// TODO: Change this
+@@ -127,8 +133,8 @@
+ 	virtual void				_PrepareQuit();
+ 	virtual void				_GetLooperName(char* name, size_t size);
+ 
+-		static	bool				_SupportsDirectMode();
+ 			status_t			_EnableDirectWindowMode();
++			void				_DirectWindowSetFullScreen(bool set);
+ 
+ 			void				_SetCurrentView(View* view);
+ 			void				_UpdateDrawState(View* view);
+@@ -137,8 +143,6 @@
+ 			bool				_MessageNeedsAllWindowsLocked(
+ 									uint32 code) const;
+ 
+-			void				_DirectWindowSetFullScreen(bool set);
+-
+ 			// TODO: Move me elsewhere
+ 			status_t			PictureToRegion(ServerPicture *picture,
+ 									BRegion&amp; region, bool inverse,
+@@ -171,6 +175,7 @@
+ 			bool				fCurrentDrawingRegionValid;
+ 
+ 			DirectWindowData*	fDirectWindowData;
++			bool				fIsDirectlyAccessing;
+ 			window_feel			fDirectWindowFeel;
+ };
+ 
+
+Modified: haiku/trunk/src/servers/app/Window.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/Window.cpp	2009-08-27 08:42:31 UTC (rev 32741)
++++ haiku/trunk/src/servers/app/Window.cpp	2009-08-27 08:50:46 UTC (rev 32742)
+@@ -77,6 +77,7 @@
+ 	:
+ 	fTitle(name),
+ 	fFrame(frame),
++	fScreen(NULL),
+ 
+ 	fVisibleRegion(),
+ 	fVisibleContentRegion(),
+@@ -213,8 +214,6 @@
+ 
+ 	fVisibleContentRegionValid = false;
+ 	fEffectiveDrawingRegionValid = false;
+-
+-	fWindow-&gt;HandleDirectConnection(B_DIRECT_MODIFY | B_CLIPPING_MODIFIED);
+ }
+ 
+ 
+@@ -562,13 +561,19 @@
+ }
+ 
+ 
+-::Screen*
+-Window::Screen() const
++void
++Window::SetScreen(const ::Screen* screen)
+ {
+-	ASSERT_MULTI_LOCKED(fDesktop-&gt;WindowLocker());
++	ASSERT_MULTI_WRITE_LOCKED(fDesktop-&gt;ScreenLocker());
++	fScreen = screen;
++}
+ 
+-	// TODO: we need to know which screen the window is on
+-	return fDesktop-&gt;VirtualScreen().ScreenAt(0);
++
++const ::Screen*
++Window::Screen() const
++{
++	ASSERT_MULTI_READ_LOCKED(fDesktop-&gt;ScreenLocker());
++	return fScreen;
+ }
+ 
+ 
+@@ -1215,18 +1220,12 @@
+ void
+ Window::WorkspaceActivated(int32 index, bool active)
+ {
+-	if (!active &amp;&amp; !IsHidden())
+-		fWindow-&gt;HandleDirectConnection(B_DIRECT_STOP);
+-
+ 	BMessage activatedMsg(B_WORKSPACE_ACTIVATED);
+ 	activatedMsg.AddInt64(&quot;when&quot;, system_time());
+ 	activatedMsg.AddInt32(&quot;workspace&quot;, index);
+ 	activatedMsg.AddBool(&quot;active&quot;, active);
+ 
+ 	ServerWindow()-&gt;SendMessageToClient(&amp;activatedMsg);
+-
+-	if (active &amp;&amp; !IsHidden())
+-		fWindow-&gt;HandleDirectConnection(B_DIRECT_START | B_BUFFER_RESET);
+ }
+ 
+ 
+@@ -1338,8 +1337,8 @@
+ 
+ 
+ void
+-Window::SetSizeLimits(int32 minWidth, int32 maxWidth,
+-	int32 minHeight, int32 maxHeight)
++Window::SetSizeLimits(int32 minWidth, int32 maxWidth, int32 minHeight,
+
+[... truncated: 137 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020042.html">[Haiku-commits] r32741 - haiku/trunk/headers/build/os
+</A></li>
+	<LI>Next message: <A HREF="020044.html">[Haiku-commits] r32742 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20043">[ date ]</a>
+              <a href="thread.html#20043">[ thread ]</a>
+              <a href="subject.html#20043">[ subject ]</a>
+              <a href="author.html#20043">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

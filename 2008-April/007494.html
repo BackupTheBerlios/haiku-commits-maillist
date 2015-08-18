@@ -1,0 +1,894 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24799 -	haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24799%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk&In-Reply-To=%3C200804042251.m34MpYC4009960%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007484.html">
+   <LINK REL="Next"  HREF="007495.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24799 -	haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24799%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk&In-Reply-To=%3C200804042251.m34MpYC4009960%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24799 -	haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sat Apr  5 00:51:34 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007484.html">[Haiku-commits] r24648 -	haiku/trunk/src/system/boot/platform/bios_ia32
+</A></li>
+        <LI>Next message: <A HREF="007495.html">[Haiku-commits] r24800 - haiku/trunk/src/apps/aboutsystem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7494">[ date ]</a>
+              <a href="thread.html#7494">[ thread ]</a>
+              <a href="subject.html#7494">[ subject ]</a>
+              <a href="author.html#7494">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-04-05 00:51:29 +0200 (Sat, 05 Apr 2008)
+New Revision: 24799
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24799&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24799&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.h
+Log:
+* Add support for devices with multiple LUNs
+* A device now has one or more LUNs which are used for LUN specific functions
+* Adapted these LUN specific functions to the new design and also change the
+  (un-)publishing accordingly
+* Handle &quot;no media&quot; cases more correctly
+* Output some interesting device infos also with tracing disabled
+* Add some more helpful debug output here and there
+
+Devices that provide multiple logical units (like those n in 1 card readers)
+should now be usable with usb_disk too. Also we don't fail when a device is
+attached which currently does not contain a media. Instead handle media changes
+correctly so inserting a media works as expected. Note that hot-unplugging and
+media removal still does not quite work right at the devfs or disk device
+manager level and easily crashes the system.
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp	2008-04-04 19:45:11 UTC (rev 24798)
++++ haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp	2008-04-04 22:51:29 UTC (rev 24799)
+@@ -18,7 +18,7 @@
+ 
+ #define DRIVER_NAME			&quot;usb_disk&quot;
+ #define DEVICE_NAME_BASE	&quot;disk/usb/&quot;
+-#define DEVICE_NAME			DEVICE_NAME_BASE&quot;%ld/%ld/raw&quot;
++#define DEVICE_NAME			DEVICE_NAME_BASE&quot;%ld/%d/raw&quot;
+ 
+ 
+ //#define TRACE_USB_DISK
+@@ -35,6 +35,7 @@
+ static usb_module_info *gUSBModule = NULL;
+ static disk_device *gDeviceList = NULL;
+ static uint32 gDeviceCount = 0;
++static uint32 gLunCount = 0;
+ static benaphore gDeviceListLock;
+ static char **gDeviceNames = NULL;
+ 
+@@ -54,19 +55,38 @@
+ 				void *data, size_t dataLength);
+ status_t	usb_disk_receive_csw(disk_device *device,
+ 				command_status_wrapper *status);
+-status_t	usb_disk_operation(disk_device *device, uint8 operation,
++status_t	usb_disk_operation(device_lun *lun, uint8 operation,
+ 				uint8 opLength, uint32 logicalBlockAddress,
+ 				uint16 transferLength, void *data, uint32 *dataLength,
+ 				bool directionIn);
+ 
+-status_t	usb_disk_request_sense(disk_device *device);
+-status_t	usb_disk_test_unit_ready(disk_device *device);
+-status_t	usb_disk_inquiry(disk_device *device);
+-status_t	usb_disk_update_capacity(disk_device *device);
+-status_t	usb_disk_synchronize(disk_device *device, bool force);
++status_t	usb_disk_request_sense(device_lun *lun);
++status_t	usb_disk_test_unit_ready(device_lun *lun);
++status_t	usb_disk_inquiry(device_lun *lun);
++status_t	usb_disk_reset_capacity(device_lun *lun);
++status_t	usb_disk_update_capacity(device_lun *lun);
++status_t	usb_disk_synchronize(device_lun *lun, bool force);
+ 
+ 
+ //
++//#pragma mark - Device Allocation Helper Functions
++//
++
++
++void
++usb_disk_free_device_and_luns(disk_device *device)
++{
++	benaphore_lock(&amp;device-&gt;lock);
++	benaphore_destroy(&amp;device-&gt;lock);
++	delete_sem(device-&gt;notify);
++	for (uint8 i = 0; i &lt; device-&gt;lun_count; i++)
++		free(device-&gt;luns[i]);
++	free(device-&gt;luns);
++	free(device);
++}
++
++
++//
+ //#pragma mark - Bulk-only Mass Storage Functions
+ //
+ 
+@@ -92,8 +112,8 @@
+ 		1, &amp;result, &amp;actualLength) != B_OK || actualLength != 1)
+ 		return 0;
+ 
+-	if (result &gt; 15) {
+-		// invalid count, only up to 15 LUNs are possible
++	if (result &gt; MAX_LOGICAL_UNIT_NUMBER) {
++		// invalid max lun
+ 		return 0;
+ 	}
+ 
+@@ -152,16 +172,17 @@
+ 
+ 
+ status_t
+-usb_disk_operation(disk_device *device, uint8 operation, uint8 opLength,
++usb_disk_operation(device_lun *lun, uint8 operation, uint8 opLength,
+ 	uint32 logicalBlockAddress, uint16 transferLength, void *data,
+ 	uint32 *dataLength, bool directionIn)
+ {
++	disk_device *device = lun-&gt;device;
+ 	command_block_wrapper command;
+ 	command.signature = CBW_SIGNATURE;
+ 	command.tag = device-&gt;current_tag++;
+ 	command.data_transfer_length = (dataLength != NULL ? *dataLength : 0);
+ 	command.flags = (directionIn ? CBW_DATA_INPUT : CBW_DATA_OUTPUT);
+-	command.lun = device-&gt;lun;
++	command.lun = lun-&gt;logical_unit_number;
+ 	command.command_block_length = opLength;
+ 	memset(command.command_block, 0, sizeof(command.command_block));
+ 
+@@ -169,7 +190,7 @@
+ 		case 6: {
+ 			scsi_command_6 *commandBlock = (scsi_command_6 *)command.command_block;
+ 			commandBlock-&gt;operation = operation;
+-			commandBlock-&gt;lun = device-&gt;lun &lt;&lt; 5;
++			commandBlock-&gt;lun = lun-&gt;logical_unit_number &lt;&lt; 5;
+ 			commandBlock-&gt;allocation_length = (uint8)transferLength;
+ 			break;
+ 		}
+@@ -177,7 +198,7 @@
+ 		case 10: {
+ 			scsi_command_10 *commandBlock = (scsi_command_10 *)command.command_block;
+ 			commandBlock-&gt;operation = operation;
+-			commandBlock-&gt;lun_flags = device-&gt;lun &lt;&lt; 5;
++			commandBlock-&gt;lun_flags = lun-&gt;logical_unit_number &lt;&lt; 5;
+ 			commandBlock-&gt;logical_block_address = htonl(logicalBlockAddress);
+ 			commandBlock-&gt;transfer_length = htons(transferLength);
+ 			break;
+@@ -252,16 +273,18 @@
+ 				result = B_OK;
+ 			} else {
+ 				// the operation is complete but has failed at the SCSI level
+-				TRACE_ALWAYS(&quot;operation failed at the SCSI level\n&quot;);
+-				usb_disk_request_sense(device);
+-				result = B_ERROR;
++				TRACE_ALWAYS(&quot;operation 0x%02x failed at the SCSI level\n&quot;,
++					operation);
++				result = usb_disk_request_sense(lun);
++				if (result == B_OK)
++					result = B_ERROR;
+ 			}
+ 			break;
+ 		}
+ 
+ 		case CSW_STATUS_PHASE_ERROR: {
+ 			// a protocol or device error occured
+-			TRACE_ALWAYS(&quot;phase error in operation\n&quot;);
++			TRACE_ALWAYS(&quot;phase error in operation 0x%02x\n&quot;, operation);
+ 			usb_disk_reset_recovery(device);
+ 			if (dataLength != NULL)
+ 				*dataLength = 0;
+@@ -279,18 +302,18 @@
+ 
+ 
+ status_t
+-usb_disk_request_sense(disk_device *device)
++usb_disk_request_sense(device_lun *lun)
+ {
+ 	uint32 dataLength = sizeof(scsi_request_sense_6_parameter);
+ 	scsi_request_sense_6_parameter parameter;
+-	status_t result = usb_disk_operation(device, SCSI_REQUEST_SENSE_6, 6, 0,
++	status_t result = usb_disk_operation(lun, SCSI_REQUEST_SENSE_6, 6, 0,
+ 		dataLength, &amp;parameter, &amp;dataLength, true);
+ 	if (result != B_OK) {
+ 		TRACE_ALWAYS(&quot;getting request sense data failed\n&quot;);
+ 		return result;
+ 	}
+ 
+-	if (parameter.sense_key &gt;= 2) {
++	if (parameter.sense_key &gt; SCSI_SENSE_KEY_NOT_READY) {
+ 		TRACE_ALWAYS(&quot;request_sense: key: 0x%02x; asc: 0x%02x; ascq: 0x%02x;\n&quot;,
+ 			parameter.sense_key, parameter.additional_sense_code,
+ 			parameter.additional_sense_code_qualifier);
+@@ -302,13 +325,17 @@
+ 			return B_OK;
+ 
+ 		case SCSI_SENSE_KEY_NOT_READY:
+-			TRACE_ALWAYS(&quot;request_sense: device not ready\n&quot;);
+-			return B_DEV_NOT_READY;
++			TRACE(&quot;request_sense: device not ready (asc 0x%02x ascq 0x%02x)\n&quot;,
++				parameter.additional_sense_code,
++				parameter.additional_sense_code_qualifier);
++			lun-&gt;media_present = false;
++			usb_disk_reset_capacity(lun);
++			return B_DEV_NO_MEDIA;
+ 
++		case SCSI_SENSE_KEY_HARDWARE_ERROR:
+ 		case SCSI_SENSE_KEY_MEDIUM_ERROR:
+-		case SCSI_SENSE_KEY_HARDWARE_ERROR:
+-			TRACE_ALWAYS(&quot;request_sense: no media or hardware error\n&quot;);
+-			return B_DEV_NO_MEDIA;
++			TRACE_ALWAYS(&quot;request_sense: media or hardware error\n&quot;);
++			return B_DEV_UNREADABLE;
+ 
+ 		case SCSI_SENSE_KEY_ILLEGAL_REQUEST:
+ 			TRACE_ALWAYS(&quot;request_sense: illegal request\n&quot;);
+@@ -316,6 +343,8 @@
+ 
+ 		case SCSI_SENSE_KEY_UNIT_ATTENTION:
+ 			TRACE_ALWAYS(&quot;request_sense: media changed\n&quot;);
++			lun-&gt;media_changed = true;
++			lun-&gt;media_present = true;
+ 			return B_DEV_MEDIA_CHANGED;
+ 
+ 		case SCSI_SENSE_KEY_DATA_PROTECT:
+@@ -332,71 +361,85 @@
+ 
+ 
+ status_t
+-usb_disk_test_unit_ready(disk_device *device)
++usb_disk_test_unit_ready(device_lun *lun)
+ {
+-	status_t result = usb_disk_operation(device, SCSI_TEST_UNIT_READY_6, 6, 0,
+-		0, NULL, NULL, true);
+-	if (result == B_OK)
+-		return B_OK;
+-
+-	return usb_disk_request_sense(device);
++	return usb_disk_operation(lun, SCSI_TEST_UNIT_READY_6, 6, 0, 0, NULL, NULL,
++		true);
+ }
+ 
+ 
+ status_t
+-usb_disk_inquiry(disk_device *device)
++usb_disk_inquiry(device_lun *lun)
+ {
+ 	uint32 dataLength = sizeof(scsi_inquiry_6_parameter);
+ 	scsi_inquiry_6_parameter parameter;
+-	status_t result = usb_disk_operation(device, SCSI_INQUIRY_6, 6, 0,
+-		dataLength, &amp;parameter, &amp;dataLength, true);
++	status_t result = B_ERROR;
++	for (uint32 tries = 0; tries &lt; 3; tries++) {
++		result = usb_disk_operation(lun, SCSI_INQUIRY_6, 6, 0, dataLength,
++			&amp;parameter, &amp;dataLength, true);
++		if (result == B_OK)
++			break;
++	}
+ 	if (result != B_OK) {
+ 		TRACE_ALWAYS(&quot;getting inquiry data failed\n&quot;);
+-		device-&gt;removable = true;
++		lun-&gt;device_type = B_DISK;
++		lun-&gt;removable = true;
+ 		return result;
+ 	}
+ 
+-	TRACE(&quot;peripherial_device_type. 0x%02x\n&quot;, parameter.peripherial_device_type);
+-	TRACE(&quot;peripherial_qualifier... 0x%02x\n&quot;, parameter.peripherial_qualifier);
+-	TRACE(&quot;removable_medium........ %s\n&quot;, parameter.removable_medium ? &quot;yes&quot; : &quot;no&quot;);
+-	TRACE(&quot;version................. 0x%02x\n&quot;, parameter.version);
+-	TRACE(&quot;response_data_format.... 0x%02x\n&quot;, parameter.response_data_format);	
+-	TRACE(&quot;vendor_identification... \&quot;%.8s\&quot;\n&quot;, parameter.vendor_identification);	
+-	TRACE(&quot;product_identification.. \&quot;%.16s\&quot;\n&quot;, parameter.product_identification);	
+-	TRACE(&quot;product_revision_level.. \&quot;%.4s\&quot;\n&quot;, parameter.product_revision_level);	
+-	device-&gt;device_type = parameter.peripherial_device_type; /* 1:1 mapping */
+-	device-&gt;removable = (parameter.removable_medium == 1);
++	TRACE(&quot;peripherial_device_type  0x%02x\n&quot;, parameter.peripherial_device_type);
++	TRACE(&quot;peripherial_qualifier    0x%02x\n&quot;, parameter.peripherial_qualifier);
++	TRACE(&quot;removable_medium         %s\n&quot;, parameter.removable_medium ? &quot;yes&quot; : &quot;no&quot;);
++	TRACE(&quot;version                  0x%02x\n&quot;, parameter.version);
++	TRACE(&quot;response_data_format     0x%02x\n&quot;, parameter.response_data_format);	
++	TRACE_ALWAYS(&quot;vendor_identification    \&quot;%.8s\&quot;\n&quot;, parameter.vendor_identification);	
++	TRACE_ALWAYS(&quot;product_identification   \&quot;%.16s\&quot;\n&quot;, parameter.product_identification);	
++	TRACE_ALWAYS(&quot;product_revision_level   \&quot;%.4s\&quot;\n&quot;, parameter.product_revision_level);	
++	lun-&gt;device_type = parameter.peripherial_device_type; /* 1:1 mapping */
++	lun-&gt;removable = (parameter.removable_medium == 1);
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-usb_disk_update_capacity(disk_device *device)
++usb_disk_reset_capacity(device_lun *lun)
+ {
++	lun-&gt;block_size = 512;
++	lun-&gt;block_count = 0;
++	return B_OK;
++}
++
++
++status_t
++usb_disk_update_capacity(device_lun *lun)
++{
+ 	uint32 dataLength = sizeof(scsi_read_capacity_10_parameter);
+ 	scsi_read_capacity_10_parameter parameter;
+-	status_t result = usb_disk_operation(device, SCSI_READ_CAPACITY_10, 10, 0,
+-		0, &amp;parameter, &amp;dataLength, true);
++	status_t result = usb_disk_operation(lun, SCSI_READ_CAPACITY_10, 10, 0, 0,
++		&amp;parameter, &amp;dataLength, true);
+ 	if (result != B_OK) {
+ 		TRACE_ALWAYS(&quot;failed to update capacity\n&quot;);
+-		device-&gt;block_size = 1;
+-		device-&gt;block_count = 0;
++		lun-&gt;media_present = false;
++		lun-&gt;media_changed = false;
++		usb_disk_reset_capacity(lun);
+ 		return result;
+ 	}
+ 
+-	device-&gt;block_size = ntohl(parameter.logical_block_length);
+-	device-&gt;block_count = ntohl(parameter.last_logical_block_address) + 1;
++	lun-&gt;media_present = true;
++	lun-&gt;media_changed = false;
++	lun-&gt;block_size = ntohl(parameter.logical_block_length);
++	lun-&gt;block_count = ntohl(parameter.last_logical_block_address) + 1;
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-usb_disk_synchronize(disk_device *device, bool force)
++usb_disk_synchronize(device_lun *lun, bool force)
+ {
+-	if (device-&gt;should_sync || force) {
+-		status_t result = usb_disk_operation(device, SCSI_SYNCHRONIZE_CACHE_10,
++	if (lun-&gt;should_sync || force) {
++		status_t result = usb_disk_operation(lun, SCSI_SYNCHRONIZE_CACHE_10,
+ 			10, 0, 0, NULL, NULL, false);
+-		device-&gt;should_sync = false;
++		lun-&gt;should_sync = false;
+ 		return result;
+ 	}
+ 
+@@ -415,7 +458,6 @@
+ {
+ 	//TRACE(&quot;callback()\n&quot;);
+ 	disk_device *device = (disk_device *)cookie;
+-
+ 	device-&gt;status = status;
+ 	device-&gt;actual_length = actualLength;
+ 	release_sem(device-&gt;notify);
+@@ -432,8 +474,7 @@
+ 	device-&gt;open_count = 0;
+ 	device-&gt;interface = 0xff;
+ 	device-&gt;current_tag = 0;
+-	device-&gt;should_sync = false;
+-	device-&gt;lun = 0;
++	device-&gt;luns = NULL;
+ 
+ 	// scan through the interfaces to find our bulk-only data interface
+ 	const usb_configuration_info *configuration = gUSBModule-&gt;get_configuration(newDevice);
+@@ -483,6 +524,7 @@
+ 
+ 	if (device-&gt;interface == 0xff) {
+ 		TRACE_ALWAYS(&quot;no valid bulk-only interface found\n&quot;);
++		free(device);
+ 		return B_ERROR;
+ 	}
+ 
+@@ -496,33 +538,58 @@
+ 	if (device-&gt;notify &lt; B_OK) {
+ 		benaphore_destroy(&amp;device-&gt;lock);
+ 		free(device);
+-		return B_NO_MORE_SEMS;
++		return device-&gt;notify;
+ 	}
+ 
+-	result = usb_disk_inquiry(device);
+-	for (uint32 tries = 0; tries &lt; 3; tries++) {
+-		if (usb_disk_test_unit_ready(device) == B_OK)
++	device-&gt;lun_count = usb_disk_get_max_lun(device) + 1;
++	device-&gt;luns = (device_lun **)malloc(device-&gt;lun_count
++		* sizeof(device_lun *));
++	for (uint8 i = 0; i &lt; device-&gt;lun_count; i++)
++		device-&gt;luns[i] = NULL;
++
++	TRACE_ALWAYS(&quot;device reports a lun count of %d\n&quot;, device-&gt;lun_count);
++	for (uint8 i = 0; i &lt; device-&gt;lun_count; i++) {
++		// create the individual luns present on this device
++		device_lun *lun = (device_lun *)malloc(sizeof(device_lun));
++		if (lun == NULL) {
++			result = B_NO_MEMORY;
+ 			break;
+-		snooze(10000);
++		}
++
++		device-&gt;luns[i] = lun;
++		lun-&gt;device = device;
++		lun-&gt;logical_unit_number = i;
++		lun-&gt;should_sync = false;
++		lun-&gt;media_present = true;
++		lun-&gt;media_changed = true;
++		usb_disk_reset_capacity(lun);
++
++		// initialize this lun
++		result = usb_disk_inquiry(lun);
++		for (uint32 tries = 0; tries &lt; 3; tries++) {
++			status_t ready = usb_disk_test_unit_ready(lun);
++			if (ready == B_OK || ready == B_DEV_NO_MEDIA)
++				break;
++			snooze(10000);
++		}
++
++		if (result != B_OK)
++			break;
+ 	}
+ 
+-	if (result != B_OK || usb_disk_update_capacity(device) != B_OK) {
+-		TRACE_ALWAYS(&quot;failed to read device data\n&quot;);
+-		delete_sem(device-&gt;notify);
+-		benaphore_destroy(&amp;device-&gt;lock);
+-		free(device);
+-		return B_ERROR;
++	if (result != B_OK) {
++		TRACE_ALWAYS(&quot;failed to initialize logical units\n&quot;);
++		usb_disk_free_device_and_luns(device);
++		return result;
+ 	}
+ 
+ 	benaphore_lock(&amp;gDeviceListLock);
+ 	device-&gt;link = (void *)gDeviceList;
+ 	gDeviceList = device;
+ 	uint32 deviceNumber = gDeviceCount++;
+-
+-	// ToDo: find out about LUNs and publish those too
+-	//uint8 maxLun = usb_disk_get_max_lun(device);
+-	//TRACE(&quot;device has max lun %d\n&quot;, maxLun);
+-	sprintf(device-&gt;name, DEVICE_NAME, deviceNumber, 0L);
++	gLunCount += device-&gt;lun_count;
++	for (uint8 i = 0; i &lt; device-&gt;lun_count; i++)
++		sprintf(device-&gt;luns[i]-&gt;name, DEVICE_NAME, deviceNumber, i);
+ 	benaphore_unlock(&amp;gDeviceListLock);
+ 
+ 	TRACE(&quot;new device: 0x%08lx\n&quot;, (uint32)device);
+@@ -551,18 +618,14 @@
+ 			element = (disk_device *)element-&gt;link;
+ 		}
+ 	}
++	gLunCount -= device-&gt;lun_count;
+ 	gDeviceCount--;
+ 	benaphore_unlock(&amp;gDeviceListLock);
+ 
+ 	device-&gt;device = 0;
+ 	device-&gt;removed = true;
+-	if (device-&gt;open_count == 0) {
+-		benaphore_lock(&amp;device-&gt;lock);
+-		benaphore_destroy(&amp;device-&gt;lock);
+-		delete_sem(device-&gt;notify);
+-		free(device);
+-	}
+-
++	if (device-&gt;open_count == 0)
++		usb_disk_free_device_and_luns(device);
+ 	return B_OK;
+ }
+ 
+@@ -573,15 +636,15 @@
+ 
+ 
+ static bool
+-usb_disk_needs_partial_buffer(disk_device *device, off_t position,
+-	size_t length, uint32 &amp;blockPosition, uint16 &amp;blockCount)
++usb_disk_needs_partial_buffer(device_lun *lun, off_t position, size_t length,
++	uint32 &amp;blockPosition, uint16 &amp;blockCount)
+ {
+-	blockPosition = (uint32)(position / device-&gt;block_size);
+-	if ((off_t)blockPosition * device-&gt;block_size != position)
++	blockPosition = (uint32)(position / lun-&gt;block_size);
++	if ((off_t)blockPosition * lun-&gt;block_size != position)
+ 		return true;
+ 
+-	blockCount = (uint16)(length / device-&gt;block_size);
+-	if ((size_t)blockCount * device-&gt;block_size != length)
++	blockCount = (uint16)(length / lun-&gt;block_size);
++	if ((size_t)blockCount * lun-&gt;block_size != length)
+ 		return true;
+ 
+ 	return false;
+@@ -589,43 +652,43 @@
+ 
+ 
+ static status_t
+-usb_disk_block_read(disk_device *device, uint32 blockPosition,
+-	uint16 blockCount, void *buffer, size_t *length)
++usb_disk_block_read(device_lun *lun, uint32 blockPosition, uint16 blockCount,
++	void *buffer, size_t *length)
+ {
+-	status_t result = usb_disk_operation(device, SCSI_READ_10, 10,
+-		blockPosition, blockCount, buffer, length, true);
++	status_t result = usb_disk_operation(lun, SCSI_READ_10, 10, blockPosition,
++		blockCount, buffer, length, true);
+ 	return result;
+ }
+ 
+ 
+ static status_t
+-usb_disk_block_write(disk_device *device, uint32 blockPosition,
+-	uint16 blockCount, void *buffer, size_t *length)
++usb_disk_block_write(device_lun *lun, uint32 blockPosition, uint16 blockCount,
++	void *buffer, size_t *length)
+ {
+-	status_t result = usb_disk_operation(device, SCSI_WRITE_10, 10,
+-		blockPosition, blockCount, buffer, length, false);
++	status_t result = usb_disk_operation(lun, SCSI_WRITE_10, 10, blockPosition,
++		blockCount, buffer, length, false);
+ 	if (result == B_OK)
+-		device-&gt;should_sync = true;
++		lun-&gt;should_sync = true;
+ 	return result;
+ }
+ 
+ 
+ static status_t
+-usb_disk_prepare_partial_buffer(disk_device *device, off_t position,
+-	size_t length, void *&amp;partialBuffer, void *&amp;blockBuffer,
+-	uint32 &amp;blockPosition, uint16 &amp;blockCount)
++usb_disk_prepare_partial_buffer(device_lun *lun, off_t position, size_t length,
++	void *&amp;partialBuffer, void *&amp;blockBuffer, uint32 &amp;blockPosition,
++	uint16 &amp;blockCount)
+ {
+-	blockPosition = (uint32)(position / device-&gt;block_size);
+-	blockCount = (uint16)((uint32)((position + length + device-&gt;block_size - 1)
+-		/ device-&gt;block_size) - blockPosition);
+-	size_t blockLength = blockCount * device-&gt;block_size;
++	blockPosition = (uint32)(position / lun-&gt;block_size);
++	blockCount = (uint16)((uint32)((position + length + lun-&gt;block_size - 1)
++		/ lun-&gt;block_size) - blockPosition);
++	size_t blockLength = blockCount * lun-&gt;block_size;
+ 	blockBuffer = malloc(blockLength);
+ 	if (blockBuffer == NULL) {
+ 		TRACE_ALWAYS(&quot;no memory to allocate partial buffer\n&quot;);
+ 		return B_NO_MEMORY;
+ 	}
+ 
+-	status_t result = usb_disk_block_read(device, blockPosition, blockCount,
++	status_t result = usb_disk_block_read(lun, blockPosition, blockCount,
+ 		blockBuffer, &amp;blockLength);
+ 	if (result != B_OK) {
+ 		TRACE_ALWAYS(&quot;block read failed when filling partial buffer\n&quot;);
+@@ -633,7 +696,7 @@
+ 		return result;
+ 	}
+ 
+-	off_t offset = position - (blockPosition * device-&gt;block_size);
++	off_t offset = position - (blockPosition * lun-&gt;block_size);
+ 	partialBuffer = (uint8 *)blockBuffer + offset;
+ 	return B_OK;
+ }
+@@ -667,11 +730,18 @@
+ 	benaphore_lock(&amp;gDeviceListLock);
+ 	disk_device *device = gDeviceList;
+ 	while (device) {
+-		if (!device-&gt;removed &amp;&amp; strncmp(rawName, device-&gt;name, 32) == 0) {
+-			device-&gt;open_count++;
+-			*cookie = device;
+-			benaphore_unlock(&amp;gDeviceListLock);
+-			return B_OK;
++		for (uint8 i = 0; i &lt; device-&gt;lun_count; i++) {
++			device_lun *lun = device-&gt;luns[i];
++			if (strncmp(rawName, lun-&gt;name, 32) == 0) {
++				// found the matching device/lun
++				if (device-&gt;removed)
++					return B_ERROR;
++
++				device-&gt;open_count++;
++				*cookie = lun;
++				benaphore_unlock(&amp;gDeviceListLock);
++				return B_OK;
++			}
+ 		}
+ 
+ 		device = (disk_device *)device-&gt;link;
+@@ -686,8 +756,8 @@
+ usb_disk_close(void *cookie)
+ {
+ 	TRACE(&quot;close()\n&quot;);
+-	disk_device *device = (disk_device *)cookie;
+-	usb_disk_synchronize(device, false);
++	device_lun *lun = (device_lun *)cookie;
++	usb_disk_synchronize(lun, false);
+ 	return B_OK;
+ }
+ 
+@@ -698,13 +768,13 @@
+ 	TRACE(&quot;free()\n&quot;);
+ 	benaphore_lock(&amp;gDeviceListLock);
+ 
+-	disk_device *device = (disk_device *)cookie;
++	device_lun *lun = (device_lun *)cookie;
++	disk_device *device = lun-&gt;device;
+ 	device-&gt;open_count--;
+ 	if (device-&gt;removed &amp;&amp; device-&gt;open_count == 0) {
+-		benaphore_lock(&amp;device-&gt;lock);
+-		benaphore_destroy(&amp;device-&gt;lock);
+-		delete_sem(device-&gt;notify);
+-		free(device);
++		// we can simply free the device here as it has been removed from the
++		// device list in the device removed notification hook
++		usb_disk_free_device_and_luns(device);
+ 	}
+ 
+ 	benaphore_unlock(&amp;gDeviceListLock);
+@@ -715,7 +785,8 @@
+ static status_t
+ usb_disk_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+ {
+-	disk_device *device = (disk_device *)cookie;
++	device_lun *lun = (device_lun *)cookie;
++	disk_device *device = lun-&gt;device;
+ 	if (device-&gt;removed)
+ 		return B_DEV_NOT_READY;
+ 
+@@ -724,21 +795,27 @@
+ 
+ 	switch (op) {
+ 		case B_GET_MEDIA_STATUS: {
+-			*(status_t *)buffer = usb_disk_test_unit_ready(device);
++			*(status_t *)buffer = usb_disk_test_unit_ready(lun);
+ 			TRACE(&quot;B_GET_MEDIA_STATUS: 0x%08lx\n&quot;, *(status_t *)buffer);
+ 			result = B_OK;
+ 			break;
+ 		}
+ 
+ 		case B_GET_GEOMETRY: {
++			if (lun-&gt;media_changed) {
++				result = usb_disk_update_capacity(lun);
++				if (result != B_OK)
++					break;
++			}
++
+ 			device_geometry *geometry = (device_geometry *)buffer;
+-			geometry-&gt;bytes_per_sector = device-&gt;block_size;
+-			geometry-&gt;cylinder_count = device-&gt;block_count;
++			geometry-&gt;bytes_per_sector = lun-&gt;block_size;
++			geometry-&gt;cylinder_count = lun-&gt;block_count;
+ 			geometry-&gt;sectors_per_track = geometry-&gt;head_count = 1;
+-			geometry-&gt;device_type = device-&gt;device_type;
+-			geometry-&gt;removable = device-&gt;removable;
+-			geometry-&gt;read_only = (device-&gt;device_type == B_CD);
+-			geometry-&gt;write_once = (device-&gt;device_type == B_WORM);
++			geometry-&gt;device_type = lun-&gt;device_type;
++			geometry-&gt;removable = lun-&gt;removable;
++			geometry-&gt;read_only = (lun-&gt;device_type == B_CD);
++			geometry-&gt;write_once = (lun-&gt;device_type == B_WORM);
+ 			TRACE(&quot;B_GET_GEOMETRY: %ld sectors at %ld bytes per sector\n&quot;,
+ 				geometry-&gt;cylinder_count, geometry-&gt;bytes_per_sector);
+ 			result = B_OK;
+@@ -746,7 +823,8 @@
+ 		}
+ 
+ 		case B_FLUSH_DRIVE_CACHE:
+-			usb_disk_synchronize(device, true);
++			TRACE(&quot;B_FLUSH_DRIVE_CACHE\n&quot;);
++			usb_disk_synchronize(lun, true);
+ 			break;
+ 
+ 		default:
+@@ -763,7 +841,8 @@
+ usb_disk_read(void *cookie, off_t position, void *buffer, size_t *length)
+ {
+ 	TRACE(&quot;read(%lld, %ld)\n&quot;, position, *length);
+-	disk_device *device = (disk_device *)cookie;
++	device_lun *lun = (device_lun *)cookie;
++	disk_device *device = lun-&gt;device;
+ 	if (device-&gt;removed) {
+ 		*length = 0;
+ 		return B_DEV_NOT_READY;
+@@ -776,20 +855,20 @@
+ 	status_t result = B_ERROR;
+ 	uint32 blockPosition = 0;
+ 	uint16 blockCount = 0;
+-	bool needsPartial = usb_disk_needs_partial_buffer(device, position,
+-		*length, blockPosition, blockCount);
++	bool needsPartial = usb_disk_needs_partial_buffer(lun, position, *length,
++		blockPosition, blockCount);
+ 	if (needsPartial) {
+ 		void *partialBuffer = NULL;
+ 		void *blockBuffer = NULL;
+-		result = usb_disk_prepare_partial_buffer(device, position, *length,
++		result = usb_disk_prepare_partial_buffer(lun, position, *length,
+ 			partialBuffer, blockBuffer, blockPosition, blockCount);
+ 		if (result == B_OK) {
+ 			memcpy(buffer, partialBuffer, *length);
+ 			free(blockBuffer);
+ 		}
+ 	} else {
+-		result = usb_disk_block_read(device, blockPosition, blockCount,
+-			buffer, length);
++		result = usb_disk_block_read(lun, blockPosition, blockCount, buffer,
++			length);
+ 	}
+ 
+ 	benaphore_unlock(&amp;device-&gt;lock);
+@@ -809,7 +888,8 @@
+ 	size_t *length)
+ {
+ 	TRACE(&quot;write(%lld, %ld)\n&quot;, position, *length);
+-	disk_device *device = (disk_device *)cookie;
++	device_lun *lun = (device_lun *)cookie;
++	disk_device *device = lun-&gt;device;
+ 	if (device-&gt;removed) {
+ 		*length = 0;
+ 		return B_DEV_NOT_READY;
+@@ -822,22 +902,22 @@
+ 	status_t result = B_ERROR;
+ 	uint32 blockPosition = 0;
+ 	uint16 blockCount = 0;
+-	bool needsPartial = usb_disk_needs_partial_buffer(device, position,
++	bool needsPartial = usb_disk_needs_partial_buffer(lun, position,
+ 		*length, blockPosition, blockCount);
+ 	if (needsPartial) {
+ 		void *partialBuffer = NULL;
+ 		void *blockBuffer = NULL;
+-		result = usb_disk_prepare_partial_buffer(device, position, *length,
++		result = usb_disk_prepare_partial_buffer(lun, position, *length,
+ 			partialBuffer, blockBuffer, blockPosition, blockCount);
+ 		if (result == B_OK) {
+ 			memcpy(partialBuffer, buffer, *length);
+-			size_t blockLength = blockCount * device-&gt;block_size;
+-			result = usb_disk_block_write(device, blockPosition, blockCount,
++			size_t blockLength = blockCount * lun-&gt;block_size;
++			result = usb_disk_block_write(lun, blockPosition, blockCount,
+ 				blockBuffer, &amp;blockLength);
+ 			free(blockBuffer);
+ 		}
+ 	} else {
+-		result = usb_disk_block_write(device, blockPosition, blockCount,
++		result = usb_disk_block_write(lun, blockPosition, blockCount,
+ 			(void *)buffer, length);
+ 	}
+ 
+@@ -881,6 +961,7 @@
+ 
+ 	gDeviceList = NULL;
+ 	gDeviceCount = 0;
++	gLunCount = 0;
+ 	status_t result = benaphore_init(&amp;gDeviceListLock, &quot;usb_disk device list lock&quot;);
+ 	if (result &lt; B_OK) {
+ 		TRACE(&quot;failed to create device list lock\n&quot;);
+@@ -931,7 +1012,7 @@
+ 		gDeviceNames = NULL;
+ 	}
+ 
+-	gDeviceNames = (char **)malloc(sizeof(char *) * (gDeviceCount + 1));
++	gDeviceNames = (char **)malloc(sizeof(char *) * (gLunCount + 1));
+ 	if (gDeviceNames == NULL)
+ 		return NULL;
+ 
+@@ -939,7 +1020,9 @@
+ 	benaphore_lock(&amp;gDeviceListLock);
+ 	disk_device *device = gDeviceList;
+ 	while (device) {
+-		gDeviceNames[index++] = strdup(device-&gt;name);
++		for (uint8 i = 0; i &lt; device-&gt;lun_count; i++)
++			gDeviceNames[index++] = strdup(device-&gt;luns[i]-&gt;name);
++
+ 		device = (disk_device *)device-&gt;link;
+ 	}
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.h	2008-04-04 19:45:11 UTC (rev 24798)
++++ haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.h	2008-04-04 22:51:29 UTC (rev 24799)
+@@ -14,6 +14,7 @@
+ 
+ #define REQUEST_MASS_STORAGE_RESET	0xff
+ #define REQUEST_GET_MAX_LUN			0xfe
++#define MAX_LOGICAL_UNIT_NUMBER		15
+ 
+ #define CBW_SIGNATURE				0x43425355
+ #define CBW_DATA_OUTPUT				0x00
+@@ -24,12 +25,14 @@
+ #define CSW_STATUS_COMMAND_FAILED	0x01
+ #define CSW_STATUS_PHASE_ERROR		0x02
+ 
++typedef struct device_lun_s device_lun;
++
++// holds common information about an attached device (pointed to by luns)
+ typedef struct disk_device_s {
+ 	usb_device	device;
+ 	bool		removed;
+ 	uint32		open_count;
+ 	benaphore	lock;
+-	char		name[32];
+ 	void *		link;
+ 
+ 	// device state
+@@ -37,22 +40,35 @@
+ 	usb_pipe	bulk_out;
+ 	uint8		interface;
+ 	uint32		current_tag;
++
++	// used to store callback information
++	sem_id		notify;
++	status_t	status;
++	size_t		actual_length;
++
++	// logical units of this device
++	uint8		lun_count;
++	device_lun **luns;
++} disk_device;
++
++
++// represents a logical unit on the pointed to device - this gets published
++struct device_lun_s {
++	disk_device *device;
++	char		name[32];
++	uint8		logical_unit_number;
+ 	bool		should_sync;
+-	uint8		lun;
+ 
+ 	// device information through read capacity/inquiry
++	bool		media_present;
++	bool		media_changed;
+ 	uint32		block_count;
+ 	uint32		block_size;
+ 	uint8		device_type;
+ 	bool		removable;
++};
+ 
+-	// used to store callback information
+-	sem_id		notify;
+-	status_t	status;
+-	size_t		actual_length;
+-} disk_device;
+ 
+-
+ typedef struct command_block_wrapper_s {
+ 	uint32		signature;
+ 	uint32		tag;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007484.html">[Haiku-commits] r24648 -	haiku/trunk/src/system/boot/platform/bios_ia32
+</A></li>
+	<LI>Next message: <A HREF="007495.html">[Haiku-commits] r24800 - haiku/trunk/src/apps/aboutsystem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7494">[ date ]</a>
+              <a href="thread.html#7494">[ thread ]</a>
+              <a href="subject.html#7494">[ subject ]</a>
+              <a href="author.html#7494">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

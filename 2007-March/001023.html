@@ -1,0 +1,232 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20308 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20308%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200703030242.l232gbgx016245%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001022.html">
+   <LINK REL="Next"  HREF="001024.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20308 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20308%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200703030242.l232gbgx016245%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20308 - haiku/trunk/src/system/kernel/fs">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Mar  3 03:42:37 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001022.html">[Haiku-commits] r20292 - in haiku/trunk: headers/os/interface	headers/private/interface src/kits/interface src/servers/app
+</A></li>
+        <LI>Next message: <A HREF="001024.html">[Haiku-commits] r20309 -	haiku/trunk/src/add-ons/kernel/file_systems/ntfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1023">[ date ]</a>
+              <a href="thread.html#1023">[ thread ]</a>
+              <a href="subject.html#1023">[ subject ]</a>
+              <a href="author.html#1023">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-03-03 03:42:36 +0100 (Sat, 03 Mar 2007)
+New Revision: 20308
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20308&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20308&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+Log:
+* Introduced the new static lock sVnodeCoveredByMutex to guard the
+  vnode::covered_by fields. Together with sMountOpLock it allows write
+  access, either lock alone suffices for read access. Before
+  sMountOpLock had to be acquired for read (and write) access, which
+  meant that while mounting/unmounting a FS path resolution would have
+  to wait. In case of the UserlandFS this would even cause a deadlock
+  while mounting if the client tried to resolve the path of the device
+  to be mounted (e.g. by opening it).
+* Added a clarifying comment about read access to the
+  fs_mount::covers_vnode/root_vnode field and removed locking in
+  resolve_volume_root_to_mount_point() which was not necessary for
+  explained reasons.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2007-03-02 13:36:32 UTC (rev 20307)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2007-03-03 02:42:36 UTC (rev 20308)
+@@ -88,6 +88,18 @@
+ #define FS_CALL(vnode, op) (vnode-&gt;mount-&gt;fs-&gt;op)
+ #define FS_MOUNT_CALL(mount, op) (mount-&gt;fs-&gt;op)
+ 
++/**	\brief Structure to manage a mounted file system
++
++	Note: The root_vnode and covers_vnode fields (what others?) are
++	initialized in fs_mount() and not changed afterwards. That is as soon
++	as the mount is mounted and it is made sure it won't be unmounted
++	(e.g. by holding a reference to a vnode of that mount) (read) access
++	to those fields is always safe, even without additional locking. Morever
++	while mounted the mount holds a reference to the covers_vnode, and thus
++	making the access path vnode-&gt;mount-&gt;covers_vnode-&gt;mount-&gt;... safe if a
++	reference to vnode is held (note that for the root mount covers_vnode
++	is NULL, though).
++ */
+ struct fs_mount {
+ 	struct fs_mount	*next;
+ 	file_system_module_info *fs;
+@@ -136,20 +148,29 @@
+  *	- sMountsTable will not be modified,
+  *	- the fields immutable after initialization of the fs_mount structures in
+  *	  sMountsTable will not be modified,
+- *	- vnode::covered_by of any vnode in sVnodeTable will not be modified,
++ *	- vnode::covered_by of any vnode in sVnodeTable will not be modified.
+  *	
+  *	The thread trying to lock the lock must not hold sVnodeMutex or
+  *	sMountMutex.
+  */
+ static recursive_lock sMountOpLock;
+ 
++/**	\brief Guards the vnode::covered_by field of any vnode
++ *
++ *	The holder is allowed to read access the vnode::covered_by field of any
++ *	vnode. Additionally holding sMountOpLock allows for write access.
++ *
++ *	The thread trying to lock the must not hold sVnodeMutex.
++ */
++static mutex sVnodeCoveredByMutex;
++
+ /**	\brief Guards sVnodeTable.
+  *
+  *	The holder is allowed to read/write access sVnodeTable and to
+  *	to any unbusy vnode in that table, save
+  *	to the immutable fields (device, id, private_node, mount) to which
+  *	only read-only access is allowed, and to the field covered_by, which is
+- *	guarded by sMountOpLock.
++ *	guarded by sMountOpLock and sVnodeCoveredByMutex.
+  *
+  *	The thread trying to lock the mutex must not hold sMountMutex.
+  *	You must not have this mutex held when calling create_sem(), as this
+@@ -1305,6 +1326,8 @@
+ 
+ 		if (context-&gt;cwd != NULL &amp;&amp; context-&gt;cwd-&gt;mount == mount) {
+ 			put_vnode(context-&gt;cwd);
++				// Note: We're only accessing the pointer, not the vnode itself
++				// in the lines below.
+ 
+ 			if (context-&gt;cwd == mount-&gt;root_vnode) {
+ 				// redirect the current working directory to the covered vnode
+@@ -1357,12 +1380,12 @@
+ 
+ 	struct vnode *volumeRoot = NULL;
+ 
+-	recursive_lock_lock(&amp;sMountOpLock);
++	mutex_lock(&amp;sVnodeCoveredByMutex);
+ 	if (vnode-&gt;covered_by) {
+ 		volumeRoot = vnode-&gt;covered_by;
+ 		inc_vnode_ref_count(volumeRoot);
+ 	}
+-	recursive_lock_unlock(&amp;sMountOpLock);
++	mutex_unlock(&amp;sVnodeCoveredByMutex);
+ 
+ 	return volumeRoot;
+ }
+@@ -1422,7 +1445,7 @@
+  *	root of a volume. If it is (and if it is not &quot;/&quot;), the function obtains
+  *	a reference to the underlying mount point node and returns it.
+  *
+- *	\param vnode The vnode in question.
++ *	\param vnode The vnode in question (caller must have a reference).
+  *	\return The mount point vnode the vnode covers, if it is indeed a volume
+  *			root and not &quot;/&quot;, or \c NULL otherwise.
+  */
+@@ -1435,13 +1458,11 @@
+ 
+ 	struct vnode *mountPoint = NULL;
+ 
+-	recursive_lock_lock(&amp;sMountOpLock);
+ 	struct fs_mount *mount = vnode-&gt;mount;
+ 	if (vnode == mount-&gt;root_vnode &amp;&amp; mount-&gt;covers_vnode) {
+ 		mountPoint = mount-&gt;covers_vnode;
+ 		inc_vnode_ref_count(mountPoint);
+ 	}
+-	recursive_lock_unlock(&amp;sMountOpLock);
+ 
+ 	return mountPoint;
+ }
+@@ -3475,6 +3496,9 @@
+ 	if (mutex_init(&amp;sMountMutex, &quot;vfs_mount_lock&quot;) &lt; 0)
+ 		panic(&quot;vfs_init: error allocating mount lock\n&quot;);
+ 
++	if (mutex_init(&amp;sVnodeCoveredByMutex, &quot;vfs_vnode_covered_by_lock&quot;) &lt; 0)
++		panic(&quot;vfs_init: error allocating vnode::covered_by lock\n&quot;);
++
+ 	if (mutex_init(&amp;sVnodeMutex, &quot;vfs_vnode_lock&quot;) &lt; 0)
+ 		panic(&quot;vfs_init: error allocating vnode lock\n&quot;);
+ 
+@@ -4016,12 +4040,12 @@
+ 		if (status != B_OK)
+ 			return;
+ 
+-		recursive_lock_lock(&amp;sMountOpLock);
++		mutex_lock(&amp;sVnodeCoveredByMutex);
+ 		if (vnode-&gt;covered_by) {
+ 			entry-&gt;d_dev = vnode-&gt;covered_by-&gt;device;
+ 			entry-&gt;d_ino = vnode-&gt;covered_by-&gt;id;
+ 		}
+-		recursive_lock_unlock(&amp;sMountOpLock);
++		mutex_unlock(&amp;sVnodeCoveredByMutex);
+ 
+ 		put_vnode(vnode);
+ 	}
+@@ -5422,8 +5446,10 @@
+ 
+ 	// No race here, since fs_mount() is the only function changing
+ 	// covers_vnode (and holds sMountOpLock at that time).
++	mutex_lock(&amp;sVnodeCoveredByMutex);
+ 	if (mount-&gt;covers_vnode)
+ 		mount-&gt;covers_vnode-&gt;covered_by = mount-&gt;root_vnode;
++	mutex_unlock(&amp;sVnodeCoveredByMutex);
+ 
+ 	if (!sRoot)
+ 		sRoot = mount-&gt;root_vnode;
+@@ -5593,7 +5619,9 @@
+ 
+ 	mutex_unlock(&amp;sVnodeMutex);
+ 
++	mutex_lock(&amp;sVnodeCoveredByMutex);
+ 	mount-&gt;covers_vnode-&gt;covered_by = NULL;
++	mutex_unlock(&amp;sVnodeCoveredByMutex);
+ 	put_vnode(mount-&gt;covers_vnode);
+ 
+ 	// Free all vnodes associated with this mount.
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001022.html">[Haiku-commits] r20292 - in haiku/trunk: headers/os/interface	headers/private/interface src/kits/interface src/servers/app
+</A></li>
+	<LI>Next message: <A HREF="001024.html">[Haiku-commits] r20309 -	haiku/trunk/src/add-ons/kernel/file_systems/ntfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1023">[ date ]</a>
+              <a href="thread.html#1023">[ thread ]</a>
+              <a href="subject.html#1023">[ subject ]</a>
+              <a href="author.html#1023">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

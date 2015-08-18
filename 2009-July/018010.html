@@ -1,0 +1,523 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31578 - haiku/trunk/src/apps/debugger/dwarf
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31578%20-%20haiku/trunk/src/apps/debugger/dwarf&In-Reply-To=%3C200907150212.n6F2C31d030434%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018009.html">
+   <LINK REL="Next"  HREF="018015.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31578 - haiku/trunk/src/apps/debugger/dwarf</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31578%20-%20haiku/trunk/src/apps/debugger/dwarf&In-Reply-To=%3C200907150212.n6F2C31d030434%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31578 - haiku/trunk/src/apps/debugger/dwarf">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Jul 15 04:12:03 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018009.html">[Haiku-commits] r31577 - in haiku/trunk/src/apps/debugger:	debug_info dwarf
+</A></li>
+        <LI>Next message: <A HREF="018015.html">[Haiku-commits] r31579 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18010">[ date ]</a>
+              <a href="thread.html#18010">[ thread ]</a>
+              <a href="subject.html#18010">[ subject ]</a>
+              <a href="author.html#18010">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-07-15 04:12:03 +0200 (Wed, 15 Jul 2009)
+New Revision: 31578
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31578&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31578&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/debugger/dwarf/DwarfExpressionEvaluator.cpp
+   haiku/trunk/src/apps/debugger/dwarf/DwarfExpressionEvaluator.h
+Log:
+Implemented interpretation of most of the DWARF expression operations. A few
+are still missing. And everything is still utterly untested.
+
+
+Modified: haiku/trunk/src/apps/debugger/dwarf/DwarfExpressionEvaluator.cpp
+===================================================================
+--- haiku/trunk/src/apps/debugger/dwarf/DwarfExpressionEvaluator.cpp	2009-07-15 02:08:47 UTC (rev 31577)
++++ haiku/trunk/src/apps/debugger/dwarf/DwarfExpressionEvaluator.cpp	2009-07-15 02:12:03 UTC (rev 31578)
+@@ -12,14 +12,24 @@
+ #include &lt;algorithm&gt;
+ #include &lt;new&gt;
+ 
++#include &lt;Variant.h&gt;
++
+ #include &quot;DataReader.h&quot;
+ #include &quot;Dwarf.h&quot;
++#include &quot;DwarfTargetInterface.h&quot;
+ 
+ 
+-static const size_t kMaxStackCapacityIncrement	= 64;
++// number of elements to increase the stack capacity when the stack is full
++static const size_t kStackCapacityIncrement = 64;
++
++// maximum number of elements we allow to be pushed on the stack
+ static const size_t kMaxStackCapacity			= 1024;
+ 
++// maximum number of operations we allow to be performed for a single expression
++// (to avoid running infinite loops forever)
++static const uint32 kMaxOperationCount			= 10000;
+ 
++
+ // #pragma mark - EvaluationException
+ 
+ 
+@@ -46,7 +56,7 @@
+ 		if (fStackCapacity &gt;= kMaxStackCapacity)
+ 			throw EvaluationException();
+ 
+-		size_t newCapacity = fStackCapacity + kMaxStackCapacityIncrement;
++		size_t newCapacity = fStackCapacity + kStackCapacityIncrement;
+ 		target_addr_t* newStack = (target_addr_t*)realloc(fStack,
+ 			newCapacity * sizeof(target_addr_t));
+ 		if (newStack == NULL)
+@@ -68,12 +78,18 @@
+ }
+ 
+ 
+-DwarfExpressionEvaluator::DwarfExpressionEvaluator(uint8 addressSize)
++DwarfExpressionEvaluator::DwarfExpressionEvaluator(
++	DwarfTargetInterface* targetInterface, uint8 addressSize)
+ 	:
++	fTargetInterface(targetInterface),
+ 	fStack(NULL),
+ 	fStackSize(0),
+ 	fStackCapacity(0),
+-	fAddressSize(addressSize)
++	fObjectAddress(0),
++	fFrameAddress(0),
++	fAddressSize(addressSize),
++	fObjectAddressValid(false),
++	fFrameAddressValid(false)
+ {
+ }
+ 
+@@ -84,6 +100,22 @@
+ }
+ 
+ 
++void
++DwarfExpressionEvaluator::SetObjectAddress(target_addr_t address)
++{
++	fObjectAddress = address;
++	fObjectAddressValid = true;
++}
++
++
++void
++DwarfExpressionEvaluator::SetFrameAddress(target_addr_t address)
++{
++	fFrameAddress = address;
++	fFrameAddressValid = true;
++}
++
++
+ status_t
+ DwarfExpressionEvaluator::Evaluate(const void* expression, size_t size)
+ {
+@@ -102,6 +134,8 @@
+ status_t
+ DwarfExpressionEvaluator::_Evaluate()
+ {
++	uint32 operationsExecuted = 0;
++
+ 	while (fDataReader.BytesRemaining() &gt; 0) {
+ 		uint8 opcode = fDataReader.Read&lt;uint8&gt;(0);
+ 
+@@ -172,67 +206,293 @@
+ 				fStack[fStackSize - 3] = tmp;
+ 				break;
+ 			}
++
+ 			case DW_OP_deref:
+-// TODO:...
++				_DereferenceAddress(fAddressSize);
+ 				break;
++			case DW_OP_deref_size:
++				_DereferenceAddress(fDataReader.Read&lt;uint8&gt;(0));
++				break;
+ 			case DW_OP_xderef:
+-// TODO:...
++				_DereferenceAddressSpaceAddress(fAddressSize);
+ 				break;
++			case DW_OP_xderef_size:
++				_DereferenceAddressSpaceAddress(fDataReader.Read&lt;uint8&gt;(0));
++				break;
++
+ 			case DW_OP_abs:
++			{
++				target_addr_t value = _Pop();
++				if (fAddressSize == 4) {
++					int32 signedValue = (int32)value;
++					_Push(signedValue &gt;= 0 ? signedValue : -signedValue);
++				} else {
++					int64 signedValue = (int64)value;
++					_Push(signedValue &gt;= 0 ? signedValue : -signedValue);
++				}
++				break;
++			}
+ 			case DW_OP_and:
++				_Push(_Pop() &amp; _Pop());
++				break;
+ 			case DW_OP_div:
++			{
++				int64 top = (int64)_Pop();
++				int64 second = (int64)_Pop();
++				_Push(top != 0 ? second / top : 0);
++				break;
++			}
+ 			case DW_OP_minus:
++			{
++				target_addr_t top = _Pop();
++				_Push(_Pop() - top);
++				break;
++			}
+ 			case DW_OP_mod:
++			{
++				// While the specs explicitly speak of signed integer division
++				// for &quot;div&quot;, nothing is mentioned for &quot;mod&quot;.
++				target_addr_t top = _Pop();
++				target_addr_t second = _Pop();
++				_Push(top != 0 ? second % top : 0);
++				break;
++			}
+ 			case DW_OP_mul:
++				_Push(_Pop() * _Pop());
++				break;
+ 			case DW_OP_neg:
++			{
++				if (fAddressSize == 4)
++					_Push(-(int32)_Pop());
++				else
++					_Push(-(int64)_Pop());
++				break;
++			}
+ 			case DW_OP_not:
++				_Push(~_Pop());
++				break;
+ 			case DW_OP_or:
++				_Push(_Pop() | _Pop());
++				break;
+ 			case DW_OP_plus:
++				_Push(_Pop() + _Pop());
++				break;
+ 			case DW_OP_plus_uconst:
++				_Push(_Pop() + fDataReader.ReadUnsignedLEB128(0));
++				break;
+ 			case DW_OP_shl:
++			{
++				target_addr_t top = _Pop();
++				_Push(_Pop() &lt;&lt; top);
++				break;
++			}
+ 			case DW_OP_shr:
++			{
++				target_addr_t top = _Pop();
++				_Push(_Pop() &gt;&gt; top);
++				break;
++			}
+ 			case DW_OP_shra:
++			{
++				target_addr_t top = _Pop();
++				int64 second = (int64)_Pop();
++				_Push(second &gt;= 0 ? second &gt;&gt; top : -(-second &gt;&gt; top));
++					// right shift on negative values is implementation defined
++				break;
++			}
+ 			case DW_OP_xor:
++				_Push(_Pop() ^ _Pop());
++				break;
++
++			case DW_OP_bra:
++				if (_Pop() == 0)
++					break;
++				// fall through
+ 			case DW_OP_skip:
+-			case DW_OP_bra:
++			{
++				int16 offset = fDataReader.Read&lt;int16&gt;(0);
++				if (offset &gt;= 0 ? offset &gt; fDataReader.BytesRemaining()
++						: -offset &gt; fDataReader.Offset()) {
++					throw EvaluationException();
++				}
++				fDataReader.SeekAbsolute(fDataReader.Offset() + offset);
++				break;
++			}
+ 
+ 			case DW_OP_eq:
++				_Push(_Pop() == _Pop() ? 1 : 0);
++				break;
+ 			case DW_OP_ge:
++			{
++				int64 top = (int64)_Pop();
++				_Push((int64)_Pop() &gt;= top ? 1 : 0);
++				break;
++			}
+ 			case DW_OP_gt:
++			{
++				int64 top = (int64)_Pop();
++				_Push((int64)_Pop() &gt; top ? 1 : 0);
++				break;
++			}
+ 			case DW_OP_le:
++			{
++				int64 top = (int64)_Pop();
++				_Push((int64)_Pop() &lt;= top ? 1 : 0);
++				break;
++			}
+ 			case DW_OP_lt:
++			{
++				int64 top = (int64)_Pop();
++				_Push((int64)_Pop() &lt; top ? 1 : 0);
++				break;
++			}
+ 			case DW_OP_ne:
++				_Push(_Pop() == _Pop() ? 1 : 0);
++				break;
+ 
++			case DW_OP_push_object_address:
++				if (!fObjectAddressValid)
++					throw EvaluationException();
++				_Push(fObjectAddress);
++				break;
++			case DW_OP_call_frame_cfa:
++				if (!fFrameAddressValid)
++					throw EvaluationException();
++				_Push(fFrameAddress);
++				break;
++
+ 			case DW_OP_regx:
++				_PushRegister(fDataReader.ReadUnsignedLEB128(0), 0);
++				break;
++			case DW_OP_bregx:
++			{
++				uint32 reg = fDataReader.ReadUnsignedLEB128(0);
++				_PushRegister(reg, fDataReader.ReadSignedLEB128(0));
++				break;
++			}
++
++			case DW_OP_form_tls_address:
++// TODO:...
++				break;
++
+ 			case DW_OP_fbreg:
+-			case DW_OP_bregx:
+-			case DW_OP_piece:
+-			case DW_OP_deref_size:
+-			case DW_OP_xderef_size:
+-			case DW_OP_nop:
+-			case DW_OP_push_object_address:
++// TODO:...
++				break;
++
+ 			case DW_OP_call2:
+ 			case DW_OP_call4:
+ 			case DW_OP_call_ref:
+-			case DW_OP_form_tls_address:
+-			case DW_OP_call_frame_cfa:
++// TODO:...
++				break;
++
++			case DW_OP_piece:
+ 			case DW_OP_bit_piece:
++// TODO:...
+ 				break;
+ 
++			case DW_OP_nop:
++				break;
++
+ 			default:
+ 				if (opcode &gt;= DW_OP_lit0 &amp;&amp; opcode &lt;= DW_OP_lit31) {
+ 					_Push(opcode - DW_OP_lit0);
+ 				} else if (opcode &gt;= DW_OP_reg0 &amp;&amp; opcode &lt;= DW_OP_reg31) {
+-// TODO:...
++					_PushRegister(opcode - DW_OP_reg0, 0);
+ 				} else if (opcode &gt;= DW_OP_breg0 &amp;&amp; opcode &lt;= DW_OP_breg31) {
+-// TODO:...
++					_PushRegister(opcode - DW_OP_reg0,
++						fDataReader.ReadSignedLEB128(0));
+ 				} else {
+ 					printf(&quot;DwarfExpressionEvaluator::_Evaluate(): unsupported &quot;
+ 						&quot;opcode: %u\n&quot;, opcode);
+ 					return B_BAD_DATA;
+ 				}
++				break;
+ 		}
++
++		if (++operationsExecuted &gt;= kMaxOperationCount)
++			return B_BAD_DATA;
+ 	}
+ 
+ 	return fDataReader.HasOverflow() ? B_BAD_DATA : B_OK;
+ }
++
++
++void
++DwarfExpressionEvaluator::_DereferenceAddress(uint8 addressSize)
++{
++	uint32 valueType;
++	switch (addressSize) {
++		case 1:
++			valueType = B_UINT8_TYPE;
++			break;
++		case 2:
++			valueType = B_UINT16_TYPE;
++			break;
++		case 4:
++			valueType = B_UINT32_TYPE;
++			break;
++		case 8:
++			if (fAddressSize == 8) {
++				valueType = B_UINT64_TYPE;
++				break;
++			}
++			// fall through
++		default:
++			throw EvaluationException();
++	}
++
++	target_addr_t address = _Pop();
++	BVariant value;
++	if (!fTargetInterface-&gt;ReadValueFromMemory(address, valueType, value)) {
++		throw EvaluationException();
++	}
++
++	_Push(value.ToUInt64());
++}
++
++
++void
++DwarfExpressionEvaluator::_DereferenceAddressSpaceAddress(uint8 addressSize)
++{
++	uint32 valueType;
++	switch (addressSize) {
++		case 1:
++			valueType = B_UINT8_TYPE;
++			break;
++		case 2:
++			valueType = B_UINT16_TYPE;
++			break;
++		case 4:
++			valueType = B_UINT32_TYPE;
++			break;
++		case 8:
++			if (fAddressSize == 8) {
++				valueType = B_UINT64_TYPE;
++				break;
++			}
++			// fall through
++		default:
++			throw EvaluationException();
++	}
++
++	target_addr_t address = _Pop();
++	target_addr_t addressSpace = _Pop();
++	BVariant value;
++	if (!fTargetInterface-&gt;ReadValueFromMemory(addressSpace, address, valueType,
++			value)) {
++		throw EvaluationException();
++	}
++
++	_Push(value.ToUInt64());
++}
++
++
++void
++DwarfExpressionEvaluator::_PushRegister(uint32 reg, target_addr_t offset)
++{
++	BVariant value;
++	if (!fTargetInterface-&gt;GetRegisterValue(reg, value))
++		throw EvaluationException();
++
++	_Push(value.ToUInt64());
++}
+
+Modified: haiku/trunk/src/apps/debugger/dwarf/DwarfExpressionEvaluator.h
+===================================================================
+--- haiku/trunk/src/apps/debugger/dwarf/DwarfExpressionEvaluator.h	2009-07-15 02:08:47 UTC (rev 31577)
++++ haiku/trunk/src/apps/debugger/dwarf/DwarfExpressionEvaluator.h	2009-07-15 02:12:03 UTC (rev 31578)
+@@ -10,11 +10,19 @@
+ #include &quot;Types.h&quot;
+ 
+ 
++class DwarfTargetInterface;
++
++
+ class DwarfExpressionEvaluator {
+ public:
+-								DwarfExpressionEvaluator(uint8 addressSize);
++								DwarfExpressionEvaluator(
++									DwarfTargetInterface* targetInterface,
++									uint8 addressSize);
+ 								~DwarfExpressionEvaluator();
+ 
++			void				SetObjectAddress(target_addr_t address);
++			void				SetFrameAddress(target_addr_t address);
++
+ 			status_t			Evaluate(const void* expression, size_t size);
+ 
+ private:
+@@ -27,13 +35,22 @@
+ 	inline	target_addr_t		_Pop();
+ 
+ 			status_t			_Evaluate();
++			void				_DereferenceAddress(uint8 addressSize);
++			void				_DereferenceAddressSpaceAddress(
++									uint8 addressSize);
++			void				_PushRegister(uint32 reg, target_addr_t offset);
+ 
+ private:
++			DwarfTargetInterface* fTargetInterface;
+ 			target_addr_t*		fStack;
+ 			size_t				fStackSize;
+ 			size_t				fStackCapacity;
+ 			DataReader			fDataReader;
++			target_addr_t		fObjectAddress;
++			target_addr_t		fFrameAddress;
+ 			uint8				fAddressSize;
++			bool				fObjectAddressValid;
++			bool				fFrameAddressValid;
+ };
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018009.html">[Haiku-commits] r31577 - in haiku/trunk/src/apps/debugger:	debug_info dwarf
+</A></li>
+	<LI>Next message: <A HREF="018015.html">[Haiku-commits] r31579 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18010">[ date ]</a>
+              <a href="thread.html#18010">[ thread ]</a>
+              <a href="subject.html#18010">[ subject ]</a>
+              <a href="author.html#18010">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

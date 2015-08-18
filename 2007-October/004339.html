@@ -1,0 +1,746 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22611 - haiku/trunk/src/kits/storage/disk_device
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22611%20-%20haiku/trunk/src/kits/storage/disk_device&In-Reply-To=%3C200710180349.l9I3npaS015233%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004338.html">
+   <LINK REL="Next"  HREF="004340.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22611 - haiku/trunk/src/kits/storage/disk_device</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22611%20-%20haiku/trunk/src/kits/storage/disk_device&In-Reply-To=%3C200710180349.l9I3npaS015233%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22611 - haiku/trunk/src/kits/storage/disk_device">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Oct 18 05:49:51 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004338.html">[Haiku-commits] r22610 - in haiku/trunk: headers/private/storage	src/kits/storage/disk_device
+</A></li>
+        <LI>Next message: <A HREF="004340.html">[Haiku-commits] r22612 -	haiku/trunk/src/system/kernel/disk_device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4339">[ date ]</a>
+              <a href="thread.html#4339">[ thread ]</a>
+              <a href="subject.html#4339">[ subject ]</a>
+              <a href="author.html#4339">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-10-18 05:49:50 +0200 (Thu, 18 Oct 2007)
+New Revision: 22611
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22611&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22611&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/kits/storage/disk_device/DiskDeviceJobGenerator.cpp
+   haiku/trunk/src/kits/storage/disk_device/DiskDeviceJobGenerator.h
+Log:
+Beginnings of the class that analyzes the changes done to a BDiskDevice
+and generates jobs that perform the individual actions transforming the
+current state of the disk device into the desired one. Most code was
+taken and adapted from the soon to be gone kernel class
+KDiskDeviceJobGenerator. The methods creating the job objects are only
+stubs ATM.
+
+
+Added: haiku/trunk/src/kits/storage/disk_device/DiskDeviceJobGenerator.cpp
+===================================================================
+--- haiku/trunk/src/kits/storage/disk_device/DiskDeviceJobGenerator.cpp	2007-10-18 03:42:30 UTC (rev 22610)
++++ haiku/trunk/src/kits/storage/disk_device/DiskDeviceJobGenerator.cpp	2007-10-18 03:49:50 UTC (rev 22611)
+@@ -0,0 +1,571 @@
++/*
++ * Copyright 2003-2007, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++
++#include &quot;DiskDeviceJobGenerator.h&quot;
++
++#include &lt;new&gt;
++
++#include &lt;string.h&gt;
++
++#include &lt;DiskDevice.h&gt;
++#include &lt;MutablePartition.h&gt;
++
++#include &lt;disk_device_manager/ddm_userland_interface.h&gt;
++
++#include &quot;PartitionDelegate.h&quot;
++
++
++using std::nothrow;
++
++
++// compare_string
++/*!	\brief \c NULL aware strcmp().
++
++	\c NULL is considered the least of all strings. \c NULL equals \c NULL.
++
++	\param str1 First string.
++	\param str2 Second string.
++	\return A value less than 0, if \a str1 is less than \a str2,
++			0, if they are equal, or a value greater than 0, if
++			\a str1 is greater \a str2.
++*/
++static inline int
++compare_string(const char* str1, const char* str2)
++{
++	if (str1 == NULL) {
++		if (str2 == NULL)
++			return 0;
++		return 1;
++	} else if (str2 == NULL)
++		return -1;
++
++	return strcmp(str1, str2);
++}
++
++
++// move_info
++struct DiskDeviceJobGenerator::move_info {
++	BPartition*	partition;
++	off_t		position;
++	off_t		target_position;
++	off_t		size;
++};
++
++
++// constructor
++DiskDeviceJobGenerator::DiskDeviceJobGenerator(BDiskDevice* device,
++		DiskDeviceJobQueue* jobQueue)
++	: fDevice(device),
++	  fJobQueue(jobQueue),
++	  fMoveInfos(NULL)
++{
++	fMoveInfoCount = fDevice-&gt;CountDescendants();
++
++	fMoveInfos = new(nothrow) move_info[fMoveInfoCount];
++//	fPartitionIDs = new(nothrow) partition_id[fMoveInfoCount];
++}
++
++
++// destructor
++DiskDeviceJobGenerator::~DiskDeviceJobGenerator()
++{
++	delete[] fMoveInfos;
++//	delete[] fPartitionIDs;
++}
++
++
++// GenerateJobs
++status_t
++DiskDeviceJobGenerator::GenerateJobs()
++{
++	// check parameters
++	if (!fDevice || !fJobQueue /*|| !fMoveInfos || !fPartitionIDs
++		|| fJobQueue-&gt;Device() != fDevice || !fDevice-&gt;ShadowPartition()*/) {
++		return B_BAD_VALUE;
++	}
++
++	// 1) Generate jobs for all physical partitions that don't have an
++	// associated shadow partition, i.e. those that shall be deleted.
++	// 2) Generate uninitialize jobs for all partition whose initialization
++	// changes, also those that shall be initialized with a disk system.
++	// This simplifies moving and resizing.
++	status_t error = _GenerateCleanupJobs(fDevice);
++	if (error != B_OK)
++		return error;
++
++	// Generate jobs that move and resize the remaining physical partitions
++	// to their final position/size.
++	error = _GeneratePlacementJobs(fDevice);
++	if (error != B_OK)
++		return error;
++
++	// Generate the remaining jobs in one run: initialization, creation of
++	// partitions, and changing of name, content name, type, parameters, and
++	// content parameters.
++	error = _GenerateRemainingJobs(NULL, fDevice);
++	if (error != B_OK)
++		return error;
++
++	return B_OK;
++}
++
++
++// _AddJob
++status_t
++DiskDeviceJobGenerator::_AddJob(DiskDeviceJob* job)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateCleanupJobs
++status_t
++DiskDeviceJobGenerator::_GenerateCleanupJobs(BPartition* partition)
++{
++// TODO: Depending on how this shall be handled, we might want to unmount
++// all descendants of a partition to be uninitialized or removed.
++	if (BMutablePartition* shadow = _GetMutablePartition(partition)) {
++		if (shadow-&gt;ChangeFlags() &amp; B_PARTITION_CHANGED_INITIALIZATION) {
++			// partition changes initialization
++			status_t error = _GenerateUninitializeJob(partition);
++			if (error != B_OK)
++				return error;
++		} else {
++			// recurse
++			for (int32 i = 0; BPartition* child = partition-&gt;_ChildAt(i); i++) {
++				status_t error = _GenerateCleanupJobs(child);
++				if (error != B_OK)
++					return error;
++			}
++		}
++	} else if (BPartition* parent = partition-&gt;Parent()) {
++		// create job and add it to the queue
++		status_t error = _GenerateDeleteChildJob(parent, partition);
++		if (error != B_OK)
++			return error;
++	}
++	return B_OK;
++}
++
++
++// _GeneratePlacementJobs
++status_t
++DiskDeviceJobGenerator::_GeneratePlacementJobs(BPartition* partition)
++{
++	if (BMutablePartition* shadow = _GetMutablePartition(partition)) {
++		// Don't resize/move partitions that have an unrecognized contents.
++		// They must have been uninitialized before.
++		if (shadow-&gt;Status() == B_PARTITION_UNRECOGNIZED
++			&amp;&amp; (shadow-&gt;Size() != partition-&gt;Size()
++				|| shadow-&gt;Offset() != partition-&gt;Offset())) {
++			return B_ERROR;
++		}
++
++		if (shadow-&gt;Size() &gt; partition-&gt;Size()) {
++			// size grows: resize first
++			status_t error = _GenerateResizeJob(partition);
++			if (error != B_OK)
++				return error;
++		}
++
++		// place the children
++		status_t error = _GenerateChildPlacementJobs(partition);
++		if (error != B_OK)
++			return error;
++
++		if (shadow-&gt;Size() &lt; partition-&gt;Size()) {
++			// size shrinks: resize now
++			status_t error = _GenerateResizeJob(partition);
++			if (error != B_OK)
++				return error;
++		}
++	}
++
++	return B_OK;
++}
++
++
++// _GenerateChildPlacementJobs
++status_t
++DiskDeviceJobGenerator::_GenerateChildPlacementJobs(BPartition* partition)
++{
++	BMutablePartition* shadow = _GetMutablePartition(partition);
++
++	// nothing to do, if the partition contains no partitioning system or
++	// shall be re-initialized
++	if (!shadow-&gt;ContentType()
++		|| (shadow-&gt;ChangeFlags() &amp; B_PARTITION_CHANGED_INITIALIZATION)) {
++		return B_OK;
++	}
++
++	// first resize all children that shall shrink and place their descendants
++	int32 childCount = 0;
++	int32 moveForth = 0;
++	int32 moveBack = 0;
++
++	for (int32 i = 0; BPartition* child = partition-&gt;_ChildAt(i); i++) {
++		if (BMutablePartition* childShadow = _GetMutablePartition(child)) {
++			// add a move_info for the child
++			move_info&amp; info = fMoveInfos[childCount];
++			childCount++;
++			info.partition = child;
++			info.position = child-&gt;Offset();
++			info.target_position = childShadow-&gt;Offset();
++			info.size = child-&gt;Size();
++
++			if (info.position &lt; info.target_position)
++				moveForth++;
++			else if (info.position &gt; info.target_position)
++				moveBack++;
++
++			// resize the child, if it shall shrink
++			if (childShadow-&gt;Size() &lt; child-&gt;Size()) {
++				status_t error = _GeneratePlacementJobs(child);
++				if (error != B_OK)
++					return error;
++				info.size = childShadow-&gt;Size();
++			}
++		}
++	}
++
++	// sort the move infos
++	if (childCount &gt; 0 &amp;&amp; moveForth + moveBack &gt; 0) {
++		qsort(fMoveInfos, childCount, sizeof(move_info),
++			  _CompareMoveInfoPosition);
++	}
++
++	// move the children to their final positions
++	while (moveForth + moveBack &gt; 0) {
++		int32 moved = 0;
++		if (moveForth &lt; moveBack) {
++			// move children back
++			for (int32 i = 0; i &lt; childCount; i++) {
++				move_info &amp;info = fMoveInfos[i];
++				if (info.position &gt; info.target_position) {
++					if (i == 0
++						|| info.target_position &gt;= fMoveInfos[i - 1].position
++							+ fMoveInfos[i - 1].size) {
++						// check OK -- the partition wouldn't be moved before
++						// the end of the preceding one
++						status_t error = _GenerateMoveJob(info.partition);
++						if (error != B_OK)
++							return error;
++						info.position = info.target_position;
++						moved++;
++						moveBack--;
++					}
++				}
++			}
++		} else {
++			// move children forth
++			for (int32 i = childCount - 1; i &gt;= 0; i--) {
++				move_info &amp;info = fMoveInfos[i];
++				if (info.position &gt; info.target_position) {
++					if (i == childCount - 1
++						|| info.target_position + info.size
++							&lt;= fMoveInfos[i - 1].position) {
++						// check OK -- the partition wouldn't be moved before
++						// the end of the preceding one
++						status_t error = _GenerateMoveJob(info.partition);
++						if (error != B_OK)
++							return error;
++						info.position = info.target_position;
++						moved++;
++						moveForth--;
++					}
++				}
++			}
++		}
++
++		// terminate, if no partition could be moved
++		if (moved == 0)
++			return B_ERROR;
++	}
++
++	// now resize all children that shall grow/keep their size and place
++	// their descendants
++	for (int32 i = 0; BPartition* child = partition-&gt;_ChildAt(i); i++) {
++		if (BMutablePartition* childShadow = _GetMutablePartition(child)) {
++			if (childShadow-&gt;Size() &gt;= child-&gt;Size()) {
++				status_t error = _GeneratePlacementJobs(child);
++				if (error != B_OK)
++					return error;
++			}
++		}
++	}
++
++	return B_OK;
++}
++
++
++// _GenerateRemainingJobs
++status_t
++DiskDeviceJobGenerator::_GenerateRemainingJobs(BPartition* parent,
++	BPartition* partition)
++{
++	user_partition_data* partitionData = partition-&gt;fPartitionData;
++
++	uint32 changeFlags
++		= partition-&gt;fDelegate-&gt;MutablePartition()-&gt;ChangeFlags();
++
++	// create the partition, if not existing yet
++	if (!partitionData) {
++		if (!parent)
++			return B_BAD_VALUE;
++
++		status_t error = _GenerateCreateChildJob(parent, partition);
++		if (error != B_OK)
++			return error;
++	} else {
++		// partition already exists: set non-content properties
++		
++
++		// name
++		if ((changeFlags &amp; B_PARTITION_CHANGED_NAME)
++			|| compare_string(partition-&gt;Name(), partitionData-&gt;name)) {
++			if (!parent)
++				return B_BAD_VALUE;
++
++			status_t error = _GenerateSetNameJob(parent, partition);
++			if (error != B_OK)
++				return error;
++		}
++
++		// type
++		if ((changeFlags &amp; B_PARTITION_CHANGED_TYPE)
++			|| compare_string(partition-&gt;Type(), partitionData-&gt;type)) {
++			if (!parent)
++				return B_BAD_VALUE;
++
++			status_t error = _GenerateSetTypeJob(parent, partition);
++			if (error != B_OK)
++				return error;
++		}
++
++		// parameters
++		if ((changeFlags &amp; B_PARTITION_CHANGED_PARAMETERS)
++			|| compare_string(partition-&gt;Parameters(),
++				partitionData-&gt;parameters)) {
++			if (!parent)
++				return B_BAD_VALUE;
++
++			status_t error = _GenerateSetParametersJob(parent, partition);
++			if (error != B_OK)
++				return error;
++		}
++	}
++
++	if (partition-&gt;ContentType()) {
++		// initialize the partition, if required
++		if (changeFlags &amp; B_PARTITION_CHANGED_INITIALIZATION) {
++			status_t error = _GenerateInitializeJob(partition);
++			if (error != B_OK)
++				return error;
++		} else {
++			// partition not (re-)initialized, set content properties
++
++			// content name
++			if ((changeFlags &amp; B_PARTITION_CHANGED_NAME)
++				|| compare_string(partition-&gt;ContentName(),
++					partitionData-&gt;content_name)) {
++				status_t error = _GenerateSetContentNameJob(partition);
++				if (error != B_OK)
++					return error;
++			}
++
++			// content parameters
++			if ((changeFlags &amp; B_PARTITION_CHANGED_PARAMETERS)
++				|| compare_string(partition-&gt;ContentParameters(),
++					partitionData-&gt;content_parameters)) {
++				status_t error = _GenerateSetContentParametersJob(partition);
++				if (error != B_OK)
++					return error;
++			}
++
++			// defragment
++			if (changeFlags &amp; B_PARTITION_CHANGED_DEFRAGMENTATION) {
++				status_t error = _GenerateDefragmentJob(partition);
++				if (error != B_OK)
++					return error;
++			}
++
++			// check / repair
++			bool repair = (changeFlags &amp; B_PARTITION_CHANGED_REPAIR);
++			if ((changeFlags &amp; B_PARTITION_CHANGED_CHECK)
++				|| repair) {
++				status_t error = _GenerateRepairJob(partition, repair);
++				if (error != B_OK)
++					return error;
++			}
++		}
++	}
++
++	// recurse
++	for (int32 i = 0; BPartition* child = partition-&gt;ChildAt(i); i++) {
++		status_t error = _GenerateRemainingJobs(partition, child);
++		if (error != B_OK)
++			return error;
++	}
++
++	return B_OK;
++}
++
++
++// _GetMutablePartition
++BMutablePartition*
++DiskDeviceJobGenerator::_GetMutablePartition(BPartition* partition)
++{
++	if (!partition)
++		return NULL;
++
++	return partition-&gt;fDelegate
++		? partition-&gt;fDelegate-&gt;MutablePartition() : NULL;
++}
++
++
++// _GenerateInitializeJob
++status_t
++DiskDeviceJobGenerator::_GenerateInitializeJob(BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateUninitializeJob
++status_t
++DiskDeviceJobGenerator::_GenerateUninitializeJob(BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateSetContentNameJob
++status_t
++DiskDeviceJobGenerator::_GenerateSetContentNameJob(BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateSetContentParametersJob
++status_t
++DiskDeviceJobGenerator::_GenerateSetContentParametersJob(BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateDefragmentJob
++status_t
++DiskDeviceJobGenerator::_GenerateDefragmentJob(BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateRepairJob
++status_t
++DiskDeviceJobGenerator::_GenerateRepairJob(BPartition* partition, bool repair)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateCreateChildJob
++status_t
++DiskDeviceJobGenerator::_GenerateCreateChildJob(BPartition* parent,
++	BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateDeleteChildJob
++status_t
++DiskDeviceJobGenerator::_GenerateDeleteChildJob(BPartition* parent,
++	BPartition* child)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateResizeJob
++status_t
++DiskDeviceJobGenerator::_GenerateResizeJob(BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateMoveJob
++status_t
++DiskDeviceJobGenerator::_GenerateMoveJob(BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateSetNameJob
++status_t
++DiskDeviceJobGenerator::_GenerateSetNameJob(BPartition* parent,
++	BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateSetTypeJob
++status_t
++DiskDeviceJobGenerator::_GenerateSetTypeJob(BPartition* parent,
++	BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _GenerateSetParametersJob
++status_t
++DiskDeviceJobGenerator::_GenerateSetParametersJob(BPartition* parent,
++	BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _CollectContentsToMove
++status_t
++DiskDeviceJobGenerator::_CollectContentsToMove(BPartition* partition)
++{
++// TODO: Implement!
++	return B_BAD_VALUE;
++}
++
++
++// _CompareMoveInfoOffset
++int
++DiskDeviceJobGenerator::_CompareMoveInfoPosition(const void* _a, const void* _b)
++{
++	const move_info* a = static_cast&lt;const move_info*&gt;(_a);
++	const move_info* b = static_cast&lt;const move_info*&gt;(_b);
++	if (a-&gt;position &lt; b-&gt;position)
++		return -1;
++	if (a-&gt;position &gt; b-&gt;position)
++		return 1;
++	return 0;
++}
+
+Added: haiku/trunk/src/kits/storage/disk_device/DiskDeviceJobGenerator.h
+===================================================================
+--- haiku/trunk/src/kits/storage/disk_device/DiskDeviceJobGenerator.h	2007-10-18 03:42:30 UTC (rev 22610)
++++ haiku/trunk/src/kits/storage/disk_device/DiskDeviceJobGenerator.h	2007-10-18 03:49:50 UTC (rev 22611)
+@@ -0,0 +1,85 @@
++/*
++ * Copyright 2003-2007, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _DISK_DEVICE_JOB_GENERATOR_H
++#define _DISK_DEVICE_JOB_GENERATOR_H
++
++#include &lt;DiskDeviceDefs.h&gt;
++
++
++class BDiskDevice;
++class BMutablePartition;
++class BPartition;
++
++
++namespace BPrivate {
++
++
++class DiskDeviceJob;
++class DiskDeviceJobQueue;
++
++
++class DiskDeviceJobGenerator {
++public:
++								DiskDeviceJobGenerator(BDiskDevice* device,
++									DiskDeviceJobQueue* jobQueue);
++								~DiskDeviceJobGenerator();
++
++			status_t			GenerateJobs();
++
++private:
++			status_t			_AddJob(DiskDeviceJob* job);
++
++			status_t			_GenerateCleanupJobs(BPartition* partition);
++			status_t			_GeneratePlacementJobs(BPartition* partition);
++			status_t			_GenerateChildPlacementJobs(
++									BPartition* partition);
++			status_t			_GenerateRemainingJobs(BPartition* parent,
++									BPartition* partition);
++
++			BMutablePartition*	_GetMutablePartition(BPartition* partition);
++
++			status_t			_GenerateInitializeJob(BPartition* partition);
++			status_t			_GenerateUninitializeJob(BPartition* partition);
++			status_t			_GenerateSetContentNameJob(
++									BPartition* partition);
++			status_t			_GenerateSetContentParametersJob(
++									BPartition* partition);
++			status_t			_GenerateDefragmentJob(BPartition* partition);
++			status_t			_GenerateRepairJob(BPartition* partition,
++									bool repair);
++
++			status_t			_GenerateCreateChildJob(BPartition* parent,
++									BPartition* partition);
++			status_t			_GenerateDeleteChildJob(BPartition* parent,
++									BPartition* child);
++			status_t			_GenerateResizeJob(BPartition* partition);
++			status_t			_GenerateMoveJob(BPartition* partition);
++			status_t 			_GenerateSetNameJob(BPartition* parent,
++									BPartition* partition);
++			status_t			_GenerateSetTypeJob(BPartition* parent,
++									BPartition* partition);
++			status_t			_GenerateSetParametersJob(BPartition* parent,
++									BPartition* partition);
++
++			status_t			_CollectContentsToMove(BPartition* partition);
++
++	static	int					_CompareMoveInfoPosition(const void* _a,
++									const void* _b);
++
++private:
++			struct move_info;
++
++			BDiskDevice*		fDevice;
++			DiskDeviceJobQueue*	fJobQueue;
++			move_info*			fMoveInfos;
++			int32				fMoveInfoCount;
++};
++
++
++}	// namespace BPrivate
++
++using BPrivate::DiskDeviceJobGenerator;
++
++#endif	// _DISK_DEVICE_JOB_GENERATOR_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004338.html">[Haiku-commits] r22610 - in haiku/trunk: headers/private/storage	src/kits/storage/disk_device
+</A></li>
+	<LI>Next message: <A HREF="004340.html">[Haiku-commits] r22612 -	haiku/trunk/src/system/kernel/disk_device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4339">[ date ]</a>
+              <a href="thread.html#4339">[ thread ]</a>
+              <a href="subject.html#4339">[ subject ]</a>
+              <a href="author.html#4339">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

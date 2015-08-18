@@ -1,0 +1,1084 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22288 - haiku/trunk/src/kits/interface/layouter
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22288%20-%20haiku/trunk/src/kits/interface/layouter&In-Reply-To=%3C200709240004.l8O049rZ006115%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003969.html">
+   <LINK REL="Next"  HREF="003971.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22288 - haiku/trunk/src/kits/interface/layouter</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22288%20-%20haiku/trunk/src/kits/interface/layouter&In-Reply-To=%3C200709240004.l8O049rZ006115%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22288 - haiku/trunk/src/kits/interface/layouter">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Sep 24 02:04:09 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003969.html">[Haiku-commits] r22287 - haiku/trunk/src/kits/interface/layouter
+</A></li>
+        <LI>Next message: <A HREF="003971.html">[Haiku-commits] r22289 - in haiku/trunk:	headers/private/graphics/intel_extreme	src/add-ons/accelerants/intel_extreme
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3970">[ date ]</a>
+              <a href="thread.html#3970">[ thread ]</a>
+              <a href="subject.html#3970">[ subject ]</a>
+              <a href="author.html#3970">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-09-24 02:03:57 +0200 (Mon, 24 Sep 2007)
+New Revision: 22288
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22288&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22288&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/kits/interface/layouter/ComplexLayouter.cpp
+   haiku/trunk/src/kits/interface/layouter/ComplexLayouter.h
+   haiku/trunk/src/kits/interface/layouter/LayoutOptimizer.cpp
+   haiku/trunk/src/kits/interface/layouter/LayoutOptimizer.h
+Log:
+Implemented a ComplexLayouter class which is going to replace the Layouter
+implementation which used the qoca constraint solver. It does the min/max
+computation itself -- thanks to Peter Moulder for hinting that we're actually
+dealing with separation constraints and proposing an algorithm. The actual
+layout is done with the help of an active set method based optimizer.
+The test results look very good so far. The code needs some cleanup (debug
+output, math comments, special handling for some cases) and is therefore not
+yet enabled by default.
+
+
+Added: haiku/trunk/src/kits/interface/layouter/ComplexLayouter.cpp
+===================================================================
+--- haiku/trunk/src/kits/interface/layouter/ComplexLayouter.cpp	2007-09-23 23:35:20 UTC (rev 22287)
++++ haiku/trunk/src/kits/interface/layouter/ComplexLayouter.cpp	2007-09-24 00:03:57 UTC (rev 22288)
+@@ -0,0 +1,846 @@
++/*
++ * Copyright 2007, Ingo Weinhold &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at cs.tu-berlin.de</A>&gt;.
++ * All rights reserved. Distributed under the terms of the MIT License.
++ */
++
++#include &quot;ComplexLayouter.h&quot;
++
++#include &lt;math.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++
++#include &lt;new&gt;
++
++#include &lt;OS.h&gt;
++#include &lt;Size.h&gt;
++
++#include &lt;AutoDeleter.h&gt;
++
++#include &quot;LayoutOptimizer.h&quot;
++#include &quot;SimpleLayouter.h&quot;
++
++
++using std::nothrow;
++
++
++// MyLayoutInfo
++class ComplexLayouter::MyLayoutInfo : public LayoutInfo {
++public:
++	MyLayoutInfo(int32 elementCount, int32 spacing)
++		: fCount(elementCount),
++		  fSpacing(spacing)
++	{
++		// We also store the location of the virtual elementCountth element.
++		// Thus fLocation[i + 1] - fLocation[i] is the size of the ith element
++		// (not considering spacing).
++		fLocations = new(nothrow) int32[elementCount + 1];
++	}
++
++	~MyLayoutInfo()
++	{
++		delete[] fLocations;
++	}
++
++	virtual float ElementLocation(int32 element)
++	{
++		if (element &lt; 0 || element &gt;= fCount)
++			return 0;
++
++		return fLocations[element];
++	}
++
++	virtual float ElementSize(int32 element)
++	{
++		if (element &lt; 0 || element &gt;= fCount)
++			return -1;
++
++		return fLocations[element + 1] - fLocations[element] - 1
++			- fSpacing;
++	}
++
++	virtual float ElementRangeSize(int32 position, int32 length)
++	{
++		if (position &lt; 0 || length &lt; 0 || position + length &gt; fCount)
++			return -1;
++
++		return fLocations[position + length] - fLocations[position] - 1
++			- fSpacing;
++	}
++
++	void Dump()
++	{
++		printf(&quot;ComplexLayouter::MyLayoutInfo(): %ld elements:\n&quot;, fCount);
++		for (int32 i = 0; i &lt; fCount + 1; i++)
++			printf(&quot;  %2ld: location: %4ld\n&quot;, i, fLocations[i]);
++	}
++
++public:
++	int32	fCount;
++	int32	fSpacing;
++	int32*	fLocations;
++};
++
++
++// Constraint
++struct ComplexLayouter::Constraint {
++	Constraint(int32 start, int32 end, int32 min, int32 max)
++		: start(start),
++		  end(end),
++		  min(min),
++		  max(max),
++		  next(NULL)
++	{
++		if (min &gt; max)
++			max = min;
++		effectiveMax = max;
++	}
++
++	void Restrict(int32 newMin, int32 newMax)
++	{
++		if (newMin &gt; min)
++			min = newMin;
++		if (newMax &lt; max)
++			max = newMax;
++		if (min &gt; max)
++			max = min;
++		effectiveMax = max;
++	}
++
++	int32		start;
++	int32		end;
++	int32		min;
++	int32		max;
++	int32		effectiveMax;
++	Constraint*	next;
++};
++
++
++// SumItem
++struct ComplexLayouter::SumItem {
++	int32	min;
++	int32	max;
++	bool	minDirty;
++	bool	maxDirty;
++};
++
++
++// SumItemBackup
++struct ComplexLayouter::SumItemBackup {
++	int32	min;
++	int32	max;
++};
++
++
++// #pragma mark - ComplexLayouter
++
++
++// constructor
++ComplexLayouter::ComplexLayouter(int32 elementCount, int32 spacing)
++	: fElementCount(elementCount),
++	  fSpacing(spacing),
++	  fConstraints(new(nothrow) Constraint*[elementCount]),
++	  fWeights(new(nothrow) float[elementCount]),
++	  fSums(new(nothrow) SumItem[elementCount + 1]),
++	  fSumBackups(new(nothrow) SumItemBackup[elementCount + 1]),
++	  fOptimizer(new(nothrow) LayoutOptimizer(elementCount)),
++	  fLayoutValid(false)
++{
++// TODO: Check initialization!
++	if (fConstraints)
++		memset(fConstraints, 0, sizeof(Constraint*) * fElementCount);
++
++	if (fWeights) {
++		for (int32 i = 0; i &lt; fElementCount; i++)
++			fWeights[i] = 1.0f;
++	}
++}
++
++
++// destructor
++ComplexLayouter::~ComplexLayouter()
++{
++	for (int32 i = 0; i &lt; fElementCount; i++) {
++		Constraint* constraint = fConstraints[i];
++		fConstraints[i] = NULL;
++		while (constraint != NULL) {
++			Constraint* next = constraint-&gt;next;
++			delete constraint;
++			constraint = next;
++		}
++	}
++
++	delete[] fConstraints;
++	delete[] fWeights;
++	delete[] fSums;
++	delete[] fSumBackups;
++  	delete fOptimizer;
++}
++
++
++// InitCheck
++status_t
++ComplexLayouter::InitCheck() const
++{
++	if (!fConstraints || !fWeights || !fSums || !fSumBackups || !fOptimizer)
++		return B_NO_MEMORY;
++	return fOptimizer-&gt;InitCheck();
++}
++
++
++// AddConstraints
++void
++ComplexLayouter::AddConstraints(int32 element, int32 length,
++	float _min, float _max, float _preferred)
++{
++	if (element &lt; 0 || length &lt;= 0 || element + length &gt; fElementCount)
++		return;
++
++//printf(&quot;%p-&gt;ComplexLayouter::AddConstraints(%ld, %ld, %ld, %ld, %ld)\n&quot;,
++//this, element, length, (int32)_min, (int32)_max, (int32)_preferred);
++
++	int32 spacing = fSpacing * (length - 1);
++	int32 min = (int32)_min + 1 - spacing;
++	int32 max = (int32)_max + 1 - spacing;
++
++	if (min &lt; 0)
++		min = 0;
++	if (max &gt; B_SIZE_UNLIMITED)
++		max = B_SIZE_UNLIMITED;
++
++	int32 end = element + length - 1;
++	Constraint** slot = fConstraints + end;
++	while (*slot != NULL &amp;&amp; (*slot)-&gt;start &gt; element)
++		slot = &amp;(*slot)-&gt;next;
++
++	if (*slot != NULL &amp;&amp; (*slot)-&gt;start == element) {
++		// previous constraint exists -- use stricter values
++		(*slot)-&gt;Restrict(min, max);
++	} else {
++		// no previous constraint -- create new one
++		Constraint* constraint = new(nothrow) Constraint(element, end, min,
++			max);
++		if (!constraint)
++			return;
++		constraint-&gt;next = *slot;
++		*slot = constraint;
++	}
++}
++
++
++// SetWeight
++void
++ComplexLayouter::SetWeight(int32 element, float weight)
++{
++	if (element &lt; 0 || element &gt;= fElementCount)
++		return;
++
++	fWeights[element] = max_c(weight, 0);
++}
++
++
++// MinSize
++float
++ComplexLayouter::MinSize()
++{
++	_ValidateLayout();
++	return fMin;
++}
++
++
++// MaxSize
++float
++ComplexLayouter::MaxSize()
++{
++	_ValidateLayout();
++	return fMax;
++}
++
++
++// PreferredSize
++float
++ComplexLayouter::PreferredSize()
++{
++	return fMin;
++}
++
++
++// CreateLayoutInfo
++LayoutInfo*
++ComplexLayouter::CreateLayoutInfo()
++{
++	MyLayoutInfo* layoutInfo = new(nothrow) MyLayoutInfo(fElementCount,
++		fSpacing);
++	if (layoutInfo &amp;&amp; !layoutInfo-&gt;fLocations) {
++		delete layoutInfo;
++		return NULL;
++	}
++
++	return layoutInfo;
++}
++
++
++// Layout
++void
++ComplexLayouter::Layout(LayoutInfo* _layoutInfo, float _size)
++{
++//printf(&quot;%p-&gt;ComplexLayouter::Layout(%ld)\n&quot;, this, (int32)_size);
++	if (fElementCount == 0)
++		return;
++
++	_ValidateLayout();
++
++	MyLayoutInfo* layoutInfo = (MyLayoutInfo*)_layoutInfo;
++
++	int32 min = fSums[fElementCount].min;
++	int32 max = fSums[fElementCount].max;
++
++	int32 size = (int32)_size + 1 - (fElementCount - 1) * fSpacing;
++	if (size &lt; min)
++		size = min;
++	if (size &gt; max)
++		size = max;
++
++	SumItem sums[fElementCount + 1];
++	memcpy(sums, fSums, (fElementCount + 1) * sizeof(SumItem));
++
++	sums[fElementCount].min = size;
++	sums[fElementCount].max = size;
++	sums[fElementCount].minDirty = (size != min);
++	sums[fElementCount].maxDirty = (size != max);
++
++	// propagate the size
++	_PropagateChangesBack(sums, fElementCount - 1, NULL);
++	_PropagateChanges(sums, fElementCount - 1, NULL);
++
++printf(&quot;Layout(%ld)\n&quot;, size);
++for (int32 i = 0; i &lt; fElementCount; i++) {
++SumItem&amp; sum = sums[i + 1];
++printf(&quot;[%ld] minc = %4ld,  maxc = %4ld\n&quot;, i + 1, sum.min, sum.max);
++}
++
++// TODO: Test whether the desired solution already satisfies all constraints.
++// If so, we can skip the constraint solving part.
++
++
++// TODO: We should probably already setup the constraints in _ValidateLayout().
++// This way we might not be able to skip as many redundant constraints, but
++// supposedly it doesn't matter all that much, since those constraints
++// wouldn't make it into the active set anyway.
++	fOptimizer-&gt;RemoveAllConstraints();
++
++	// add constraints
++	for (int32 i = 0; i &lt; fElementCount; i++) {
++		SumItem&amp; sum = fSums[i + 1];
++
++		Constraint* constraint = fConstraints[i];
++		while (constraint != NULL) {
++			SumItem&amp; base = fSums[constraint-&gt;start];
++			int32 sumMin = base.min + constraint-&gt;min;
++			int32 baseMax = sum.max - constraint-&gt;min;
++			bool minRedundant = (sumMin &lt; sum.min &amp;&amp; baseMax &gt; base.max);
++
++			int32 sumMax = base.max + constraint-&gt;effectiveMax;
++			int32 baseMin = sum.min - constraint-&gt;effectiveMax;
++			bool maxRedundant = (sumMax &gt; sum.max &amp;&amp; baseMin &lt; base.min);
++
++			if (!minRedundant || !maxRedundant) {
++				bool success = true;
++				if (constraint-&gt;min == constraint-&gt;effectiveMax) {
++					// min and max equal -- add an equality constraint
++					success = fOptimizer-&gt;AddConstraint(constraint-&gt;start - 1,
++						constraint-&gt;end, constraint-&gt;min, true);
++				} else {
++					// min and max not equal -- add them individually,
++					// unless redundant
++					if (!minRedundant) {
++						success |= fOptimizer-&gt;AddConstraint(
++							constraint-&gt;start - 1, constraint-&gt;end,
++							constraint-&gt;min, false);
++					}
++					if (!maxRedundant) {
++						success |= fOptimizer-&gt;AddConstraint(constraint-&gt;end,
++							constraint-&gt;start - 1,
++							-constraint-&gt;effectiveMax, false);
++					}
++				}
++			}
++
++			constraint = constraint-&gt;next;
++		}
++	}
++
++	// prepare a feasible solution (the minimum)
++	double values[fElementCount];
++	for (int32 i = 0; i &lt; fElementCount; i++)
++		values[i] = sums[i + 1].min - sums[i].min;
++
++	// prepare the desired solution
++	int32 sizes[fElementCount];
++	SimpleLayouter::DistributeSize(size, fWeights, sizes, fElementCount);
++	double realSizes[fElementCount];
++	for (int32 i = 0; i &lt; fElementCount; i++)
++		realSizes[i] = sizes[i];
++
++printf(&quot;feasible solution vs. desired solution:\n&quot;);
++for (int32 i = 0; i &lt; fElementCount; i++)
++printf(&quot;%8.4f   %8.4f\n&quot;, values[i], realSizes[i]);
++
++	// solve
++bigtime_t time = system_time();
++	if (!fOptimizer-&gt;Solve(realSizes, size, values))
++		return;
++time = system_time() - time;
++
++	// compute integer solution
++	// The basic strategy is to floor() the sums. This guarantees that the
++	// difference between two rounded sums remains in the range of floor()
++	// and ceil() of their real value difference. Since the constraints have
++	// integer values, the integer solution will satisfy all constraints the
++	// real solution satisfied.
++printf(&quot;computed solution in %lld us:\n&quot;, time);
++	double realSum = 0;
++	int32 spacing = 0;
++	layoutInfo-&gt;fLocations[0] = 0;
++	for (int32 i = 0; i &lt; fElementCount; i++) {
++		realSum += values[i];
++		double roundedRealSum = floor(realSum);
++		if (fuzzy_equals(realSum, roundedRealSum + 1))
++			realSum = roundedRealSum + 1;
++		layoutInfo-&gt;fLocations[i + 1] = (int32)roundedRealSum + spacing;
++		spacing += fSpacing;
++
++printf(&quot;x[%ld] = %8.4f   %4ld\n&quot;, i, values[i], layoutInfo-&gt;fLocations[i + 1] - layoutInfo-&gt;fLocations[i]);
++	}
++}
++
++
++// CloneLayouter
++Layouter*
++ComplexLayouter::CloneLayouter()
++{
++	ComplexLayouter* layouter
++		= new(nothrow) ComplexLayouter(fElementCount, fSpacing);
++	ObjectDeleter&lt;ComplexLayouter&gt; layouterDeleter(layouter);
++	if (!layouter || layouter-&gt;InitCheck() != B_OK
++		|| !layouter-&gt;fOptimizer-&gt;AddConstraintsFrom(fOptimizer)) {
++		return NULL;
++	}
++
++	// clone the constraints
++	for (int32 i = 0; i &lt; fElementCount; i++) {
++		Constraint* constraint = fConstraints[i];
++		Constraint** end = layouter-&gt;fConstraints + i;
++		while (constraint) {
++			*end = new(nothrow) Constraint(constraint-&gt;start, constraint-&gt;end,
++				constraint-&gt;min, constraint-&gt;max);
++			if (!*end)
++				return NULL;
++
++			end = &amp;(*end)-&gt;next;
++			constraint = constraint-&gt;next;
++		}
++	}
++
++	// copy the other stuff
++	memcpy(layouter-&gt;fWeights, fWeights, fElementCount * sizeof(float));
++	memcpy(layouter-&gt;fSums, fSums, (fElementCount + 1) * sizeof(SumItem));
++	memcpy(layouter-&gt;fSumBackups, fSumBackups,
++		(fElementCount + 1) * sizeof(SumItemBackup));
++	layouter-&gt;fMin = fMin;
++	layouter-&gt;fMax = fMax;
++	layouter-&gt;fLayoutValid = fLayoutValid;
++
++	return layouterDeleter.Detach();
++}
++
++
++// _ValidateLayout
++void
++ComplexLayouter::_ValidateLayout()
++{
++	if (fLayoutValid)
++		return;
++
++	fSums[0].min = 0;
++	fSums[0].max = 0;
++
++	for (int32 i = 0; i &lt; fElementCount; i++) {
++		SumItem&amp; sum = fSums[i + 1];
++		sum.min = 0;
++		sum.max = B_SIZE_UNLIMITED;
++		sum.minDirty = false;
++		sum.maxDirty = false;
++	}
++
++	// apply min constraints forward:
++	//   minc[k] &gt;= minc[i-1] + min[i,j]
++	for (int32 i = 0; i &lt; fElementCount; i++) {
++		SumItem&amp; sum = fSums[i + 1];
++
++		Constraint* constraint = fConstraints[i];
++		while (constraint != NULL) {
++			int32 minSum = fSums[constraint-&gt;start].min + constraint-&gt;min;
++			if (minSum &gt; sum.min)
++				sum.min = minSum;
++else {
++printf(&quot;min constraint is redundant: x%ld + ... + x%ld &gt;= %ld\n&quot;,
++constraint-&gt;start, constraint-&gt;end, constraint-&gt;min);
++}
++
++			constraint = constraint-&gt;next;
++		}
++	}
++
++	// apply min constraints backwards:
++	//   maxc[i-1] &lt;= maxc[k] - min[i,j]
++	for (int32 i = fElementCount - 1; i &gt;= 0; i--) {
++		SumItem&amp; sum = fSums[i + 1];
++
++		Constraint* constraint = fConstraints[i];
++		while (constraint != NULL) {
++			SumItem&amp; base = fSums[constraint-&gt;start];
++			int32 baseMax = sum.max - constraint-&gt;min;
++			if (baseMax &lt; base.max)
++				base.max = baseMax;
++
++			constraint = constraint-&gt;next;
++		}
++	}
++
++	// apply max constraints
++	for (int32 i = 0; i &lt; fElementCount; i++) {
++		Constraint* constraint = fConstraints[i];
++		while (constraint != NULL) {
++			_ApplyMaxConstraint(constraint, i);
++
++			constraint = constraint-&gt;next;
++		}
++//printf(&quot;fSums[%ld] = {%ld, %ld}\n&quot;, i + 1, sum.min, sum.max);
++	}
++
++for (int32 i = 0; i &lt; fElementCount; i++) {
++SumItem&amp; sum = fSums[i + 1];
++printf(&quot;[%ld] minc = %4ld,  maxc = %4ld\n&quot;, i + 1, sum.min, sum.max);
++}
++
++	if (fElementCount == 0) {
++		fMin = -1;
++		fMax = B_SIZE_UNLIMITED;
++	} else {
++		int32 spacing = (fElementCount - 1) * fSpacing;
++		fMin = fSums[fElementCount].min + spacing - 1;
++		fMax = fSums[fElementCount].max + spacing - 1;
++	}
++
++	fLayoutValid = true;
++}
++
++/*
++		x[i] + ... + x[i+j] &gt;= min[i,j]
++		x[i] + ... + x[i+j] &lt;= max[i,j]
++	with
++		1 &lt;= i &lt;= n
++		0 &lt;= j &lt;= n - i
++		0 &lt;= min[i,j] &lt;= max[i,j]
++
++	Let
++
++		c[0] = 0
++		c[k] = x[1] + ... + x[k]	for 1 &lt;= k &lt;= n
++
++	it follows
++
++		x[i] + ... + x[i+j] = c[i+j] - c[i-1]
++
++	and thus the constraints can be rewritten as
++
++		c[i+j] - c[i-1] &gt;= min[i,j]
++		c[i+j] - c[i-1] &lt;= max[i,j]
++
++	or	
++
++		c[i+j] &gt;= c[i-1] + min[i,j]
++		c[i+j] &lt;= c[i-1] + max[i,j]
++
++	We're looking for minimal minc[] and maximal maxc[] such that
++
++		minc[i+j] &gt;= minc[i-1] + min[i,j]
++		maxc[i+j] &lt;= maxc[i-1] + max[i,j]
++
++		minc[i+j] &lt;= minc[i-1] + max[i,j]
++		maxc[i+j] &gt;= maxc[i-1] + min[i,j]
++
++	holds for all i and j. The latter two kinds of constraints have to be
++	enforced backwards:
++
++		minc[i-1] &gt;= minc[i+j] - max[i,j]
++		maxc[i-1] &lt;= maxc[i+j] - min[i,j]
++
++
++
++-----------------
++
++	// (1) maxc[k] &lt;= maxc[i-1] + max[i,j]
++	// (2) minc[i-1] &gt;= minc[k] - max[i,j]
++
++	Modifying maxc[k] according to (1) potentially invalidates constraints of
++	these forms:
++
++		(i)  maxc[i'-1] &lt;= maxc[k] - min[i',j']
++		(ii) maxc[k+1+j'] &lt;= maxc[k] + max[k+1,j']
++
++	After propagating (i) constraints backwards, all of them will be hold,
++	though more (ii) constraints might have been invalidated, though.
++	Propagating (ii) constraints forward afterwards, will make them all hold.
++	Since the min[i,j] and max[i,j] constraints are separation constraints and
++	the CSP not including the newly added constraint was conflict-free,
++	propagating the (i) and (ii) constraints won't change the maxc[i], i &lt; k by
++	more than what maxc[k] changed. If afterwards the constraint (1) doesn't
++	hold, it apparently conflicts with the other constraints.
++*/
++
++
++// _ApplyMaxConstraint
++void
++ComplexLayouter::_ApplyMaxConstraint(Constraint* currentConstraint, int32 index)
++{
++	SumItem&amp; sum = fSums[index + 1];
++	SumItem&amp; base = fSums[currentConstraint-&gt;start];
++
++	// We want to apply:
++	//   c[i+j] &lt;= c[i-1] + max[i,j]
++	//
++	// This has the following direct consequences (let k = i + j):
++	// (1) maxc[k] &lt;= maxc[i-1] + max[i,j]
++	// (2) minc[i-1] &gt;= minc[k] - max[i,j]
++	//
++	// If maxc[k] or minc[i-i] changed, those changes have to be propagated
++	// back.
++
++	// apply (1) maxc[k] &lt;= maxc[i-1] + max[i,j]
++	int32 max = currentConstraint-&gt;effectiveMax;
++	int32 sumMax = base.max + max;
++
++	// enforce maxc[i+j] &gt;= minc[i+j]
++	if (sumMax &lt; sum.min) {
++		sumMax = sum.min;
++		max = sumMax - base.max;
++	}
++
++	// apply (2) minc[i-1] &gt;= minc[k] - max[i,j]
++	// and check minc[i-1] &lt;= maxc[i-1]
++	int32 baseMin = sum.min - max;
++	if (baseMin &gt; base.max) {
++		baseMin = base.max;
++		max = sum.min - baseMin;
++		sumMax = base.max + max;
++	}
++
++	// apply changes
++
++if (currentConstraint-&gt;effectiveMax != max) {
++printf(&quot;relaxing conflicting max constraint (1): x%ld + ... + x%ld &lt;= %ld -&gt; %ld\n&quot;,
++currentConstraint-&gt;start, currentConstraint-&gt;end,
++currentConstraint-&gt;effectiveMax, max);
++}
++	currentConstraint-&gt;effectiveMax = max;
++
++	if (baseMin &lt;= base.min &amp;&amp; sumMax &gt;= sum.max)
++{
++printf(&quot;max constraint is redundant: x%ld + ... + x%ld &lt;= %ld\n&quot;,
++currentConstraint-&gt;start, currentConstraint-&gt;end, currentConstraint-&gt;effectiveMax);
++		return;
++}
++
++	// backup old values, in case we detect a conflict later
++	_BackupValues(index);
++
++	int32 diff;
++	do {
++		// apply the changes
++		int32 changedIndex = currentConstraint-&gt;start;
++
++		if (baseMin &gt; base.min) {
++			base.min = baseMin;
++			base.minDirty = true;
++		}
++
++		if (sumMax &lt; sum.max) {
++			changedIndex = index;
++			sum.max = sumMax;
++			sum.maxDirty = true;
++		}
++
++		// propagate the changes
++		_PropagateChangesBack(fSums, changedIndex, currentConstraint);
++		_PropagateChanges(fSums, index, currentConstraint);
++
++		// check the new constraint again -- if it doesn't hold, it
++		// conflicts with the other constraints
++		diff = 0;
++
++		// check (1) maxc[k] &lt;= maxc[i-1] + max[i,j]
++		max = currentConstraint-&gt;effectiveMax;
++		sumMax = base.max + max;
++		if (sumMax &lt; sum.max)
++			diff = sum.max - sumMax;
++
++		// check (2) minc[i-1] &gt;= minc[k] - max[i,j]
++		baseMin = sum.min - max;
++		if (baseMin &gt; base.min)
++			diff = max_c(diff, baseMin - base.min);
++
++		// clear the dirty flags
++		for (int32 i = 0; i &lt;= changedIndex; i++) {
++			SumItem&amp; sum = fSums[i + 1];
++			sum.minDirty = false;
++			sum.maxDirty = false;
++		}
++
++		// if we've got a conflict, we relax the constraint and try again
++		if (diff &gt; 0) {
++			max += diff;
++printf(&quot;relaxing conflicting max constraint (2): x%ld + ... + x%ld &lt;= %ld -&gt; %ld\n&quot;,
++currentConstraint-&gt;start, currentConstraint-&gt;end,
++currentConstraint-&gt;effectiveMax, max);
++			currentConstraint-&gt;effectiveMax = max;
++
++			_RestoreValues(index);
++
++			sumMax = base.max + max;
++			baseMin = sum.min - max;
++
++			if (baseMin &lt;= base.min &amp;&amp; sumMax &gt;= sum.max)
++				return;
++		}
++	} while (diff &gt; 0);
++}
++
++
++// _PropagateChanges
++/*!	Propagate changes forward using min and max constraints. Max constraints
++	Beyond \a toIndex or at \a to toIndex after (and including)
++	\a lastMaxConstraint will be ignored. To have all constraints be
++	considered pass \c fElementCount and \c NULL.
++*/
++void
++ComplexLayouter::_PropagateChanges(SumItem* sums, int32 toIndex,
++	Constraint* lastMaxConstraint)
++{
++	for (int32 i = 0; i &lt; fElementCount; i++) {
++		SumItem&amp; sum = sums[i + 1];
++
++		bool ignoreMaxConstraints = (i &gt; toIndex);
++
++		Constraint* constraint = fConstraints[i];
++		while (constraint != NULL) {
++			SumItem&amp; base = sums[constraint-&gt;start];
++
++			if (constraint == lastMaxConstraint)
++				ignoreMaxConstraints = true;
++
++			// minc[k] &gt;= minc[i-1] + min[i,j]
++			if (base.minDirty) {
++				int32 sumMin = base.min + constraint-&gt;min;
++				if (sumMin &gt; sum.min) {
++					sum.min = sumMin;
++					sum.minDirty = true;
++				}
++			}
++
++			// maxc[k] &lt;= maxc[i-1] + max[i,j]
++			if (base.maxDirty &amp;&amp; !ignoreMaxConstraints) {
++				int32 sumMax = base.max + constraint-&gt;effectiveMax;
++				if (sumMax &lt; sum.max) {
++					sum.max = sumMax;
++					sum.maxDirty = true;
++				}
++			}
++
++			constraint = constraint-&gt;next;
++		}
++
++		if (sum.minDirty || sum.maxDirty) {
++			if (sum.min &gt; sum.max) {
++// TODO: Can this actually happen?
++printf(&quot;adjusted max in propagation phase: index: %ld: %ld -&gt; %ld\n&quot;, i, sum.max, sum.min);
++				sum.max = sum.min;
++				sum.maxDirty = true;
++			}
++		}
++	}
++}
++
++
++// _PropagateChangesBack
++void
++ComplexLayouter::_PropagateChangesBack(SumItem* sums, int32 changedIndex,
++	Constraint* lastMaxConstraint)
++{
++	for (int32 i = changedIndex; i &gt;= 0; i--) {
++		SumItem&amp; sum = sums[i + 1];
++
++		bool ignoreMaxConstraints = false;
++
++		Constraint* constraint = fConstraints[i];
++		while (constraint != NULL) {
++			SumItem&amp; base = sums[constraint-&gt;start];
++
++			if (constraint == lastMaxConstraint)
++				ignoreMaxConstraints = true;
++
++			// minc[i-1] &gt;= minc[k] - max[i,j]
++			if (sum.minDirty &amp;&amp; !ignoreMaxConstraints) {
++				int32 baseMin = sum.min - constraint-&gt;effectiveMax;
++				if (baseMin &gt; base.min) {
++if (baseMin &gt; base.max) {
++printf(&quot;min above max in back propagation phase: index: (%ld -&gt; %ld), &quot;
++&quot;min: %ld, max: %ld\n&quot;, i, constraint-&gt;start, baseMin, base.max);
++}
++					base.min = baseMin;
++					base.minDirty = true;
++				}
++			}
++
++			// maxc[i-1] &lt;= maxc[k] - min[i,j]
++			if (sum.maxDirty) {
++				int32 baseMax = sum.max - constraint-&gt;min;
++				if (baseMax &lt; base.max) {
++if (baseMax &lt; base.min) {
++printf(&quot;max below min in back propagation phase: index: (%ld -&gt; %ld), &quot;
++&quot;max: %ld, min: %ld\n&quot;, i, constraint-&gt;start, baseMax, base.min);
++}
++					base.max = baseMax;
++					base.maxDirty = true;
++				}
++			}
++
++			constraint = constraint-&gt;next;
++		}
++	}
++}
++
++
++// _BackupValues
++void
++ComplexLayouter::_BackupValues(int32 maxIndex)
++{
++	for (int32 i = 0; i &lt;= maxIndex; i++) {
++		SumItem&amp; sum = fSums[i + 1];
++		fSumBackups[i + 1].min = sum.min;
++		fSumBackups[i + 1].max = sum.max;
++	}
++}
++
++
++// _RestoreValues
++void
++ComplexLayouter::_RestoreValues(int32 maxIndex)
++{
++	for (int32 i = 0; i &lt;= maxIndex; i++) {
++		SumItem&amp; sum = fSums[i + 1];
++		sum.min = fSumBackups[i + 1].min;
++		sum.max = fSumBackups[i + 1].max;
++	}
++}
++
+
+Added: haiku/trunk/src/kits/interface/layouter/ComplexLayouter.h
+===================================================================
+--- haiku/trunk/src/kits/interface/layouter/ComplexLayouter.h	2007-09-23 23:35:20 UTC (rev 22287)
++++ haiku/trunk/src/kits/interface/layouter/ComplexLayouter.h	2007-09-24 00:03:57 UTC (rev 22288)
+@@ -0,0 +1,78 @@
++/*
++ * Copyright 2007, Ingo Weinhold &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at cs.tu-berlin.de</A>&gt;.
++ * All rights reserved. Distributed under the terms of the MIT License.
++ */
++#ifndef COMPLEX_LAYOUTER_H
++#define COMPLEX_LAYOUTER_H
++
++#include &lt;List.h&gt;
++
++#include &quot;Layouter.h&quot;
++
++
++namespace BPrivate {
++namespace Layout {
++
++class LayoutOptimizer;
++
++class ComplexLayouter : public Layouter {
++public:
++								ComplexLayouter(int32 elementCount,
++									int32 spacing);
++	virtual						~ComplexLayouter();
++
++	virtual	status_t			InitCheck() const;
++
++	virtual	void				AddConstraints(int32 element, int32 length,
++									float min, float max, float preferred);
++	virtual	void				SetWeight(int32 element, float weight);
++
++	virtual	float				MinSize();
++	virtual	float				MaxSize();
++	virtual	float				PreferredSize();
++
++	virtual	LayoutInfo*			CreateLayoutInfo();
++	
++	virtual	void				Layout(LayoutInfo* layoutInfo, float size);
++
++	virtual	Layouter*			CloneLayouter();
++
++private:
++			class MyLayoutInfo;
++			struct Constraint;
++			struct SumItem;
++			struct SumItemBackup;
++
++
++			void				_ValidateLayout();
++			void				_ApplyMaxConstraint(
++									Constraint* currentConstraint, int32 index);
++			void				_PropagateChanges(SumItem* sums, int32 toIndex,
++									Constraint* lastMaxConstraint);
++			void				_PropagateChangesBack(SumItem* sums,
++									int32 changedIndex,
++									Constraint* lastMaxConstraint);
++		
++			void				_BackupValues(int32 maxIndex);
++			void				_RestoreValues(int32 maxIndex);
++
++private:
++			int32				fElementCount;
++			int32				fSpacing;
++			Constraint**		fConstraints;
++			float*				fWeights;
++			SumItem*			fSums;
++			SumItemBackup*		fSumBackups;
++			LayoutOptimizer*	fOptimizer;
++			float				fMin;
++			float				fMax;
++			bool				fLayoutValid;
++};
++
++}	// namespace Layout
++}	// namespace BPrivate
++
++using BPrivate::Layout::ComplexLayouter;
++
++
++#endif	// COMPLEX_LAYOUTER_H
+
+Added: haiku/trunk/src/kits/interface/layouter/LayoutOptimizer.cpp
+===================================================================
+--- haiku/trunk/src/kits/interface/layouter/LayoutOptimizer.cpp	2007-09-23 23:35:20 UTC (rev 22287)
++++ haiku/trunk/src/kits/interface/layouter/LayoutOptimizer.cpp	2007-09-24 00:03:57 UTC (rev 22288)
+@@ -0,0 +1,982 @@
++/*
++ * Copyright 2007, Ingo Weinhold &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at cs.tu-berlin.de</A>&gt;.
++ * All rights reserved. Distributed under the terms of the MIT License.
++ */
++
++#include &quot;LayoutOptimizer.h&quot;
++
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++
++#include &lt;new&gt;
++
++#include &lt;AutoDeleter.h&gt;
++
++
++using std::nothrow;
++
++
++// #pragma mark - vector and matrix operations
++
++
++// is_zero
++static inline bool
++is_zero(double* x, int n)
++{
++	for (int i = 0; i &lt; n; i++) {
++		if (!fuzzy_equals(x[i], 0))
++			return false;
++	}
++
++	return true;
++}
++
++
++// add_vectors
++static inline void
++add_vectors(double* x, const double* y, int n)
++{
++	for (int i = 0; i &lt; n; i++)
++		x[i] += y[i];
++}
++
++
++// add_vectors_scaled
++static inline void
++add_vectors_scaled(double* x, const double* y, double scalar, int n)
++{
++	for (int i = 0; i &lt; n; i++)
++		x[i] += y[i] * scalar;
++}
++
++
++// negate_vector
++static inline void
++negate_vector(double* x, int n)
++{
++	for (int i = 0; i &lt; n; i++)
++		x[i] = -x[i];
++}
+
+[... truncated: 998 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003969.html">[Haiku-commits] r22287 - haiku/trunk/src/kits/interface/layouter
+</A></li>
+	<LI>Next message: <A HREF="003971.html">[Haiku-commits] r22289 - in haiku/trunk:	headers/private/graphics/intel_extreme	src/add-ons/accelerants/intel_extreme
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3970">[ date ]</a>
+              <a href="thread.html#3970">[ thread ]</a>
+              <a href="subject.html#3970">[ subject ]</a>
+              <a href="author.html#3970">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

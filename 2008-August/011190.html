@@ -1,0 +1,138 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27118 - haiku/trunk/src/system/kernel/slab
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27118%20-%20haiku/trunk/src/system/kernel/slab&In-Reply-To=%3C200808212302.m7LN2DdZ010908%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011189.html">
+   <LINK REL="Next"  HREF="011204.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27118 - haiku/trunk/src/system/kernel/slab</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27118%20-%20haiku/trunk/src/system/kernel/slab&In-Reply-To=%3C200808212302.m7LN2DdZ010908%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27118 - haiku/trunk/src/system/kernel/slab">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Aug 22 01:02:13 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011189.html">[Haiku-commits] r27117 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/arch/x86 src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="011204.html">[Haiku-commits] r27118 - haiku/trunk/src/system/kernel/slab
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11190">[ date ]</a>
+              <a href="thread.html#11190">[ thread ]</a>
+              <a href="subject.html#11190">[ subject ]</a>
+              <a href="author.html#11190">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-22 01:02:08 +0200 (Fri, 22 Aug 2008)
+New Revision: 27118
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27118&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27118&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/slab/Slab.cpp
+Log:
+* Implement CACHE_DONT_SLEEP partially. At least for small object caches
+  without object depot it should be complete. For the other stuff
+  internal_alloc() would need to pass the flag on to block_alloc(), but
+  that isn't possible yet.
+* Adjusted the low memory handler to respect the minimum object reserve
+  of the object caches.
+
+The swap_test_heap test does seem to pass reliably with 128 MB RAM and
+128 MB allocation, now. It's quite slow, though. Particularly while the
+allocation is filled, the system is completely unusable.
+
+
+Modified: haiku/trunk/src/system/kernel/slab/Slab.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/slab/Slab.cpp	2008-08-21 22:50:11 UTC (rev 27117)
++++ haiku/trunk/src/system/kernel/slab/Slab.cpp	2008-08-21 23:02:08 UTC (rev 27118)
+@@ -27,6 +27,7 @@
+ #include &lt;util/DoublyLinkedList.h&gt;
+ #include &lt;util/OpenHashTable.h&gt;
+ #include &lt;vm.h&gt;
++#include &lt;vm_address_space.h&gt;
+ 
+ 
+ // TODO kMagazineCapacity should be dynamically tuned per cache.
+@@ -422,6 +423,7 @@
+ 		return buffer;
+ 	}
+ 
++	// TODO: Support CACHE_DONT_SLEEP!
+ 	return block_alloc(size);
+ }
+ 
+@@ -459,8 +461,10 @@
+ 	// if we are allocating, it is because we need the pages immediatly
+ 	// so we lock them. when moving the slab to the empty list we should
+ 	// unlock them, and lock them again when getting one from the empty list.
+-	area_id areaId = create_area(cache-&gt;name, pages, addressSpec,
+-		cache-&gt;slab_size, lock, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	area_id areaId = vm_create_anonymous_area(vm_kernel_address_space_id(),
++		cache-&gt;name, pages, addressSpec, cache-&gt;slab_size, lock,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
++		(flags &amp; CACHE_DONT_SLEEP) != 0 ? CREATE_AREA_DONT_WAIT : 0, true);
+ 
+ 	if (unlockWhileAllocating)
+ 		cache-&gt;Lock();
+@@ -561,6 +565,22 @@
+ 		break;
+ 	}
+ 
++	// If the object cache has minimum object reserve, make sure that we don't
++	// free too many slabs.
++	if (cache-&gt;min_object_reserve &gt; 0 &amp;&amp; cache-&gt;empty_count &gt; 0) {
++		size_t objectsPerSlab = cache-&gt;empty.Head()-&gt;size;
++		size_t freeObjects = cache-&gt;total_objects - cache-&gt;used_count;
++
++		if (cache-&gt;min_object_reserve + objectsPerSlab &gt;= freeObjects)
++			return;
++
++		size_t slabsToFree = (freeObjects - cache-&gt;min_object_reserve)
++			/ objectsPerSlab;
++
++		if (cache-&gt;empty_count &gt; minimumAllowed + slabsToFree)
++			minimumAllowed = cache-&gt;empty_count - slabsToFree;
++	}
++
+ 	if (cache-&gt;empty_count &lt;= minimumAllowed)
+ 		return;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011189.html">[Haiku-commits] r27117 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/arch/x86 src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="011204.html">[Haiku-commits] r27118 - haiku/trunk/src/system/kernel/slab
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11190">[ date ]</a>
+              <a href="thread.html#11190">[ thread ]</a>
+              <a href="subject.html#11190">[ subject ]</a>
+              <a href="author.html#11190">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

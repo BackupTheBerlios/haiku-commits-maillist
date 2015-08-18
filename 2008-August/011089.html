@@ -1,0 +1,681 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27056 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27056%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/cache%20src/system/kernel/vm&In-Reply-To=%3C200808182328.m7INSd7Q017796%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011088.html">
+   <LINK REL="Next"  HREF="011090.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27056 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27056%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/cache%20src/system/kernel/vm&In-Reply-To=%3C200808182328.m7INSd7Q017796%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27056 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Aug 19 01:28:39 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011088.html">[Haiku-commits] r27055 - in haiku/trunk: headers/private/kernel	src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="011090.html">[Haiku-commits] r27057 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11089">[ date ]</a>
+              <a href="thread.html#11089">[ thread ]</a>
+              <a href="subject.html#11089">[ subject ]</a>
+              <a href="author.html#11089">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-19 01:28:34 +0200 (Tue, 19 Aug 2008)
+New Revision: 27056
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27056&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27056&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/cache/vnode_store.cpp
+   haiku/trunk/src/system/kernel/cache/vnode_store.h
+   haiku/trunk/src/system/kernel/vm/Jamfile
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h
+   haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.cpp
+   haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.h
+   haiku/trunk/src/system/kernel/vm/VMDeviceCache.cpp
+   haiku/trunk/src/system/kernel/vm/VMDeviceCache.h
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* VMCache::Write(): Added &quot;uint32 flags&quot; argument which is supposed to
+  be passed on to the IORequest. Most relevantly physical pages can now
+  be written directly by passing B_PHYSICAL_IO_REQUEST.
+* Added VMCache::WriteAsync() which is supposed to write pages
+  asynchronously. The base class version version falls back to the
+  synchronous Write(). Only VMVnodeCache implements WriteAsync() ATM,
+  VMAnonymousCache (swap support) still has to be adjusted accordingly.
+* write_page() doesn't need to map the page anymore as it can write the
+  physical page directly.
+* Modified the page writer to write pages asynchronously. This shouldn't
+  have any noticeable effect yet. It will though as soon as the I/O
+  scheduler reorders I/O operations.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -37,6 +37,7 @@
+ 
+ #include &lt;util/SplayTree.h&gt;
+ 
++class AsyncIOCallback;
+ struct vm_page_mapping;
+ struct VMCache;
+ typedef DoublyLinkedListLink&lt;vm_page_mapping&gt; vm_page_mapping_link;
+@@ -224,7 +225,10 @@
+ 	virtual	status_t	Read(off_t offset, const iovec *vecs, size_t count,
+ 							size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+-							size_t *_numBytes);
++							uint32 flags, size_t *_numBytes);
++	virtual	status_t	WriteAsync(off_t offset, const iovec* vecs,
++							size_t count, size_t numBytes, uint32 flags,
++							AsyncIOCallback* callback);
+ 
+ 	virtual	status_t	Fault(struct vm_address_space *aspace, off_t offset);
+ 
+
+Modified: haiku/trunk/src/system/kernel/cache/vnode_store.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/vnode_store.cpp	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/cache/vnode_store.cpp	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -73,13 +73,22 @@
+ 
+ status_t
+ VMVnodeCache::Write(off_t offset, const iovec *vecs, size_t count,
+-	size_t *_numBytes)
++	uint32 flags, size_t *_numBytes)
+ {
+-	return vfs_write_pages(fVnode, NULL, offset, vecs, count, 0, _numBytes);
++	return vfs_write_pages(fVnode, NULL, offset, vecs, count, flags, _numBytes);
+ }
+ 
+ 
+ status_t
++VMVnodeCache::WriteAsync(off_t offset, const iovec* vecs, size_t count,
++	size_t numBytes, uint32 flags, AsyncIOCallback* callback)
++{
++	return vfs_asynchronous_write_pages(fVnode, NULL, offset, vecs, count,
++		numBytes, flags, callback);
++}
++
++
++status_t
+ VMVnodeCache::Fault(struct vm_address_space *aspace, off_t offset)
+ {
+ 	return B_BAD_HANDLER;
+
+Modified: haiku/trunk/src/system/kernel/cache/vnode_store.h
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/vnode_store.h	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/cache/vnode_store.h	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -22,7 +22,10 @@
+ 	virtual	status_t	Read(off_t offset, const iovec *vecs, size_t count,
+ 							size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+-							size_t *_numBytes);
++							uint32 flags, size_t *_numBytes);
++	virtual	status_t	WriteAsync(off_t offset, const iovec* vecs,
++							size_t count, size_t numBytes, uint32 flags,
++							AsyncIOCallback* callback);
+ 
+ 	virtual	status_t	Fault(struct vm_address_space *aspace, off_t offset);
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/Jamfile	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/vm/Jamfile	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -2,6 +2,8 @@
+ 
+ UsePrivateHeaders shared ;
+ 
++UseHeaders [ FDirName $(SUBDIR) $(DOTDOT) device_manager ] ;
++
+ KernelMergeObject kernel_vm.o :
+ 	vm.cpp
+ 	vm_address_space.cpp
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -376,7 +376,7 @@
+ 
+ status_t
+ VMAnonymousCache::Write(off_t offset, const iovec *vecs, size_t count,
+-	size_t *_numBytes)
++	uint32 flags, size_t *_numBytes)
+ {
+ 	off_t pageIndex = offset &gt;&gt; PAGE_SHIFT;
+ 
+@@ -410,7 +410,7 @@
+ 		off_t pos = (swapAddr - swapFile-&gt;first_page) * B_PAGE_SIZE;
+ 
+ 		status_t status = vfs_write_pages(swapFile-&gt;vnode, NULL, pos, vecs + i,
+-				n, 0, _numBytes);
++				n, flags, _numBytes);
+ 		if (status != B_OK) {
+ 			Lock();
+ 			fAllocatedSwapSize -= n * B_PAGE_SIZE;
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -39,7 +39,7 @@
+ 	virtual	status_t	Read(off_t offset, const iovec *vecs, size_t count,
+ 							size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+-							size_t *_numBytes);
++							uint32 flags, size_t *_numBytes);
+ 
+ 	virtual	status_t	Fault(struct vm_address_space *aspace, off_t offset);
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.cpp	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.cpp	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -105,7 +105,7 @@
+ 
+ status_t
+ VMAnonymousNoSwapCache::Write(off_t offset, const iovec *vecs, size_t count,
+-	size_t *_numBytes)
++	uint32 flags, size_t *_numBytes)
+ {
+ 	// no place to write, this will cause the page daemon to skip this store
+ 	return B_ERROR;
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.h
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.h	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.h	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -25,7 +25,7 @@
+ 	virtual	status_t	Read(off_t offset, const iovec *vecs, size_t count,
+ 							size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+-							size_t *_numBytes);
++							uint32 flags, size_t *_numBytes);
+ 
+ 	virtual	status_t	Fault(struct vm_address_space *aspace, off_t offset);
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/VMDeviceCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMDeviceCache.cpp	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/vm/VMDeviceCache.cpp	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -36,7 +36,7 @@
+ 
+ status_t
+ VMDeviceCache::Write(off_t offset, const iovec *vecs, size_t count,
+-	size_t *_numBytes)
++	uint32 flags, size_t *_numBytes)
+ {
+ 	// no place to write, this will cause the page daemon to skip this store
+ 	return B_OK;
+
+Modified: haiku/trunk/src/system/kernel/vm/VMDeviceCache.h
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMDeviceCache.h	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/vm/VMDeviceCache.h	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -21,7 +21,7 @@
+ 	virtual	status_t	Read(off_t offset, const iovec *vecs, size_t count,
+ 							size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+-							size_t *_numBytes);
++							uint32 flags, size_t *_numBytes);
+ 
+ private:
+ 	addr_t	fBaseAddress;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -21,6 +21,7 @@
+ #include &lt;tracing.h&gt;
+ #include &lt;util/khash.h&gt;
+ #include &lt;util/AutoLock.h&gt;
++#include &lt;vfs.h&gt;
+ #include &lt;vm.h&gt;
+ #include &lt;vm_page.h&gt;
+ #include &lt;vm_priv.h&gt;
+@@ -867,13 +868,29 @@
+ 
+ 
+ status_t
+-VMCache::Write(off_t offset, const iovec *vecs, size_t count, size_t *_numBytes)
++VMCache::Write(off_t offset, const iovec *vecs, size_t count, uint32 flags,
++	size_t *_numBytes)
+ {
+ 	return B_ERROR;
+ }
+ 
+ 
+ status_t
++VMCache::WriteAsync(off_t offset, const iovec* vecs, size_t count,
++	size_t numBytes, uint32 flags, AsyncIOCallback* callback)
++{
++	// Not supported, fall back to the synchronous hook.
++	size_t transferred = numBytes;
++	status_t error = Write(offset, vecs, count, flags, &amp;transferred);
++
++	if (callback != NULL)
++		callback-&gt;IOFinished(error, transferred != numBytes, transferred);
++
++	return error;
++}
++
++
++status_t
+ VMCache::Fault(struct vm_address_space *aspace, off_t offset)
+ {
+ 	return B_BAD_ADDRESS;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2008-08-18 23:09:10 UTC (rev 27055)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2008-08-18 23:28:34 UTC (rev 27056)
+@@ -23,6 +23,7 @@
+ #include &lt;thread.h&gt;
+ #include &lt;tracing.h&gt;
+ #include &lt;util/AutoLock.h&gt;
++#include &lt;vfs.h&gt;
+ #include &lt;vm.h&gt;
+ #include &lt;vm_address_space.h&gt;
+ #include &lt;vm_priv.h&gt;
+@@ -30,6 +31,7 @@
+ #include &lt;vm_cache.h&gt;
+ 
+ #include &quot;PageCacheLocker.h&quot;
++#include &quot;io_requests.h&quot;
+ 
+ 
+ //#define TRACE_VM_PAGE
+@@ -853,30 +855,27 @@
+ 
+ 
+ static status_t
+-write_page(vm_page *page)
++write_page(vm_page *page, uint32 flags, AsyncIOCallback* callback)
+ {
+-	size_t length = B_PAGE_SIZE;
+-	status_t status;
+-	iovec vecs[1];
+-
+ 	TRACE((&quot;write_page(page = %p): offset = %Ld\n&quot;, page, (off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT));
+ 
+-	status = vm_get_physical_page(page-&gt;physical_page_number * B_PAGE_SIZE,
+-		(addr_t *)&amp;vecs[0].iov_base, PHYSICAL_PAGE_CAN_WAIT);
+-	if (status &lt; B_OK)
+-		panic(&quot;could not map page!&quot;);
++	off_t offset = (off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT;
++
++	iovec vecs[1];
++	vecs-&gt;iov_base = (void*)(addr_t)(page-&gt;physical_page_number * B_PAGE_SIZE);
+ 	vecs-&gt;iov_len = B_PAGE_SIZE;
+ 
+-	status = page-&gt;cache-&gt;Write((off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT,
+-		vecs, 1, &amp;length);
++	if (callback != NULL) {
++		// asynchronous I/O
++		return page-&gt;cache-&gt;WriteAsync(offset, vecs, 1, B_PAGE_SIZE,
++			flags | B_PHYSICAL_IO_REQUEST, callback);
++	}
+ 
+-	vm_put_physical_page((addr_t)vecs[0].iov_base);
+-#if 0
+-	if (status &lt; B_OK) {
+-		dprintf(&quot;write_page(page = %p): offset = %lx, status = %ld\n&quot;,
+-			page, page-&gt;cache_offset, status);
+-	}
+-#endif
++	// synchronous I/0
++	size_t length = B_PAGE_SIZE;
++	status_t status = page-&gt;cache-&gt;Write(offset, vecs, 1,
++		flags | B_PHYSICAL_IO_REQUEST, &amp;length);
++
+ 	if (status == B_OK &amp;&amp; length == 0)
+ 		status = B_ERROR;
+ 
+@@ -947,6 +946,168 @@
+ }
+ 
+ 
++class PageWriterCallback;
++
++
++class PageWriterRun {
++public:
++	status_t Init(uint32 maxPages);
++
++	void PrepareNextRun();
++	void AddPage(vm_page* page);
++	void Go();
++
++	void PageWritten(PageWriterCallback* callback, status_t status,
++		bool partialTransfer, size_t bytesTransferred);
++
++private:
++	uint32				fMaxPages;
++	uint32				fPageCount;
++	vint32				fPendingPages;
++	PageWriterCallback*	fCallbacks;
++	ConditionVariable	fAllFinishedCondition;
++};
++
++
++class PageWriterCallback : public AsyncIOCallback {
++public:
++	void SetTo(PageWriterRun* run, vm_page* page)
++	{
++		fRun = run;
++		fPage = page;
++		fCache = page-&gt;cache;
++		fStatus = B_OK;
++		fBusyCondition.Publish(page, &quot;page&quot;);
++	}
++
++	vm_page* Page() const	{ return fPage; }
++	VMCache* Cache() const	{ return fCache; }
++	status_t Status() const	{ return fStatus; }
++
++	ConditionVariable&amp; BusyCondition()	{ return fBusyCondition; }
++
++	virtual void IOFinished(status_t status, bool partialTransfer,
++		size_t bytesTransferred)
++	{
++		fStatus = status == B_OK &amp;&amp; bytesTransferred == 0 ? B_ERROR : status;
++		fRun-&gt;PageWritten(this, status, partialTransfer, bytesTransferred);
++	}
++
++private:
++	PageWriterRun*		fRun;
++	vm_page*			fPage;
++	VMCache*			fCache;
++	status_t			fStatus;
++	ConditionVariable	fBusyCondition;
++};
++
++
++status_t
++PageWriterRun::Init(uint32 maxPages)
++{
++	fMaxPages = maxPages;
++	fPageCount = 0;
++	fPendingPages = 0;
++
++	fCallbacks = new(std::nothrow) PageWriterCallback[maxPages];
++	if (fCallbacks == NULL)
++		return B_NO_MEMORY;
++
++	return B_OK;
++}
++
++
++void
++PageWriterRun::PrepareNextRun()
++{
++	fPageCount = 0;
++	fPendingPages = 0;
++}
++
++
++void
++PageWriterRun::AddPage(vm_page* page)
++{
++	page-&gt;state = PAGE_STATE_BUSY;
++	page-&gt;busy_writing = true;
++
++	fCallbacks[fPageCount].SetTo(this, page);
++	fPageCount++;
++}
++
++
++void
++PageWriterRun::Go()
++{
++	fPendingPages = fPageCount;
++
++	fAllFinishedCondition.Init(this, &quot;page writer wait for I/O&quot;);
++	ConditionVariableEntry waitEntry;
++	fAllFinishedCondition.Add(&amp;waitEntry);
++
++	// schedule writes
++	for (uint32 i = 0; i &lt; fPageCount; i++) {
++		PageWriterCallback&amp; callback = fCallbacks[i];
++		write_page(callback.Page(), B_VIP_IO_REQUEST, &amp;callback);
++	}
++
++	// wait until all pages have been written
++	waitEntry.Wait();
++
++	// mark pages depending on whether they could be written or not
++
++	for (uint32 i = 0; i &lt; fPageCount; i++) {
++		PageWriterCallback&amp; callback = fCallbacks[i];
++		vm_page* page = callback.Page();
++		vm_cache* cache = callback.Cache();
++		cache-&gt;Lock();
++
++		if (callback.Status() == B_OK) {
++			// put it into the active queue
++			InterruptsSpinLocker locker(sPageLock);
++			move_page_to_active_or_inactive_queue(page, true);
++			page-&gt;busy_writing = false;
++		} else {
++			// We don't have to put the PAGE_MODIFIED bit back, as it's
++			// still in the modified pages list.
++			{
++				InterruptsSpinLocker locker(sPageLock);
++				page-&gt;state = PAGE_STATE_MODIFIED;
++				enqueue_page(&amp;sModifiedPageQueue, page);
++			}
++			if (!page-&gt;busy_writing) {
++				// someone has cleared the busy_writing flag which tells
++				// us our page has gone invalid
++				cache-&gt;RemovePage(page);
++			} else
++				page-&gt;busy_writing = false;
++		}
++
++		callback.BusyCondition().Unpublish();
++
++		cache-&gt;Unlock();
++	}
++
++	for (uint32 i = 0; i &lt; fPageCount; i++) {
++		vm_cache* cache = fCallbacks[i].Cache();
++
++		// We release the cache references after all pages were made
++		// unbusy again - otherwise releasing a vnode could deadlock.
++		cache-&gt;ReleaseStoreRef();
++		cache-&gt;ReleaseRef();
++	}
++}
++
++
++void
++PageWriterRun::PageWritten(PageWriterCallback* callback, status_t status,
++	bool partialTransfer, size_t bytesTransferred)
++{
++	if (atomic_add(&amp;fPendingPages, -1) == 1)
++		fAllFinishedCondition.NotifyAll();
++}
++
++
+ /*!	The page writer continuously takes some pages from the modified
+ 	queue, writes them back, and moves them back to the active queue.
+ 	It runs in its own thread, and is only there to keep the number
+@@ -956,6 +1117,16 @@
+ status_t
+ page_writer(void* /*unused*/)
+ {
++	// TODO: once the I/O scheduler is there, we should write
++	// a lot more pages back.
++	const uint32 kNumPages = 32;
++
++	PageWriterRun run;
++	if (run.Init(kNumPages) != B_OK) {
++		panic(&quot;page writer: Failed to init PageWriterRun!&quot;);
++		return B_ERROR;
++	}
++
+ 	vm_page marker;
+ 	marker.type = PAGE_TYPE_DUMMY;
+ 	marker.cache = NULL;
+@@ -972,16 +1143,9 @@
+ 				// all 3 seconds when no one triggers us
+ 		}
+ 
+-		const uint32 kNumPages = 32;
+-		ConditionVariable busyConditions[kNumPages];
+-		union {
+-			vm_page *pages[kNumPages];
+-			vm_cache *caches[kNumPages];
+-		} u;
+ 		uint32 numPages = 0;
++		run.PrepareNextRun();
+ 
+-		// TODO: once the I/O scheduler is there, we should write
+-		// a lot more pages back.
+ 		// TODO: make this laptop friendly, too (ie. only start doing
+ 		// something if someone else did something or there is really
+ 		// enough to do).
+@@ -1023,77 +1187,29 @@
+ 
+ 			// state might have change while we were locking the cache
+ 			if (page-&gt;state != PAGE_STATE_MODIFIED) {
+-				// release the cache reference first
++				// release the cache reference
++				locker.Unlock();
+ 				cache-&gt;ReleaseStoreRef();
+ 				continue;
+ 			}
+ 
+ 			remove_page_from_queue(&amp;sModifiedPageQueue, page);
+-			page-&gt;state = PAGE_STATE_BUSY;
+-			page-&gt;busy_writing = true;
+ 
+-			busyConditions[numPages].Publish(page, &quot;page&quot;);
++			run.AddPage(page);
+ 
+ 			locker.Unlock();
+ 
+ 			//dprintf(&quot;write page %p, cache %p (%ld)\n&quot;, page, page-&gt;cache, page-&gt;cache-&gt;ref_count);
+ 			vm_clear_map_flags(page, PAGE_MODIFIED);
+ 			cache-&gt;AcquireRefLocked();
+-			u.pages[numPages++] = page;
++			numPages++;
+ 		}
+ 
+ 		if (numPages == 0)
+ 			continue;
+ 
+-		// write pages to disk
+-
+-		// TODO: put this as requests into the I/O scheduler
+-		status_t writeStatus[kNumPages];
+-		for (uint32 i = 0; i &lt; numPages; i++) {
+-			writeStatus[i] = write_page(u.pages[i]);
+-		}
+-
+-		// mark pages depending on whether they could be written or not
+-
+-		for (uint32 i = 0; i &lt; numPages; i++) {
+-			vm_cache *cache = u.pages[i]-&gt;cache;
+-			cache-&gt;Lock();
+-
+-			if (writeStatus[i] == B_OK) {
+-				// put it into the active queue
+-				InterruptsSpinLocker locker(sPageLock);
+-				move_page_to_active_or_inactive_queue(u.pages[i], true);
+-				u.pages[i]-&gt;busy_writing = false;
+-			} else {
+-				// We don't have to put the PAGE_MODIFIED bit back, as it's
+-				// still in the modified pages list.
+-				{
+-					InterruptsSpinLocker locker(sPageLock);
+-					u.pages[i]-&gt;state = PAGE_STATE_MODIFIED;
+-					enqueue_page(&amp;sModifiedPageQueue, u.pages[i]);
+-				}
+-				if (!u.pages[i]-&gt;busy_writing) {
+-					// someone has cleared the busy_writing flag which tells
+-					// us our page has gone invalid
+-					cache-&gt;RemovePage(u.pages[i]);
+-				} else
+-					u.pages[i]-&gt;busy_writing = false;
+-			}
+-
+-			busyConditions[i].Unpublish();
+-
+-			u.caches[i] = cache;
+-			cache-&gt;Unlock();
+-		}
+-
+-		for (uint32 i = 0; i &lt; numPages; i++) {
+-			vm_cache *cache = u.caches[i];
+-
+-			// We release the cache references after all pages were made
+-			// unbusy again - otherwise releasing a vnode could deadlock.
+-			cache-&gt;ReleaseStoreRef();
+-			cache-&gt;ReleaseRef();
+-		}
++		// write pages to disk and do all the cleanup
++		run.Go();
+ 	}
+ 
+ 	remove_page_marker(marker);
+@@ -1336,7 +1452,7 @@
+ 		vm_clear_map_flags(page, PAGE_MODIFIED);
+ 
+ 		cache-&gt;Unlock();
+-		status_t status = write_page(page);
++		status_t status = write_page(page, 0, NULL);
+ 		cache-&gt;Lock();
+ 
+ 		InterruptsSpinLocker locker(&amp;sPageLock);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011088.html">[Haiku-commits] r27055 - in haiku/trunk: headers/private/kernel	src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="011090.html">[Haiku-commits] r27057 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11089">[ date ]</a>
+              <a href="thread.html#11089">[ thread ]</a>
+              <a href="subject.html#11089">[ subject ]</a>
+              <a href="author.html#11089">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

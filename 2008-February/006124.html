@@ -1,0 +1,241 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23994 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23994%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200802180104.m1I14KSY017598%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006122.html">
+   <LINK REL="Next"  HREF="006125.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23994 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23994%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200802180104.m1I14KSY017598%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23994 - in haiku/trunk: headers/private/kernel	src/system/kernel">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Mon Feb 18 02:04:20 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006122.html">[Haiku-commits] r23993 - haiku/trunk/build/jam
+</A></li>
+        <LI>Next message: <A HREF="006125.html">[Haiku-commits] r23995 - haiku/trunk/src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6124">[ date ]</a>
+              <a href="thread.html#6124">[ thread ]</a>
+              <a href="subject.html#6124">[ subject ]</a>
+              <a href="author.html#6124">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-02-18 02:04:19 +0100 (Mon, 18 Feb 2008)
+New Revision: 23994
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23994&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23994&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/heap.h
+   haiku/trunk/src/system/kernel/heap.cpp
+Log:
+Use a dedicated heap to allocate everything that is needed during heap growth.
+This eliminates the edge case where the grow thread would not be able to create
+a new area because no memory could be allocated for the allocation of the area.
+As this case cannot happen anymore, it is also not possible to deadlock in
+memalign. Therefore the timeout (which would only have prevented the deadlock
+but wouldn't have solved the edge case anyway) has been removed too.
+Add options to dump the dedicated grow heap and to only print the current heap
+count to the &quot;heap&quot; debugger command.
+
+Modified: haiku/trunk/headers/private/kernel/heap.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/heap.h	2008-02-17 19:47:29 UTC (rev 23993)
++++ haiku/trunk/headers/private/kernel/heap.h	2008-02-18 01:04:19 UTC (rev 23994)
+@@ -11,12 +11,13 @@
+ #include &lt;OS.h&gt;
+ 
+ // allocate 16MB initial heap for the kernel
+-#define INITIAL_HEAP_SIZE	16 * 1024 * 1024
++#define INITIAL_HEAP_SIZE			16 * 1024 * 1024
+ // grow by another 8MB each time the heap runs out of memory
+-#define HEAP_GROW_SIZE		8 * 1024 * 1024
++#define HEAP_GROW_SIZE				8 * 1024 * 1024
++// allocate a dedicated 2MB area for dynamic growing
++#define HEAP_DEDICATED_GROW_SIZE	2 * 1024 * 1024
+ 
+ 
+-
+ #ifdef __cplusplus
+ extern &quot;C&quot; {
+ #endif
+
+Modified: haiku/trunk/src/system/kernel/heap.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/heap.cpp	2008-02-17 19:47:29 UTC (rev 23993)
++++ haiku/trunk/src/system/kernel/heap.cpp	2008-02-18 01:04:19 UTC (rev 23994)
+@@ -83,6 +83,8 @@
+ 
+ static heap_allocator *sHeapList = NULL;
+ static heap_allocator *sLastGrowRequest = NULL;
++static heap_allocator *sGrowHeap = NULL;
++static thread_id sHeapGrowThread = -1;
+ static sem_id sHeapGrowSem = -1;
+ static sem_id sHeapGrownNotify = -1;
+ 
+@@ -209,6 +211,26 @@
+ static int
+ dump_heap_list(int argc, char **argv)
+ {
++	if (argc == 2) {
++		if (strcmp(argv[1], &quot;grow&quot;) == 0) {
++			// only dump dedicated grow heap info
++			dprintf(&quot;dedicated grow heap:\n&quot;);
++			dump_allocator(sGrowHeap);
++		} else if (strcmp(argv[1], &quot;stats&quot;) == 0) {
++			uint32 heapCount = 0;
++			heap_allocator *heap = sHeapList;
++			while (heap) {
++				heapCount++;
++				heap = heap-&gt;next;
++			}
++
++			dprintf(&quot;current heap count: %ld\n&quot;, heapCount);
++		} else
++			print_debugger_command_usage(argv[0]);
++
++		return 0;
++	}
++
+ 	heap_allocator *heap = sHeapList;
+ 	while (heap) {
+ 		dump_allocator(heap);
+@@ -707,7 +729,7 @@
+ 
+ 	TRACE((&quot;memalign(): asked to allocate %lu bytes, returning pointer %p\n&quot;, size, address));
+ 
+-	if (heap-&gt;next == NULL) {
++	if (heap-&gt;next == NULL &amp;&amp; shouldGrow) {
+ 		// suggest growing if we are the last heap and we have
+ 		// less than three free pages left
+ 		*shouldGrow = (heap-&gt;free_pages == NULL
+@@ -998,7 +1020,11 @@
+ 	sHeapList = heap_attach(base, size, false);
+ 
+ 	// set up some debug commands
+-	add_debugger_command(&quot;heap&quot;, &amp;dump_heap_list, &quot;Dump stats about the kernel heap(s)&quot;);
++	add_debugger_command_etc(&quot;heap&quot;, &amp;dump_heap_list,
++		&quot;Dump infos about the kernel heap(s)&quot;, &quot;[(\&quot;grow\&quot; | \&quot;stats\&quot;)]\n&quot;
++		&quot;Dump infos about the kernel heap(s). If \&quot;grow\&quot; is specified, only\n&quot;
++		&quot;infos about the dedicated grow heap are printed. If \&quot;stats\&quot; is\n&quot;
++		&quot;given as the argument, currently only the heap count is printed\n&quot;, 0);
+ #if KERNEL_HEAP_LEAK_CHECK
+ 	add_debugger_command_etc(&quot;allocations&quot;, &amp;dump_allocations,
+ 		&quot;Dump current allocations&quot;, &quot;[(\&quot;team\&quot; | \&quot;thread\&quot;) &lt;id&gt;] [\&quot;stats\&quot;]\n&quot;
+@@ -1041,14 +1067,31 @@
+ status_t
+ heap_init_post_thread()
+ {
+-	thread_id thread = spawn_kernel_thread(heap_grow_thread, &quot;heap grower&quot;,
++	void *dedicated = NULL;
++	area_id area = create_area(&quot;heap dedicated grow&quot;, &amp;dedicated,
++		B_ANY_KERNEL_BLOCK_ADDRESS, HEAP_DEDICATED_GROW_SIZE, B_FULL_LOCK,
++		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (area &lt; 0) {
++		panic(&quot;heap_init_post_thread(): cannot allocate dedicated grow memory\n&quot;);
++		return area;
++	}
++
++	sGrowHeap = heap_attach((addr_t)dedicated, HEAP_DEDICATED_GROW_SIZE, true);
++	if (sGrowHeap == NULL) {
++		panic(&quot;heap_init_post_thread(): failed to attach dedicated grow heap\n&quot;);
++		delete_area(area);
++		return B_ERROR;
++	}
++
++	sHeapGrowThread = spawn_kernel_thread(heap_grow_thread, &quot;heap grower&quot;,
+ 		B_URGENT_PRIORITY, NULL);
+-	if (thread &lt; 0) {
++	if (sHeapGrowThread &lt; 0) {
+ 		panic(&quot;heap_init_post_thread(): cannot create heap grow thread\n&quot;);
+-		return B_ERROR;
++		delete_area(area);
++		return sHeapGrowThread;
+ 	}
+ 
+-	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
++	send_signal_etc(sHeapGrowThread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 	return B_OK;
+ }
+ 
+@@ -1070,6 +1113,17 @@
+ 		return NULL;
+ 	}
+ 
++	if (thread_get_current_thread_id() == sHeapGrowThread) {
++		// this is the grower thread, allocate from our dedicated memory
++		void *result = heap_memalign(sGrowHeap, alignment, size, NULL);
++		if (result == NULL) {
++			panic(&quot;heap: grow thread ran out of dedicated memory!\n&quot;);
++			return NULL;
++		}
++
++		return result;
++	}
++
+ 	heap_allocator *heap = sHeapList;
+ 	while (heap) {
+ 		bool shouldGrow = false;
+@@ -1078,9 +1132,8 @@
+ 			// the last heap will or has run out of memory, notify the grower
+ 			sLastGrowRequest = heap;
+ 			if (result == NULL) {
+-				// urgent request, do the request and wait for at max 250ms
+-				release_sem(sHeapGrowSem);
+-				acquire_sem_etc(sHeapGrownNotify, 1, B_RELATIVE_TIMEOUT, 250000);
++				// urgent request, do the request and wait
++				switch_sem(sHeapGrowSem, sHeapGrownNotify);
+ 			} else {
+ 				// not so urgent, just notify the grower
+ 				release_sem_etc(sHeapGrowSem, 1, B_DO_NOT_RESCHEDULE);
+@@ -1131,6 +1184,10 @@
+ 		heap = heap-&gt;next;
+ 	}
+ 
++	// maybe it was allocated from the dedicated grow heap
++	if (heap_free(sGrowHeap, address) == B_OK)
++		return;
++
+ 	panic(&quot;free(): free failed for address %p\n&quot;, address);
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006122.html">[Haiku-commits] r23993 - haiku/trunk/build/jam
+</A></li>
+	<LI>Next message: <A HREF="006125.html">[Haiku-commits] r23995 - haiku/trunk/src/kits/storage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6124">[ date ]</a>
+              <a href="thread.html#6124">[ thread ]</a>
+              <a href="subject.html#6124">[ subject ]</a>
+              <a href="author.html#6124">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

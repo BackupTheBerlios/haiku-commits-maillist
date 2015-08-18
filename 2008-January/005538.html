@@ -1,0 +1,207 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23559 - haiku/trunk/src/add-ons/translators/jpeg
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23559%20-%20haiku/trunk/src/add-ons/translators/jpeg&In-Reply-To=%3C200801161328.m0GDSSZY024354%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005535.html">
+   <LINK REL="Next"  HREF="005539.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23559 - haiku/trunk/src/add-ons/translators/jpeg</H1>
+    <B>stippi at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23559%20-%20haiku/trunk/src/add-ons/translators/jpeg&In-Reply-To=%3C200801161328.m0GDSSZY024354%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23559 - haiku/trunk/src/add-ons/translators/jpeg">stippi at mail.berlios.de
+       </A><BR>
+    <I>Wed Jan 16 14:28:28 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005535.html">[Haiku-commits] r23558 - haiku/trunk/src/apps/terminal
+</A></li>
+        <LI>Next message: <A HREF="005539.html">[Haiku-commits] r23559 - haiku/trunk/src/add-ons/translators/jpeg
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5538">[ date ]</a>
+              <a href="thread.html#5538">[ thread ]</a>
+              <a href="subject.html#5538">[ subject ]</a>
+              <a href="author.html#5538">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2008-01-16 14:28:28 +0100 (Wed, 16 Jan 2008)
+New Revision: 23559
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23559&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23559&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/translators/jpeg/JPEGTranslator.cpp
+   haiku/trunk/src/add-ons/translators/jpeg/JPEGTranslator.h
+   haiku/trunk/src/add-ons/translators/jpeg/be_jerror.cpp
+Log:
+* it was a really bad idea to invoke exit() on critical errors from an add-on
+  that only loads bitmaps and is supposed to return a status_t error from
+  the Translate() function, especially for people using this in mission
+  critical applications.
+  The requirements on the error handler that is
+  to be installed for the jpeg library are not to return to the calling
+  function for critical errors. C++ exceptions seem like the
+  natural solution to the problem, but unfortunately, they simply don't
+  seem to work, possibly because we are inside an add-on. Ingo had the idea
+  to use setjmp() and longjmp() to go directly from the error handler back
+  to the top level code and this works. I have implemented this from what
+  I understand from reading the opengroup spec, but the compiler currently
+  issues a warning. Feel free to fix. The desired effects are achieved though, 
+  the translator recovers correctly from broken jpg files now.
+  Also, I don't know if the translator should somehow &quot;uninstall&quot; the
+  breakpoint. Again, feel free to fix or tell me.
+
+
+Modified: haiku/trunk/src/add-ons/translators/jpeg/JPEGTranslator.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/translators/jpeg/JPEGTranslator.cpp	2008-01-16 11:33:47 UTC (rev 23558)
++++ haiku/trunk/src/add-ons/translators/jpeg/JPEGTranslator.cpp	2008-01-16 13:28:28 UTC (rev 23559)
+@@ -1101,21 +1101,44 @@
+ 	return B_OK;
+ }
+ 
++static jmp_buf sLongJumpBuffer;
++jmp_buf* gLongJumpBuffer = &sLongJumpBuffer;
++
+ /*!	Arguably the most important method in the add-on */
+ status_t
+ Translate(BPositionIO *inSource, const translator_info *inInfo,
+ 	BMessage *ioExtension, uint32 outType, BPositionIO *outDestination)
+ {
+ 	// If no specific type was requested, convert to the interchange format
+-	if (outType == 0) outType = B_TRANSLATOR_BITMAP;
+-	
+-	// What action to take, based on the findings of Identify()
+-	if (outType == inInfo-&gt;type) {
+-		return Copy(inSource, outDestination);
+-	} else if (inInfo-&gt;type == B_TRANSLATOR_BITMAP &amp;&amp; outType == JPEG_FORMAT) {
+-		return Compress(inSource, outDestination);
+-	} else if (inInfo-&gt;type == JPEG_FORMAT &amp;&amp; outType == B_TRANSLATOR_BITMAP) {
+-		return Decompress(inSource, outDestination, ioExtension);
++	if (outType == 0)
++		outType = B_TRANSLATOR_BITMAP;
++
++	// Setup a &quot;breakpoint&quot; since throwing exceptions does not seem to work
++	// at all in an add-on. (?)
++	// In the be_jerror.cpp we implement a handler for critical library errors
++	// (be_error_exit()) and there we use the longjmp() function to return to
++	// this place. If this happens, it is as if the setjmp() call is called
++	// a second time, but this time the return value will be 1. The first
++	// invokation will return 0.
++	int jmpRet = setjmp(sLongJumpBuffer);
++	if (jmpRet == 1)
++		return B_ERROR;
++
++	try {
++		// What action to take, based on the findings of Identify()
++		if (outType == inInfo-&gt;type) {
++			return Copy(inSource, outDestination);
++		} else if (inInfo-&gt;type == B_TRANSLATOR_BITMAP
++				&amp;&amp; outType == JPEG_FORMAT) {
++			return Compress(inSource, outDestination);
++		} else if (inInfo-&gt;type == JPEG_FORMAT
++				&amp;&amp; outType == B_TRANSLATOR_BITMAP) {
++			return Decompress(inSource, outDestination, ioExtension);
++		}
++	} catch (...) {
++		fprintf(stderr, &quot;libjpeg encoutered a critical error &quot;
++			&quot;(caught C++ exception).\n&quot;);
++		return B_ERROR;
+ 	}
+ 
+ 	return B_NO_TRANSLATOR;
+
+Modified: haiku/trunk/src/add-ons/translators/jpeg/JPEGTranslator.h
+===================================================================
+--- haiku/trunk/src/add-ons/translators/jpeg/JPEGTranslator.h	2008-01-16 11:33:47 UTC (rev 23558)
++++ haiku/trunk/src/add-ons/translators/jpeg/JPEGTranslator.h	2008-01-16 13:28:28 UTC (rev 23559)
+@@ -42,6 +42,7 @@
+ #include &lt;TranslationKit.h&gt;
+ #include &lt;TranslatorAddOn.h&gt;
+ 
++#include &lt;setjmp.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+@@ -214,5 +215,6 @@
+ //---------------------------------------------------
+ EXTERN(struct jpeg_error_mgr *) be_jpeg_std_error (struct jpeg_error_mgr * err, jpeg_settings * settings); // from &quot;be_jerror.cpp&quot;
+ 
++extern jmp_buf* gLongJumpBuffer;
+ 
+ #endif // _JPEGTRANSLATOR_H_
+
+Modified: haiku/trunk/src/add-ons/translators/jpeg/be_jerror.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/translators/jpeg/be_jerror.cpp	2008-01-16 11:33:47 UTC (rev 23558)
++++ haiku/trunk/src/add-ons/translators/jpeg/be_jerror.cpp	2008-01-16 13:28:28 UTC (rev 23559)
+@@ -67,15 +67,12 @@
+ 	/* Create the message */
+ 	(*cinfo-&gt;err-&gt;format_message) (cinfo, buffer);
+ 
+-#if 0
+-	/* show error message */
+-	(new BAlert(&quot;JPEG Library Error&quot;, buffer, &quot;OK&quot;, NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT))-&gt;Go();
+-#endif
++	fprintf(stderr, &quot;JPEG Library Error: %s\n&quot;, buffer);
+ 
+ 	/* Let the memory manager delete any temp files before we die */
+ 	jpeg_destroy(cinfo);
+ 
+-	exit(B_ERROR);
++	longjmp(*gLongJumpBuffer, 0);
+ }
+ 
+ 
+@@ -90,12 +87,11 @@
+ 	/* Create the message */
+ 	(*cinfo-&gt;err-&gt;format_message) (cinfo, buffer);
+ 
+-#if 0
+ 	/* If it's compressing or decompressing and user turned messages on */
+-	if (!cinfo-&gt;is_decompressor || cinfo-&gt;err-&gt;ShowReadWarnings)
++	if (!cinfo-&gt;is_decompressor || cinfo-&gt;err-&gt;ShowReadWarnings) {
+ 		/* show warning message */
+-		(new BAlert(&quot;JPEG Library Warning&quot;, buffer, &quot;OK&quot;, NULL, NULL, B_WIDTH_AS_USUAL, B_WARNING_ALERT))-&gt;Go();
+-#endif
++		fprintf(stderr, &quot;JPEG Library Warning: %s\n&quot;, buffer);
++	}
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005535.html">[Haiku-commits] r23558 - haiku/trunk/src/apps/terminal
+</A></li>
+	<LI>Next message: <A HREF="005539.html">[Haiku-commits] r23559 - haiku/trunk/src/add-ons/translators/jpeg
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5538">[ date ]</a>
+              <a href="thread.html#5538">[ thread ]</a>
+              <a href="subject.html#5538">[ subject ]</a>
+              <a href="author.html#5538">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

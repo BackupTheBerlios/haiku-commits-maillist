@@ -1,0 +1,493 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r33159 - haiku/trunk/src/servers/midi
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r33159%20-%20haiku/trunk/src/servers/midi&In-Reply-To=%3C200909172351.n8HNpPTK010831%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020656.html">
+   <LINK REL="Next"  HREF="020659.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r33159 - haiku/trunk/src/servers/midi</H1>
+    <B>phoudoin at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r33159%20-%20haiku/trunk/src/servers/midi&In-Reply-To=%3C200909172351.n8HNpPTK010831%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r33159 - haiku/trunk/src/servers/midi">phoudoin at mail.berlios.de
+       </A><BR>
+    <I>Fri Sep 18 01:51:25 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020656.html">[Haiku-commits] r33158 -	haiku/trunk/src/add-ons/kernel/drivers/network/attansic_l1/dev/age
+</A></li>
+        <LI>Next message: <A HREF="020659.html">[Haiku-commits] r33160 - in haiku/trunk: build/jam	src/add-ons/kernel/drivers/network/attansic_l1/dev/age
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20658">[ date ]</a>
+              <a href="thread.html#20658">[ thread ]</a>
+              <a href="subject.html#20658">[ subject ]</a>
+              <a href="author.html#20658">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: phoudoin
+Date: 2009-09-18 01:51:19 +0200 (Fri, 18 Sep 2009)
+New Revision: 33159
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=33159&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=33159&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/midi/DeviceWatcher.cpp
+   haiku/trunk/src/servers/midi/DeviceWatcher.h
+   haiku/trunk/src/servers/midi/Jamfile
+   haiku/trunk/src/servers/midi/PortDrivers.cpp
+   haiku/trunk/src/servers/midi/PortDrivers.h
+Log:
+ * Any status byte could now break SysEx sequence. We only  
+   swallow SysEx end byte (F7) when it's the expected one. 
+   Should fix #4445.
+ * Implement device remove handling.
+   Which should fix #4053.
+ 
+Please test it.
+
+
+
+Modified: haiku/trunk/src/servers/midi/DeviceWatcher.cpp
+===================================================================
+--- haiku/trunk/src/servers/midi/DeviceWatcher.cpp	2009-09-17 05:38:11 UTC (rev 33158)
++++ haiku/trunk/src/servers/midi/DeviceWatcher.cpp	2009-09-17 23:51:19 UTC (rev 33159)
+@@ -10,7 +10,6 @@
+ 
+ #include &quot;DeviceWatcher.h&quot;
+ #include &quot;PortDrivers.h&quot;
+-#include &quot;debug.h&quot;
+ 
+ #include &lt;Application.h&gt;
+ #include &lt;Bitmap.h&gt;
+@@ -20,15 +19,36 @@
+ #include &lt;Path.h&gt;
+ #include &lt;Resources.h&gt;
+ #include &lt;Roster.h&gt;
+-
+ #include &lt;PathMonitor.h&gt;
+ 
++#include &lt;new&gt;
++using std::nothrow;
++
+ using namespace BPrivate;
++using BPrivate::HashMap;
++using BPrivate::HashString;
+ 
++
+ const char *kDevicesRoot = &quot;/dev/midi&quot;;
+ 
++
++class DeviceEndpoints {
++public:
++	DeviceEndpoints(int fd, MidiPortConsumer* consumer, MidiPortProducer* producer)
++		:  fFD(fd), fConsumer(consumer), fProducer(producer)
++	{
++	}
++		
++	int 				fFD;
++	MidiPortConsumer*		fConsumer;
++	MidiPortProducer*		fProducer;
++};
++
++
++
+ DeviceWatcher::DeviceWatcher()
+-	: BLooper(&quot;MIDI devices watcher&quot;)
++	: BLooper(&quot;MIDI devices watcher&quot;),
++	fDeviceEndpointsMap()
+ {
+ 	// TODO: add support for vector icons
+ 	
+@@ -138,23 +158,29 @@
+ void
+ DeviceWatcher::_AddDevice(const char* path)
+ {
++	if ( fDeviceEndpointsMap.ContainsKey(path) )
++		// Already known
++		return;
++		
+ 	int fd = open(path, O_RDWR | O_EXCL);
+ 	if (fd &lt; 0)
+ 		return;
+ 		
+ 	// printf(&quot;DeviceWatcher::_AddDevice(\&quot;%s\&quot;);\n&quot;, path);
+-		
+-	BMidiEndpoint* endpoint;
+ 
+-	endpoint = new MidiPortConsumer(fd, path);
+-	_SetIcons(endpoint);
+-	printf(&quot;Register %s MidiPortConsumer\n&quot;, endpoint-&gt;Name());
+-	endpoint-&gt;Register();
++	
++	MidiPortConsumer* consumer = new MidiPortConsumer(fd, path);
++	_SetIcons(consumer);
++	// printf(&quot;Register %s MidiPortConsumer\n&quot;, consumer-&gt;Name());
++	consumer-&gt;Register();
+ 
+-	endpoint = new MidiPortProducer(fd, path);
+-	_SetIcons(endpoint);
+-	printf(&quot;Register %s MidiPortProducer\n&quot;, endpoint-&gt;Name());
+-	endpoint-&gt;Register();
++	MidiPortProducer* producer = new MidiPortProducer(fd, path);
++	_SetIcons(producer);
++	// printf(&quot;Register %s MidiPortProducer\n&quot;, producer-&gt;Name());
++	producer-&gt;Register();
++
++	DeviceEndpoints * deviceEndpoints = new DeviceEndpoints(fd, consumer, producer);
++	fDeviceEndpointsMap.Put(path, deviceEndpoints);	
+ }
+ 
+ 
+@@ -163,7 +189,19 @@
+ {
+ 	// printf(&quot;DeviceWatcher::_RemoveDevice(\&quot;%s\&quot;);\n&quot;, path);
+ 		
+-	// TODO: handle device removing
++	DeviceEndpoints * deviceEndpoints = fDeviceEndpointsMap.Get(path);
++	if (!deviceEndpoints)
++		return;
++		
++	close(deviceEndpoints-&gt;fFD);
++
++	deviceEndpoints-&gt;fConsumer-&gt;Unregister();
++	deviceEndpoints-&gt;fProducer-&gt;Unregister();
++
++	delete deviceEndpoints-&gt;fConsumer;
++	delete deviceEndpoints-&gt;fProducer;
++
++	fDeviceEndpointsMap.Remove(path);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/servers/midi/DeviceWatcher.h
+===================================================================
+--- haiku/trunk/src/servers/midi/DeviceWatcher.h	2009-09-17 05:38:11 UTC (rev 33158)
++++ haiku/trunk/src/servers/midi/DeviceWatcher.h	2009-09-17 23:51:19 UTC (rev 33159)
+@@ -12,9 +12,12 @@
+ 
+ #include &lt;Looper.h&gt;
+ 
++#include &quot;HashMap.h&quot;
++#include &quot;HashString.h&quot;
+ 
+ class BBitmap;
+ class BMidiEndpoint;
++class DeviceEndpoints;
+ 
+ class DeviceWatcher : public BLooper {
+ public:
+@@ -32,6 +35,9 @@
+ 	void _RemoveDevice(const char* path);
+ 	void _SetIcons(BMidiEndpoint* endp);
+ 
++	typedef HashMap&lt;HashString, DeviceEndpoints*&gt; DeviceEndpointsMap;
++	DeviceEndpointsMap		fDeviceEndpointsMap;
++
+ 	BBitmap* fLargeIcon;
+ 	BBitmap* fMiniIcon;
+ };
+
+Modified: haiku/trunk/src/servers/midi/Jamfile
+===================================================================
+--- haiku/trunk/src/servers/midi/Jamfile	2009-09-17 05:38:11 UTC (rev 33158)
++++ haiku/trunk/src/servers/midi/Jamfile	2009-09-17 23:51:19 UTC (rev 33159)
+@@ -2,7 +2,7 @@
+ 
+ SetSubDirSupportedPlatformsBeOSCompatible ;
+ 
+-UsePrivateHeaders midi storage ;
++UsePrivateHeaders midi shared storage ;
+ 
+ Server midi_server :
+ 	MidiServerApp.cpp 
+@@ -12,7 +12,7 @@
+ 	# storage
+ 	NodeMonitorHandler.cpp
+ 	
+-	: be midi2 $(TARGET_LIBSTDC++)
++	: be midi2 libshared.a $(TARGET_LIBSTDC++)
+ 	: midi_server.rdef
+ ;
+ 
+
+Modified: haiku/trunk/src/servers/midi/PortDrivers.cpp
+===================================================================
+--- haiku/trunk/src/servers/midi/PortDrivers.cpp	2009-09-17 05:38:11 UTC (rev 33158)
++++ haiku/trunk/src/servers/midi/PortDrivers.cpp	2009-09-17 23:51:19 UTC (rev 33159)
+@@ -1,85 +1,79 @@
+ /*
+- * Copyright (c) 2003-2004 Matthijs Hollemans
+- * Copyright (c) 2004 Christian Packmann
+- * Copyright (c) 2003 Jerome Leveque
++ * Copyright 2003-2009, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
+  *
+- * Permission is hereby granted, free of charge, to any person obtaining a 
+- * copy of this software and associated documentation files (the &quot;Software&quot;), 
+- * to deal in the Software without restriction, including without limitation 
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+- * and/or sell copies of the Software, and to permit persons to whom the 
+- * Software is furnished to do so, subject to the following conditions:
+- * 
+- * The above copyright notice and this permission notice shall be included in 
+- * all copies or substantial portions of the Software.
+- * 
+- * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+- * DEALINGS IN THE SOFTWARE.
++ * Authors:
++ *		Matthijs Hollemans
++ *		Christian Packmann
++ *		Jerome Leveque
++ *		Philippe Houdoin
+  */
+ 
++#include &quot;PortDrivers.h&quot;
++
++#include &lt;String.h&gt;
++
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+-#include &quot;PortDrivers.h&quot;
+ 
+-//------------------------------------------------------------------------------
+-
+-MidiPortConsumer::MidiPortConsumer(int fd_, const char* name = NULL)
++MidiPortConsumer::MidiPortConsumer(int fd, const char* name)
+ 	: BMidiLocalConsumer(name)
+ {
+-	fd = fd_;
++	fFileDescriptor = fd;
+ }
+ 
+-//------------------------------------------------------------------------------
+ 
+-void MidiPortConsumer::Data(
+-	uchar* data, size_t length, bool atomic, bigtime_t time)
++void 
++MidiPortConsumer::Data(uchar* data, size_t length, 
++	bool atomic, bigtime_t time)
+ {
+ 	snooze_until(time - Latency(), B_SYSTEM_TIMEBASE);
+ 
+-	if (write(fd, data, length) == -1)
+-	{
++	if (write(fFileDescriptor, data, length) == -1) {
+ 		perror(&quot;Error sending data to driver&quot;);
+ 	}
+ }
+ 
+-//------------------------------------------------------------------------------
+ 
+-MidiPortProducer::MidiPortProducer(int fd_, const char *name = NULL)
++// #pragma mark -
++
++
++MidiPortProducer::MidiPortProducer(int fd, const char *name)
+ 	: BMidiLocalProducer(name)
+ {
+-	fd = fd_;
+-	keepRunning = true;
++	fFileDescriptor = fd;
++	fKeepRunning = true;
+ 
+-	thread_id thread = spawn_thread(
+-		SpawnThread, &quot;MidiPortProducer&quot;, B_URGENT_PRIORITY, this);
++	BString tmp = name;
++	tmp &lt;&lt; &quot; reader&quot;;
++	
++	fReaderThread = spawn_thread(
++		_ReaderThread, tmp.String(), B_URGENT_PRIORITY, this);
+ 
+-	resume_thread(thread);
++	resume_thread(fReaderThread);
+ }
+ 
+-//------------------------------------------------------------------------------
+ 
+ MidiPortProducer::~MidiPortProducer()
+ {
+-	keepRunning = false;
++	fKeepRunning = false;
++	
++	status_t dummy;
++	wait_for_thread(fReaderThread, &amp;dummy);
+ }
+ 
+-//------------------------------------------------------------------------------
+ 
+-int32 MidiPortProducer::SpawnThread(void* data)
++int32 
++MidiPortProducer::_ReaderThread(void* data)
+ {
+ 	return ((MidiPortProducer*) data)-&gt;GetData();
+ }
+ 
+-//------------------------------------------------------------------------------
+ 
+-int32 MidiPortProducer::GetData()
++int32 
++MidiPortProducer::GetData()
+ {
+ 	uint8 msgBuf[3];
+ 	uint8* sysexBuf = NULL;
+@@ -95,9 +89,9 @@
+ 
+ 	uint8 next = 0;
+ 
+-	while (keepRunning)
++	while (fKeepRunning)
+ 	{
+-		if (read(fd, &amp;next, 1) != 1)
++		if (read(fFileDescriptor, &amp;next, 1) != 1)
+ 		{
+ 			perror(&quot;Error reading data from driver&quot;);
+ 			if (haveSysEx)
+@@ -114,14 +108,20 @@
+ 					sysexAlloc *= 2;
+ 					sysexBuf = (uint8*) realloc(sysexBuf, sysexAlloc);
+ 				}
+-			} else if (next == B_SYS_EX_END) {
+-				SpraySystemExclusive(sysexBuf, sysexSize);
+-				haveSysEx = false;
++				continue;
+ 			} else if ((next &amp; 0xF8) == 0xF8) {
+ 				// System Realtime interleaved in System Exclusive byte(s)
+ 				SpraySystemRealTime(next);
++				continue;
++			} else {  // whatever byte, this one ends the running SysEx sequence
++				SpraySystemExclusive(sysexBuf, sysexSize);
++				haveSysEx = false;
++				if (next == B_SYS_EX_END)
++					// swallow SysEx end byte
++					continue;	
++				// any other byte, while ending the SysEx sequence, 
++				// should be handled, not dropped
+ 			}
+-			continue;
+ 		}
+ 		
+ 		if ((next &amp; 0xF8) == 0xF8)  // System Realtime
+
+Modified: haiku/trunk/src/servers/midi/PortDrivers.h
+===================================================================
+--- haiku/trunk/src/servers/midi/PortDrivers.h	2009-09-17 05:38:11 UTC (rev 33158)
++++ haiku/trunk/src/servers/midi/PortDrivers.h	2009-09-17 23:51:19 UTC (rev 33159)
+@@ -1,56 +1,44 @@
+ /*
+- * Copyright (c) 2003 Matthijs Hollemans
+- * Copyright (c) 2003 Jerome Leveque
++ * Copyright 2003-2009, Haiku, Inc. All rights reserved.
++ * Distributed under the terms of the MIT License.
+  *
+- * Permission is hereby granted, free of charge, to any person obtaining a 
+- * copy of this software and associated documentation files (the &quot;Software&quot;), 
+- * to deal in the Software without restriction, including without limitation 
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense, 
+- * and/or sell copies of the Software, and to permit persons to whom the 
+- * Software is furnished to do so, subject to the following conditions:
+- * 
+- * The above copyright notice and this permission notice shall be included in 
+- * all copies or substantial portions of the Software.
+- * 
+- * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
+- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+- * DEALINGS IN THE SOFTWARE.
++ * Authors:
++ *		Matthijs Hollemans
++ *		Jerome Leveque
++ *		Philippe Houdoin
+  */
++#ifndef PORT_DRIVERS_H
++#define PORT_DRIVERS_H
+ 
+-#ifndef _PORT_DRIVERS_H
+-#define _PORT_DRIVERS_H
+-
+ #include &lt;MidiProducer.h&gt;
+ #include &lt;MidiConsumer.h&gt;
+ 
+ class MidiPortConsumer : public BMidiLocalConsumer
+ {
+ public:
+-	MidiPortConsumer(int fd, const char* name);
++	MidiPortConsumer(int fd, const char* path);
+ 
+-	virtual void Data(uchar* data, size_t length, bool atomic, bigtime_t time);
++	void 			Data(uchar* data, size_t length, bool atomic, bigtime_t time);
+ 
+ private:
+-	int fd;
++	int fFileDescriptor;
+ };
+ 
++
+ class MidiPortProducer : public BMidiLocalProducer
+ {
+ public:
+-	MidiPortProducer(int fd, const char* name);
++	MidiPortProducer(int fd, const char* path = NULL);
+ 	~MidiPortProducer(void);
+ 
+-	int32 GetData(void);
++	int32 			GetData(void);
+ 
+ private:
+-	static int32 SpawnThread(void* data);
++	static int32 	_ReaderThread(void* data);
+ 
+-	int fd;
+-	bool keepRunning;
++	int 			fFileDescriptor;
++	volatile bool 	fKeepRunning;
++	thread_id		fReaderThread;
+ };
+ 
+-#endif // _PORT_DRIVERS_H
++#endif // PORT_DRIVERS_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020656.html">[Haiku-commits] r33158 -	haiku/trunk/src/add-ons/kernel/drivers/network/attansic_l1/dev/age
+</A></li>
+	<LI>Next message: <A HREF="020659.html">[Haiku-commits] r33160 - in haiku/trunk: build/jam	src/add-ons/kernel/drivers/network/attansic_l1/dev/age
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20658">[ date ]</a>
+              <a href="thread.html#20658">[ thread ]</a>
+              <a href="subject.html#20658">[ subject ]</a>
+              <a href="author.html#20658">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

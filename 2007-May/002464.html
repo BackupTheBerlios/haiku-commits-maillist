@@ -1,0 +1,255 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21259 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21259%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200705281236.l4SCa35w004341%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002463.html">
+   <LINK REL="Next"  HREF="002465.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21259 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmu_man at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21259%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200705281236.l4SCa35w004341%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21259 - haiku/trunk/src/add-ons/kernel/busses/usb">mmu_man at mail.berlios.de
+       </A><BR>
+    <I>Mon May 28 14:36:03 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002463.html">[Haiku-commits] r21258 - haiku/trunk/docs/user/support
+</A></li>
+        <LI>Next message: <A HREF="002465.html">[Haiku-commits] r21260 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2464">[ date ]</a>
+              <a href="thread.html#2464">[ thread ]</a>
+              <a href="subject.html#2464">[ subject ]</a>
+              <a href="author.html#2464">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmu_man
+Date: 2007-05-28 14:36:02 +0200 (Mon, 28 May 2007)
+New Revision: 21259
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21259&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21259&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci_hardware.h
+Log:
+Patch by Salvatore Benedetto:
+Code readability; portability fixes.
+Added unimplemented SubmitIsochronous().
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2007-05-28 12:18:49 UTC (rev 21258)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2007-05-28 12:36:02 UTC (rev 21259)
+@@ -367,6 +367,7 @@
+ 	// 1: low speed control transfers
+ 	// 2: full speed control transfers
+ 	// 3: bulk transfers
++	// TODO: 4: bandwidth reclamation queue
+ 	fQueueCount = 4;
+ 	fQueues = new(std::nothrow) Queue *[fQueueCount];
+ 	if (!fQueues) {
+@@ -389,9 +390,15 @@
+ 	// Make sure the last queue terminates
+ 	fQueues[fQueueCount - 1]-&gt;TerminateByStrayDescriptor();
+ 
+-	for (int32 i = 0; i &lt; 1024; i++)
+-		fFrameList[i] = fQueues[0]-&gt;PhysicalAddress() | FRAMELIST_NEXT_IS_QH;
++	// Create the array that will keep bandwidth information
++	fFrameBandwidth = new(std::nothrow) int32[NUMBER_OF_FRAMES];
+ 
++	for (int32 i = 0; i &lt; NUMBER_OF_FRAMES; i++) {
++		fFrameList[i] =	fQueues[UHCI_INTERRUPT_QUEUE]-&gt;PhysicalAddress()
++			| FRAMELIST_NEXT_IS_QH;
++		fFrameBandwidth[i] = MAX_AVAILABLE_BANDWIDTH;
++	}
++
+ 	// create semaphore the finisher thread will wait for
+ 	fFinishTransfersSem = create_sem(0, &quot;UHCI Finish Transfers&quot;);
+ 	if (fFinishTransfersSem &lt; B_OK) {
+@@ -437,6 +444,7 @@
+ 		delete fQueues[i];
+ 
+ 	delete [] fQueues;
++	delete [] fFrameBandwidth;
+ 	delete fRootHub;
+ 	delete_area(fFrameArea);
+ 
+@@ -506,6 +514,10 @@
+ 	if (transfer-&gt;TransferPipe()-&gt;Type() &amp; USB_OBJECT_CONTROL_PIPE)
+ 		return SubmitRequest(transfer);
+ 
++	// Process isochronous transfers
++	if (transfer-&gt;TransferPipe()-&gt;Type() &amp; USB_OBJECT_ISO_PIPE)
++		return SubmitIsochronous(transfer);
++
+ 	uhci_td *firstDescriptor = NULL;
+ 	uhci_qh *transferQueue = NULL;
+ 	status_t result = CreateFilledTransfer(transfer, &amp;firstDescriptor,
+@@ -516,11 +528,9 @@
+ 	Queue *queue = NULL;
+ 	Pipe *pipe = transfer-&gt;TransferPipe();
+ 	if (pipe-&gt;Type() &amp; USB_OBJECT_INTERRUPT_PIPE) {
+-		// use interrupt queue
+-		queue = fQueues[0];
++		queue = fQueues[UHCI_INTERRUPT_QUEUE];
+ 	} else {
+-		// use bulk queue
+-		queue = fQueues[3];
++		queue = fQueues[UHCI_BULK_QUEUE];
+ 	}
+ 
+ 	bool directionIn = (pipe-&gt;Direction() == Pipe::In);
+@@ -634,11 +644,9 @@
+ 
+ 	Queue *queue = NULL;
+ 	if (pipe-&gt;Speed() == USB_SPEED_LOWSPEED) {
+-		// use the low speed control queue
+-		queue = fQueues[1];
++		queue = fQueues[UHCI_LOW_SPEED_CONTROL_QUEUE];
+ 	} else {
+-		// use the full speed control queue
+-		queue = fQueues[2];
++		queue = fQueues[UHCI_FULL_SPEED_CONTROL_QUEUE];
+ 	}
+ 
+ 	uhci_qh *transferQueue = CreateTransferQueue(setupDescriptor);
+@@ -697,6 +705,26 @@
+ }
+ 
+ 
++status_t
++UHCI::SubmitIsochronous(Transfer *transfer)
++{
++	/*
++	 * This is the main isochronous method.
++	 * Here we attach one Transfer Descriptor (TD) per frame by starting
++	 * at the position specified by StartingFrameNumber. If there is
++	 * not enought bandwidth at that entry number, we find the next
++	 * available one.
++	 * The TD is obviously appended to the latest existing isochronous
++	 * TD (if any) in that frame.
++	 * Everytime a TD is added, fFrameBandiwidth[i] is decremented by
++	 * the TD bandwidth, while it is incremented once the TD has been
++	 * processed by the controller
++	 */
++
++	return B_ERROR;
++}
++
++
+ int32
+ UHCI::FinishThread(void *data)
+ {
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2007-05-28 12:18:49 UTC (rev 21258)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2007-05-28 12:36:02 UTC (rev 21259)
+@@ -14,6 +14,12 @@
+ #include &quot;uhci_hardware.h&quot;
+ #include &lt;lock.h&gt;
+ 
++#define UHCI_INTERRUPT_QUEUE				0
++#define UHCI_LOW_SPEED_CONTROL_QUEUE		1
++#define UHCI_FULL_SPEED_CONTROL_QUEUE		2
++#define UHCI_BULK_QUEUE						3
++#define UHCI_BANDWIDTH_RECLAMATION_QUEUE	4
++
+ struct pci_info;
+ struct pci_module_info;
+ class UHCIRootHub;
+@@ -70,6 +76,7 @@
+ virtual	status_t					SubmitTransfer(Transfer *transfer);
+ virtual status_t					CancelQueuedTransfers(Pipe *pipe);
+ 		status_t					SubmitRequest(Transfer *transfer);
++		status_t					SubmitIsochronous(Transfer *transfer);
+ 
+ static	status_t					AddTo(Stack *stack);
+ 
+@@ -149,6 +156,10 @@
+ 		area_id						fFrameArea;
+ 		addr_t						*fFrameList;
+ 
++		// fFrameBandwidth[n] holds the available bandwidth 
++		// of the nth frame in microseconds
++		int32						*fFrameBandwidth;
++
+ 		// Queues
+ 		int32						fQueueCount;
+ 		Queue						**fQueues;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci_hardware.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci_hardware.h	2007-05-28 12:18:49 UTC (rev 21258)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci_hardware.h	2007-05-28 12:36:02 UTC (rev 21259)
+@@ -79,15 +79,18 @@
+ #define FRAMELIST_TERMINATE    0x1
+ #define FRAMELIST_NEXT_IS_QH   0x2
+ 
++// Number of frames
++#define NUMBER_OF_FRAMES		1024
++#define MAX_AVAILABLE_BANDWIDTH	900	// Microseconds
+ 
+ // Represents a Transfer Descriptor (TD)
+ typedef struct
+ {
+ 	// Hardware part
+-	addr_t	link_phy;		// Link to the next TD/QH
++	uint32	link_phy;		// Link to the next TD/QH
+ 	uint32	status;			// Status field
+ 	uint32	token;			// Contains the packet header (where it needs to be sent)
+-	void	*buffer_phy;	// A pointer to the buffer with the actual packet
++	uint32	buffer_phy;		// A pointer to the buffer with the actual packet
+ 	// Software part
+ 	addr_t	this_phy;		// A physical pointer to this address
+ 	void	*link_log;		// Pointer to the next logical TD/QT
+@@ -139,8 +142,8 @@
+ typedef struct
+ {
+ 	// Hardware part
+-	addr_t	link_phy;		// Link to the next TD/QH
+-	addr_t	element_phy;	// Pointer to the first element in the queue
++	uint32	link_phy;		// Link to the next TD/QH
++	uint32	element_phy;	// Pointer to the first element in the queue
+ 	// Software part
+ 	addr_t	this_phy;		// The physical pointer to this address
+ 	void	*link_log;		// Pointer to the next logical TD/QH
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002463.html">[Haiku-commits] r21258 - haiku/trunk/docs/user/support
+</A></li>
+	<LI>Next message: <A HREF="002465.html">[Haiku-commits] r21260 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2464">[ date ]</a>
+              <a href="thread.html#2464">[ thread ]</a>
+              <a href="subject.html#2464">[ subject ]</a>
+              <a href="author.html#2464">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

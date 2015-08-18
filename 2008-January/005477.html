@@ -1,0 +1,1079 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23511 - haiku/trunk/src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23511%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200801140950.m0E9oXDc003104%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005474.html">
+   <LINK REL="Next"  HREF="005478.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23511 - haiku/trunk/src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23511%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200801140950.m0E9oXDc003104%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23511 - haiku/trunk/src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Jan 14 10:50:33 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005474.html">[Haiku-commits] r23510 - haiku/trunk/src/apps/codycam
+</A></li>
+        <LI>Next message: <A HREF="005478.html">[Haiku-commits] r23512 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5477">[ date ]</a>
+              <a href="thread.html#5477">[ thread ]</a>
+              <a href="subject.html#5477">[ subject ]</a>
+              <a href="author.html#5477">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-01-14 10:50:32 +0100 (Mon, 14 Jan 2008)
+New Revision: 23511
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23511&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23511&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/debug/debug.cpp
+Removed:
+   haiku/trunk/src/system/kernel/debug/debug.c
+Modified:
+   haiku/trunk/src/system/kernel/debug/Jamfile
+   haiku/trunk/src/system/kernel/debug/gdb.h
+Log:
+debug.c -&gt; debug.cpp
+
+
+Modified: haiku/trunk/src/system/kernel/debug/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/Jamfile	2008-01-14 02:04:42 UTC (rev 23510)
++++ haiku/trunk/src/system/kernel/debug/Jamfile	2008-01-14 09:50:32 UTC (rev 23511)
+@@ -4,7 +4,7 @@
+ 
+ KernelMergeObject kernel_debug.o :
+ 	blue_screen.cpp
+-	debug.c
++	debug.cpp
+ 	frame_buffer_console.cpp
+ 	gdb.c
+ 	tracing.cpp
+
+Deleted: haiku/trunk/src/system/kernel/debug/debug.c
+
+Copied: haiku/trunk/src/system/kernel/debug/debug.cpp (from rev 23510, haiku/trunk/src/system/kernel/debug/debug.c)
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/debug.c	2008-01-14 02:04:42 UTC (rev 23510)
++++ haiku/trunk/src/system/kernel/debug/debug.cpp	2008-01-14 09:50:32 UTC (rev 23511)
+@@ -0,0 +1,1134 @@
++/*
++ * Copyright 2002-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
++ * Distributed under the terms of the MIT License.
++ *
++ * Copyright 2001, Travis Geiselbrecht. All rights reserved.
++ * Distributed under the terms of the NewOS License.
++ */
++
++/*! This file contains the debugger and debug output facilities */
++
++#include &quot;blue_screen.h&quot;
++#include &quot;gdb.h&quot;
++
++#include &lt;debug.h&gt;
++#include &lt;driver_settings.h&gt;
++#include &lt;frame_buffer_console.h&gt;
++#include &lt;int.h&gt;
++#include &lt;kernel.h&gt;
++#include &lt;smp.h&gt;
++#include &lt;thread.h&gt;
++#include &lt;tracing.h&gt;
++#include &lt;vm.h&gt;
++
++#include &lt;arch/debug_console.h&gt;
++#include &lt;arch/debug.h&gt;
++#include &lt;util/ring_buffer.h&gt;
++
++#include &lt;syslog_daemon.h&gt;
++
++#include &lt;ctype.h&gt;
++#include &lt;setjmp.h&gt;
++#include &lt;stdarg.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;syslog.h&gt;
++
++
++int kgets(char *buffer, int length);
++
++typedef struct debugger_command {
++	struct debugger_command *next;
++	int (*func)(int, char **);
++	const char *name;
++	const char *description;
++} debugger_command;
++
++int dbg_register_file[B_MAX_CPU_COUNT][14];
++	/* XXXmpetit -- must be made generic */
++
++static bool sSerialDebugEnabled = true;
++static bool sSyslogOutputEnabled = true;
++static bool sBlueScreenEnabled = false;
++	// must always be false on startup
++static bool sDebugScreenEnabled = false;
++static bool sBlueScreenOutput = true;
++static spinlock sSpinlock = 0;
++static int32 sDebuggerOnCPU = -1;
++
++static sem_id sSyslogNotify = -1;
++static struct syslog_message *sSyslogMessage;
++static struct ring_buffer *sSyslogBuffer;
++static bool sSyslogDropped = false;
++
++static struct debugger_command *sCommands;
++
++static jmp_buf sInvokeCommandEnv;
++static bool sInvokeCommandDirectly = false;
++
++#define SYSLOG_BUFFER_SIZE 65536
++#define OUTPUT_BUFFER_SIZE 1024
++static char sOutputBuffer[OUTPUT_BUFFER_SIZE];
++static char sLastOutputBuffer[OUTPUT_BUFFER_SIZE];
++
++static void flush_pending_repeats(void);
++static void check_pending_repeats(void *data, int iter);
++
++static int64 sMessageRepeatFirstTime = 0;
++static int64 sMessageRepeatLastTime = 0;
++static int32 sMessageRepeatCount = 0;
++
++#define LINE_BUFFER_SIZE 1024
++#define MAX_ARGS 16
++#define HISTORY_SIZE 16
++
++static char sLineBuffer[HISTORY_SIZE][LINE_BUFFER_SIZE] = { &quot;&quot;, };
++static char sParseLine[LINE_BUFFER_SIZE];
++static int32 sCurrentLine = 0;
++static char *sArguments[MAX_ARGS] = { NULL, };
++
++#define distance(a, b) ((a) &lt; (b) ? (b) - (a) : (a) - (b))
++
++
++static debugger_command *
++find_command(char *name, bool partialMatch)
++{
++	debugger_command *command;
++	int length;
++
++	// search command by full name
++
++	for (command = sCommands; command != NULL; command = command-&gt;next) {
++		if (strcmp(name, command-&gt;name) == 0)
++			return command;
++	}
++
++	// if it couldn't be found, search for a partial match
++
++	if (partialMatch) {
++		length = strlen(name);
++		if (length == 0)
++			return NULL;
++
++		for (command = sCommands; command != NULL; command = command-&gt;next) {
++			if (strncmp(name, command-&gt;name, length) == 0)
++				return command;
++		}
++	}
++
++	return NULL;
++}
++
++
++static void
++kputchar(char c)
++{
++	if (sSerialDebugEnabled)
++		arch_debug_serial_putchar(c);
++	if (sBlueScreenEnabled || sDebugScreenEnabled)
++		blue_screen_putchar(c);
++}
++
++
++static void
++kputs(const char *s)
++{
++	if (sSerialDebugEnabled)
++		arch_debug_serial_puts(s);
++	if (sBlueScreenEnabled || sDebugScreenEnabled)
++		blue_screen_puts(s);
++}
++
++
++static int
++read_line(char *buffer, int32 maxLength)
++{
++	int32 currentHistoryLine = sCurrentLine;
++	int32 position = 0;
++	bool done = false;
++	char c;
++
++	char (*readChar)(void);
++	if (sBlueScreenOutput)
++		readChar = blue_screen_getchar;
++	else
++		readChar = arch_debug_serial_getchar;
++
++	while (!done) {
++		c = readChar();
++
++		switch (c) {
++			case '\n':
++			case '\r':
++				buffer[position++] = '\0';
++				kputchar('\n');
++				done = true;
++				break;
++			case 8: // backspace
++				if (position &gt; 0) {
++					kputs(&quot;\x1b[1D&quot;); // move to the left one
++					kputchar(' ');
++					kputs(&quot;\x1b[1D&quot;); // move to the left one
++					position--;
++				}
++				break;
++			case 27: // escape sequence
++				c = readChar();
++				if (c != '[') {
++					// ignore broken escape sequence
++					break;
++				}
++				c = readChar();
++				switch (c) {
++					case 'C': // right arrow acts like space
++						buffer[position++] = ' ';
++						kputchar(' ');
++						break;
++					case 'D': // left arrow acts like backspace
++						if (position &gt; 0) {
++							kputs(&quot;\x1b[1D&quot;); // move to the left one
++							kputchar(' ');
++							kputs(&quot;\x1b[1D&quot;); // move to the left one
++							position--;
++						}
++						break;
++					case 'A': // up arrow
++					case 'B': // down arrow
++					{
++						int32 historyLine = 0;
++
++						if (c == 65) {
++							// up arrow
++							historyLine = currentHistoryLine - 1;
++							if (historyLine &lt; 0)
++								historyLine = HISTORY_SIZE - 1;
++						} else {
++							// down arrow
++							if (currentHistoryLine == sCurrentLine)
++								break;
++
++							historyLine = currentHistoryLine + 1;
++							if (historyLine &gt;= HISTORY_SIZE)
++								historyLine = 0;
++						}
++
++						// clear the history again if we're in the current line again
++						// (the buffer we get just is the current line buffer)
++						if (historyLine == sCurrentLine)
++							sLineBuffer[historyLine][0] = '\0';
++
++						// swap the current line with something from the history
++						if (position &gt; 0)
++							kprintf(&quot;\x1b[%ldD&quot;, position); // move to beginning of line
++
++						strcpy(buffer, sLineBuffer[historyLine]);
++						position = strlen(buffer);
++						kprintf(&quot;%s\x1b[K&quot;, buffer); // print the line and clear the rest
++						currentHistoryLine = historyLine;
++						break;
++					}
++					default:
++						break;
++				}
++				break;
++			case '$':
++			case '+':
++				if (!sBlueScreenOutput) {
++					/* HACK ALERT!!!
++					 *
++					 * If we get a $ at the beginning of the line
++					 * we assume we are talking with GDB
++					 */
++					if (position == 0) {
++						strcpy(buffer, &quot;gdb&quot;);
++						position = 4;
++						done = true;
++						break;
++					} 
++				}
++				/* supposed to fall through */
++			default:
++				if (isprint(c)) {
++					buffer[position++] = c;
++					kputchar(c);
++				}
++				break;
++		}
++
++		if (position &gt;= maxLength - 2) {
++			buffer[position++] = '\0';
++			kputchar('\n');
++			done = true;
++			break;
++		}
++	}
++
++	return position;
++}
++
++
++int
++kgets(char *buffer, int length)
++{
++	return read_line(buffer, length);
++}
++
++
++static int
++parse_line(const char *buffer, char **argv, int *_argc, int32 maxArgs)
++{
++	char *string = sParseLine;
++	int32 index = 0;
++
++	strcpy(string, buffer);
++
++	for (; index &lt; maxArgs &amp;&amp; string[0]; index++) {
++		char quoted;
++		char c;
++
++		// skip white space
++		while ((c = string[0]) != '\0' &amp;&amp; isspace(c)) {
++			string++;
++		}
++		if (!c)
++			break;
++
++		if (c == '\'' || c == '&quot;') {
++			argv[index] = ++string;
++			quoted = c;
++		} else {
++			argv[index] = string;
++			quoted = 0;
++		}
++
++		// find end of string
++
++		while (string[0]
++			&amp;&amp; ((quoted &amp;&amp; string[0] != quoted)
++				|| (!quoted &amp;&amp; !isspace(string[0])))) {
++			if (string[0] == '\\') {
++				// filter out backslashes
++				strcpy(string, string + 1);
++				string++;
++			}
++			string++;
++		}
++
++		if (string[0]) {
++			// terminate string
++			string[0] = '\0';
++			string++;
++		}
++    }
++
++	return *_argc = index;
++}
++
++
++/*!	This function is a safe gate through which debugger commands are invoked.
++	It sets a fault handler before invoking the command, so that an invalid
++	memory access will not result in another KDL session on top of this one
++	(and &quot;cont&quot; not to work anymore). We use setjmp() + longjmp() to &quot;unwind&quot;
++	the stack after catching a fault.
++ */
++static int
++invoke_command(struct debugger_command *command, int argc, char** argv)
++{
++	struct thread* thread = thread_get_current_thread();
++	addr_t oldFaultHandler = thread-&gt;fault_handler;
++
++	// replace argv[0] with the actual command name
++	argv[0] = (char *)command-&gt;name;
++
++	// Invoking the command directly might be useful when debugging debugger
++	// commands.
++	if (sInvokeCommandDirectly)
++		return command-&gt;func(argc, argv);
++
++	if (setjmp(sInvokeCommandEnv) == 0) {
++		int result;
++		thread-&gt;fault_handler = (addr_t)&amp;&error;
++		// Fake goto to trick the compiler not to optimize the code at the label
++		// away.
++		if (!thread)
++			goto error;
++
++		result = command-&gt;func(argc, argv);
++		thread-&gt;fault_handler = oldFaultHandler;
++		return result;
++
++error:
++		longjmp(sInvokeCommandEnv, 1);
++			// jump into the else branch
++	} else {
++		kprintf(&quot;\n[*** READ/WRITE FAULT ***]\n&quot;);
++	}
++
++	thread-&gt;fault_handler = oldFaultHandler;
++	return 0;
++}
++
++
++static void
++kernel_debugger_loop(void)
++{
++	int32 previousCPU = sDebuggerOnCPU;
++	sDebuggerOnCPU = smp_get_current_cpu();
++
++	kprintf(&quot;Welcome to Kernel Debugging Land...\n&quot;);
++	kprintf(&quot;Running on CPU %ld\n&quot;, sDebuggerOnCPU);
++
++	for (;;) {
++		struct debugger_command *cmd = NULL;
++		int argc;
++
++		kprintf(&quot;kdebug&gt; &quot;);
++		read_line(sLineBuffer[sCurrentLine], LINE_BUFFER_SIZE);
++		parse_line(sLineBuffer[sCurrentLine], sArguments, &amp;argc, MAX_ARGS);
++
++		// We support calling last executed command again if
++		// B_KDEDUG_CONT was returned last time, so cmd != NULL
++		if (argc &lt;= 0 &amp;&amp; cmd == NULL)
++			continue;
++
++		sDebuggerOnCPU = smp_get_current_cpu();
++
++		if (argc &gt; 0)
++			cmd = find_command(sArguments[0], true);
++
++		if (cmd == NULL)
++			kprintf(&quot;unknown command, enter \&quot;help\&quot; to get a list of all supported commands\n&quot;);
++		else {
++			int rc = invoke_command(cmd, argc, sArguments);
++
++			if (rc == B_KDEBUG_QUIT)
++				break;	// okay, exit now.
++
++			if (rc != B_KDEBUG_CONT)
++				cmd = NULL;		// forget last command executed...
++		}
++
++		if (++sCurrentLine &gt;= HISTORY_SIZE)
++			sCurrentLine = 0;
++	}
++
++	sDebuggerOnCPU = previousCPU;
++}
++
++
++static int
++cmd_reboot(int argc, char **argv)
++{
++	arch_cpu_shutdown(true);
++	return 0;
++		// I'll be really suprised if this line ever runs! ;-)
++}
++
++
++static int
++cmd_shutdown(int argc, char **argv)
++{
++	arch_cpu_shutdown(false);
++	return 0;
++}
++
++
++static int
++cmd_help(int argc, char **argv)
++{
++	debugger_command *command, *specified = NULL;
++	const char *start = NULL;
++	int32 startLength = 0;
++
++	if (argc &gt; 1) {
++		specified = find_command(argv[1], false);
++		if (specified == NULL) {
++			start = argv[1];
++			startLength = strlen(start);
++		}
++	}
++
++	if (specified != NULL) {
++		// only print out the help of the specified command (and all of its aliases)
++		kprintf(&quot;debugger command for \&quot;%s\&quot; and aliases:\n&quot;, specified-&gt;name);
++	} else if (start != NULL)
++		kprintf(&quot;debugger commands starting with \&quot;%s\&quot;:\n&quot;, start);
++	else
++		kprintf(&quot;debugger commands:\n&quot;);
++
++	for (command = sCommands; command != NULL; command = command-&gt;next) {
++		if (specified &amp;&amp; command-&gt;func != specified-&gt;func)
++			continue;
++		if (start != NULL &amp;&amp; strncmp(start, command-&gt;name, startLength))
++			continue;
++
++		kprintf(&quot; %-20s\t\t%s\n&quot;, command-&gt;name, command-&gt;description ? command-&gt;description : &quot;-&quot;);
++	}
++
++	return 0;
++}
++
++
++static int
++cmd_continue(int argc, char **argv)
++{
++	return B_KDEBUG_QUIT;
++}
++
++
++static status_t
++syslog_sender(void *data)
++{
++	status_t error = B_BAD_PORT_ID;
++	port_id port = -1;
++	bool bufferPending = false;
++	int32 length = 0;
++
++	while (true) {
++		// wait for syslog data to become available
++		acquire_sem(sSyslogNotify);
++
++		sSyslogMessage-&gt;when = real_time_clock();
++
++		if (error == B_BAD_PORT_ID) {
++			// last message couldn't be sent, try to locate the syslog_daemon
++			port = find_port(SYSLOG_PORT_NAME);
++		}
++
++		if (port &gt;= B_OK) {
++			if (!bufferPending) {
++				// we need to have exclusive access to our syslog buffer
++				cpu_status state = disable_interrupts();
++				acquire_spinlock(&amp;sSpinlock);
++
++				length = ring_buffer_readable(sSyslogBuffer);
++				if (length &gt; (int32)SYSLOG_MAX_MESSAGE_LENGTH)
++					length = SYSLOG_MAX_MESSAGE_LENGTH;
++
++				length = ring_buffer_read(sSyslogBuffer,
++					(uint8 *)sSyslogMessage-&gt;message, length);
++				if (sSyslogDropped) {
++					// add drop marker
++					if (length &lt; (int32)SYSLOG_MAX_MESSAGE_LENGTH - 6)
++						strlcat(sSyslogMessage-&gt;message, &quot;&lt;DROP&gt;&quot;, SYSLOG_MAX_MESSAGE_LENGTH);
++					else if (length &gt; 7)
++						strcpy(sSyslogMessage-&gt;message + length - 7, &quot;&lt;DROP&gt;&quot;);
++
++					sSyslogDropped = false;
++				}
++
++				release_spinlock(&amp;sSpinlock);
++				restore_interrupts(state);
++			}
++
++			if (length == 0) {
++				// the buffer we came here for might have been sent already
++				bufferPending = false;
++				continue;
++			}
++
++			error = write_port_etc(port, SYSLOG_MESSAGE, sSyslogMessage,
++				sizeof(struct syslog_message) + length, B_RELATIVE_TIMEOUT, 0);
++
++			if (error &lt; B_OK) {
++				// sending has failed - just wait, maybe it'll work later.
++				bufferPending = true;
++				continue;
++			}
++
++			if (bufferPending) {
++				// we could write the last pending buffer, try to read more
++				// from the syslog ring buffer
++				release_sem_etc(sSyslogNotify, 1, B_DO_NOT_RESCHEDULE);
++				bufferPending = false;
++			}
++		}
++	}
++
++	return 0;
++}
++
++
++static void
++syslog_write(const char *text, int32 length)
++{
++	bool trunc = false;
++
++	if (sSyslogBuffer == NULL)
++		return;
++
++	if ((int32)ring_buffer_writable(sSyslogBuffer) &lt; length) {
++		// truncate data
++		length = ring_buffer_writable(sSyslogBuffer);
++
++		if (length &gt; 8) {
++			trunc = true;
++			length -= 8;
++		} else
++			sSyslogDropped = true;
++	}
++
++	ring_buffer_write(sSyslogBuffer, (uint8 *)text, length);
++	if (trunc)
++		ring_buffer_write(sSyslogBuffer, (uint8 *)&quot;&lt;TRUNC&gt;&quot;, 7);
++
++	release_sem_etc(sSyslogNotify, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
++static status_t
++syslog_init_post_threads(void)
++{
++	if (!sSyslogOutputEnabled)
++		return B_OK;
++
++	sSyslogNotify = create_sem(0, &quot;syslog data&quot;);
++	if (sSyslogNotify &gt;= B_OK) {
++		thread_id thread = spawn_kernel_thread(syslog_sender, &quot;syslog sender&quot;,
++			B_LOW_PRIORITY, NULL);
++		if (thread &gt;= B_OK &amp;&amp; resume_thread(thread) == B_OK)
++			return B_OK;
++	}
++
++	// initializing kernel syslog service failed -- disable it
++
++	sSyslogOutputEnabled = false;
++	free(sSyslogMessage);
++	free(sSyslogBuffer);
++	delete_sem(sSyslogNotify);
++
++	return B_ERROR;
++}
++
++
++static status_t
++syslog_init(struct kernel_args *args)
++{
++	status_t status;
++
++	if (!sSyslogOutputEnabled)
++		return B_OK;
++
++	sSyslogMessage = (syslog_message*)malloc(SYSLOG_MESSAGE_BUFFER_SIZE);
++	if (sSyslogMessage == NULL) {
++		status = B_NO_MEMORY;
++		goto err1;
++	}
++
++	sSyslogBuffer = create_ring_buffer(SYSLOG_BUFFER_SIZE);
++	if (sSyslogBuffer == NULL) {
++		status = B_NO_MEMORY;
++		goto err2;
++	}
++
++	// initialize syslog message
++	sSyslogMessage-&gt;from = 0;
++	sSyslogMessage-&gt;options = LOG_KERN;
++	sSyslogMessage-&gt;priority = LOG_DEBUG;
++	sSyslogMessage-&gt;ident[0] = '\0';
++	//strcpy(sSyslogMessage-&gt;ident, &quot;KERNEL&quot;);
++
++	if (args-&gt;debug_output != NULL)
++		syslog_write((const char*)args-&gt;debug_output, args-&gt;debug_size);
++
++	return B_OK;
++
++err3:
++	free(sSyslogBuffer);
++err2:
++	free(sSyslogMessage);
++err1:
++	sSyslogOutputEnabled = false;
++	return status;
++}
++
++
++//	#pragma mark - private kernel API
++
++
++void
++debug_stop_screen_debug_output(void)
++{
++	sDebugScreenEnabled = false;
++}
++
++
++bool
++debug_debugger_running(void)
++{
++	return sDebuggerOnCPU != -1;
++}
++
++
++void
++debug_puts(const char *string, int32 length)
++{
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&amp;sSpinlock);
++
++	if (length &gt;= OUTPUT_BUFFER_SIZE)
++		length = OUTPUT_BUFFER_SIZE - 1;
++
++	if (length &gt; 1 &amp;&amp; string[length - 1] == '\n'
++		&amp;&amp; strncmp(string, sLastOutputBuffer, length) == 0) {
++		sMessageRepeatCount++;
++		sMessageRepeatLastTime = system_time();
++		if (sMessageRepeatFirstTime == 0)
++			sMessageRepeatFirstTime = sMessageRepeatLastTime;
++	} else {
++		flush_pending_repeats();
++		kputs(string);
++
++		// kputs() doesn't output to syslog (as it's only used
++		// from the kernel debugger elsewhere)
++		if (sSyslogOutputEnabled)
++			syslog_write(string, length);
++
++		memcpy(sLastOutputBuffer, string, length);
++		sLastOutputBuffer[length] = 0;
++	}
++
++	release_spinlock(&amp;sSpinlock);
++	restore_interrupts(state);
++}
++
++
++void
++debug_early_boot_message(const char *string)
++{
++	arch_debug_serial_early_boot_message(string);
++}
++
++
++status_t
++debug_init(kernel_args *args)
++{
++	return arch_debug_console_init(args);
++}
++
++
++status_t
++debug_init_post_vm(kernel_args *args)
++{
++	void *handle;
++
++	add_debugger_command(&quot;help&quot;, &amp;cmd_help, &quot;List all debugger commands&quot;);
++	add_debugger_command(&quot;reboot&quot;, &amp;cmd_reboot, &quot;Reboot the system&quot;);
++	add_debugger_command(&quot;shutdown&quot;, &amp;cmd_shutdown, &quot;Shut down the system&quot;);
++	add_debugger_command(&quot;gdb&quot;, &amp;cmd_gdb, &quot;Connect to remote gdb&quot;);
++	add_debugger_command(&quot;exit&quot;, &amp;cmd_continue, &quot;Same as \&quot;continue\&quot;&quot;);
++	add_debugger_command(&quot;es&quot;, &amp;cmd_continue, &quot;Same as \&quot;continue\&quot;&quot;);
++	add_debugger_command(&quot;continue&quot;, &amp;cmd_continue, &quot;Leave kernel debugger&quot;);
++
++	frame_buffer_console_init(args);
++	arch_debug_console_init_settings(args);
++	tracing_init();
++
++	// get debug settings
++	handle = load_driver_settings(&quot;kernel&quot;);
++	if (handle != NULL) {
++		sSerialDebugEnabled = get_driver_boolean_parameter(handle,
++			&quot;serial_debug_output&quot;, sSerialDebugEnabled, sSerialDebugEnabled);
++		sSyslogOutputEnabled = get_driver_boolean_parameter(handle,
++			&quot;syslog_debug_output&quot;, sSyslogOutputEnabled, sSyslogOutputEnabled);
++		sBlueScreenOutput = get_driver_boolean_parameter(handle,
++			&quot;bluescreen&quot;, true, true);
++
++		unload_driver_settings(handle);
++	}
++
++	handle = load_driver_settings(B_SAFEMODE_DRIVER_SETTINGS);
++	if (handle != NULL) {
++		sDebugScreenEnabled = get_driver_boolean_parameter(handle,
++			&quot;debug_screen&quot;, false, false);
++
++		unload_driver_settings(handle);
++	}
++
++	if ((sBlueScreenOutput || sDebugScreenEnabled)
++		&amp;&amp; blue_screen_init() != B_OK)
++		sBlueScreenOutput = sDebugScreenEnabled = false;
++
++	if (sDebugScreenEnabled)
++		blue_screen_enter(true);
++
++	syslog_init(args);
++
++	return arch_debug_init(args);
++}
++
++
++status_t
++debug_init_post_modules(struct kernel_args *args)
++{
++	void *cookie;
++
++	// check for dupped lines every 10/10 second
++	register_kernel_daemon(check_pending_repeats, NULL, 10);
++
++	syslog_init_post_threads();
++
++	// load kernel debugger addons
++	cookie = open_module_list(&quot;debugger&quot;);
++	while (true) {
++		char name[B_FILE_NAME_LENGTH];
++		size_t nameLength = sizeof(name);
++		module_info *module;
++
++		if (read_next_module_name(cookie, name, &amp;nameLength) != B_OK)
++			break;
++		if (get_module(name, &amp;module) == B_OK)
++			dprintf(&quot;kernel debugger extention \&quot;%s\&quot;: loaded\n&quot;, name);
++		else
++			dprintf(&quot;kernel debugger extention \&quot;%s\&quot;: failed to load\n&quot;, name);
++	}
++	close_module_list(cookie);
++
++	return frame_buffer_console_init_post_modules(args);
++}
++
++
++//	#pragma mark - public API
++
++
++int
++add_debugger_command(char *name, int (*func)(int, char **), char *desc)
++{
++	cpu_status state;
++	struct debugger_command *cmd;
++
++	cmd = (struct debugger_command *)malloc(sizeof(struct debugger_command));
++	if (cmd == NULL)
++		return ENOMEM;
++
++	cmd-&gt;func = func;
++	cmd-&gt;name = name;
++	cmd-&gt;description = desc;
++
++	state = disable_interrupts();
++	acquire_spinlock(&amp;sSpinlock);
++
++	cmd-&gt;next = sCommands;
++	sCommands = cmd;
++
++	release_spinlock(&amp;sSpinlock);
++	restore_interrupts(state);
++
++	return B_NO_ERROR;
++}
++
++
++int
++remove_debugger_command(char * name, int (*func)(int, char **))
++{
++	struct debugger_command *cmd = sCommands;
++	struct debugger_command *prev = NULL;
++	cpu_status state;
++
++	state = disable_interrupts();
++	acquire_spinlock(&amp;sSpinlock);
++
++	while (cmd) {
++		if (!strcmp(cmd-&gt;name, name) &amp;&amp; cmd-&gt;func == func)
++			break;
++
++		prev = cmd;
++		cmd = cmd-&gt;next;
++	}
++
++	if (cmd) {
++		if (cmd == sCommands)
++			sCommands = cmd-&gt;next;
++		else
++			prev-&gt;next = cmd-&gt;next;
++	}
++
++	release_spinlock(&amp;sSpinlock);
++	restore_interrupts(state);
++
++	if (cmd) {
++		free(cmd);
++		return B_NO_ERROR;
++	}
++
++	return B_NAME_NOT_FOUND;
++}
++
++
++uint32
++parse_expression(const char *expression)
++{
++	// TODO: Implement expression parser (cf. BeBook).
++	return strtoul(expression, NULL, 0);
++}
++
++
++void
++panic(const char *format, ...)
++{
++	va_list args;
++	char temp[128];
++
++	va_start(args, format);
++	vsnprintf(temp, sizeof(temp), format, args);
++	va_end(args);
++
++	kernel_debugger(temp);
++}
++
++
++void
++kernel_debugger(const char *message)
++{
++	static vint32 inDebugger;
++	cpu_status state;
++	bool dprintfState;
++
++	state = disable_interrupts();
++	atomic_add(&amp;inDebugger, 1);
++
++	arch_debug_save_registers(&amp;dbg_register_file[smp_get_current_cpu()][0]);
++	dprintfState = set_dprintf_enabled(true);
++
++	if (sDebuggerOnCPU != smp_get_current_cpu()) {
++		// First entry, halt all of the other cpus
++
++		// XXX need to flush current smp mailbox to make sure this goes
++		// through. Otherwise it'll hang
++		smp_send_broadcast_ici(SMP_MSG_CPU_HALT, 0, 0, 0, (void *)&amp;inDebugger,
++			SMP_MSG_FLAG_SYNC);
++	}
++
++	if (sBlueScreenOutput) {
++		if (blue_screen_enter(false) == B_OK)
++			sBlueScreenEnabled = true;
++	}
++
++	if (message)
++		kprintf(&quot;PANIC: %s\n&quot;, message);
++
++	kernel_debugger_loop();
++
++	set_dprintf_enabled(dprintfState);
++
++	sBlueScreenEnabled = false;
++	atomic_add(&amp;inDebugger, -1);
++	restore_interrupts(state);
++
++	// ToDo: in case we change dbg_register_file - don't we want to restore it?
++}
++
++
++bool
++set_dprintf_enabled(bool newState)
++{
++	bool oldState = sSerialDebugEnabled;
++	sSerialDebugEnabled = newState;
++
++	return oldState;
++}
++
++
++static void
++flush_pending_repeats(void)
++{
++	if (sMessageRepeatCount &gt; 0) {
++		int32 length;
++
++		if (sMessageRepeatCount &gt; 1) {
++			static char temp[40];
++			length = snprintf(temp, sizeof(temp),
++				&quot;Last message repeated %ld times.\n&quot;, sMessageRepeatCount);
++
++			if (sSerialDebugEnabled)
++				arch_debug_serial_puts(temp);
++			if (sSyslogOutputEnabled)
++				syslog_write(temp, length);
++			if (sBlueScreenEnabled || sDebugScreenEnabled)
++				blue_screen_puts(temp);
++		} else {
++			// if we only have one repeat just reprint the last buffer
++			if (sSerialDebugEnabled)
++				arch_debug_serial_puts(sLastOutputBuffer);
++			if (sSyslogOutputEnabled)
++				syslog_write(sLastOutputBuffer, strlen(sLastOutputBuffer));
++			if (sBlueScreenEnabled || sDebugScreenEnabled)
++				blue_screen_puts(sLastOutputBuffer);
++		}
++
++		sMessageRepeatFirstTime = 0;
++		sMessageRepeatCount = 0;
++	}
++}
++
++
++static void
++check_pending_repeats(void *data, int iter)
++{
++	(void)data;
++	(void)iter;
++	if (sMessageRepeatCount &gt; 0
++		&amp;&amp; ((system_time() - sMessageRepeatLastTime) &gt; 1000000
++		|| (system_time() - sMessageRepeatFirstTime) &gt; 3000000)) {
++		cpu_status state = disable_interrupts();
++		acquire_spinlock(&amp;sSpinlock);
++
++		flush_pending_repeats();
++
++		release_spinlock(&amp;sSpinlock);
+
+[... truncated: 172 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005474.html">[Haiku-commits] r23510 - haiku/trunk/src/apps/codycam
+</A></li>
+	<LI>Next message: <A HREF="005478.html">[Haiku-commits] r23512 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5477">[ date ]</a>
+              <a href="thread.html#5477">[ thread ]</a>
+              <a href="subject.html#5477">[ subject ]</a>
+              <a href="author.html#5477">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

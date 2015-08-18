@@ -1,0 +1,181 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20569 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20569%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704050021.l350LZAO022780%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001427.html">
+   <LINK REL="Next"  HREF="001429.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20569 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20569%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704050021.l350LZAO022780%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20569 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr  5 02:21:35 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001427.html">[Haiku-commits] r20568 - haiku/trunk/docs/user/drivers
+</A></li>
+        <LI>Next message: <A HREF="001429.html">[Haiku-commits] r20570 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1428">[ date ]</a>
+              <a href="thread.html#1428">[ thread ]</a>
+              <a href="subject.html#1428">[ subject ]</a>
+              <a href="author.html#1428">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-05 02:21:22 +0200 (Thu, 05 Apr 2007)
+New Revision: 20569
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20569&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20569&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+Log:
+keep PUSH'ed pointer in receiver side of TCP so we can wait for more data in recv()
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp	2007-04-04 23:46:05 UTC (rev 20568)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp	2007-04-05 00:21:22 UTC (rev 20569)
+@@ -26,7 +26,8 @@
+ 	fNumBytes(0),
+ 	fContiguousBytes(0),
+ 	fFirstSequence(0),
+-	fLastSequence(0)
++	fLastSequence(0),
++	fPushPointer(0)
+ {
+ }
+ 
+@@ -352,3 +353,9 @@
+ 
+ 	return fContiguousBytes + fFirstSequence - sequence;
+ }
++
++void
++BufferQueue::SetPushPointer(tcp_sequence sequence)
++{
++	fPushPointer = sequence;
++}
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h	2007-04-04 23:46:05 UTC (rev 20568)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h	2007-04-05 00:21:22 UTC (rev 20569)
+@@ -33,6 +33,9 @@
+ 		size_t Available() const { return fContiguousBytes; }
+ 		size_t Available(tcp_sequence sequence) const;
+ 
++		size_t PushedData() const { return fPushPointer &gt; fFirstSequence ? fPushPointer - fFirstSequence : 0; }
++		void SetPushPointer(tcp_sequence sequence);
++
+ 		size_t Used() const { return fNumBytes; }
+ 		size_t Free() const { return fMaxBytes - fNumBytes; }
+ 
+@@ -49,6 +52,7 @@
+ 		size_t	fContiguousBytes;
+ 		tcp_sequence fFirstSequence;
+ 		tcp_sequence fLastSequence;
++		tcp_sequence fPushPointer;
+ };
+ 
+ #endif	// BUFFER_QUEUE_H
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-04 23:46:05 UTC (rev 20568)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-05 00:21:22 UTC (rev 20569)
+@@ -496,22 +496,28 @@
+ 
+ 	// read data out of buffer
+ 	// TODO: add support for urgent data (MSG_OOB)
+-	// TODO: wait until enough bytes are available
+ 
+ 	bigtime_t timeout = system_time() + socket-&gt;receive.timeout;
+ 
+-	do {
++	while (fReceiveQueue.PushedData() == 0
++			&amp;&amp; fReceiveQueue.Available() &lt; numBytes
++			&amp;&amp; (fFlags &amp; FLAG_NO_RECEIVE) == 0) {
+ 		locker.Unlock();
+ 
+ 		status_t status = acquire_sem_etc(fReceiveLock, 1,
+ 			B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, timeout);
+-		if (status &lt; B_OK)
+-			return status;
+ 
+ 		locker.Lock();
+-	} while (fReceiveQueue.Available() &lt; socket-&gt;receive.low_water_mark
+-			 &amp;&amp; (fFlags &amp; FLAG_NO_RECEIVE) == 0);
+ 
++		if (status &lt; B_OK) {
++			// TODO: If we are timing out, should we push the
++			//       available data?
++			if (status == B_TIMED_OUT &amp;&amp; fReceiveQueue.Available() &gt; 0)
++				break;
++			return status;
++		}
++	}
++
+ 	TRACE(&quot;ReadData(): read %lu bytes, %lu are available&quot;,
+ 		  numBytes, fReceiveQueue.Available());
+ 
+@@ -793,6 +799,8 @@
+ 				fReceiveNext += buffer-&gt;size;
+ 				TRACE(&quot;Receive(): receive next = %lu&quot;, (uint32)fReceiveNext);
+ 				fReceiveQueue.Add(buffer, segment.sequence);
++				if (segment.flags &amp; TCP_FLAG_PUSH)
++					fReceiveQueue.SetPushPointer(fReceiveNext);
+ 
+ 				release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+ 					// TODO: real conditional locking needed!
+@@ -1018,6 +1026,9 @@
+ 	} else
+ 		gBufferModule-&gt;free(buffer);
+ 
++	if (segment.flags &amp; TCP_FLAG_PUSH)
++		fReceiveQueue.SetPushPointer(fReceiveNext);
++
+ 	return action;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001427.html">[Haiku-commits] r20568 - haiku/trunk/docs/user/drivers
+</A></li>
+	<LI>Next message: <A HREF="001429.html">[Haiku-commits] r20570 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1428">[ date ]</a>
+              <a href="thread.html#1428">[ thread ]</a>
+              <a href="subject.html#1428">[ subject ]</a>
+              <a href="author.html#1428">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

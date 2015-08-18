@@ -1,0 +1,200 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26240 - in haiku/trunk/src/system/kernel: .	arch/x86
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26240%20-%20in%20haiku/trunk/src/system/kernel%3A%20.%0A%09arch/x86&In-Reply-To=%3C200807032037.m63KbB84001939%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009998.html">
+   <LINK REL="Next"  HREF="010000.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26240 - in haiku/trunk/src/system/kernel: .	arch/x86</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26240%20-%20in%20haiku/trunk/src/system/kernel%3A%20.%0A%09arch/x86&In-Reply-To=%3C200807032037.m63KbB84001939%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26240 - in haiku/trunk/src/system/kernel: .	arch/x86">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Jul  3 22:37:11 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009998.html">[Haiku-commits] r26239 - in haiku/trunk: headers/private/kernel src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="010000.html">[Haiku-commits] r26241 -	haiku/trunk/src/add-ons/kernel/file_systems/ext2
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9999">[ date ]</a>
+              <a href="thread.html#9999">[ thread ]</a>
+              <a href="subject.html#9999">[ subject ]</a>
+              <a href="author.html#9999">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-07-03 22:37:08 +0200 (Thu, 03 Jul 2008)
+New Revision: 26240
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26240&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26240&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/arch/x86/arch_interrupts.S
+   haiku/trunk/src/system/kernel/arch/x86/arch_thread.cpp
+   haiku/trunk/src/system/kernel/thread.cpp
+Log:
+stippi + bonefish:
+* Missing backslash in UPDATE_THREAD_KERNEL_TIME() macro. Caused the
+  thread's kernel time never to be updated when the thread left the
+  kernel. The time would be added to the user time instead.
+* Changed semantics of thread_at_kernel_exit(). It leaves interrupts
+  disabled when returning, now. All code using it would disable
+  interrupts afterwards anyway, and inbetween the thread could be
+  interrupted causing two more time updates (or actually not causing
+  them erroneously).
+* The code in x86's interrupt handler entry (int_bottom) also checks
+  thread::in_kernel now, to determine whether the thread was already
+  considered to be in userland. This is necessary since the sysexit
+  instruction doesn't reenable interrupts, so that we have to do that
+  with the preceeding instruction. Hence an interrupt can occur
+  inbetween, which would incorrectly add the interrupt's kernel time
+  to the thread's user time.
+* For userland threads team_create_thread_start() didn't invoke
+  thread_at_kernel_exit() or any equivalent. We do that in 
+  arch_thread_enter_userspace() now.
+
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_interrupts.S
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_interrupts.S	2008-07-03 11:52:36 UTC (rev 26239)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_interrupts.S	2008-07-03 20:37:08 UTC (rev 26240)
+@@ -53,7 +53,7 @@
+ 	call	system_time;									\
+ 															\
+ 	movl	%eax, %ebx;				/* save for later */	\
+-	movl	%edx, %ecx;
++	movl	%edx, %ecx;										\
+ 															\
+ 	/* thread-&gt;kernel_time += now - thread-&gt;last_time; */	\
+ 	sub		THREAD_last_time(%edi), %eax;					\
+@@ -248,9 +248,18 @@
+ 
+ 	testl	$0x20000, IFRAME_flags(%ebp)	// VM86 mode
+ 	jnz		int_bottom_vm86
+-	cmp		$USER_CODE_SEG, IFRAME_cs(%ebp)
++	cmp		$USER_CODE_SEG, IFRAME_cs(%ebp)	// user mode
+ 	je		int_bottom_user
+ 
++	// We need to recheck user mode using the thread's in_kernel flag, since
++	// sysexit introduces a raced condition: It doesn't reenable interrupts,
++	// so that we have to do it in the instruction before, thus opening a
++	// window for an interrupt while still being in the kernel, but having set
++	// up everything for userland already.
++	movl	%dr3, %edi						// thread pointer
++	cmpb	$0, THREAD_in_kernel(%edi)
++	je		int_bottom_user
++
+ 	// disable interrupts -- the handler will enable them, if necessary
+ 	cli
+ 
+@@ -474,8 +483,7 @@
+ 	// make sure interrupts are enabled (they are, when coming from a syscall
+ 	// but otherwise they might be disabled)
+ 	sti
+-	call	thread_at_kernel_exit
+-	cli								// disable interrupts
++	call	thread_at_kernel_exit	// also disables interrupts
+ 	jmp		kernel_exit_work_done
+ 
+   bad_syscall_params:
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_thread.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_thread.cpp	2008-07-03 11:52:36 UTC (rev 26239)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_thread.cpp	2008-07-03 20:37:08 UTC (rev 26240)
+@@ -409,7 +409,8 @@
+ 	if (user_memcpy((void *)stackTop, args, sizeof(args)) &lt; B_OK)
+ 		return B_BAD_ADDRESS;
+ 
+-	disable_interrupts();
++	thread_at_kernel_exit();
++		// also disables interrupts
+ 
+ 	i386_set_tss_and_kstack(t-&gt;kernel_stack_top);
+ 
+
+Modified: haiku/trunk/src/system/kernel/thread.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/thread.cpp	2008-07-03 11:52:36 UTC (rev 26239)
++++ haiku/trunk/src/system/kernel/thread.cpp	2008-07-03 20:37:08 UTC (rev 26240)
+@@ -331,9 +331,6 @@
+ {
+ 	struct thread *thread = thread_get_current_thread();
+ 
+-	// a signal may have been delivered here
+-	thread_at_kernel_exit();
+-
+ 	// jump to the entry point in user space
+ 	arch_thread_enter_userspace(thread, (addr_t)thread-&gt;entry,
+ 		thread-&gt;args1, thread-&gt;args2);
+@@ -1571,6 +1568,8 @@
+ /*!
+ 	Called whenever a thread exits kernel space to user space.
+ 	Tracks time, handles signals, ...
++	Interrupts must be enabled. When the function returns, interrupts will be
++	disabled.
+ */
+ void
+ thread_at_kernel_exit(void)
+@@ -1584,7 +1583,7 @@
+ 		scheduler_reschedule();
+ 	}
+ 
+-	cpu_status state = disable_interrupts();
++	disable_interrupts();
+ 
+ 	thread-&gt;in_kernel = false;
+ 
+@@ -1592,14 +1591,12 @@
+ 	bigtime_t now = system_time();
+ 	thread-&gt;kernel_time += now - thread-&gt;last_time;
+ 	thread-&gt;last_time = now;
+-
+-	restore_interrupts(state);
+ }
+ 
+ 
+ /*!	The quick version of thread_kernel_exit(), in case no signals are pending
+ 	and no debugging shall be done.
+-	Interrupts are disabled in this case.
++	Interrupts must be disabled.
+ */
+ void
+ thread_at_kernel_exit_no_signals(void)
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009998.html">[Haiku-commits] r26239 - in haiku/trunk: headers/private/kernel src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="010000.html">[Haiku-commits] r26241 -	haiku/trunk/src/add-ons/kernel/file_systems/ext2
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9999">[ date ]</a>
+              <a href="thread.html#9999">[ thread ]</a>
+              <a href="subject.html#9999">[ subject ]</a>
+              <a href="author.html#9999">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

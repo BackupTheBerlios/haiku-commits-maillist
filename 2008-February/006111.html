@@ -1,0 +1,785 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23985 - haiku/trunk/src/tests/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23985%20-%20haiku/trunk/src/tests/system/kernel&In-Reply-To=%3C200802171627.m1HGRHmj030454%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006110.html">
+   <LINK REL="Next"  HREF="006115.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23985 - haiku/trunk/src/tests/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23985%20-%20haiku/trunk/src/tests/system/kernel&In-Reply-To=%3C200802171627.m1HGRHmj030454%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23985 - haiku/trunk/src/tests/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Feb 17 17:27:17 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006110.html">[Haiku-commits] r23984 - in haiku/trunk: headers/private/net	src/add-ons/kernel/drivers/network/stack	src/add-ons/kernel/network/protocols/tcp	src/add-ons/kernel/network/stack
+</A></li>
+        <LI>Next message: <A HREF="006115.html">[Haiku-commits] r23985 - haiku/trunk/src/tests/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6111">[ date ]</a>
+              <a href="thread.html#6111">[ thread ]</a>
+              <a href="subject.html#6111">[ subject ]</a>
+              <a href="author.html#6111">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-02-17 17:27:17 +0100 (Sun, 17 Feb 2008)
+New Revision: 23985
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23985&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23985&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/tests/system/kernel/syscall_restart_test.cpp
+Modified:
+   haiku/trunk/src/tests/system/kernel/Jamfile
+Log:
+Test program for syscall restarts. Only a few syscalls are tested yet.
+Nested syscall restarts (interrupted syscall in a signal handler)
+aren't tested yet.
+
+
+Modified: haiku/trunk/src/tests/system/kernel/Jamfile
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/Jamfile	2008-02-17 16:25:07 UTC (rev 23984)
++++ haiku/trunk/src/tests/system/kernel/Jamfile	2008-02-17 16:27:17 UTC (rev 23985)
+@@ -32,6 +32,8 @@
+ SimpleTest select_check : select_check.cpp ;
+ SimpleTest select_close_test : select_close_test.cpp ;
+ 
++SimpleTest syscall_restart_test : syscall_restart_test.cpp : network ;
++
+ SetSupportedPlatformsForTarget syscall_time
+ 	: $(HAIKU_BEOS_COMPATIBLE_PLATFORMS) ;
+ SimpleTest syscall_time : syscall_time.cpp ;
+
+Added: haiku/trunk/src/tests/system/kernel/syscall_restart_test.cpp
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/syscall_restart_test.cpp	2008-02-17 16:25:07 UTC (rev 23984)
++++ haiku/trunk/src/tests/system/kernel/syscall_restart_test.cpp	2008-02-17 16:27:17 UTC (rev 23985)
+@@ -0,0 +1,689 @@
++#include &lt;errno.h&gt;
++#include &lt;netinet/in.h&gt;
++#include &lt;signal.h&gt;
++#include &lt;stdarg.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/socket.h&gt;
++
++#include &lt;OS.h&gt;
++
++
++enum run_mode {
++	RUN_IGNORE_SIGNAL,
++	RUN_HANDLE_SIGNAL,
++	RUN_HANDLE_SIGNAL_RESTART
++};
++
++
++class Test {
++public:
++	Test(const char* name)
++		: fName(name)
++	{
++	}
++
++	virtual ~Test()
++	{
++	}
++
++	bool Run(run_mode mode)
++	{
++		fRunMode = mode;
++		fSignalHandlerCalled = false;
++
++		status_t error = Prepare();
++		if (error != B_OK)
++			return Error(&quot;Failed to prepare test: %s&quot;, strerror(error));
++
++		thread_id thread = spawn_thread(_ThreadEntry, fName, B_NORMAL_PRIORITY,
++			this);
++		if (thread &lt; 0)
++			return Error(&quot;Failed to spawn thread: %s\n&quot;, strerror(thread));
++
++		resume_thread(thread);
++
++		// ...
++		// * interrupt without restart
++		// * interrupt with restart
++
++		snooze(100000);
++		kill(thread, SIGINT);
++
++		PrepareFinish();
++
++		status_t result;
++		wait_for_thread(thread, &amp;result);
++
++		if (result != (Interrupted() ? B_INTERRUPTED : B_OK)) {
++			return Error(&quot;Unexpected syscall return value: %s\n&quot;,
++				strerror(result));
++		}
++
++		if ((RunMode() == RUN_IGNORE_SIGNAL) == fSignalHandlerCalled) {
++			if (RunMode() == RUN_IGNORE_SIGNAL)
++				return Error(&quot;Handler was called but shouldn't have been!&quot;);
++			else
++				return Error(&quot;Handler was not called!&quot;);
++		}
++
++		return Finish(Interrupted());
++	}
++
++	void Run()
++	{
++		printf(&quot;%s\n&quot;, fName);
++
++		struct {
++			const char*	name;
++			run_mode	mode;
++		} tests[] = {
++			{ &quot;ignore signal&quot;, RUN_IGNORE_SIGNAL },
++			{ &quot;handle signal no restart&quot;, RUN_HANDLE_SIGNAL },
++			{ &quot;handle signal restart&quot;, RUN_HANDLE_SIGNAL_RESTART },
++			{}
++		};
++
++		for (int i = 0; tests[i].name != NULL; i++) {
++			printf(&quot;  %-30s: &quot;, tests[i].name);
++			fflush(stdout);
++			ClearError();
++			if (Run(tests[i].mode))
++				printf(&quot;ok\n&quot;);
++			else
++				printf(&quot;failed (%s)\n&quot;, fError);
++
++			Cleanup();
++		}
++	}
++
++	run_mode RunMode() const { return fRunMode; }
++	bool Interrupted() const { return RunMode() == RUN_HANDLE_SIGNAL; }
++	bigtime_t TimeWaited() const { return fTimeWaited; }
++
++protected:
++	virtual status_t Prepare()
++	{
++		return B_OK;
++	}
++
++	virtual status_t DoSyscall() = 0;
++
++	virtual void HandleSignal()
++	{
++	}
++
++	virtual void PrepareFinish()
++	{
++	}
++
++	virtual bool Finish(bool interrupted)
++	{
++		return true;
++	}
++
++	virtual void Cleanup()
++	{
++	}
++
++	bool Error(const char* format,...)
++	{
++		va_list args;
++		va_start(args, format);
++		vsnprintf(fError, sizeof(fError), format, args);
++		va_end(args);
++
++		return false;
++	}
++
++	bool Check(bool condition, const char* format,...)
++	{
++		if (condition)
++			return true;
++
++		va_list args;
++		va_start(args, format);
++		vsnprintf(fError, sizeof(fError), format, args);
++		va_end(args);
++
++		return false;
++	}
++
++	void ClearError()
++	{
++		fError[0] = '\0';
++	}
++
++private:
++	static status_t _ThreadEntry(void* data)
++	{
++		return ((Test*)data)-&gt;_TestThread();
++	}
++
++	static void _SignalHandler(int signal, char* userData)
++	{
++		Test* self = (Test*)userData;
++
++		self-&gt;fSignalHandlerCalled = true;
++		self-&gt;HandleSignal();
++	}
++
++	status_t _TestThread()
++	{
++		// install handler
++		struct sigaction action;
++		if (RunMode() == RUN_IGNORE_SIGNAL)
++			action.sa_handler = SIG_IGN;
++		else
++			action.sa_handler = (void (*)(int))_SignalHandler;
++
++		action.sa_flags = RunMode() == RUN_HANDLE_SIGNAL_RESTART
++			? SA_RESTART : 0;
++
++		sigemptyset(&amp;action.sa_mask);
++		action.sa_userdata = this;
++
++		sigaction(SIGINT, &amp;action, NULL);
++
++		bigtime_t startTime = system_time();
++		status_t status = DoSyscall();
++		fTimeWaited = system_time() - startTime;
++
++		return status;
++	}
++
++private:
++	const char*	fName;
++	run_mode	fRunMode;
++	bool		fSignalHandlerCalled;
++	bigtime_t	fTimeWaited;
++	char		fError[1024];
++};
++
++
++class SnoozeTest : public Test {
++public:
++	SnoozeTest()
++		: Test(&quot;snooze&quot;)
++	{
++	}
++
++	virtual status_t DoSyscall()
++	{
++		return snooze(1000000);
++	}
++
++	virtual bool Finish(bool interrupted)
++	{
++		if (interrupted)
++			return Check(TimeWaited() &lt; 200000, &quot;waited too long&quot;);
++
++		return Check(TimeWaited() &gt; 900000 &amp;&amp; TimeWaited() &lt; 1100000,
++			&quot;waited %lld us instead of 1000000 us&quot;, TimeWaited());
++	}
++};
++
++
++class ReadTest : public Test {
++public:
++	ReadTest()
++		: Test(&quot;read&quot;)
++	{
++	}
++
++	virtual status_t Prepare()
++	{
++		fBytesRead = -1;
++		fFDs = (int[2]){-1, -1};
++
++		if (pipe(fFDs) != 0)
++			return errno;
++
++		return B_OK;
++	}
++
++	virtual status_t DoSyscall()
++	{
++		char buffer[256];
++		fBytesRead = read(fFDs[0], buffer, sizeof(buffer));
++
++		return fBytesRead &lt; 0 ? errno : B_OK;
++	}
++
++	virtual void PrepareFinish()
++	{
++		write(fFDs[1], &quot;Ingo&quot;, 4);
++	}
++
++	virtual bool Finish(bool interrupted)
++	{
++		if (interrupted)
++			return Check(fBytesRead &lt; 0, &quot;unexpected read&quot;);
++
++		return Check(fBytesRead == 4, &quot;should have read 4 bytes, read only %ld &quot;
++			&quot;bytes&quot;, fBytesRead);
++	}
++
++	virtual void Cleanup()
++	{
++		close(fFDs[0]);
++		close(fFDs[1]);
++	}
++
++private:
++	bigtime_t	fTimeWaited;
++	ssize_t		fBytesRead;
++	int			fFDs[2];
++};
++
++
++class WriteTest : public Test {
++public:
++	WriteTest()
++		: Test(&quot;write&quot;)
++	{
++	}
++
++	virtual status_t Prepare()
++	{
++		fBytesWritten = -1;
++		fFDs = (int[2]){-1, -1};
++
++		if (pipe(fFDs) != 0)
++			return errno;
++
++		// fill pipe
++		fcntl(fFDs[1], F_SETFL, O_NONBLOCK);
++		while (write(fFDs[1], &quot;a&quot;, 1) == 1);
++
++		return B_OK;
++	}
++
++	virtual status_t DoSyscall()
++	{
++		// blocking wait
++		fcntl(fFDs[1], F_SETFL, 0);
++		fBytesWritten = write(fFDs[1], &quot;Ingo&quot;, 4);
++
++		return fBytesWritten &lt; 0 ? errno : B_OK;
++	}
++
++	virtual void PrepareFinish()
++	{
++		char buffer[256];
++		read(fFDs[0], buffer, sizeof(buffer));
++	}
++
++	virtual bool Finish(bool interrupted)
++	{
++		if (interrupted)
++			return Check(fBytesWritten &lt; 0, &quot;unexpected write&quot;);
++
++		return Check(fBytesWritten == 4, &quot;should have written 4 bytes, wrote only %ld &quot;
++			&quot;bytes&quot;, fBytesWritten);
++	}
++
++	virtual void Cleanup()
++	{
++		close(fFDs[0]);
++		close(fFDs[1]);
++	}
++
++private:
++	ssize_t		fBytesWritten;
++	int			fFDs[2];
++};
++
++
++class AcquireSwitchSemTest : public Test {
++public:
++	AcquireSwitchSemTest(bool useSwitch)
++		: Test(useSwitch ? &quot;switch_sem&quot; : &quot;acquire_sem&quot;),
++		fSwitch(useSwitch)
++	{
++	}
++
++	virtual status_t Prepare()
++	{
++		fSemaphore = create_sem(0, &quot;test sem&quot;);
++
++		return (fSemaphore &gt;= 0 ? B_OK : fSemaphore);
++	}
++
++	virtual status_t DoSyscall()
++	{
++		if (fSwitch)
++			return switch_sem(-1, fSemaphore);
++
++		return acquire_sem(fSemaphore);
++	}
++
++	virtual void PrepareFinish()
++	{
++		release_sem(fSemaphore);
++	}
++
++/*
++	virtual bool Finish(bool interrupted)
++	{
++//		int32 semCount = -1;
++//		get_sem_count(fSemaphore, &amp;semCount);
++
++		if (interrupted)
++			return true;
++
++		return Check(fBytesWritten == 4, &quot;should have written 4 bytes, wrote only %ld &quot;
++			&quot;bytes&quot;, fBytesWritten);
++	}
++*/
++
++	virtual void Cleanup()
++	{
++		delete_sem(fSemaphore);
++	}
++
++protected:
++	sem_id		fSemaphore;
++	bool		fSwitch;
++};
++
++
++class AcquireSwitchSemEtcTest : public Test {
++public:
++	AcquireSwitchSemEtcTest(bool useSwitch)
++		: Test(useSwitch ? &quot;switch_sem_etc&quot; : &quot;acquire_sem_etc&quot;),
++		fSwitch(useSwitch)
++	{
++	}
++
++	virtual status_t Prepare()
++	{
++		fSemaphore = create_sem(0, &quot;test sem&quot;);
++
++		return fSemaphore &gt;= 0 ? B_OK : fSemaphore;
++	}
++
++	virtual status_t DoSyscall()
++	{
++		status_t status;
++		if (fSwitch) {
++			status = switch_sem_etc(-1, fSemaphore, 1, B_RELATIVE_TIMEOUT,
++				1000000);
++		} else {
++			status = acquire_sem_etc(fSemaphore, 1, B_RELATIVE_TIMEOUT,
++				1000000);
++		}
++
++		if (!Interrupted() &amp;&amp; status == B_TIMED_OUT)
++			return B_OK;
++
++		return status;
++	}
++
++	virtual bool Finish(bool interrupted)
++	{
++		if (interrupted)
++			return Check(TimeWaited() &lt; 200000, &quot;waited too long&quot;);
++
++		return Check(TimeWaited() &gt; 900000 &amp;&amp; TimeWaited() &lt; 1100000,
++			&quot;waited %lld us instead of 1000000 us&quot;, TimeWaited());
++	}
++
++	virtual void Cleanup()
++	{
++		delete_sem(fSemaphore);
++	}
++
++protected:
++	sem_id		fSemaphore;
++	bool		fSwitch;
++};
++
++
++class AcceptTest : public Test {
++public:
++	AcceptTest()
++		: Test(&quot;accept&quot;)
++	{
++	}
++
++	virtual status_t Prepare()
++	{
++		fAcceptedSocket = -1;
++
++		fServerSocket = socket(AF_INET, SOCK_STREAM, 0);
++		if (fServerSocket &lt; 0) {
++			fprintf(stderr, &quot;Could not open server socket: %s\n&quot;,
++				strerror(errno));
++			return errno;
++		}
++
++		int reuse = 1;
++		if (setsockopt(fServerSocket, SOL_SOCKET, SO_REUSEADDR, &amp;reuse,
++				sizeof(int)) == -1) {
++			fprintf(stderr, &quot;Could not make server socket reusable: %s\n&quot;,
++				strerror(errno));
++			return errno;
++		}
++
++		memset(&amp;fServerAddress, 0, sizeof(sockaddr_in));
++		fServerAddress.sin_family = AF_INET;
++		fServerAddress.sin_addr.s_addr = INADDR_LOOPBACK;
++
++		if (bind(fServerSocket, (struct sockaddr *)&amp;fServerAddress,
++				sizeof(struct sockaddr)) == -1) {
++			fprintf(stderr, &quot;Could not bind server socket: %s\n&quot;,
++				strerror(errno));
++			return errno;
++		}
++
++		socklen_t length = sizeof(sockaddr_in);
++		getsockname(fServerSocket, (sockaddr*)&amp;fServerAddress,
++			&amp;length);
++
++		if (listen(fServerSocket, 10) == -1) {
++			fprintf(stderr, &quot;Could not listen on server socket: %s\n&quot;,
++				strerror(errno));
++			return errno;
++		}
++
++		return B_OK;
++	}
++
++	virtual status_t DoSyscall()
++	{
++		sockaddr_in clientAddress;
++		socklen_t length = sizeof(struct sockaddr_in);
++
++		fAcceptedSocket = accept(fServerSocket,
++			(struct sockaddr *)&amp;clientAddress, &amp;length);
++		if (fAcceptedSocket == -1)
++			return errno;
++
++		return B_OK;
++	}
++
++	virtual void PrepareFinish()
++	{
++		if (Interrupted())
++			return;
++
++		int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
++		if (clientSocket == -1) {
++			fprintf(stderr, &quot;Could not open client socket: %s\n&quot;,
++				strerror(errno));
++			return;
++		}
++
++		if (connect(clientSocket, (struct sockaddr *)&amp;fServerAddress,
++				sizeof(struct sockaddr)) == -1) {
++			fprintf(stderr, &quot;Could not connect to server socket: %s\n&quot;,
++				strerror(errno));
++		}
++
++		close(clientSocket);
++	}
++
++	virtual bool Finish(bool interrupted)
++	{
++		if (interrupted)
++			return Check(fAcceptedSocket &lt; 0, &quot;got socket&quot;);
++
++		return Check(fAcceptedSocket &gt;= 0, &quot;got no socket&quot;);
++	}
++
++	virtual void Cleanup()
++	{
++		close(fAcceptedSocket);
++		close(fServerSocket);
++	}
++
++protected:
++	int			fServerSocket;
++	sockaddr_in	fServerAddress;
++	int			fAcceptedSocket;
++};
++
++
++class ReceiveTest : public Test {
++public:
++	ReceiveTest()
++		: Test(&quot;recv&quot;)
++	{
++	}
++
++	virtual status_t Prepare()
++	{
++		fBytesRead = -1;
++		fAcceptedSocket = -1;
++		fClientSocket = -1;
++
++		fServerSocket = socket(AF_INET, SOCK_STREAM, 0);
++		if (fServerSocket &lt; 0) {
++			fprintf(stderr, &quot;Could not open server socket: %s\n&quot;,
++				strerror(errno));
++			return errno;
++		}
++
++		int reuse = 1;
++		if (setsockopt(fServerSocket, SOL_SOCKET, SO_REUSEADDR, &amp;reuse,
++				sizeof(int)) == -1) {
++			fprintf(stderr, &quot;Could not make server socket reusable: %s\n&quot;,
++				strerror(errno));
++			return errno;
++		}
++
++		memset(&amp;fServerAddress, 0, sizeof(sockaddr_in));
++		fServerAddress.sin_family = AF_INET;
++		fServerAddress.sin_addr.s_addr = INADDR_LOOPBACK;
++
++		if (bind(fServerSocket, (struct sockaddr *)&amp;fServerAddress,
++				sizeof(struct sockaddr)) == -1) {
++			fprintf(stderr, &quot;Could not bind server socket: %s\n&quot;,
++				strerror(errno));
++			return errno;
++		}
++
++		socklen_t length = sizeof(sockaddr_in);
++		getsockname(fServerSocket, (sockaddr*)&amp;fServerAddress,
++			&amp;length);
++
++		if (listen(fServerSocket, 10) == -1) {
++			fprintf(stderr, &quot;Could not listen on server socket: %s\n&quot;,
++				strerror(errno));
++			return errno;
++		}
++
++		fClientSocket = socket(AF_INET, SOCK_STREAM, 0);
++		if (fClientSocket == -1) {
++			fprintf(stderr, &quot;Could not open client socket: %s\n&quot;,
++				strerror(errno));
++			return errno;
++		}
++
++		fcntl(fClientSocket, F_SETFL, O_NONBLOCK);
++
++		if (connect(fClientSocket, (struct sockaddr *)&amp;fServerAddress,
++				sizeof(struct sockaddr)) == -1) {
++			if (errno != EINPROGRESS) {
++				fprintf(stderr, &quot;Could not connect to server socket: %s\n&quot;,
++					strerror(errno));
++				return errno;
++			}
++		}
++
++		sockaddr_in clientAddress;
++		length = sizeof(struct sockaddr_in);
++
++		fAcceptedSocket = accept(fServerSocket,
++			(struct sockaddr *)&amp;clientAddress, &amp;length);
++		if (fAcceptedSocket == -1)
++			return errno;
++
++		fcntl(fClientSocket, F_SETFL, 0);
++
++		snooze(100000);
++
++		return B_OK;
++	}
++
++	virtual status_t DoSyscall()
++	{
++		char buffer[256];
++		fBytesRead = recv(fAcceptedSocket, buffer, sizeof(buffer), 0);
++
++		return fBytesRead &lt; 0 ? errno : B_OK;
++	}
++
++	virtual void PrepareFinish()
++	{
++		write(fClientSocket, &quot;Axel&quot;, 4);
++	}
++
++	virtual bool Finish(bool interrupted)
++	{
++		if (interrupted)
++			return Check(fBytesRead &lt; 0, &quot;unexpected read&quot;);
++
++		return Check(fBytesRead == 4, &quot;should have read 4 bytes, read only %ld &quot;
++			&quot;bytes&quot;, fBytesRead);
++	}
++
++	virtual void Cleanup()
++	{
++		close(fAcceptedSocket);
++		close(fServerSocket);
++		close(fClientSocket);
++	}
++
++protected:
++	int			fServerSocket;
++	sockaddr_in	fServerAddress;
++	int			fAcceptedSocket;
++	int			fClientSocket;
++	ssize_t		fBytesRead;
++};
++
++
++int
++main()
++{
++	Test* tests[] = {
++/*		new SnoozeTest,
++		new ReadTest,
++		new WriteTest,
++		new AcquireSwitchSemTest(false),
++		new AcquireSwitchSemTest(true),
++		new AcquireSwitchSemEtcTest(false),
++		new AcquireSwitchSemEtcTest(true),
++		new AcceptTest,
++*/		new ReceiveTest,
++		NULL
++	};
++
++	for (int i = 0; tests[i] != NULL; i++)
++		tests[i]-&gt;Run();
++
++	return 0;
++}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006110.html">[Haiku-commits] r23984 - in haiku/trunk: headers/private/net	src/add-ons/kernel/drivers/network/stack	src/add-ons/kernel/network/protocols/tcp	src/add-ons/kernel/network/stack
+</A></li>
+	<LI>Next message: <A HREF="006115.html">[Haiku-commits] r23985 - haiku/trunk/src/tests/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6111">[ date ]</a>
+              <a href="thread.html#6111">[ thread ]</a>
+              <a href="subject.html#6111">[ subject ]</a>
+              <a href="author.html#6111">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,242 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27649 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27649%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/debug&In-Reply-To=%3C200809201244.m8KCigWx002954%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012036.html">
+   <LINK REL="Next"  HREF="012038.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27649 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27649%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/debug&In-Reply-To=%3C200809201244.m8KCigWx002954%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27649 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Sep 20 14:44:42 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012036.html">[Haiku-commits] r27648 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/arch/x86
+</A></li>
+        <LI>Next message: <A HREF="012038.html">[Haiku-commits] r27650 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12037">[ date ]</a>
+              <a href="thread.html#12037">[ thread ]</a>
+              <a href="subject.html#12037">[ subject ]</a>
+              <a href="author.html#12037">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-20 14:44:41 +0200 (Sat, 20 Sep 2008)
+New Revision: 27649
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27649&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27649&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/user_debugger.h
+   haiku/trunk/src/system/kernel/debug/user_debugger.cpp
+Log:
+The handling of a full profiling buffer couldn't work for two reasons:
+* We can't enable interrupts in an interrupt handler. Instead we use the
+  newly introduced callback feature, which notifies the debugger right
+  before returning from the interrupt.
+* We didn't indicate that the profiling buffer was full and that the
+  thread shouldn't be profiled ATM. Therefore it could happen that it
+  was profiled while trying to notify the debugger that the profiling
+  buffer was full, resulting in a deadlock. Introduce a respective flag
+  in the thread debug structure.
+
+
+Modified: haiku/trunk/headers/private/kernel/user_debugger.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/user_debugger.h	2008-09-20 12:38:27 UTC (rev 27648)
++++ haiku/trunk/headers/private/kernel/user_debugger.h	2008-09-20 12:44:41 UTC (rev 27649)
+@@ -86,6 +86,8 @@
+ 			// number of samples the buffer currently holds
+ 		int32			stack_depth;
+ 			// number of return addresses to record per timer interval
++		bool			buffer_full;
++			// indicates that the sample buffer is full
+ 		union {
+ 			bigtime_t	interval_left;
+ 				// when unscheduled: the time left of the current sampling
+
+Modified: haiku/trunk/src/system/kernel/debug/user_debugger.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/user_debugger.cpp	2008-09-20 12:38:27 UTC (rev 27648)
++++ haiku/trunk/src/system/kernel/debug/user_debugger.cpp	2008-09-20 12:44:41 UTC (rev 27649)
+@@ -284,6 +284,7 @@
+ 		info-&gt;ignore_signals_once = 0;
+ 		info-&gt;profile.sample_area = -1;
+ 		info-&gt;profile.samples = NULL;
++		info-&gt;profile.buffer_full = false;
+ 		info-&gt;profile.installed_timer = NULL;
+ 	}
+ }
+@@ -309,6 +310,7 @@
+ 		info-&gt;ignore_signals_once = 0;
+ 		info-&gt;profile.sample_area = -1;
+ 		info-&gt;profile.samples = NULL;
++		info-&gt;profile.buffer_full = false;
+ 	}
+ }
+ 
+@@ -1002,6 +1004,7 @@
+ 	int32 stackDepth = threadDebugInfo.profile.stack_depth;
+ 	threadDebugInfo.profile.sample_area = -1;
+ 	threadDebugInfo.profile.samples = NULL;
++	threadDebugInfo.profile.buffer_full = false;
+ 
+ 	atomic_or(&amp;threadDebugInfo.flags, B_THREAD_DEBUG_DYING);
+ 
+@@ -1147,26 +1150,19 @@
+ }
+ 
+ 
+-static int32
+-profiling_event(timer* /*unused*/)
++static void
++profiling_buffer_full(void*)
+ {
+ 	struct thread* thread = thread_get_current_thread();
+ 	thread_debug_info&amp; debugInfo = thread-&gt;debug_info;
+ 
+-	if (debugInfo.profile.samples != NULL) {
+-		int32 stackDepth = debugInfo.profile.stack_depth;
+-		addr_t* returnAddresses = debugInfo.profile.samples
+-			+ debugInfo.profile.sample_count;
+-		int32 count = arch_debug_get_stack_trace(returnAddresses, stackDepth, 1,
+-			0, false);
++	GRAB_THREAD_LOCK();
+ 
+-		for (int32 i = count; i &lt; stackDepth; i++)
+-			returnAddresses[i] = 0;
+-
+-		debugInfo.profile.sample_count += stackDepth;
++	if (debugInfo.profile.samples != NULL &amp;&amp; debugInfo.profile.buffer_full) {
+ 		int32 sampleCount = debugInfo.profile.sample_count;
++		int32 stackDepth = debugInfo.profile.stack_depth;
+ 		if (debugInfo.profile.max_samples - sampleCount &lt; stackDepth) {
+-			// The sample buffer is full; notify the debugger.
++			// The sample buffer is indeed full; notify the debugger.
+ 			debugInfo.profile.sample_count = 0;
+ 
+ 			RELEASE_THREAD_LOCK();
+@@ -1176,7 +1172,7 @@
+ 			debug_profiler_update message;
+ 			message.sample_count = sampleCount;
+ 			message.stack_depth = stackDepth;
+-			message.stopped = true;
++			message.stopped = false;
+ 
+ 			thread_hit_debug_event(B_DEBUGGER_MESSAGE_PROFILER_UPDATE, &amp;message,
+ 				sizeof(message), false);
+@@ -1184,12 +1180,45 @@
+ 			disable_interrupts();
+ 			GRAB_THREAD_LOCK();
+ 		}
++
++		if (debugInfo.profile.samples != NULL) {
++			schedule_profiling_timer(thread, debugInfo.profile.interval);
++			debugInfo.profile.buffer_full = false;
++		}
+ 	}
+ 
+-	// reschedule timer
+-	if (debugInfo.profile.samples != NULL)
+-		schedule_profiling_timer(thread, debugInfo.profile.interval);
+-	else
++	RELEASE_THREAD_LOCK();
++}
++
++
++static int32
++profiling_event(timer* /*unused*/)
++{
++	struct thread* thread = thread_get_current_thread();
++	thread_debug_info&amp; debugInfo = thread-&gt;debug_info;
++
++	if (debugInfo.profile.samples != NULL) {
++		int32 stackDepth = debugInfo.profile.stack_depth;
++		addr_t* returnAddresses = debugInfo.profile.samples
++			+ debugInfo.profile.sample_count;
++		int32 count = arch_debug_get_stack_trace(returnAddresses, stackDepth, 1,
++			0, false);
++
++		for (int32 i = count; i &lt; stackDepth; i++)
++			returnAddresses[i] = 0;
++
++		debugInfo.profile.sample_count += stackDepth;
++		int32 sampleCount = debugInfo.profile.sample_count;
++		if (debugInfo.profile.max_samples - sampleCount &lt; stackDepth) {
++			// The sample buffer is full; we'll have to notify the debugger.
++			// We can't do that right here. Instead we set a post interrupt
++			// callback doing that for us, and don't reschedule the timer yet.
++			thread-&gt;post_interrupt_callback = profiling_buffer_full;
++			debugInfo.profile.installed_timer = NULL;
++			debugInfo.profile.buffer_full = true;
++		} else
++			schedule_profiling_timer(thread, debugInfo.profile.interval);
++	} else
+ 		debugInfo.profile.installed_timer = NULL;
+ 
+ 	return B_HANDLED_INTERRUPT;
+@@ -1216,7 +1245,8 @@
+ void
+ user_debug_thread_scheduled(struct thread* thread)
+ {
+-	if (thread-&gt;debug_info.profile.samples != NULL) {
++	if (thread-&gt;debug_info.profile.samples != NULL
++		&amp;&amp; !thread-&gt;debug_info.profile.buffer_full) {
+ 		// install profiling timer
+ 		schedule_profiling_timer(thread,
+ 			thread-&gt;debug_info.profile.interval_left);
+@@ -2157,6 +2187,7 @@
+ 								= areaInfo.size / sizeof(addr_t);
+ 							threadDebugInfo.profile.sample_count = 0;
+ 							threadDebugInfo.profile.stack_depth = stackDepth;
++							threadDebugInfo.profile.buffer_full = false;
+ 							threadDebugInfo.profile.interval_left = interval;
+ 							threadDebugInfo.profile.installed_timer = NULL;
+ 						} else
+@@ -2216,6 +2247,7 @@
+ 						stackDepth = threadDebugInfo.profile.stack_depth;
+ 						threadDebugInfo.profile.sample_area = -1;
+ 						threadDebugInfo.profile.samples = NULL;
++						threadDebugInfo.profile.buffer_full = false;
+ 					} else
+ 						result = B_BAD_VALUE;
+ 				} else
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012036.html">[Haiku-commits] r27648 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/arch/x86
+</A></li>
+	<LI>Next message: <A HREF="012038.html">[Haiku-commits] r27650 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12037">[ date ]</a>
+              <a href="thread.html#12037">[ thread ]</a>
+              <a href="subject.html#12037">[ subject ]</a>
+              <a href="author.html#12037">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

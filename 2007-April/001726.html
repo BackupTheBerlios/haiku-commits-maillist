@@ -1,0 +1,259 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20769 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20769%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704200922.l3K9M7Gb010431%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001724.html">
+   <LINK REL="Next"  HREF="001727.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20769 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20769%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704200922.l3K9M7Gb010431%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20769 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Fri Apr 20 11:22:07 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001724.html">[Haiku-commits] r20768 - haiku/trunk/src/apps/abouthaiku
+</A></li>
+        <LI>Next message: <A HREF="001727.html">[Haiku-commits] r20770 -	haiku/trunk/src/add-ons/kernel/file_systems/googlefs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1726">[ date ]</a>
+              <a href="thread.html#1726">[ thread ]</a>
+              <a href="subject.html#1726">[ subject ]</a>
+              <a href="author.html#1726">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-20 11:21:55 +0200 (Fri, 20 Apr 2007)
+New Revision: 20769
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20769&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20769&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+Log:
+more TCP fixes, we should now be able to send large amounts of data through congestioned links.
+
+ - fixed BufferQueue's RemoveUntil.
+ - reset SND.NXT on third duplicate ACK (fast retransmit).
+ - on retransmit reset SND.NXT to SND.UNA (it will be updated back when we get good ACKs).
+ - fixed effective window calculation.
+ - relaxed SWS checking a bit, don't send partial packets on retransmission as the window might have been reduced due to congestion.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp	2007-04-20 08:49:02 UTC (rev 20768)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.cpp	2007-04-20 09:21:55 UTC (rev 20769)
+@@ -183,17 +183,12 @@
+ {
+ 	TRACE((&quot;BufferQueue@%p::RemoveUntil(sequence %lu)\n&quot;, this, (uint32)sequence));
+ 
+-	fFirstSequence = sequence;
++	if (sequence &lt; fFirstSequence)
++		return B_OK;
+ 
+ 	SegmentList::Iterator iterator = fList.GetIterator();
+ 	net_buffer *buffer = NULL;
+-	while ((buffer = iterator.Next()) != NULL) {
+-		if (sequence &lt;= buffer-&gt;sequence) {
+-			fFirstSequence = buffer-&gt;sequence;
+-				// just in case there is a hole, how unlikely this may ever be
+-			break;
+-		}
+-
++	while ((buffer = iterator.Next()) != NULL &amp;&amp; buffer-&gt;sequence &lt; sequence) {
+ 		if (sequence &gt;= buffer-&gt;sequence + buffer-&gt;size) {
+ 			// remove this buffer completely
+ 			iterator.Remove();
+@@ -209,9 +204,15 @@
+ 			buffer-&gt;sequence += size;
+ 			fNumBytes -= size;
+ 			fContiguousBytes -= size;
++			break;
+ 		}
+ 	}
+ 
++	if (fList.IsEmpty())
++		fFirstSequence = fLastSequence;
++	else
++		fFirstSequence = fList.Head()-&gt;sequence;
++
+ 	return B_OK;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-20 08:49:02 UTC (rev 20768)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-20 09:21:55 UTC (rev 20769)
+@@ -62,12 +62,12 @@
+ 
+ #ifdef PROBE_TCP
+ #	define PROBE(buffer, window) \
+-	dprintf(&quot;TCP PROBE %llu %s %s %ld %lu %lu %lu %lu %lu %lu %lu %lu %llu\n&quot;, \
++	dprintf(&quot;TCP PROBE %llu %s %s %ld %lu %lu %lu %lu %lu %lu %lu %lu %lu %llu\n&quot;, \
+ 		system_time(), PrintAddress(&amp;buffer-&gt;source), \
+ 		PrintAddress(&amp;buffer-&gt;destination), buffer-&gt;size, (uint32)fSendNext, \
+ 		(uint32)fSendUnacknowledged, fCongestionWindow, fSlowStartThreshold, \
+ 		window, fSendWindow, (uint32)(fSendMax - fSendUnacknowledged), \
+-		fSendQueue.Used(), fRetransmitTimeout)
++		fSendQueue.Available(fSendNext), fSendQueue.Used(), fRetransmitTimeout)
+ #else
+ #	define PROBE(buffer, window)	do { } while (0)
+ #endif
+@@ -1016,10 +1016,9 @@
+ 		// - the buffer is at least larger than half of the maximum send window, or
+ 		// - we're retransmitting data
+ 		if (length == segmentMaxSize
+-			|| ((flightSize == 0 || (fOptions &amp; TCP_NODELAY) != 0)
+-				&amp;&amp; tcp_sequence(fSendNext + length) == fSendQueue.LastSequence())
+-			|| (fSendMaxWindow &gt; 0 &amp;&amp; length &gt;= fSendMaxWindow / 2)
+-			|| fSendNext &lt; fSendMax)
++			|| (fOptions &amp; TCP_NODELAY) != 0
++			|| tcp_sequence(fSendNext + length) == fSendQueue.LastSequence()
++			|| (fSendMaxWindow &gt; 0 &amp;&amp; length &gt;= fSendMaxWindow / 2))
+ 			return true;
+ 	}
+ 
+@@ -1091,16 +1090,27 @@
+ 	if (fCongestionWindow &gt; 0)
+ 		sendWindow = min_c(sendWindow, fCongestionWindow);
+ 
+-	// a TCP may not send more data to the network than the
+-	// currently unacknowledged sequence (SND.UNA) plus the
+-	// calculated send window.
++	// SND.UNA  SND.NXT        SND.MAX
++	//  |        |              |
++	//  v        v              v
++	//  -----------------------------------
++	//  | effective window           |
++	//  -----------------------------------
+ 
++	// Flight size represents the window of data which is currently in the
++	// ether. We should never send data such as the flight size becomes larger
++	// than the effective window. Note however that the effective window may be
++	// reduced (by congestion for instance), so at some point in time flight
++	// size may be larger than the currently calculated window.
++
+ 	uint32 flightSize = fSendMax - fSendUnacknowledged;
+-	if (flightSize &gt; sendWindow) {
++	uint32 consumedWindow = fSendNext - fSendUnacknowledged;
++
++	if (consumedWindow &gt; sendWindow) {
+ 		sendWindow = 0;
+ 		// TODO enter persist state? try to get a window update.
+ 	} else
+-		sendWindow -= flightSize;
++		sendWindow -= consumedWindow;
+ 
+ 	if (force &amp;&amp; sendWindow == 0 &amp;&amp; fSendNext &lt;= fSendQueue.LastSequence()) {
+ 		// send one byte of data to ask for a window update
+@@ -1155,9 +1165,12 @@
+ 			buffer, buffer-&gt;size, PrintAddress(&amp;buffer-&gt;source),
+ 			PrintAddress(&amp;buffer-&gt;destination));
+ 		TRACE(&quot;              flags 0x%x, seq %lu, ack %lu, rwnd %hu, cwnd %lu&quot;
+-			  &quot;, ssthresh %lu&quot;, segment.flags, segment.sequence,
+-			  segment.acknowledge, segment.advertised_window,
+-			  fCongestionWindow, fSlowStartThreshold);
++			&quot;, ssthresh %lu&quot;, segment.flags, segment.sequence,
++			segment.acknowledge, segment.advertised_window,
++			fCongestionWindow, fSlowStartThreshold);
++		TRACE(&quot;              len %lu first %lu last %lu&quot;, segmentLength,
++			(uint32)fSendQueue.FirstSequence(),
++			(uint32)fSendQueue.LastSequence());
+ 
+ 		PROBE(buffer, sendWindow);
+ 		sendWindow -= buffer-&gt;size;
+@@ -1219,17 +1232,6 @@
+ }
+ 
+ 
+-status_t
+-TCPEndpoint::_SendQueued(tcp_sequence sendNext)
+-{
+-	tcp_sequence previousSendNext = fSendNext;
+-	fSendNext = sendNext;
+-	status_t status = _SendQueued();
+-	fSendNext = previousSendNext;
+-	return status;
+-}
+-
+-
+ int
+ TCPEndpoint::_GetMSS(const sockaddr *address) const
+ {
+@@ -1693,7 +1695,8 @@
+ {
+ 	TRACE(&quot;Retransmit()&quot;);
+ 	_ResetSlowStart();
+-	_SendQueued(fSendUnacknowledged);
++	fSendNext = fSendUnacknowledged;
++	_SendQueued();
+ }
+ 
+ 
+@@ -1738,10 +1741,11 @@
+ 		_ResetSlowStart();
+ 		fCongestionWindow = fSlowStartThreshold + 3
+ 			* fSendMaxSegmentSize;
++		fSendNext = segment.acknowledge;
+ 	} else if (fDuplicateAcknowledgeCount &gt; 3)
+ 		fCongestionWindow += fSendMaxSegmentSize;
+ 
+-	_SendQueued(segment.acknowledge);
++	_SendQueued();
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-20 08:49:02 UTC (rev 20768)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-20 09:21:55 UTC (rev 20769)
+@@ -90,7 +90,6 @@
+ 		bool _ShouldSendSegment(tcp_segment_header &amp;segment, uint32 length,
+ 			uint32 segmentMaxSize, uint32 flightSize);
+ 		status_t _SendQueued(bool force = false);
+-		status_t _SendQueued(tcp_sequence sendNext);
+ 		int _GetMSS(const struct sockaddr *) const;
+ 		status_t _ShutdownEgress(bool closing);
+ 		ssize_t _AvailableData() const;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001724.html">[Haiku-commits] r20768 - haiku/trunk/src/apps/abouthaiku
+</A></li>
+	<LI>Next message: <A HREF="001727.html">[Haiku-commits] r20770 -	haiku/trunk/src/add-ons/kernel/file_systems/googlefs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1726">[ date ]</a>
+              <a href="thread.html#1726">[ thread ]</a>
+              <a href="subject.html#1726">[ subject ]</a>
+              <a href="author.html#1726">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

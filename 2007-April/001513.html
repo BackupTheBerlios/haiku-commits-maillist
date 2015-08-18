@@ -1,0 +1,212 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20631 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/protocols/tcp	src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20631%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/protocols/tcp%0A%09src/add-ons/kernel/network/stack&In-Reply-To=%3C200704100529.l3A5T9Lm014723%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001512.html">
+   <LINK REL="Next"  HREF="001514.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20631 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/protocols/tcp	src/add-ons/kernel/network/stack</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20631%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/protocols/tcp%0A%09src/add-ons/kernel/network/stack&In-Reply-To=%3C200704100529.l3A5T9Lm014723%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20631 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/protocols/tcp	src/add-ons/kernel/network/stack">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Tue Apr 10 07:29:09 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001512.html">[Haiku-commits] r20630 - haiku/trunk/src/add-ons/translators/raw
+</A></li>
+        <LI>Next message: <A HREF="001514.html">[Haiku-commits] r20632 - haiku/trunk/src/add-ons/translators/raw
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1513">[ date ]</a>
+              <a href="thread.html#1513">[ thread ]</a>
+              <a href="subject.html#1513">[ subject ]</a>
+              <a href="author.html#1513">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-10 07:28:56 +0200 (Tue, 10 Apr 2007)
+New Revision: 20631
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20631&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20631&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/net/net_socket.h
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp
+Log:
+Fixed some more TCP issues.
+
+ - Properly flag sockets using non-blocking connects() when in SYN SENT.
+ - and when in LISTEN, we should use the socket's connection queue size.
+
+
+Modified: haiku/trunk/headers/private/net/net_socket.h
+===================================================================
+--- haiku/trunk/headers/private/net/net_socket.h	2007-04-10 00:14:32 UTC (rev 20630)
++++ haiku/trunk/headers/private/net/net_socket.h	2007-04-10 05:28:56 UTC (rev 20631)
+@@ -65,6 +65,7 @@
+ 	status_t	(*spawn_pending_socket)(net_socket *parent, net_socket **_socket);
+ 	void		(*delete_socket)(net_socket *socket);
+ 	status_t	(*dequeue_connected)(net_socket *parent, net_socket **_socket);
++	ssize_t		(*count_connected)(net_socket *parent);
+ 	status_t	(*set_max_backlog)(net_socket *socket, uint32 backlog);
+ 	status_t	(*set_connected)(net_socket *socket);
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-10 00:14:32 UTC (rev 20630)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-10 05:28:56 UTC (rev 20631)
+@@ -52,7 +52,7 @@
+ // the space after 'this' is important in order for this to work with cpp 2.95
+ #	define TRACE(format, args...)	dprintf(&quot;TCP:%p:&quot; format &quot;\n&quot;, this , ##args)
+ #else
+-#	define TRACE(args...)
++#	define TRACE(args...)			do { } while (0)
+ #endif
+ 
+ // Initial estimate for packet round trip time (RTT)
+@@ -62,6 +62,9 @@
+ enum {
+ 	FLAG_OPTION_WINDOW_SHIFT	= 0x01,
+ 	FLAG_OPTION_TIMESTAMP		= 0x02,
++	// TODO: Should FLAG_NO_RECEIVE apply as well to received connections?
++	//       That is, what is excepected from accept() after a shutdown()
++	//       is performed on a listen()ing socket.
+ 	FLAG_NO_RECEIVE				= 0x04,
+ };
+ 
+@@ -334,13 +337,16 @@
+ 
+ 	// If we are running over Loopback, after _SendQueued() returns we
+ 	// may be in ESTABLISHED already.
+-	if (fState == ESTABLISHED)
++	if (fState == ESTABLISHED) {
++		TRACE(&quot;  Connect() completed after _SendQueued()&quot;);
+ 		return B_OK;
++	}
+ 
+ 	// wait until 3-way handshake is complete (if needed)
+ 	bigtime_t timeout = min_c(socket-&gt;send.timeout, TCP_CONNECTION_TIMEOUT);
+ 	if (timeout == 0) {
+ 		// we're a non-blocking socket
++		TRACE(&quot;  Connect() delayed, return EINPROGRESS&quot;);
+ 		return EINPROGRESS;
+ 	}
+ 
+@@ -368,6 +374,8 @@
+ 			return status;
+ 
+ 		status = gSocketModule-&gt;dequeue_connected(socket, _acceptedSocket);
++		if (status == B_OK)
++			TRACE(&quot;  Accept() returning %p&quot;, (*_acceptedSocket)-&gt;first_protocol);
+ 	} while (status &lt; B_OK);
+ 
+ 	return status;
+@@ -533,9 +541,8 @@
+ ssize_t
+ TCPEndpoint::SendAvailable()
+ {
+-	TRACE(&quot;SendAvailable()&quot;);
+-
+ 	RecursiveLocker locker(fLock);
++	TRACE(&quot;SendAvailable(): %li&quot;, fSendQueue.Free());
+ 	return fSendQueue.Free();
+ }
+ 
+@@ -767,6 +774,8 @@
+ 		}
+ 	}
+ 
++	TRACE(&quot;  ListenReceive() created new endpoint %p&quot;, endpoint);
++
+ 	// send SYN+ACK
+ 	status_t status = endpoint-&gt;_SendQueued();
+ 
+@@ -1403,6 +1412,14 @@
+ ssize_t
+ TCPEndpoint::_AvailableData() const
+ {
++	// TODO: Refer to the FLAG_NO_RECEIVE comment above regarding
++	//       the application of FLAG_NO_RECEIVE in listen()ing
++	//       sockets.
++	if (fState == LISTEN)
++		return gSocketModule-&gt;count_connected(socket);
++	else if (fState == SYNCHRONIZE_SENT)
++		return 0;
++
+ 	ssize_t availableData = fReceiveQueue.Available();
+ 
+ 	if (availableData == 0 &amp;&amp; !_ShouldReceive())
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp	2007-04-10 00:14:32 UTC (rev 20630)
++++ haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp	2007-04-10 05:28:56 UTC (rev 20631)
+@@ -372,6 +372,22 @@
+ }
+ 
+ 
++ssize_t
++socket_count_connected(net_socket *_parent)
++{
++	net_socket_private *parent = (net_socket_private *)_parent;
++
++	BenaphoreLocker _(parent-&gt;lock);
++
++	int count = 0;
++	for (void *it = list_get_first_item(&amp;parent-&gt;connected_children);
++			it != NULL; it = list_get_next_item(&amp;parent-&gt;connected_children, it))
++		count++;
++
++	return count;
++}
++
++
+ status_t
+ socket_set_max_backlog(net_socket *_socket, uint32 backlog)
+ {
+@@ -1101,6 +1117,7 @@
+ 	socket_spawn_pending,
+ 	socket_delete,
+ 	socket_dequeue_connected,
++	socket_count_connected,
+ 	socket_set_max_backlog,
+ 	socket_connected,
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001512.html">[Haiku-commits] r20630 - haiku/trunk/src/add-ons/translators/raw
+</A></li>
+	<LI>Next message: <A HREF="001514.html">[Haiku-commits] r20632 - haiku/trunk/src/add-ons/translators/raw
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1513">[ date ]</a>
+              <a href="thread.html#1513">[ thread ]</a>
+              <a href="subject.html#1513">[ subject ]</a>
+              <a href="author.html#1513">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

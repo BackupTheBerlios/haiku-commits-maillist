@@ -1,0 +1,417 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22942 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22942%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200711180105.lAI15eLa025648%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004777.html">
+   <LINK REL="Next"  HREF="004779.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22942 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22942%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200711180105.lAI15eLa025648%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22942 - haiku/trunk/src/add-ons/kernel/busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun Nov 18 02:05:40 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004777.html">[Haiku-commits] r22941 - haiku/trunk/build/jam
+</A></li>
+        <LI>Next message: <A HREF="004779.html">[Haiku-commits] r22943 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4778">[ date ]</a>
+              <a href="thread.html#4778">[ thread ]</a>
+              <a href="subject.html#4778">[ subject ]</a>
+              <a href="author.html#4778">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2007-11-18 02:05:39 +0100 (Sun, 18 Nov 2007)
+New Revision: 22942
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22942&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22942&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/ehci_hardware.h
+Log:
+* Implement interrupt transfers in EHCI
+* Uses a &quot;collapsed binary tree&quot; (for lack of a better name) to support the different intervals
+* Remove a leftover variable declaration that was hiding error conditions away...
+* Some cleanup
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp	2007-11-17 23:46:01 UTC (rev 22941)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp	2007-11-18 01:05:39 UTC (rev 22942)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2006, Haiku Inc. All rights reserved.
++ * Copyright 2006-2007, Haiku Inc. All rights reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -238,18 +238,69 @@
+ 
+ 	// allocate the periodic frame list
+ 	fPeriodicFrameListArea = fStack-&gt;AllocateArea((void **)&amp;fPeriodicFrameList,
+-		(void **)&amp;physicalAddress, B_PAGE_SIZE, &quot;USB EHCI Periodic Framelist&quot;);
++		(void **)&amp;physicalAddress, B_PAGE_SIZE * 2, &quot;USB EHCI Periodic Framelist&quot;);
+ 	if (fPeriodicFrameListArea &lt; B_OK) {
+ 		TRACE_ERROR((&quot;usb_ehci: unable to allocate periodic framelist\n&quot;));
+ 		return;
+ 	}
+ 
+-	// terminate all elements
+-	for (int32 i = 0; i &lt; 1024; i++)
+-		fPeriodicFrameList[i] = EHCI_PFRAMELIST_TERM;
+-
++	// set the periodic frame list base on the controller
+ 	WriteOpReg(EHCI_PERIODICLISTBASE, (uint32)physicalAddress);
+ 
++	// create the interrupt entries to support different polling intervals
++	TRACE((&quot;usb_ehci: creating interrupt entries\n&quot;));
++	addr_t physicalBase = physicalAddress + B_PAGE_SIZE;
++	uint8 *logicalBase = (uint8 *)fPeriodicFrameList + B_PAGE_SIZE;
++	memset(logicalBase, 0, B_PAGE_SIZE);
++
++	fInterruptEntries = (interrupt_entry *)logicalBase;
++	for (int32 i = 0; i &lt; 10; i++) {
++		ehci_qh *queueHead = &amp;fInterruptEntries[i].queue_head;
++		queueHead-&gt;this_phy = physicalBase;
++		queueHead-&gt;current_qtd_phy = EHCI_QTD_TERMINATE;
++		queueHead-&gt;overlay.next_phy = EHCI_QTD_TERMINATE;
++		queueHead-&gt;overlay.alt_next_phy = EHCI_QTD_TERMINATE;
++		queueHead-&gt;overlay.token = EHCI_QTD_STATUS_HALTED;
++
++		// set dummy endpoint information
++		queueHead-&gt;endpoint_chars = EHCI_QH_CHARS_EPS_HIGH
++			| (3 &lt;&lt; EHCI_QH_CHARS_RL_SHIFT) | (64 &lt;&lt; EHCI_QH_CHARS_MPL_SHIFT)
++			| EHCI_QH_CHARS_TOGGLE;
++		queueHead-&gt;endpoint_caps = (1 &lt;&lt; EHCI_QH_CAPS_MULT_SHIFT)
++			| (0xff &lt;&lt; EHCI_QH_CAPS_ISM_SHIFT);
++
++		physicalBase += sizeof(interrupt_entry);
++	}
++
++	// build flat interrupt tree
++	TRACE((&quot;usb_ehci: build up interrupt links\n&quot;));
++	uint32 interval = 1024;
++	uint32 intervalIndex = 9;
++	while (interval &gt; 1) {
++		uint32 insertIndex = interval / 2;
++		while (insertIndex &lt; 1024) {
++			uint32 entry = fInterruptEntries[intervalIndex].queue_head.this_phy;
++			fPeriodicFrameList[insertIndex] = entry | EHCI_PFRAMELIST_QH;
++			insertIndex += interval;
++		}
++
++		intervalIndex--;
++		interval /= 2;
++	}
++
++	// setup the empty slot in the list and linking of all -&gt; first
++	ehci_qh *firstLogical = &amp;fInterruptEntries[0].queue_head;
++	uint32 firstPhysical = firstLogical-&gt;this_phy | EHCI_QH_TYPE_QH;
++	fPeriodicFrameList[0] = firstPhysical;
++	for (int32 i = 1; i &lt; 10; i++) {
++		fInterruptEntries[i].queue_head.next_phy = firstPhysical;
++		fInterruptEntries[i].queue_head.next_log = firstLogical;
++	}
++
++	// terminate the first entry
++	firstLogical-&gt;next_phy = EHCI_QH_TERMINATE;
++	firstLogical-&gt;next_log = NULL;
++
+ 	// allocate a queue head that will always stay in the async frame list
+ 	fAsyncQueueHead = CreateQueueHead();
+ 	if (!fAsyncQueueHead) {
+@@ -387,36 +438,13 @@
+ 	}
+ 
+ 	Pipe *pipe = transfer-&gt;TransferPipe();
+-	switch (pipe-&gt;Speed()) {
+-		case USB_SPEED_LOWSPEED:
+-			queueHead-&gt;endpoint_chars = EHCI_QH_CHARS_EPS_LOW;
+-			break;
+-		case USB_SPEED_FULLSPEED:
+-			queueHead-&gt;endpoint_chars = EHCI_QH_CHARS_EPS_FULL;
+-			break;
+-		case USB_SPEED_HIGHSPEED:
+-			queueHead-&gt;endpoint_chars = EHCI_QH_CHARS_EPS_HIGH;
+-			break;
+-		default:
+-			TRACE_ERROR((&quot;usb_ehci: unknown pipe speed\n&quot;));
+-			FreeQueueHead(queueHead);
+-			return B_ERROR;
++	status_t result = InitQueueHead(queueHead, pipe);
++	if (result &lt; B_OK) {
++		TRACE_ERROR((&quot;usb_ehci: failed to init queue head\n&quot;));
++		FreeQueueHead(queueHead);
++		return result;
+ 	}
+ 
+-	if (pipe-&gt;Type() &amp; USB_OBJECT_CONTROL_PIPE) {
+-		queueHead-&gt;endpoint_chars |=
+-			(pipe-&gt;Speed() != USB_SPEED_HIGHSPEED ? EHCI_QH_CHARS_CONTROL : 0);
+-	}
+-
+-	queueHead-&gt;endpoint_chars |= (3 &lt;&lt; EHCI_QH_CHARS_RL_SHIFT)
+-		| (pipe-&gt;MaxPacketSize() &lt;&lt; EHCI_QH_CHARS_MPL_SHIFT)
+-		| (pipe-&gt;EndpointAddress() &lt;&lt; EHCI_QH_CHARS_EPT_SHIFT)
+-		| (pipe-&gt;DeviceAddress() &lt;&lt; EHCI_QH_CHARS_DEV_SHIFT)
+-		| EHCI_QH_CHARS_TOGGLE;
+-	queueHead-&gt;endpoint_caps = (1 &lt;&lt; EHCI_QH_CAPS_MULT_SHIFT)
+-		| (0x1c &lt;&lt; EHCI_QH_CAPS_SCM_SHIFT);
+-
+-	status_t result;
+ 	bool directionIn;
+ 	ehci_qtd *dataDescriptor;
+ 	if (pipe-&gt;Type() &amp; USB_OBJECT_CONTROL_PIPE)
+@@ -458,14 +486,62 @@
+ status_t
+ EHCI::SubmitPeriodicTransfer(Transfer *transfer)
+ {
+-	return B_ERROR;
++	Pipe *pipe = transfer-&gt;TransferPipe();
++	if ((pipe-&gt;Type() &amp; USB_OBJECT_INTERRUPT_PIPE) == 0)
++		return B_ERROR;
++
++	ehci_qh *queueHead = CreateQueueHead();
++	if (!queueHead) {
++		TRACE_ERROR((&quot;usb_ehci: failed to allocate periodic queue head\n&quot;));
++		return B_NO_MEMORY;
++	}
++
++	status_t result = InitQueueHead(queueHead, pipe);
++	if (result &lt; B_OK) {
++		TRACE_ERROR((&quot;usb_ehci: failed to init queue head\n&quot;));
++		FreeQueueHead(queueHead);
++		return result;
++	}
++
++	bool directionIn;
++	ehci_qtd *dataDescriptor;
++	result = FillQueueWithData(transfer, queueHead, &amp;dataDescriptor,
++		&amp;directionIn);
++
++	if (result &lt; B_OK) {
++		TRACE_ERROR((&quot;usb_ehci: failed to fill transfer queue with data\n&quot;));
++		FreeQueueHead(queueHead);
++		return result;
++	}
++
++	result = AddPendingTransfer(transfer, queueHead, dataDescriptor, directionIn);
++	if (result &lt; B_OK) {
++		TRACE_ERROR((&quot;usb_ehci: failed to add pending transfer\n&quot;));
++		FreeQueueHead(queueHead);
++		return result;
++	}
++
++#ifdef TRACE_USB
++	TRACE((&quot;usb_ehci: linking interrupt queue\n&quot;));
++	print_queue(queueHead);
++#endif
++
++	result = LinkInterruptQueueHead(queueHead,
++		((InterruptPipe *)pipe)-&gt;Interval());
++	if (result &lt; B_OK) {
++		TRACE_ERROR((&quot;usb_ehci: failed to link queue head to the async list\n&quot;));
++		FreeQueueHead(queueHead);
++		return result;
++	}
++
++	return B_OK;
+ }
+ 
+ 
+ status_t
+ EHCI::NotifyPipeChange(Pipe *pipe, usb_change change)
+ {
+-	TRACE_ERROR((&quot;usb_ehci: pipe change %d for pipe 0x%08lx\n&quot;, change, (uint32)pipe));
++	TRACE((&quot;usb_ehci: pipe change %d for pipe 0x%08lx\n&quot;, change, (uint32)pipe));
+ 	switch (change) {
+ 		case USB_CHANGE_CREATED:
+ 		case USB_CHANGE_DESTROYED: {
+@@ -966,7 +1042,6 @@
+ 					// a transfer error occured
+ 					TRACE_ERROR((&quot;usb_ehci: qtd (0x%08lx) error: 0x%08lx\n&quot;, descriptor-&gt;this_phy, status));
+ 
+-					status_t callbackStatus = B_ERROR;
+ 					uint8 errorCount = status &gt;&gt; EHCI_QTD_ERRCOUNT_SHIFT;
+ 					errorCount &amp;= EHCI_QTD_ERRCOUNT_MASK;
+ 					if (errorCount == 0) {
+@@ -1177,6 +1252,43 @@
+ }
+ 
+ 
++status_t
++EHCI::InitQueueHead(ehci_qh *queueHead, Pipe *pipe)
++{
++	switch (pipe-&gt;Speed()) {
++		case USB_SPEED_LOWSPEED:
++			queueHead-&gt;endpoint_chars = EHCI_QH_CHARS_EPS_LOW;
++			break;
++		case USB_SPEED_FULLSPEED:
++			queueHead-&gt;endpoint_chars = EHCI_QH_CHARS_EPS_FULL;
++			break;
++		case USB_SPEED_HIGHSPEED:
++			queueHead-&gt;endpoint_chars = EHCI_QH_CHARS_EPS_HIGH;
++			break;
++		default:
++			TRACE_ERROR((&quot;usb_ehci: unknown pipe speed\n&quot;));
++			return B_ERROR;
++	}
++
++	if (pipe-&gt;Type() &amp; USB_OBJECT_CONTROL_PIPE) {
++		queueHead-&gt;endpoint_chars |=
++			(pipe-&gt;Speed() != USB_SPEED_HIGHSPEED ? EHCI_QH_CHARS_CONTROL : 0);
++	}
++
++	queueHead-&gt;endpoint_chars |= (3 &lt;&lt; EHCI_QH_CHARS_RL_SHIFT)
++		| (pipe-&gt;MaxPacketSize() &lt;&lt; EHCI_QH_CHARS_MPL_SHIFT)
++		| (pipe-&gt;EndpointAddress() &lt;&lt; EHCI_QH_CHARS_EPT_SHIFT)
++		| (pipe-&gt;DeviceAddress() &lt;&lt; EHCI_QH_CHARS_DEV_SHIFT)
++		| EHCI_QH_CHARS_TOGGLE;
++	queueHead-&gt;endpoint_caps = (1 &lt;&lt; EHCI_QH_CAPS_MULT_SHIFT);
++
++	if (pipe-&gt;Type() &amp; USB_OBJECT_INTERRUPT_PIPE)
++		queueHead-&gt;endpoint_caps |= (0xff &lt;&lt; EHCI_QH_CAPS_ISM_SHIFT);
++
++	return B_OK;
++}
++
++
+ void
+ EHCI::FreeQueueHead(ehci_qh *queueHead)
+ {
+@@ -1209,6 +1321,34 @@
+ 
+ 
+ status_t
++EHCI::LinkInterruptQueueHead(ehci_qh *queueHead, uint8 interval)
++{
++	if (!Lock())
++		return B_ERROR;
++
++	// this should not happen
++	if (interval &lt; 1)
++		interval = 1;
++
++	// this may happen as intervals can go up to 16; we limit the value to
++	// 10 as you cannot support intervals above that with a frame list of
++	// just 1024 entries...
++	if (interval &gt; 10)
++		interval = 10;
++
++	ehci_qh *interruptQueue = &amp;fInterruptEntries[interval - 1].queue_head;
++	queueHead-&gt;next_log = interruptQueue-&gt;next_log;
++	queueHead-&gt;next_phy = interruptQueue-&gt;next_phy;
++	queueHead-&gt;prev_log = interruptQueue;
++	interruptQueue-&gt;next_log = queueHead;
++	interruptQueue-&gt;next_phy = queueHead-&gt;this_phy | EHCI_QH_TYPE_QH;
++
++	Unlock();
++	return B_OK;
++}
++
++
++status_t
+ EHCI::UnlinkQueueHead(ehci_qh *queueHead, ehci_qh **freeListHead)
+ {
+ 	if (!Lock())
+@@ -1220,7 +1360,6 @@
+ 	prevHead-&gt;next_log = queueHead-&gt;next_log;
+ 	nextHead-&gt;prev_log = queueHead-&gt;prev_log;
+ 	queueHead-&gt;next_phy = fAsyncQueueHead-&gt;this_phy | EHCI_QH_TYPE_QH;
+-	queueHead-&gt;next_log = NULL;
+ 	queueHead-&gt;prev_log = NULL;
+ 
+ 	queueHead-&gt;next_log = *freeListHead;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h	2007-11-17 23:46:01 UTC (rev 22941)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h	2007-11-18 01:05:39 UTC (rev 22942)
+@@ -76,9 +76,13 @@
+ 
+ 		// Queue Head functions
+ 		ehci_qh						*CreateQueueHead();
++		status_t					InitQueueHead(ehci_qh *queueHead,
++										Pipe *pipe);
+ 		void						FreeQueueHead(ehci_qh *queueHead);
+ 
+ 		status_t					LinkQueueHead(ehci_qh *queueHead);
++		status_t					LinkInterruptQueueHead(ehci_qh *queueHead,
++										uint8 interval);
+ 		status_t					UnlinkQueueHead(ehci_qh *queueHead,
+ 										ehci_qh **freeList);
+ 
+@@ -133,11 +137,12 @@
+ 		pci_info					*fPCIInfo;
+ 		Stack						*fStack;
+ 
+-		// Framelist memory
++		// Periodic transfer framelist and interrupt entries
+ 		area_id						fPeriodicFrameListArea;
+ 		addr_t						*fPeriodicFrameList;
++		interrupt_entry				*fInterruptEntries;
+ 
+-		// Async frame list management
++		// Async transfer queue management
+ 		ehci_qh						*fAsyncQueueHead;
+ 		sem_id						fAsyncAdvanceSem;
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ehci_hardware.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ehci_hardware.h	2007-11-17 23:46:01 UTC (rev 22941)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ehci_hardware.h	2007-11-18 01:05:39 UTC (rev 22942)
+@@ -190,6 +190,12 @@
+ } ehci_qh;
+ 
+ 
++typedef struct {
++	ehci_qh		queue_head;
++	uint32		padding[2];
++} interrupt_entry;
++
++
+ // Applies to ehci_qh.link_phy
+ #define EHCI_QH_TYPE_ITD		(0 &lt;&lt; 1)
+ #define EHCI_QH_TYPE_QH			(1 &lt;&lt; 1)
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004777.html">[Haiku-commits] r22941 - haiku/trunk/build/jam
+</A></li>
+	<LI>Next message: <A HREF="004779.html">[Haiku-commits] r22943 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4778">[ date ]</a>
+              <a href="thread.html#4778">[ thread ]</a>
+              <a href="subject.html#4778">[ subject ]</a>
+              <a href="author.html#4778">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

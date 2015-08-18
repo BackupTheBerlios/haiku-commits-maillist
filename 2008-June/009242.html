@@ -1,0 +1,1112 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25744 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25744%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/debug&In-Reply-To=%3C200806010225.m512P3di025474%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   
+   <LINK REL="Next"  HREF="009243.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25744 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25744%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/debug&In-Reply-To=%3C200806010225.m512P3di025474%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25744 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Jun  1 04:25:03 CEST 2008</I>
+    <P><UL>
+        
+        <LI>Next message: <A HREF="009243.html">[Haiku-commits] r25745 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9242">[ date ]</a>
+              <a href="thread.html#9242">[ thread ]</a>
+              <a href="subject.html#9242">[ subject ]</a>
+              <a href="author.html#9242">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-06-01 04:25:00 +0200 (Sun, 01 Jun 2008)
+New Revision: 25744
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25744&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25744&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/debug/debug_builtin_commands.cpp
+   haiku/trunk/src/system/kernel/debug/debug_builtin_commands.h
+   haiku/trunk/src/system/kernel/debug/debug_output_filter.h
+Modified:
+   haiku/trunk/headers/private/kernel/debug.h
+   haiku/trunk/src/system/kernel/debug/Jamfile
+   haiku/trunk/src/system/kernel/debug/blue_screen.cpp
+   haiku/trunk/src/system/kernel/debug/debug.cpp
+   haiku/trunk/src/system/kernel/debug/debug_commands.cpp
+   haiku/trunk/src/system/kernel/debug/debug_commands.h
+   haiku/trunk/src/system/kernel/debug/debug_parser.cpp
+Log:
+* Introduced pipes in the kernel debugger. The syntax is similar to
+  pipes in the shell, though the semantics is a little different: The
+  second command is invoked whenever the first command has written a
+  complete line. The line is passed as last argument to the second
+  command. The new command flag B_KDEBUG_PIPE_FINAL_RERUN causes the
+  second command to be invoked again (with NULL argument) after the
+  first command is done.
+* Added kprintf_unfiltered() and kputs_unfiltered() which bypass the
+  pipe mechanism and directly print to the bluescreen/serial output.
+* Moved most commands from debug.cpp to the new
+  debug_builtin_commands.cpp.
+* B_KDEBUG_DONT_PARSE_ARGUMENTS commands don't get an argument anymore,
+  if it would consist of white space only.
+* Added new debugger command return value B_KDEBUG_ERROR, which
+  indicates that executing the command failed. This return code will
+  abort a complete pipe.
+* Since debugger commands can nest (i.e. one command can invoke another
+  one) the setjmp()/longjmp() mechanism to restore the stack after a
+  page fault in a command needs more than one jump buffer.
+* Added abort_debugger_command(), which longjmp()s out of the currently
+  executed command. This will also abort the current pipe.
+* When pagination is enabled pressing &quot;a&quot; will abort the running command
+  (as opposed to &quot;q&quot; which only disables the blue screen output, but
+  lets the command continue).
+* Added debugger commands:
+  - &quot;grep&quot; which can be used to filter output by pattern. Removed the
+    &quot;filter&quot; command and the underlying mechanism that did that before.
+  - &quot;head&quot; which prints only the first lines of output of another
+    command.
+  - &quot;wc&quot; counts lines, words, and characters of another command's
+    output.
+
+
+Modified: haiku/trunk/headers/private/kernel/debug.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/debug.h	2008-05-31 21:01:05 UTC (rev 25743)
++++ haiku/trunk/headers/private/kernel/debug.h	2008-06-01 02:25:00 UTC (rev 25744)
+@@ -42,7 +42,12 @@
+ #	define ASSERT_PRINT(x, format...)	do { } while(0)
+ #endif
+ 
++// command return value
++#define B_KDEBUG_ERROR	4
++
++// command flags
+ #define B_KDEBUG_DONT_PARSE_ARGUMENTS	(0x01)
++#define B_KDEBUG_PIPE_FINAL_RERUN		(0x02)
+ 
+ struct debugger_module_info {
+ 	module_info info;
+@@ -74,6 +79,9 @@
+ extern void debug_stop_screen_debug_output(void);
+ 
+ extern void	kputs(const char *string);
++extern void	kputs_unfiltered(const char *string);
++extern void kprintf_unfiltered(const char *format, ...)
++				__attribute__ ((format (__printf__, 1, 2)));
+ extern void dprintf_no_syslog(const char *format, ...)
+ 				__attribute__ ((format (__printf__, 1, 2)));
+ 
+
+Modified: haiku/trunk/src/system/kernel/debug/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/Jamfile	2008-05-31 21:01:05 UTC (rev 25743)
++++ haiku/trunk/src/system/kernel/debug/Jamfile	2008-06-01 02:25:00 UTC (rev 25744)
+@@ -6,6 +6,7 @@
+ KernelMergeObject kernel_debug.o :
+ 	blue_screen.cpp
+ 	debug.cpp
++	debug_builtin_commands.cpp
+ 	debug_commands.cpp
+ 	debug_paranoia.cpp
+ 	debug_parser.cpp
+
+Modified: haiku/trunk/src/system/kernel/debug/blue_screen.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/blue_screen.cpp	2008-05-31 21:01:05 UTC (rev 25743)
++++ haiku/trunk/src/system/kernel/debug/blue_screen.cpp	2008-06-01 02:25:00 UTC (rev 25744)
+@@ -121,7 +121,7 @@
+ 		// Use the paging mechanism: either, we're in the debugger, and a
+ 		// command is being executed, or we're currently showing boot debug
+ 		// output
+-		const char *text = &quot;Press key to continue, Q to quit&quot;;
++		const char *text = &quot;Press key to continue, Q to quit, A to abort&quot;;
+ 		int32 length = strlen(text);
+ 		if (sScreen.x + length &gt; sScreen.columns) {
+ 			// make sure we don't overwrite too much
+@@ -136,8 +136,13 @@
+ 		}
+ 
+ 		char c = blue_screen_getchar();
+-		if (c == 'q')
++		if (c == 'q') {
+ 			sScreen.ignore_output = true;
++		} else if (c == 'a') {
++			abort_debugger_command();
++				// should not return
++			sScreen.ignore_output = true;
++		}
+ 
+ 		// remove on screen text again
+ 		sModule-&gt;fill_glyph(sScreen.columns - length, sScreen.y, length,
+
+Modified: haiku/trunk/src/system/kernel/debug/debug.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/debug.cpp	2008-05-31 21:01:05 UTC (rev 25743)
++++ haiku/trunk/src/system/kernel/debug/debug.cpp	2008-06-01 02:25:00 UTC (rev 25744)
+@@ -9,7 +9,6 @@
+ /*! This file contains the debugger and debug output facilities */
+ 
+ #include &quot;blue_screen.h&quot;
+-#include &quot;gdb.h&quot;
+ 
+ #include &lt;debug.h&gt;
+ #include &lt;debug_paranoia.h&gt;
+@@ -35,7 +34,9 @@
+ #include &lt;string.h&gt;
+ #include &lt;syslog.h&gt;
+ 
++#include &quot;debug_builtin_commands.h&quot;
+ #include &quot;debug_commands.h&quot;
++#include &quot;debug_output_filter.h&quot;
+ #include &quot;debug_variables.h&quot;
+ 
+ 
+@@ -67,6 +68,8 @@
+ #define OUTPUT_BUFFER_SIZE 1024
+ static char sOutputBuffer[OUTPUT_BUFFER_SIZE];
+ static char sLastOutputBuffer[OUTPUT_BUFFER_SIZE];
++static DebugOutputFilter* sDebugOutputFilter = NULL;
++DefaultDebugOutputFilter gDefaultDebugOutputFilter;
+ 
+ static void flush_pending_repeats(void);
+ static void check_pending_repeats(void *data, int iter);
+@@ -84,22 +87,80 @@
+ 
+ static char sLineBuffer[HISTORY_SIZE][LINE_BUFFER_SIZE] = { &quot;&quot;, };
+ static char sParseLine[LINE_BUFFER_SIZE];
+-static char sFilter[64];
+ static int32 sCurrentLine = 0;
+ 
+ #define distance(a, b) ((a) &lt; (b) ? (b) - (a) : (a) - (b))
+ 
+ 
++// #pragma mark - DebugOutputFilter
++
++
++DebugOutputFilter::DebugOutputFilter()
++{
++}
++
++
++DebugOutputFilter::~DebugOutputFilter()
++{
++}
++
++
++void
++DebugOutputFilter::PrintString(const char* string)
++{
++}
++
++
++void
++DebugOutputFilter::Print(const char* format, va_list args)
++{
++}
++
++
++void
++DefaultDebugOutputFilter::PrintString(const char* string)
++{
++	if (sSerialDebugEnabled)
++		arch_debug_serial_puts(string);
++	if (sBlueScreenEnabled || sDebugScreenEnabled)
++		blue_screen_puts(string);
++
++	for (uint32 i = 0; sSerialDebugEnabled &amp;&amp; i &lt; kMaxDebuggerModules; i++) {
++		if (sDebuggerModules[i] &amp;&amp; sDebuggerModules[i]-&gt;debugger_puts)
++			sDebuggerModules[i]-&gt;debugger_puts(string, strlen(string));
++	}
++}
++
++
++void
++DefaultDebugOutputFilter::Print(const char* format, va_list args)
++{
++	vsnprintf(sOutputBuffer, OUTPUT_BUFFER_SIZE, format, args);
++	flush_pending_repeats();
++	PrintString(sOutputBuffer);
++}
++
++
++// #pragma mark -
++
++
++DebugOutputFilter*
++set_debug_output_filter(DebugOutputFilter* filter)
++{
++	DebugOutputFilter* oldFilter = sDebugOutputFilter;
++	sDebugOutputFilter = filter;
++	return oldFilter;
++}
++
++
+ static void
+ kputchar(char c)
+ {
+-	uint32 i;
+-
+ 	if (sSerialDebugEnabled)
+ 		arch_debug_serial_putchar(c);
+ 	if (sBlueScreenEnabled || sDebugScreenEnabled)
+ 		blue_screen_putchar(c);
+-	for (i = 0; sSerialDebugEnabled &amp;&amp; i &lt; kMaxDebuggerModules; i++)
++	for (uint32 i = 0; sSerialDebugEnabled &amp;&amp; i &lt; kMaxDebuggerModules; i++)
+ 		if (sDebuggerModules[i] &amp;&amp; sDebuggerModules[i]-&gt;debugger_puts)
+ 			sDebuggerModules[i]-&gt;debugger_puts(&amp;c, sizeof(c));
+ }
+@@ -108,15 +169,15 @@
+ void
+ kputs(const char *s)
+ {
+-	uint32 i;
++	if (sDebugOutputFilter != NULL)
++		sDebugOutputFilter-&gt;PrintString(s);
++}
+ 
+-	if (sSerialDebugEnabled)
+-		arch_debug_serial_puts(s);
+-	if (sBlueScreenEnabled || sDebugScreenEnabled)
+-		blue_screen_puts(s);
+-	for (i = 0; sSerialDebugEnabled &amp;&amp; i &lt; kMaxDebuggerModules; i++)
+-		if (sDebuggerModules[i] &amp;&amp; sDebuggerModules[i]-&gt;debugger_puts)
+-			sDebuggerModules[i]-&gt;debugger_puts(s, strlen(s));
++
++void
++kputs_unfiltered(const char *s)
++{
++	gDefaultDebugOutputFilter.PrintString(s);
+ }
+ 
+ 
+@@ -631,124 +692,17 @@
+ 
+ 
+ static int
+-cmd_reboot(int argc, char **argv)
+-{
+-	arch_cpu_shutdown(true);
+-	return 0;
+-		// I'll be really suprised if this line ever runs! ;-)
+-}
+-
+-
+-static int
+-cmd_shutdown(int argc, char **argv)
+-{
+-	arch_cpu_shutdown(false);
+-	return 0;
+-}
+-
+-
+-static int
+-cmd_help(int argc, char **argv)
+-{
+-	debugger_command *command, *specified = NULL;
+-	const char *start = NULL;
+-	int32 startLength = 0;
+-	bool ambiguous;
+-
+-	if (argc &gt; 1) {
+-		specified = find_debugger_command(argv[1], false, ambiguous);
+-		if (specified == NULL) {
+-			start = argv[1];
+-			startLength = strlen(start);
+-		}
+-	}
+-
+-	if (specified != NULL) {
+-		// only print out the help of the specified command (and all of its aliases)
+-		kprintf(&quot;debugger command for \&quot;%s\&quot; and aliases:\n&quot;, specified-&gt;name);
+-	} else if (start != NULL)
+-		kprintf(&quot;debugger commands starting with \&quot;%s\&quot;:\n&quot;, start);
+-	else
+-		kprintf(&quot;debugger commands:\n&quot;);
+-
+-	for (command = get_debugger_commands(); command != NULL;
+-			command = command-&gt;next) {
+-		if (specified &amp;&amp; command-&gt;func != specified-&gt;func)
+-			continue;
+-		if (start != NULL &amp;&amp; strncmp(start, command-&gt;name, startLength))
+-			continue;
+-
+-		kprintf(&quot; %-20s\t\t%s\n&quot;, command-&gt;name, command-&gt;description ? command-&gt;description : &quot;-&quot;);
+-	}
+-
+-	return 0;
+-}
+-
+-
+-static int
+-cmd_continue(int argc, char **argv)
+-{
+-	return B_KDEBUG_QUIT;
+-}
+-
+-
+-static int
+ cmd_dump_kdl_message(int argc, char **argv)
+ {
+ 	if (sCurrentKernelDebuggerMessage) {
+ 		kputs(sCurrentKernelDebuggerMessage);
+-		kputchar('\n');
++		kputs(&quot;\n&quot;);
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static int
+-cmd_expr(int argc, char **argv)
+-{
+-	if (argc != 2) {
+-		print_debugger_command_usage(argv[0]);
+-		return 0;
+-	}
+ 
+-	uint64 result;
+-	if (evaluate_debug_expression(argv[1], &amp;result, false)) {
+-		kprintf(&quot;%llu (0x%llx)\n&quot;, result, result);
+-		set_debug_variable(&quot;_&quot;, result);
+-	}
+-
+-	return 0;
+-}
+-
+-
+-static int
+-cmd_filter(int argc, char **argv)
+-{
+-	if (argc != 2) {
+-		sFilter[0] = '\0';
+-		return 0;
+-	}
+-
+-	strlcpy(sFilter, argv[1], sizeof(sFilter));
+-	return 0;
+-}
+-
+-
+-static int
+-cmd_error(int argc, char **argv)
+-{
+-	if (argc != 2) {
+-		print_debugger_command_usage(argv[0]);
+-		return 0;
+-	}
+-
+-	int32 error = parse_expression(argv[1]);
+-	kprintf(&quot;error 0x%lx: %s\n&quot;, error, strerror(error));
+-
+-	return 0;
+-}
+-
+-
+ static status_t
+ syslog_sender(void *data)
+ {
+@@ -1000,6 +954,8 @@
+ status_t
+ debug_init(kernel_args *args)
+ {
++	new(&amp;gDefaultDebugOutputFilter) DefaultDebugOutputFilter;
++
+ 	debug_paranoia_init();
+ 	return arch_debug_console_init(args);
+ }
+@@ -1008,44 +964,13 @@
+ status_t
+ debug_init_post_vm(kernel_args *args)
+ {
+-	add_debugger_command_etc(&quot;help&quot;, &amp;cmd_help, &quot;List all debugger commands&quot;,
+-		&quot;[name]\n&quot;
+-		&quot;Lists all debugger commands or those starting with \&quot;name\&quot;.\n&quot;, 0);
+-	add_debugger_command_etc(&quot;reboot&quot;, &amp;cmd_reboot, &quot;Reboot the system&quot;,
+-		&quot;\n&quot;
+-		&quot;Reboots the system.\n&quot;, 0);
+-	add_debugger_command_etc(&quot;shutdown&quot;, &amp;cmd_shutdown, &quot;Shut down the system&quot;,
+-		&quot;\n&quot;
+-		&quot;Shuts down the system.\n&quot;, 0);
+-	add_debugger_command_etc(&quot;gdb&quot;, &amp;cmd_gdb, &quot;Connect to remote gdb&quot;,
+-		&quot;\n&quot;
+-		&quot;Connects to a remote gdb connected to the serial port.\n&quot;, 0);
+-	add_debugger_command_etc(&quot;continue&quot;, &amp;cmd_continue, &quot;Leave kernel debugger&quot;,
+-		&quot;\n&quot;
+-		&quot;Leaves kernel debugger.\n&quot;, 0);
+-	add_debugger_command_alias(&quot;exit&quot;, &quot;continue&quot;, &quot;Same as \&quot;continue\&quot;&quot;);
+-	add_debugger_command_alias(&quot;es&quot;, &quot;continue&quot;, &quot;Same as \&quot;continue\&quot;&quot;);
+ 	add_debugger_command_etc(&quot;message&quot;, &amp;cmd_dump_kdl_message,
+ 		&quot;Reprint the message printed when entering KDL&quot;,
+ 		&quot;\n&quot;
+ 		&quot;Reprints the message printed when entering KDL.\n&quot;, 0);
+-	add_debugger_command_etc(&quot;expr&quot;, &amp;cmd_expr,
+-		&quot;Evaluates the given expression and prints the result&quot;,
+-		&quot;&lt;expression&gt;\n&quot;
+-		&quot;Evaluates the given expression and prints the result.\n&quot;,
+-		B_KDEBUG_DONT_PARSE_ARGUMENTS);
+-	add_debugger_command_etc(&quot;filter&quot;, &amp;cmd_filter,
+-		&quot;Filters output of all debugger commands&quot;,
+-		&quot;&lt;pattern&gt;\n&quot;
+-		&quot;Filters out all debug output of commands that does not match the\n&quot;
+-		&quot;specified pattern. If no pattern is given, it is removed\n&quot;, 0);
+-	add_debugger_command_etc(&quot;error&quot;, &amp;cmd_error,
+-		&quot;Prints a human-readable description for an error code&quot;,
+-		&quot;&lt;error&gt;\n&quot;
+-		&quot;Prints a human-readable description for the given numeric error\n&quot;
+-		&quot;code.\n&quot;
+-		&quot;  &lt;error&gt;  - The numeric error code.\n&quot;, 0);
+ 
++	debug_builtin_commands_init();
++
+ 	debug_variables_init();
+ 	frame_buffer_console_init(args);
+ 	arch_debug_console_init_settings(args);
+@@ -1181,6 +1106,8 @@
+ 			sBlueScreenEnabled = true;
+ 	}
+ 
++	sDebugOutputFilter = &gDefaultDebugOutputFilter;
++
+ 	if (message)
+ 		kprintf(&quot;PANIC: %s\n&quot;, message);
+ 
+@@ -1196,6 +1123,8 @@
+ 	call_modules_hook(false);
+ 	set_dprintf_enabled(dprintfState);
+ 
++	sDebugOutputFilter = NULL;
++
+ 	sBlueScreenEnabled = false;
+ 	atomic_add(&amp;inDebugger, -1);
+ 	restore_interrupts(state);
+@@ -1354,21 +1283,22 @@
+ void
+ kprintf(const char *format, ...)
+ {
+-	va_list args;
++	if (sDebugOutputFilter != NULL) {
++		va_list args;
++		va_start(args, format);
++		sDebugOutputFilter-&gt;Print(format, args);
++		va_end(args);
++	}
++}
+ 
+-	// ToDo: don't print anything if the debugger is not running!
+ 
++void
++kprintf_unfiltered(const char *format, ...)
++{
++	va_list args;
+ 	va_start(args, format);
+-	vsnprintf(sOutputBuffer, OUTPUT_BUFFER_SIZE, format, args);
++	gDefaultDebugOutputFilter.Print(format, args);
+ 	va_end(args);
+-
+-	if (in_command_invocation() &amp;&amp; sFilter[0]) {
+-		if (strstr(sOutputBuffer, sFilter) == NULL)
+-			return;
+-	}
+-
+-	flush_pending_repeats();
+-	kputs(sOutputBuffer);
+ }
+ 
+ 
+
+Added: haiku/trunk/src/system/kernel/debug/debug_builtin_commands.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/debug_builtin_commands.cpp	2008-05-31 21:01:05 UTC (rev 25743)
++++ haiku/trunk/src/system/kernel/debug/debug_builtin_commands.cpp	2008-06-01 02:25:00 UTC (rev 25744)
+@@ -0,0 +1,318 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de</A>
++ * Copyright 2002-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
++ * Distributed under the terms of the MIT License.
++ *
++ * Copyright 2001, Travis Geiselbrecht. All rights reserved.
++ * Distributed under the terms of the NewOS License.
++ */
++
++#include &quot;debug_builtin_commands.h&quot;
++
++#include &lt;ctype.h&gt;
++#include &lt;debug.h&gt;
++#include &lt;kernel.h&gt;
++
++#include &quot;debug_commands.h&quot;
++#include &quot;gdb.h&quot;
++
++
++static int
++cmd_reboot(int argc, char **argv)
++{
++	arch_cpu_shutdown(true);
++	return 0;
++		// I'll be really suprised if this line ever runs! ;-)
++}
++
++
++static int
++cmd_shutdown(int argc, char **argv)
++{
++	arch_cpu_shutdown(false);
++	return 0;
++}
++
++
++static int
++cmd_help(int argc, char **argv)
++{
++	debugger_command *command, *specified = NULL;
++	const char *start = NULL;
++	int32 startLength = 0;
++	bool ambiguous;
++
++	if (argc &gt; 1) {
++		specified = find_debugger_command(argv[1], false, ambiguous);
++		if (specified == NULL) {
++			start = argv[1];
++			startLength = strlen(start);
++		}
++	}
++
++	if (specified != NULL) {
++		// only print out the help of the specified command (and all of its aliases)
++		kprintf(&quot;debugger command for \&quot;%s\&quot; and aliases:\n&quot;, specified-&gt;name);
++	} else if (start != NULL)
++		kprintf(&quot;debugger commands starting with \&quot;%s\&quot;:\n&quot;, start);
++	else
++		kprintf(&quot;debugger commands:\n&quot;);
++
++	for (command = get_debugger_commands(); command != NULL;
++			command = command-&gt;next) {
++		if (specified &amp;&amp; command-&gt;func != specified-&gt;func)
++			continue;
++		if (start != NULL &amp;&amp; strncmp(start, command-&gt;name, startLength))
++			continue;
++
++		kprintf(&quot; %-20s\t\t%s\n&quot;, command-&gt;name, command-&gt;description ? command-&gt;description : &quot;-&quot;);
++	}
++
++	return 0;
++}
++
++
++static int
++cmd_continue(int argc, char **argv)
++{
++	return B_KDEBUG_QUIT;
++}
++
++
++static int
++cmd_expr(int argc, char **argv)
++{
++	if (argc != 2) {
++		print_debugger_command_usage(argv[0]);
++		return 0;
++	}
++
++	uint64 result;
++	if (evaluate_debug_expression(argv[1], &amp;result, false)) {
++		kprintf(&quot;%llu (0x%llx)\n&quot;, result, result);
++		set_debug_variable(&quot;_&quot;, result);
++	}
++
++	return 0;
++}
++
++
++static int
++cmd_error(int argc, char **argv)
++{
++	if (argc != 2) {
++		print_debugger_command_usage(argv[0]);
++		return 0;
++	}
++
++	int32 error = parse_expression(argv[1]);
++	kprintf(&quot;error 0x%lx: %s\n&quot;, error, strerror(error));
++
++	return 0;
++}
++
++
++static int
++cmd_head(int argc, char** argv)
++{
++	debugger_command_pipe_segment* segment
++		= get_current_debugger_command_pipe_segment();
++	if (segment == NULL) {
++		kprintf_unfiltered(&quot;%s can only be run as part of a pipe!\n&quot;, argv[0]);
++		return B_KDEBUG_ERROR;
++	}
++
++	struct user_data {
++		uint64	max_lines;
++		uint64	lines;
++	};
++	user_data* userData = (user_data*)segment-&gt;user_data;
++
++	if (segment-&gt;invocations == 0) {
++		if (argc != 3) {
++			print_debugger_command_usage(argv[0]);
++			return B_KDEBUG_ERROR;
++		}
++
++		if (!evaluate_debug_expression(argv[1], &amp;userData-&gt;max_lines, false))
++			return B_KDEBUG_ERROR;
++		userData-&gt;lines = 0;
++	}
++
++	if (++userData-&gt;lines &lt;= userData-&gt;max_lines) {
++		kputs(argv[2]);
++		kputs(&quot;\n&quot;);
++	}
++
++	return 0;
++}
++
++
++static int
++cmd_grep(int argc, char** argv)
++{
++	bool caseSensitive = true;
++	bool inverseMatch = false;
++
++	int argi = 1;
++	for (; argi &lt; argc; argi++) {
++		const char* arg = argv[argi];
++		if (arg[0] != '-')
++			break;
++
++		for (int32 i = 1; arg[i] != '\0'; i++) {
++			if (arg[i] == 'i') {
++				caseSensitive = false;
++			} else if (arg[i] == 'v') {
++				inverseMatch = true;
++			} else {
++				print_debugger_command_usage(argv[0]);
++				return B_KDEBUG_ERROR;
++			}
++		}
++	}
++
++	if (argc - argi != 2) {
++		print_debugger_command_usage(argv[0]);
++		return B_KDEBUG_ERROR;
++	}
++
++	const char* pattern = argv[argi++];
++	const char* line = argv[argi++];
++
++	bool match;
++	if (caseSensitive) {
++		match = strstr(line, pattern) != NULL;
++	} else {
++		match = false;
++		int32 lineLen = strlen(line);
++		int32 patternLen = strlen(pattern);
++		for (int32 i = 0; i &lt;= lineLen - patternLen; i++) {
++			// This is rather slow, but should be OK for our purposes.
++			if (strncasecmp(line + i, pattern, patternLen) == 0) {
++				match = true;
++				break;
++			}
++		}
++	}
++
++	if (match != inverseMatch) {
++		kputs(line);
++		kputs(&quot;\n&quot;);
++	}
++
++	return 0;
++}
++
++
++static int
++cmd_wc(int argc, char** argv)
++{
++	debugger_command_pipe_segment* segment
++		= get_current_debugger_command_pipe_segment();
++	if (segment == NULL) {
++		kprintf_unfiltered(&quot;%s can only be run as part of a pipe!\n&quot;, argv[0]);
++		return B_KDEBUG_ERROR;
++	}
++
++	struct user_data {
++		uint64	lines;
++		uint64	words;
++		uint64	chars;
++	};
++	user_data* userData = (user_data*)segment-&gt;user_data;
++
++	if (segment-&gt;invocations == 0) {
++		if (argc != 2) {
++			print_debugger_command_usage(argv[0]);
++			return B_KDEBUG_ERROR;
++		}
++
++		userData-&gt;lines = 0;
++		userData-&gt;words = 0;
++		userData-&gt;chars = 0;
++	}
++
++	const char* line = argv[1];
++	if (line == NULL) {
++		// last run -- print results
++		kprintf(&quot;%10lld %10lld %10lld\n&quot;, userData-&gt;lines, userData-&gt;words,
++			userData-&gt;chars);
++		return 0;
++	}
++
++	userData-&gt;lines++;
++	userData-&gt;chars++;
++		// newline
++
++	// count words and chars in this line
++	bool inWord = false;
++	for (; *line != '\0'; line++) {
++		userData-&gt;chars++;
++		if ((isspace(*line) != 0) == inWord) {
++			inWord = !inWord;
++			if (inWord)
++				userData-&gt;words++;
++		}
++	}
++
++	return 0;
++}
++
++
++// #pragma mark -
++
++
++void
++debug_builtin_commands_init()
++{
++	add_debugger_command_etc(&quot;help&quot;, &amp;cmd_help, &quot;List all debugger commands&quot;,
++		&quot;[name]\n&quot;
++		&quot;Lists all debugger commands or those starting with \&quot;name\&quot;.\n&quot;, 0);
++	add_debugger_command_etc(&quot;reboot&quot;, &amp;cmd_reboot, &quot;Reboot the system&quot;,
++		&quot;\n&quot;
++		&quot;Reboots the system.\n&quot;, 0);
++	add_debugger_command_etc(&quot;shutdown&quot;, &amp;cmd_shutdown, &quot;Shut down the system&quot;,
++		&quot;\n&quot;
++		&quot;Shuts down the system.\n&quot;, 0);
++	add_debugger_command_etc(&quot;gdb&quot;, &amp;cmd_gdb, &quot;Connect to remote gdb&quot;,
++		&quot;\n&quot;
++		&quot;Connects to a remote gdb connected to the serial port.\n&quot;, 0);
++	add_debugger_command_etc(&quot;continue&quot;, &amp;cmd_continue, &quot;Leave kernel debugger&quot;,
++		&quot;\n&quot;
++		&quot;Leaves kernel debugger.\n&quot;, 0);
++	add_debugger_command_alias(&quot;exit&quot;, &quot;continue&quot;, &quot;Same as \&quot;continue\&quot;&quot;);
++	add_debugger_command_alias(&quot;es&quot;, &quot;continue&quot;, &quot;Same as \&quot;continue\&quot;&quot;);
++	add_debugger_command_etc(&quot;expr&quot;, &amp;cmd_expr,
++		&quot;Evaluates the given expression and prints the result&quot;,
++		&quot;&lt;expression&gt;\n&quot;
++		&quot;Evaluates the given expression and prints the result.\n&quot;,
++		B_KDEBUG_DONT_PARSE_ARGUMENTS);
++	add_debugger_command_etc(&quot;error&quot;, &amp;cmd_error,
++		&quot;Prints a human-readable description for an error code&quot;,
++		&quot;&lt;error&gt;\n&quot;
++		&quot;Prints a human-readable description for the given numeric error\n&quot;
++		&quot;code.\n&quot;
++		&quot;  &lt;error&gt;  - The numeric error code.\n&quot;, 0);
++	add_debugger_command_etc(&quot;head&quot;, &amp;cmd_head,
++		&quot;Prints only the first lines of output from another command&quot;,
++		&quot;&lt;maxLines&gt;\n&quot;
++		&quot;Should be used in a command pipe. It prints only the first\n&quot;
++		&quot;&lt;maxLines&gt; lines of output from the previous command in the pipe and\n&quot;
++		&quot;silently discards the rest of the output.\n&quot;, 0);
++	add_debugger_command_etc(&quot;grep&quot;, &amp;cmd_grep,
++		&quot;Filters output from another command&quot;,
++		&quot;[ -i ] [ -v ] &lt;pattern&gt;\n&quot;
++		&quot;Should be used in a command pipe. It filters all output from the\n&quot;
++		&quot;previous command in the pipe according to the given pattern.\n&quot;
++		&quot;When \&quot;-v\&quot; is specified, only those lines are printed that don't\n&quot;
++		&quot;match the given pattern, otherwise only those that do match. When\n&quot;
++		&quot;\&quot;-i\&quot; is specified, the pattern is matched case insensitive,\n&quot;
++		&quot;otherwise case sensitive.\n&quot;, 0);
++	add_debugger_command_etc(&quot;wc&quot;, &amp;cmd_wc,
++		&quot;Counts the lines, words, and characters of another command's output&quot;,
++		&quot;&lt;maxLines&gt;\n&quot;
++		&quot;Should be used in a command pipe. It prints how many lines, words,\n&quot;
++		&quot;and characters the output of the previous command consists of.\n&quot;,
++		B_KDEBUG_PIPE_FINAL_RERUN);
++}
+
+Added: haiku/trunk/src/system/kernel/debug/debug_builtin_commands.h
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/debug_builtin_commands.h	2008-05-31 21:01:05 UTC (rev 25743)
++++ haiku/trunk/src/system/kernel/debug/debug_builtin_commands.h	2008-06-01 02:25:00 UTC (rev 25744)
+@@ -0,0 +1,20 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _KERNEL_DEBUG_BUILTIN_COMMANDS_H
++#define _KERNEL_DEBUG_BUILTIN_COMMANDS_H
++
++
++#ifdef __cplusplus
++extern &quot;C&quot; {
++#endif
++
++void debug_builtin_commands_init();
++
++#ifdef __cplusplus
++}	// extern &quot;C&quot;
++#endif
++
++
++#endif	// _KERNEL_DEBUG_BUILTIN_COMMANDS_H
+
+Modified: haiku/trunk/src/system/kernel/debug/debug_commands.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/debug_commands.cpp	2008-05-31 21:01:05 UTC (rev 25743)
++++ haiku/trunk/src/system/kernel/debug/debug_commands.cpp	2008-06-01 02:25:00 UTC (rev 25744)
+@@ -10,6 +10,7 @@
+ #include &quot;debug_commands.h&quot;
+ 
+ #include &lt;setjmp.h&gt;
++#include &lt;stdio.h&gt;
+ #include &lt;string.h&gt;
+ 
+ #include &lt;KernelExport.h&gt;
+@@ -19,18 +20,174 @@
+ #include &lt;thread.h&gt;
+ #include &lt;util/AutoLock.h&gt;
+ 
++#include &quot;debug_output_filter.h&quot;
+ #include &quot;debug_variables.h&quot;
+ 
+ 
++#define INVOKE_COMMAND_FAULT	1
++#define INVOKE_COMMAND_ERROR	2
++
++static const int32 kMaxInvokeCommandDepth = 5;
++static const int32 kOutputBufferSize = 1024;
++
+ static spinlock sSpinlock = 0;
+ 
+ static struct debugger_command *sCommands;
+ 
+-static jmp_buf sInvokeCommandEnv;
++static jmp_buf sInvokeCommandEnv[kMaxInvokeCommandDepth];
++static int32 sInvokeCommandLevel = 0;
+ static bool sInvokeCommandDirectly = false;
+ static bool sInCommand = false;
++static char sOutputBuffers[MAX_DEBUGGER_COMMAND_PIPE_LENGTH][kOutputBufferSize];
++static debugger_command_pipe* sCurrentPipe;
++static int32 sCurrentPipeSegment;
+ 
+ 
++static int invoke_pipe_segment(debugger_command_pipe* pipe, int32 index,
++	char* argument);
++
++
++class PipeDebugOutputFilter : public DebugOutputFilter {
++public:
++	PipeDebugOutputFilter()
++	{
++	}
++
++	PipeDebugOutputFilter(debugger_command_pipe* pipe, int32 segment,
++			char* buffer, size_t bufferSize)
++		:
++		fPipe(pipe),
++		fSegment(segment),
++		fBuffer(buffer),
++		fBufferCapacity(bufferSize - 1),
++		fBufferSize(0)
++	{
++	}
++
++	virtual void PrintString(const char* string)
++	{
++		if (fPipe-&gt;broken)
++			return;
++
++		size_t size = strlen(string);
++		while (const char* newLine = strchr(string, '\n')) {
++			size_t length = newLine - string;
++			_Append(string, length);
++
++			// invoke command
++			fBuffer[fBufferSize] = '\0';
++			invoke_pipe_segment(fPipe, fSegment + 1, fBuffer);
++
++			fBufferSize = 0;
++
++			string = newLine + 1;
++			size -= length + 1;
++		}
++
++		_Append(string, size);
++
++		if (fBufferSize == fBufferCapacity) {
++			// buffer is full, but contains no newline -- execute anyway
++			invoke_pipe_segment(fPipe, fSegment + 1, fBuffer);
++			fBufferSize = 0;
++		}
++	}
++
++	virtual void Print(const char* format, va_list args)
++	{
++		if (fPipe-&gt;broken)
++			return;
++
++		// print directly into the buffer
++		fBufferSize += vsnprintf(fBuffer + fBufferSize,
++			fBufferCapacity - fBufferSize, format, args);
++
++		// execute every complete line
++		fBuffer[fBufferSize] = '\0';
++		char* line = fBuffer;
++
++		while (char* newLine = strchr(line, '\n')) {
++			// invoke command
++			*newLine = '\0';
++			invoke_pipe_segment(fPipe, fSegment + 1, line);
++
++			line = newLine + 1;
++		}
++
++		size_t left = fBuffer + fBufferSize - line;
++
++		if (left == fBufferCapacity) {
++			// buffer is full, but contains no newline -- execute anyway
++			invoke_pipe_segment(fPipe, fSegment + 1, fBuffer);
++			left = 0;
++		}
++
++		if (left &gt; 0)
++			memmove(fBuffer, line, left);
++
++		fBufferSize = left;
++	}
++
++private:
++	void _Append(const char* string, size_t length)
++	{
++		size_t toAppend = min_c(length, fBufferCapacity - fBufferSize);
++		memcpy(fBuffer + fBufferSize, string, toAppend);
++		fBufferSize += length;
++	}
++
++private:
++	debugger_command_pipe*	fPipe;
++	int32					fSegment;
++	char*					fBuffer;
++	size_t					fBufferCapacity;
++	size_t					fBufferSize;
++};
++
++
++static PipeDebugOutputFilter sPipeOutputFilters[
++	MAX_DEBUGGER_COMMAND_PIPE_LENGTH - 1];
++
++
++static int
++invoke_pipe_segment(debugger_command_pipe* pipe, int32 index, char* argument)
++{
++	// set debug output
++	DebugOutputFilter* oldFilter = set_debug_output_filter(
++		index == pipe-&gt;segment_count - 1
++			? &amp;gDefaultDebugOutputFilter : &amp;sPipeOutputFilters[index]);
++
++	// set last command argument
++	debugger_command_pipe_segment&amp; segment = pipe-&gt;segments[index];
++	if (index &gt; 0)
++		segment.argv[segment.argc - 1] = argument;
++
++	// invoke command
++	int32 oldIndex = sCurrentPipeSegment;
++	sCurrentPipeSegment = index;
++
++	int result = invoke_debugger_command(segment.command, segment.argc,
++		segment.argv);
++	segment.invocations++;
++
++	sCurrentPipeSegment = oldIndex;
++
++	// reset debug output
++	set_debug_output_filter(oldFilter);
++
++	if (result == B_KDEBUG_ERROR) {
++		pipe-&gt;broken = true;
++
++		// Abort the previous pipe segment execution. The complete pipe is
++		// aborted iteratively this way.
++		if (index &gt; 0)
++			abort_debugger_command();
++	}
++
++	return result;
++}
++
++
+ debugger_command*
+ next_debugger_command(debugger_command* command, const char* prefix, int prefixLen)
+ {
+@@ -98,9 +255,10 @@
+ 	// intercept invocations with &quot;--help&quot; and directly print the usage text
+ 	// If we know the command's usage text, intercept &quot;--help&quot; invocations
+ 	// and print it directly.
+-	if (argc == 2 &amp;&amp; strcmp(argv[1], &quot;--help&quot;) == 0 &amp;&amp; command-&gt;usage != NULL) {
+-		kprintf(&quot;usage: %s &quot;, command-&gt;name);
+-		kputs(command-&gt;usage);
++	if (argc == 2 &amp;&amp; argv[1] != NULL &amp;&amp; strcmp(argv[1], &quot;--help&quot;) == 0
++			&amp;&amp; command-&gt;usage != NULL) {
++		kprintf_unfiltered(&quot;usage: %s &quot;, command-&gt;name);
++		kputs_unfiltered(command-&gt;usage);
+ 		return 0;
+ 	}
+ 
+@@ -117,33 +275,99 @@
+ 
+ 	sInCommand = true;
+
+[... truncated: 458 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	
+	<LI>Next message: <A HREF="009243.html">[Haiku-commits] r25745 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9242">[ date ]</a>
+              <a href="thread.html#9242">[ thread ]</a>
+              <a href="subject.html#9242">[ subject ]</a>
+              <a href="author.html#9242">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

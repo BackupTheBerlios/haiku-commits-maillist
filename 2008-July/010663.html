@@ -1,0 +1,431 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26689 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26689%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200807301832.m6UIWGnA006754%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010666.html">
+   <LINK REL="Next"  HREF="010664.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26689 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26689%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200807301832.m6UIWGnA006754%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26689 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Jul 30 20:32:16 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010666.html">[Haiku-commits] r26688 - haiku/trunk/src/add-ons/kernel/drivers/bluetooth/h2/h2generic
+</A></li>
+        <LI>Next message: <A HREF="010664.html">[Haiku-commits] r26690 - in haiku/trunk: headers/libs/print/libprint	src/add-ons/print/drivers/pdf/source	src/add-ons/print/drivers/preview src/libs/print/libprint
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10663">[ date ]</a>
+              <a href="thread.html#10663">[ thread ]</a>
+              <a href="subject.html#10663">[ subject ]</a>
+              <a href="author.html#10663">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-07-30 20:32:14 +0200 (Wed, 30 Jul 2008)
+New Revision: 26689
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26689&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26689&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/BPlusTree.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Index.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
+Log:
+First round of locking fixes:
+* Moved locking the data stream out of the BPlusTree methods; this fixes at
+  least two locations where another thread could have seen outdated/incorrect
+  data.
+* Removed some superfluous code in bfs_rename(): we don't have to revert to the
+  previous situation, the transaction does this for us automatically.
+* Added a simple MultiWriteLocker, even though it's not really necessary anymore
+  (since we always hold the transaction lock first when we lock more than one
+  inode at a time).
+* Inode::Create() called InodeAllocator::Keep() a bit too early, the file cache
+  and map wasn't created and assigned yet.
+* InodeAllocator now keeps the inode write locked.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/BPlusTree.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/BPlusTree.cpp	2008-07-30 16:51:06 UTC (rev 26688)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/BPlusTree.cpp	2008-07-30 18:32:14 UTC (rev 26689)
+@@ -1242,9 +1242,9 @@
+ }
+ 
+ 
+-/*!
+-	This inserts a key into the tree. The changes made to the tree will
++/*!	This inserts a key into the tree. The changes made to the tree will
+ 	all be part of the \a transaction.
++	You need to have the inode write locked.
+ */
+ status_t
+ BPlusTree::Insert(Transaction &amp;transaction, const uint8 *key, uint16 keyLength,
+@@ -1258,8 +1258,7 @@
+ 		panic(&quot;tried to insert invalid value %Ld!\n&quot;, value);
+ #endif
+ 
+-	// lock access to stream
+-	WriteLocker locker(fStream-&gt;Lock());
++	ASSERT_WRITE_LOCKED_RW_LOCK(&amp;fStream-&gt;Lock());
+ 
+ 	Stack&lt;node_and_key&gt; stack;
+ 	if (_SeekDown(stack, key, keyLength) != B_OK)
+@@ -1395,8 +1394,7 @@
+ }
+ 
+ 
+-/*!
+-	Removes the duplicate index/value pair from the tree.
++/*!	Removes the duplicate index/value pair from the tree.
+ 	It's part of the private tree interface.
+ */
+ status_t
+@@ -1578,8 +1576,7 @@
+ }
+ 
+ 
+-/*!
+-	Removes the key with the given index from the specified node.
++/*!	Removes the key with the given index from the specified node.
+ 	Since it has to get the key from the node anyway (to obtain it's
+ 	pointer), it's not needed to pass the key &amp; its length, although
+ 	the calling method (BPlusTree::Remove()) have this data.
+@@ -1639,10 +1636,10 @@
+ }
+ 
+ 
+-/*!
+-	Removes the specified key from the tree. The &quot;value&quot; parameter is only used
++/*!	Removes the specified key from the tree. The &quot;value&quot; parameter is only used
+ 	for trees which allow duplicates, so you may safely ignore it.
+ 	It's not an optional parameter, so at least you have to think about it.
++	You need to have the inode write locked.
+ */
+ status_t
+ BPlusTree::Remove(Transaction &amp;transaction, const uint8 *key, uint16 keyLength,
+@@ -1652,8 +1649,7 @@
+ 		|| keyLength &gt; BPLUSTREE_MAX_KEY_LENGTH)
+ 		RETURN_ERROR(B_BAD_VALUE);
+ 
+-	// lock access to stream
+-	WriteLocker locker(fStream-&gt;Lock());
++	ASSERT_WRITE_LOCKED_RW_LOCK(&amp;fStream-&gt;Lock());
+ 
+ 	Stack&lt;node_and_key&gt; stack;
+ 	if (_SeekDown(stack, key, keyLength) != B_OK)
+@@ -1749,14 +1745,14 @@
+ }
+ 
+ 
+-/*!
+-	Replaces the value for the key in the tree.
++/*!	Replaces the value for the key in the tree.
+ 	Returns B_OK if the key could be found and its value replaced,
+ 	B_ENTRY_NOT_FOUND if the key couldn't be found, and other errors
+ 	to indicate that something went terribly wrong.
+ 	Note that this doesn't work with duplicates - it will just
+ 	return B_BAD_TYPE if you call this function on a tree where
+ 	duplicates are allowed.
++	You need to have the inode write locked.
+ */
+ status_t
+ BPlusTree::Replace(Transaction &amp;transaction, const uint8 *key,
+@@ -1770,8 +1766,7 @@
+ 	if (fAllowDuplicates)
+ 		RETURN_ERROR(B_BAD_TYPE);
+ 
+-	// lock access to stream (a read lock is okay for this purpose)
+-	ReadLocker locker(fStream-&gt;Lock());
++	ASSERT_WRITE_LOCKED_RW_LOCK(&amp;fStream-&gt;Lock());
+ 
+ 	off_t nodeOffset = fHeader-&gt;RootNode();
+ 	CachedNode cached(this);
+@@ -1801,8 +1796,7 @@
+ }
+ 
+ 
+-/*!
+-	Searches the key in the tree, and stores the offset found in
++/*!	Searches the key in the tree, and stores the offset found in
+ 	_value, if successful.
+ 	It's very similar to BPlusTree::SeekDown(), but doesn't fill
+ 	a stack while it descends the tree.
+@@ -1812,6 +1806,7 @@
+ 	Note that this doesn't work with duplicates - it will just
+ 	return B_BAD_TYPE if you call this function on a tree where
+ 	duplicates are allowed.
++	You need to have the inode read or write locked.
+ */
+ status_t
+ BPlusTree::Find(const uint8 *key, uint16 keyLength, off_t *_value)
+@@ -1824,8 +1819,7 @@
+ 	if (fAllowDuplicates)
+ 		RETURN_ERROR(B_BAD_TYPE);
+ 
+-	// lock access to stream
+-	ReadLocker locker(fStream-&gt;Lock());
++	ASSERT_READ_LOCKED_RW_LOCK(&amp;fStream-&gt;Lock());
+ 
+ 	off_t nodeOffset = fHeader-&gt;RootNode();
+ 	CachedNode cached(this);
+@@ -2080,8 +2074,7 @@
+ }
+ 
+ 
+-/*!
+-	This is more or less a copy of BPlusTree::Find() - but it just
++/*!	This is more or less a copy of BPlusTree::Find() - but it just
+ 	sets the current position in the iterator, regardless of if the
+ 	key could be found or not.
+ */
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Index.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Index.cpp	2008-07-30 16:51:06 UTC (rev 26688)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Index.cpp	2008-07-30 18:32:14 UTC (rev 26689)
+@@ -75,6 +75,8 @@
+ 	if (indices == NULL)
+ 		return B_ENTRY_NOT_FOUND;
+ 
++	ReadLocker locker(indices-&gt;Lock());
++
+ 	BPlusTree *tree;
+ 	if (indices-&gt;GetTree(&amp;tree) != B_OK)
+ 		return B_BAD_VALUE;
+@@ -268,6 +270,8 @@
+ 
+ 	// remove the old key from the tree
+ 
++	WriteLocker locker(Node()-&gt;Lock());
++
+ 	if (oldKey != NULL) {
+ 		status = tree-&gt;Remove(transaction, (const uint8 *)oldKey, oldLength,
+ 			inode-&gt;ID());
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2008-07-30 16:51:06 UTC (rev 26688)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2008-07-30 18:32:14 UTC (rev 26689)
+@@ -169,6 +169,7 @@
+ 			fInode-&gt;Node().flags &amp;= ~HOST_ENDIAN_TO_BFS_INT32(INODE_IN_USE);
+ 				// this unblocks any pending bfs_read_vnode() calls
+ 			fInode-&gt;Free(*fTransaction);
++			rw_lock_write_unlock(&amp;fInode-&gt;Lock());
+ 			remove_vnode(volume-&gt;FSVolume(), fInode-&gt;ID());
+ 		} else
+ 			volume-&gt;Free(*fTransaction, fRun);
+@@ -208,6 +209,7 @@
+ 		}
+ 	}
+ 
++	rw_lock_write_lock(&amp;fInode-&gt;Lock());
+ 	*_inode = fInode;
+ 	return B_OK;
+ }
+@@ -259,6 +261,8 @@
+ 			TRANSACTION_ABORTED, &amp;_TransactionListener, fInode);
+ 	}
+ 
++	rw_lock_write_unlock(&amp;fInode-&gt;Lock());
++
+ 	fTransaction = NULL;
+ 	fInode = NULL;
+ 
+@@ -1163,6 +1167,8 @@
+ 	BPlusTree *tree;
+ 	status_t status = attributes-&gt;GetTree(&amp;tree);
+ 	if (status == B_OK) {
++		ReadLocker locker(attributes-&gt;Lock());
++
+ 		ino_t id;
+ 		status = tree-&gt;Find((uint8 *)name, (uint16)strlen(name), &amp;id);
+ 		if (status == B_OK) {
+@@ -2206,6 +2212,8 @@
+ 	if (GetTree(&amp;tree) != B_OK)
+ 		RETURN_ERROR(B_BAD_VALUE);
+ 
++	WriteLocker locker(Lock());
++
+ 	// does the file even exist?
+ 	off_t id;
+ 	if (tree-&gt;Find((uint8 *)name, (uint16)strlen(name), &amp;id) &lt; B_OK)
+@@ -2482,10 +2490,6 @@
+ 		index.InsertLastModified(transaction, inode);
+ 	}
+ 
+-	// Everything worked well until this point, we have a fully
+-	// initialized inode, and we want to keep it
+-	allocator.Keep(vnodeOps, publishFlags);
+-
+ 	if (inode-&gt;IsFile() || inode-&gt;IsAttribute()) {
+ 		inode-&gt;SetFileCache(file_cache_create(volume-&gt;ID(), inode-&gt;ID(),
+ 			inode-&gt;Size()));
+@@ -2493,6 +2497,10 @@
+ 			inode-&gt;Size()));
+ 	}
+ 
++	// Everything worked well until this point, we have a fully
++	// initialized inode, and we want to keep it
++	allocator.Keep(vnodeOps, publishFlags);
++
+ 	if (_created)
+ 		*_created = true;
+ 	if (_id != NULL)
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp	2008-07-30 16:51:06 UTC (rev 26688)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp	2008-07-30 18:32:14 UTC (rev 26689)
+@@ -24,6 +24,30 @@
+ 	disk_super_block super_block;
+ };
+ 
++class MultiWriteLocker {
++public:
++	MultiWriteLocker(Inode* inodeA, Inode* inodeB)
++	{
++		if (inodeA-&gt;ID() &lt; inodeB-&gt;ID()) {
++			Inode* tempInode = inodeA;
++			inodeA = inodeB;
++			inodeB = tempInode;
++		}
++
++		fOuterLocker.SetTo(inodeA-&gt;Lock(), false);
++		if (inodeA != inodeB)
++			fInnerLocker.SetTo(inodeB-&gt;Lock(), false);
++	}
++
++	~MultiWriteLocker()
++	{
++	}
++
++private:
++	WriteLocker fOuterLocker;
++	WriteLocker fInnerLocker;
++};
++
+ extern void fill_stat_buffer(Inode *inode, struct stat &amp;stat);
+ 
+ 
+@@ -530,6 +554,8 @@
+ 	if (directory-&gt;GetTree(&amp;tree) != B_OK)
+ 		RETURN_ERROR(B_BAD_VALUE);
+ 
++	ReadLocker locker(directory-&gt;Lock());
++
+ 	status = tree-&gt;Find((uint8 *)file, (uint16)strlen(file), _vnodeID);
+ 	if (status &lt; B_OK) {
+ 		//PRINT((&quot;bfs_walk() could not find %Ld:\&quot;%s\&quot;: %s\n&quot;, directory-&gt;BlockNumber(), file, strerror(status)));
+@@ -944,6 +970,9 @@
+ 	if (oldDirectory == newDirectory &amp;&amp; !strcmp(oldName, newName))
+ 		return B_OK;
+ 
++	Transaction transaction(volume, oldDirectory-&gt;BlockNumber());
++	MultiWriteLocker locker(oldDirectory, newDirectory);
++
+ 	// are we allowed to do what we've been told?
+ 	status_t status = oldDirectory-&gt;CheckPermissions(W_OK);
+ 	if (status == B_OK)
+@@ -951,8 +980,6 @@
+ 	if (status &lt; B_OK)
+ 		return status;
+ 
+-	Transaction transaction(volume, oldDirectory-&gt;BlockNumber());
+-
+ 	// Get the directory's tree, and a pointer to the inode which should be
+ 	// changed
+ 	BPlusTree *tree;
+@@ -1041,10 +1068,6 @@
+ 	if (status &lt; B_OK)
+ 		return status;
+ 
+-	// If anything fails now, we have to remove the inode from the
+-	// new directory in any case to restore the previous state
+-	status_t bailStatus = B_OK;
+-
+ 	// update the name only when they differ
+ 	bool nameUpdated = false;
+ 	if (strcmp(oldName, newName)) {
+@@ -1082,41 +1105,9 @@
+ 					newDirectory-&gt;ID(), newName, id);
+ 				return B_OK;
+ 			}
+-			// If we get here, something has gone wrong already!
+-
+-			// Those better don't fail, or we switch to a read-only
+-			// device for safety reasons (Volume::Panic() does this
+-			// for us)
+-			// Anyway, if we overwrote a file in the target directory
+-			// this is lost now (only in-memory, not on-disk)...
+-			bailStatus = tree-&gt;Insert(transaction, (const uint8 *)oldName,
+-				strlen(oldName), id);
+-			if (movedTree != NULL) {
+-				movedTree-&gt;Replace(transaction, (const uint8 *)&quot;..&quot;, 2,
+-					oldDirectory-&gt;ID());
+-			}
+ 		}
+ 	}
+ 
+-	if (bailStatus == B_OK &amp;&amp; nameUpdated) {
+-		bailStatus = inode-&gt;SetName(transaction, oldName);
+-		if (status == B_OK) {
+-			// update inode and index
+-			inode-&gt;WriteBack(transaction);
+-
+-			Index index(volume);
+-			index.UpdateName(transaction, newName, oldName, inode);
+-		}
+-	}
+-
+-	if (bailStatus == B_OK) {
+-		bailStatus = newTree-&gt;Remove(transaction, (const uint8 *)newName,
+-			strlen(newName), id);
+-	}
+-
+-	if (bailStatus &lt; B_OK)
+-		volume-&gt;Panic();
+-
+ 	return status;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010666.html">[Haiku-commits] r26688 - haiku/trunk/src/add-ons/kernel/drivers/bluetooth/h2/h2generic
+</A></li>
+	<LI>Next message: <A HREF="010664.html">[Haiku-commits] r26690 - in haiku/trunk: headers/libs/print/libprint	src/add-ons/print/drivers/pdf/source	src/add-ons/print/drivers/preview src/libs/print/libprint
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10663">[ date ]</a>
+              <a href="thread.html#10663">[ thread ]</a>
+              <a href="subject.html#10663">[ subject ]</a>
+              <a href="author.html#10663">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

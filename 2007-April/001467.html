@@ -1,0 +1,361 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20600 -	haiku/trunk/src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20600%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200704060623.l366NkZ4013390%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001466.html">
+   <LINK REL="Next"  HREF="001469.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20600 -	haiku/trunk/src/add-ons/kernel/network/stack</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20600%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200704060623.l366NkZ4013390%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20600 -	haiku/trunk/src/add-ons/kernel/network/stack">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Fri Apr  6 08:23:46 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001466.html">[Haiku-commits] r20599 -	haiku/trunk/src/add-ons/kernel/network/devices/ethernet
+</A></li>
+        <LI>Next message: <A HREF="001469.html">[Haiku-commits] r20600 - haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1467">[ date ]</a>
+              <a href="thread.html#1467">[ thread ]</a>
+              <a href="subject.html#1467">[ subject ]</a>
+              <a href="author.html#1467">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-06 08:23:35 +0200 (Fri, 06 Apr 2007)
+New Revision: 20600
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20600&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20600&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/domains.h
+   haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h
+   haiku/trunk/src/add-ons/kernel/network/stack/routes.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/routes.h
+Log:
+started some work to properly handle device_removed() and setting interfaces down in general.
+
+ - remove all routes that use interfaces going down.
+ - when a device is going down, remove associated domain interfaces.
+ - interfaces weren't getting a properly referenced device interface, fixed.
+ - down call down_device_interface when deleting a interface, instead set it down and let the upcounts do its job.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp	2007-04-06 06:23:27 UTC (rev 20599)
++++ haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp	2007-04-06 06:23:35 UTC (rev 20600)
+@@ -332,10 +332,7 @@
+ 					if (((uint32)request.ifr_flags &amp; IFF_UP)
+ 							!= (interface-&gt;flags &amp; IFF_UP)) {
+ 						if ((interface-&gt;flags &amp; IFF_UP) != 0) {
+-							// bring the interface down
+-							interface-&gt;flags &amp;= ~(IFF_UP | IFF_LINK);
+-							interface-&gt;first_info-&gt;interface_down(
+-								interface-&gt;first_protocol);
++							interface_set_down(interface);
+ 						} else {
+ 							// bring it up
+ 							status = interface-&gt;first_info-&gt;interface_up(
+@@ -564,6 +561,8 @@
+ 
+ 	deviceInterface-&gt;up_count--;
+ 
++	domain_interface_went_down(protocol-&gt;interface);
++
+ 	if (deviceInterface-&gt;up_count &gt; 0)
+ 		return;
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp	2007-04-06 06:23:27 UTC (rev 20599)
++++ haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp	2007-04-06 06:23:35 UTC (rev 20600)
+@@ -225,6 +225,49 @@
+ }
+ 
+ 
++void
++domain_interface_went_down(net_interface *interface)
++{
++	// the domain should be locked here. always check
++	// all callers to be sure. We get here via
++	// interface_set_down().
++
++	dprintf(&quot;domain_interface_went_down(%i, %s)\n&quot;,
++		interface-&gt;domain-&gt;family, interface-&gt;name);
++
++	// domain might have been locked by:
++	//  - domain_removed_device_interface() &lt;--- here
++	//     remove_interface_from_domain()
++	//      delete_interface()
++	//       interface_set_down()
++	//  - datalink_control() &lt;--- here
++	//     interface_set_down()
++	invalidate_routes(interface-&gt;domain, interface);
++}
++
++
++void
++domain_removed_device_interface(net_device_interface *interface)
++{
++	BenaphoreLocker locker(sDomainLock);
++
++	net_domain_private *domain = NULL;
++	while (true) {
++		domain = (net_domain_private *)list_get_next_item(&amp;sDomains, domain);
++		if (domain == NULL)
++			break;
++
++		BenaphoreLocker locker(domain-&gt;lock);
++
++		net_interface_private *priv = find_interface(domain, interface-&gt;name);
++		if (priv == NULL)
++			continue;
++
++		remove_interface_from_domain(priv);
++	}
++}
++
++
+ status_t
+ register_domain(int family, const char *name,
+ 	struct net_protocol_module_info *module, 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/domains.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/domains.h	2007-04-06 06:23:27 UTC (rev 20599)
++++ haiku/trunk/src/add-ons/kernel/network/stack/domains.h	2007-04-06 06:23:35 UTC (rev 20600)
+@@ -16,6 +16,9 @@
+ #include &lt;util/DoublyLinkedList.h&gt;
+ 
+ 
++struct net_device_interface;
++
++
+ struct net_domain_private : net_domain {
+ 	struct list_link	link;
+ 
+@@ -34,6 +37,8 @@
+ status_t add_interface_to_domain(net_domain *domain, struct ifreq&amp; request);
+ status_t remove_interface_from_domain(net_interface *interface);
+ void domain_interfaces_link_changed(net_device *device);
++void domain_interface_went_down(net_interface *);
++void domain_removed_device_interface(net_device_interface *);
+ 
+ net_domain *get_domain(int family);
+ status_t register_domain(int family, const char *name,
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp	2007-04-06 06:23:27 UTC (rev 20599)
++++ haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp	2007-04-06 06:23:35 UTC (rev 20600)
+@@ -63,6 +63,16 @@
+ }
+ 
+ 
++net_device_interface *
++grab_device_interface(net_device_interface *interface)
++{
++	if (interface == NULL || atomic_add(&amp;interface-&gt;ref_count, 1) == 0)
++		return NULL;
++
++	return interface;
++}
++
++
+ //	#pragma mark - interfaces
+ 
+ 
+@@ -135,7 +145,7 @@
+ 	interface-&gt;type = 0;
+ 	interface-&gt;mtu = deviceInterface-&gt;device-&gt;mtu;
+ 	interface-&gt;metric = 0;
+-	interface-&gt;device_interface = deviceInterface;
++	interface-&gt;device_interface = grab_device_interface(deviceInterface);
+ 
+ 	status_t status = get_domain_datalink_protocols(interface);
+ 	if (status &lt; B_OK) {
+@@ -154,14 +164,33 @@
+ 
+ 
+ void
++interface_set_down(net_interface *interface)
++{
++	if ((interface-&gt;flags &amp; IFF_UP) == 0)
++		return;
++
++	// TODO: IFF_LINK should belong in device only
++	interface-&gt;flags &amp;= ~(IFF_UP | IFF_LINK);
++	interface-&gt;first_info-&gt;interface_down(interface-&gt;first_protocol);
++}
++
++
++void
+ delete_interface(net_interface_private *interface)
+ {
+-	if ((interface-&gt;flags &amp; IFF_UP) != 0) {
+-		// the interface is still up - we need to change that before deleting it
+-		interface-&gt;flags &amp;= ~IFF_UP;
+-		down_device_interface(interface-&gt;device_interface);
+-	}
++	// deleting an interface is fairly complex as we need
++	// to clear all references to it throughout the stack
+ 
++	// this will possibly call (if IFF_UP):
++	//  interface_protocol_down()
++	//   domain_interface_went_down()
++	//    invalidate_routes()
++	//     remove_route()
++	//      update_route_infos()
++	//       get_route_internal()
++	//   down_device_interface() -- if upcount reaches 0
++	interface_set_down(interface);
++
+ 	put_device_interface(interface-&gt;device_interface);
+ 
+ 	free(interface-&gt;address);
+@@ -388,9 +417,15 @@
+ {
+ 	net_device *device = interface-&gt;device;
+ 
++	dprintf(&quot;down_device_interface(%s)\n&quot;, interface-&gt;name);
++
+ 	device-&gt;flags &amp;= ~IFF_UP;
+ 	interface-&gt;module-&gt;down(device);
+ 
++	// TODO: there is a race condition between the previous
++	//       -&gt;down and device-&gt;module-&gt;receive_data which
++	//       locks us here waiting for the reader_thread
++
+ 	// make sure the reader thread is gone before shutting down the interface
+ 	status_t status;
+ 	wait_for_thread(interface-&gt;reader_thread, &amp;status);
+@@ -600,7 +635,25 @@
+ device_removed(net_device *device)
+ {
+ 	BenaphoreLocker locker(sInterfaceLock);
+-	// TODO: all what this function should do is to clear the IFF_UP flag of the interfaces.
++
++	net_device_interface *interface = find_device_interface(device-&gt;name);
++	if (interface == NULL)
++		return ENODEV;
++
++	// Propagate the loss of the device throughout the stack.
++	// This is very complex, refer to delete_interface() for
++	// further details.
++
++	// this will possibly call:
++	//  remove_interface_from_domain() [domain gets locked]
++	//   delete_interface()
++	//    ... [see delete_interface()]
++	domain_removed_device_interface(interface);
++
++	// TODO: make sure all readers are gone
++	//       make sure all watchers are gone
++	//       remove device interface
++
+ 	return B_OK;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h	2007-04-06 06:23:27 UTC (rev 20599)
++++ haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h	2007-04-06 06:23:35 UTC (rev 20600)
+@@ -69,6 +69,7 @@
+ 	const char *baseName, net_device_interface *deviceInterface,
+ 	struct net_interface_private **_interface);
+ void delete_interface(net_interface_private *interface);
++void interface_set_down(net_interface *);
+ 
+ // device interfaces
+ void get_device_interface_address(net_device_interface *interface,
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/routes.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/routes.cpp	2007-04-06 06:23:27 UTC (rev 20599)
++++ haiku/trunk/src/add-ons/kernel/network/stack/routes.cpp	2007-04-06 06:23:35 UTC (rev 20600)
+@@ -493,6 +493,28 @@
+ }
+ 
+ 
++void
++invalidate_routes(net_domain *_domain, net_interface *interface)
++{
++	// this function is called with the domain locked
++	// (see domain_interface_went_down)
++	net_domain_private *domain = (net_domain_private *)_domain;
++
++	dprintf(&quot;invalidate_routes(%i, %s)\n&quot;, domain-&gt;family, interface-&gt;name);
++
++	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();
++	while (iterator.HasNext()) {
++		net_route *route = iterator.Next();
++
++		// TODO handle refcounting, if the route needs to linger
++		//      for some reason we should set interface or
++		//      something of the sorts that invalidates it's reference
++		if (route-&gt;interface == interface)
++			remove_route(domain, route);
++	}
++}
++
++
+ struct net_route *
+ get_route(struct net_domain *_domain, const struct sockaddr *address)
+ {
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/routes.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/routes.h	2007-04-06 06:23:27 UTC (rev 20599)
++++ haiku/trunk/src/add-ons/kernel/network/stack/routes.h	2007-04-06 06:23:35 UTC (rev 20600)
+@@ -39,6 +39,7 @@
+ 				const struct net_route *route);
+ status_t get_route_information(struct net_domain *domain, void *buffer,
+ 				size_t length);
++void invalidate_routes(net_domain *, net_interface *);
+ struct net_route *get_route(struct net_domain *domain,
+ 				const struct sockaddr *address);
+ void put_route(struct net_domain *domain, struct net_route *route);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001466.html">[Haiku-commits] r20599 -	haiku/trunk/src/add-ons/kernel/network/devices/ethernet
+</A></li>
+	<LI>Next message: <A HREF="001469.html">[Haiku-commits] r20600 - haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1467">[ date ]</a>
+              <a href="thread.html#1467">[ thread ]</a>
+              <a href="subject.html#1467">[ subject ]</a>
+              <a href="author.html#1467">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

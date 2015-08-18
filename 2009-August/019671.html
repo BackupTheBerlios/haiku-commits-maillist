@@ -1,0 +1,159 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32551 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32551%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200908210014.n7L0Erbc014705%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019670.html">
+   <LINK REL="Next"  HREF="019675.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32551 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32551%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200908210014.n7L0Erbc014705%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32551 - haiku/trunk/src/add-ons/kernel/busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Fri Aug 21 02:14:53 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019670.html">[Haiku-commits] r32550 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="019675.html">[Haiku-commits] r32552 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19671">[ date ]</a>
+              <a href="thread.html#19671">[ thread ]</a>
+              <a href="subject.html#19671">[ subject ]</a>
+              <a href="author.html#19671">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-08-21 02:14:50 +0200 (Fri, 21 Aug 2009)
+New Revision: 32551
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32551&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32551&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+Log:
+We cannot use the condition codes to determine if a transfer descriptor is
+processed. The controller may initialize it to any value when starting to
+process the descriptor. If a controller did that it was possible that we thought
+a transfer was already done even if it actually just started. Transfers would
+then return that weren't processed, returning uninitialized buffers.
+Instead of relying on the condition codes we now check that the head and tail
+pointers are the same. This guarantees that all transfer descriptors of the
+endpoint at hand are completed.
+Reverted r32534 again as this one fixes the problem for real. The same things
+that were mentioned there could happen here essentially, so in the worst case
+the device or controller could stall because of freeing in-use structures.
+Fixes #4067.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2009-08-20 23:39:22 UTC (rev 32550)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2009-08-21 00:14:50 UTC (rev 32551)
+@@ -888,6 +888,18 @@
+ 			ohci_general_td *descriptor = transfer-&gt;first_descriptor;
+ 			status_t callbackStatus = B_OK;
+ 
++			ohci_endpoint_descriptor *endpoint = transfer-&gt;endpoint;
++			if ((endpoint-&gt;head_physical_descriptor &amp; OHCI_ENDPOINT_HEAD_MASK)
++				!= endpoint-&gt;tail_physical_descriptor) {
++				// there are still active transfers on this endpoint, we need
++				// to wait for all of them to complete, otherwise we'd read
++				// a potentially bogus data toggle value below
++				TRACE(&quot;endpoint %p still has active tds\n&quot;, endpoint);
++				lastTransfer = transfer;
++				transfer = transfer-&gt;link;
++				continue;
++			}
++
+ 			while (descriptor &amp;&amp; !transfer-&gt;canceled) {
+ 				uint32 status = OHCI_TD_GET_CONDITION_CODE(descriptor-&gt;flags);
+ 				if (status == OHCI_TD_CONDITION_NOT_ACCESSED) {
+@@ -899,7 +911,6 @@
+ 				if (status != OHCI_TD_CONDITION_NO_ERROR) {
+ 					// an error occured, but we must ensure that the td
+ 					// was actually done
+-					ohci_endpoint_descriptor *endpoint = transfer-&gt;endpoint;
+ 					if (endpoint-&gt;head_physical_descriptor &amp; OHCI_ENDPOINT_HALTED) {
+ 						// the endpoint is halted, this guaratees us that this
+ 						// descriptor has passed (we don't know if the endpoint
+@@ -1035,7 +1046,7 @@
+ 
+ 					// get the last data toggle and store it for next time
+ 					transfer-&gt;transfer-&gt;TransferPipe()-&gt;SetDataToggle(
+-						(transfer-&gt;endpoint-&gt;head_physical_descriptor
++						(endpoint-&gt;head_physical_descriptor
+ 							&amp; OHCI_ENDPOINT_TOGGLE_CARRY) != 0);
+ 
+ 					if (transfer-&gt;transfer-&gt;IsFragmented()) {
+@@ -1078,7 +1089,7 @@
+ OHCI::_SubmitRequest(Transfer *transfer)
+ {
+ 	usb_request_data *requestData = transfer-&gt;RequestData();
+-	bool directionIn = (requestData-&gt;RequestType &amp; USB_REQTYPE_DEVICE_IN) &gt; 0;
++	bool directionIn = (requestData-&gt;RequestType &amp; USB_REQTYPE_DEVICE_IN) != 0;
+ 
+ 	ohci_general_td *setupDescriptor
+ 		= _CreateGeneralDescriptor(sizeof(usb_request_data));
+@@ -1231,7 +1242,7 @@
+ 	tail-&gt;next_logical_descriptor = first-&gt;next_logical_descriptor;
+ 
+ 	// the first descriptor becomes the new tail
+-	first-&gt;flags = OHCI_TD_SET_CONDITION_CODE(OHCI_TD_CONDITION_NOT_ACCESSED);
++	first-&gt;flags = 0;
+ 	first-&gt;buffer_physical = 0;
+ 	first-&gt;next_physical_descriptor = 0;
+ 	first-&gt;last_physical_byte_address = 0;
+@@ -1247,6 +1258,7 @@
+ 	// update the endpoint tail pointer to reflect the change
+ 	endpoint-&gt;tail_logical_descriptor = first;
+ 	endpoint-&gt;tail_physical_descriptor = (uint32)first-&gt;physical_address;
++	TRACE(&quot;switched tail from %p to %p\n&quot;, tail, first);
+ 
+ #if 0
+ 	_PrintEndpoint(endpoint);
+@@ -1410,7 +1422,7 @@
+ 		return B_ERROR;
+ 	} else {
+ 		ohci_general_td *tail = _CreateGeneralDescriptor(0);
+-		tail-&gt;flags = OHCI_TD_SET_CONDITION_CODE(OHCI_TD_CONDITION_NOT_ACCESSED);
++		tail-&gt;flags = 0;
+ 		endpoint-&gt;tail_logical_descriptor = tail;
+ 		endpoint-&gt;head_physical_descriptor = tail-&gt;physical_address;
+ 		endpoint-&gt;tail_physical_descriptor = tail-&gt;physical_address;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019670.html">[Haiku-commits] r32550 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="019675.html">[Haiku-commits] r32552 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19671">[ date ]</a>
+              <a href="thread.html#19671">[ thread ]</a>
+              <a href="subject.html#19671">[ subject ]</a>
+              <a href="author.html#19671">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

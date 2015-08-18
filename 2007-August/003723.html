@@ -1,0 +1,407 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22100 - haiku/trunk/src/apps/terminal
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22100%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200708282119.l7SLJGuY011330%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003722.html">
+   <LINK REL="Next"  HREF="003724.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22100 - haiku/trunk/src/apps/terminal</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22100%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200708282119.l7SLJGuY011330%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22100 - haiku/trunk/src/apps/terminal">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Aug 28 23:19:16 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003722.html">[Haiku-commits] r22099 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+        <LI>Next message: <A HREF="003724.html">[Haiku-commits] r22101 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3723">[ date ]</a>
+              <a href="thread.html#3723">[ thread ]</a>
+              <a href="subject.html#3723">[ subject ]</a>
+              <a href="author.html#3723">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-08-28 23:19:15 +0200 (Tue, 28 Aug 2007)
+New Revision: 22100
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22100&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22100&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/terminal/Shell.h
+   haiku/trunk/src/apps/terminal/TermApp.cpp
+   haiku/trunk/src/apps/terminal/TermApp.h
+   haiku/trunk/src/apps/terminal/TermConst.h
+   haiku/trunk/src/apps/terminal/TermView.cpp
+   haiku/trunk/src/apps/terminal/TermView.h
+   haiku/trunk/src/apps/terminal/TermWindow.cpp
+   haiku/trunk/src/apps/terminal/TermWindow.h
+Log:
+Added a SIGCHLD handler, so that the terminal will notice when one of
+its shells has been terminated. Usually the thread reading from the tty
+master would notice when all slaves have been closed, but they won't be
+closed when the shell started a background job that's still living.
+
+Unfortunately there are race conditions in the terminal that can lead to
+deadlock when a session is closed. The service threads usually happily
+lock the window, while the (locked) window would wait for the service
+threads to quit.
+
+
+
+Modified: haiku/trunk/src/apps/terminal/Shell.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/Shell.h	2007-08-28 21:10:39 UTC (rev 22099)
++++ haiku/trunk/src/apps/terminal/Shell.h	2007-08-28 21:19:15 UTC (rev 22100)
+@@ -37,7 +37,8 @@
+ 	status_t	GetAttr(struct termios &amp;attr);
+ 	status_t	SetAttr(struct termios &amp;attr);
+ 
+-	int		FD() const;
++	int			FD() const;
++	pid_t		ProcessID() const	{ return fProcessID; }
+ 	
+ 	virtual	void	ViewAttached(TermView *view);
+ 	virtual void	ViewDetached();
+
+Modified: haiku/trunk/src/apps/terminal/TermApp.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermApp.cpp	2007-08-28 21:10:39 UTC (rev 22099)
++++ haiku/trunk/src/apps/terminal/TermApp.cpp	2007-08-28 21:19:15 UTC (rev 22100)
+@@ -9,11 +9,11 @@
+ 
+ #include &quot;TermApp.h&quot;
+ 
+-#include &quot;Arguments.h&quot;
+-#include &quot;CodeConv.h&quot;
+-#include &quot;PrefHandler.h&quot;
+-#include &quot;TermWindow.h&quot;
+-#include &quot;TermConst.h&quot;
++#include &lt;errno.h&gt;
++#include &lt;signal.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;unistd.h&gt;
+ 
+ #include &lt;Alert.h&gt;
+ #include &lt;Clipboard.h&gt;
+@@ -24,9 +24,11 @@
+ #include &lt;String.h&gt;
+ #include &lt;TextView.h&gt;
+ 
+-#include &lt;stdio.h&gt;
+-#include &lt;stdlib.h&gt;
+-#include &lt;unistd.h&gt;
++#include &quot;Arguments.h&quot;
++#include &quot;CodeConv.h&quot;
++#include &quot;PrefHandler.h&quot;
++#include &quot;TermWindow.h&quot;
++#include &quot;TermConst.h&quot;
+ 
+ 
+ static bool sUsageRequested = false;
+@@ -74,6 +76,18 @@
+ 	if (sUsageRequested)
+ 		return;
+ 
++	// Install a SIGCHLD signal handler, so that we will be notified, when
++	// a shell exits.
++	struct sigaction action;
++	action.sa_handler = (sighandler_t)_SigChildHandler;
++	sigemptyset(&amp;action.sa_mask);
++	action.sa_flags = SA_NODEFER;
++	action.sa_userdata = this;
++	if (sigaction(SIGCHLD, &amp;action, NULL) &lt; 0) {
++		fprintf(stderr, &quot;sigaction() failed: %s\n&quot;, strerror(errno));
++		// continue anyway
++	}
++
+ 	status_t status = _MakeTermWindow(fTermFrame);
+ 
+ 	// failed spawn, print stdout and open alert panel
+@@ -143,6 +157,10 @@
+ 			break;
+ 		}
+ 
++		case MSG_CHECK_CHILDREN:
++			_HandleChildCleanup();
++			break;
++
+ 		default:
+ 			BApplication::MessageReceived(msg);
+ 			break;
+@@ -474,6 +492,39 @@
+ 
+ 
+ void
++TermApp::_HandleChildCleanup()
++{
++}
++
++
++/*static*/ void
++TermApp::_SigChildHandler(int signal, void* data)
++{
++	// Spawing a thread that does the actual signal handling is pretty much
++	// the only safe thing to do in a multi-threaded application. The
++	// interrupted thread might have been anywhere, e.g. in a critical section,
++	// holding locks. If we do anything that does require locking at any point
++	// (e.g. memory allocation, messaging), we risk a dead-lock or data
++	// structure corruption. Spawing a thread is safe though, since its only
++	// a system call.
++	thread_id thread = spawn_thread(_ChildCleanupThread, &quot;child cleanup&quot;,
++		B_NORMAL_PRIORITY, ((TermApp*)data)-&gt;fTermWindow);
++	if (thread &gt;= 0)
++		resume_thread(thread);
++}
++
++
++/*static*/ status_t
++TermApp::_ChildCleanupThread(void* data)
++{
++	// Just drop the windowa message and let it do the actual work. This
++	// saves us additional synchronization measures.
++	return ((TermWindow*)data)-&gt;PostMessage(MSG_CHECK_CHILDREN);
++}
++
++
++
++void
+ TermApp::_Usage(char *name)
+ {
+ 	fprintf(stderr, &quot;Haiku Terminal\n&quot;
+
+Modified: haiku/trunk/src/apps/terminal/TermApp.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermApp.h	2007-08-28 21:10:39 UTC (rev 22099)
++++ haiku/trunk/src/apps/terminal/TermApp.h	2007-08-28 21:19:15 UTC (rev 22100)
+@@ -63,6 +63,10 @@
+ 		void _UnregisterTerminal();
+ 		void _RegisterTerminal();
+ 
++		void _HandleChildCleanup();
++		static void _SigChildHandler(int signal, void* data);
++		static status_t _ChildCleanupThread(void* data);
++
+ 		void _Usage(char *name);
+ 
+ 		bool		fStartFullscreen;
+
+Modified: haiku/trunk/src/apps/terminal/TermConst.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermConst.h	2007-08-28 21:10:39 UTC (rev 22099)
++++ haiku/trunk/src/apps/terminal/TermConst.h	2007-08-28 21:19:15 UTC (rev 22100)
+@@ -83,6 +83,7 @@
+ 
+ const uint32 MSG_FONT_CHANGED		= 'fntc';
+ const uint32 SAVE_AS_DEFAULT 		= 'sadf';
++const uint32 MSG_CHECK_CHILDREN		= 'ckch';
+ 
+ // Preference Read/Write Keys
+ const char* const PREF_HALF_FONT_FAMILY = &quot;Half Font Famly&quot;;
+
+Modified: haiku/trunk/src/apps/terminal/TermView.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermView.cpp	2007-08-28 21:10:39 UTC (rev 22099)
++++ haiku/trunk/src/apps/terminal/TermView.cpp	2007-08-28 21:19:15 UTC (rev 22100)
+@@ -2521,6 +2521,22 @@
+ }
+ 
+ 
++void
++TermView::CheckShellGone()
++{
++	if (!fShell)
++		return;
++
++	// check, if the shell does still live
++	pid_t pid = fShell-&gt;ProcessID();
++	team_info info;
++	if (get_team_info(pid, &amp;info) == B_BAD_TEAM_ID) {
++		// the shell is gone
++		NotifyQuit(0);
++	}
++}
++
++
+ inline void
+ TermView::_Redraw(int x1, int y1, int x2, int y2)
+ {
+
+Modified: haiku/trunk/src/apps/terminal/TermView.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermView.h	2007-08-28 21:10:39 UTC (rev 22099)
++++ haiku/trunk/src/apps/terminal/TermView.h	2007-08-28 21:19:15 UTC (rev 22100)
+@@ -115,6 +115,8 @@
+ 	bool	Find(const BString &amp;str, bool forwardSearch, bool matchCase, bool matchWord);
+ 	void	GetSelection(BString &amp;str);
+ 
++	void	CheckShellGone();
++
+ protected:
+ 	virtual void	AttachedToWindow();
+ 	virtual void	DetachedFromWindow();
+
+Modified: haiku/trunk/src/apps/terminal/TermWindow.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermWindow.cpp	2007-08-28 21:10:39 UTC (rev 22099)
++++ haiku/trunk/src/apps/terminal/TermWindow.cpp	2007-08-28 21:19:15 UTC (rev 22100)
+@@ -254,12 +254,15 @@
+ 			break;
+ 
+ 		case kCloseView:
+-			// TODO: We assume that this message was sent from the current active tab.
+-			// Since the implementation of BTabView uses AddChild/RemoveChild on the
+-			// views, the current active tab is the only one who is attached, thus
+-			// the only one which could send a message. Change this.
+-			_RemoveTab(fTabView-&gt;Selection());			
+-			break;	
++		{
++			TermView* termView;
++			if (message-&gt;FindPointer(&quot;termView&quot;, (void**)&amp;termView) == B_OK) {
++				int32 index = _IndexOfTermView(termView);
++				if (index &gt;= 0)
++					_RemoveTab(index);
++			}
++			break;
++		}
+ 
+ 		case MENU_NEW_TERM: 
+ 		{
+@@ -455,12 +458,12 @@
+ 		case MSG_FONT_CHANGED:
+ 	    		PostMessage(MSG_HALF_FONT_CHANGED);
+ 			break;
+-		
++
+ 		case MSG_COLOR_CHANGED:
+ 			_SetTermColors(_ActiveTermView());
+ 			_ActiveTermView()-&gt;Invalidate();
+ 			break;
+-		
++
+ 		case SAVE_AS_DEFAULT: 
+ 		{
+ 			BPath path;
+@@ -476,6 +479,10 @@
+ 			_DoPrint();
+ 			break;
+ 
++		case MSG_CHECK_CHILDREN:
++			_CheckChildren();
++			break;
++
+ 		case B_ABOUT_REQUESTED:
+ 			be_app-&gt;PostMessage(B_ABOUT_REQUESTED);
+ 			break;
+@@ -659,6 +666,50 @@
+ }
+ 
+ 
++int32
++TermWindow::_IndexOfTermView(TermView* termView) const
++{
++	if (!termView)
++		return -1;
++
++	// find the view
++	int32 count = fTabView-&gt;CountTabs();
++	for (int32 i = count - 1; i &gt;= 0; i--) {
++		BScrollView* scrollView
++			= dynamic_cast&lt;BScrollView*&gt;(fTabView-&gt;ViewForTab(i));
++		if (!scrollView)
++			continue;
++
++		if (termView == scrollView-&gt;Target())
++			return i;
++	}
++
++	return -1;
++}
++
++
++void
++TermWindow::_CheckChildren()
++{
++	// There seems to be no separate list of sessions, so we have to iterate
++	// through the tabs.
++	int32 count = fTabView-&gt;CountTabs();
++	for (int32 i = count - 1; i &gt;= 0; i--) {
++		// get the term view
++		BScrollView* scrollView
++			= dynamic_cast&lt;BScrollView*&gt;(fTabView-&gt;ViewForTab(i));
++		if (!scrollView)
++			continue;
++		TermView* termView = dynamic_cast&lt;TermView*&gt;(scrollView-&gt;Target());
++		if (!termView)
++			continue;
++
++		termView-&gt;CheckShellGone();
++	}
++}
++
++
++
+ // CustomTermView
+ CustomTermView::CustomTermView(int32 rows, int32 columns, int32 argc, const char **argv, int32 historySize)
+ 	:
+@@ -672,6 +723,7 @@
+ {
+ 	if (Window()) {
+ 		BMessage message(kCloseView);
++		message.AddPointer(&quot;termView&quot;, this);
+ 		message.AddInt32(&quot;reason&quot;, reason);
+ 		Window()-&gt;PostMessage(&amp;message);
+ 	}
+
+Modified: haiku/trunk/src/apps/terminal/TermWindow.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermWindow.h	2007-08-28 21:10:39 UTC (rev 22099)
++++ haiku/trunk/src/apps/terminal/TermWindow.h	2007-08-28 21:19:15 UTC (rev 22100)
+@@ -67,6 +67,8 @@
+ 	void			_AddTab(Arguments *args);
+ 	void			_RemoveTab(int32 index);
+ 	TermView*		_ActiveTermView();
++	int32			_IndexOfTermView(TermView* termView) const;
++	void			_CheckChildren();
+ 	
+ 	SmartTabView	*fTabView;
+ 	TermView		*fTermView;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003722.html">[Haiku-commits] r22099 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+	<LI>Next message: <A HREF="003724.html">[Haiku-commits] r22101 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3723">[ date ]</a>
+              <a href="thread.html#3723">[ thread ]</a>
+              <a href="subject.html#3723">[ subject ]</a>
+              <a href="author.html#3723">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

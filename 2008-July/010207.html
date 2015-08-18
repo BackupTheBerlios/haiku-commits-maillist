@@ -1,0 +1,750 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26384 -	haiku/branches/developer/bonefish/vm/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26384%20-%0A%09haiku/branches/developer/bonefish/vm/src/system/kernel/vm&In-Reply-To=%3C200807112359.m6BNxpFs003645%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010206.html">
+   <LINK REL="Next"  HREF="010208.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26384 -	haiku/branches/developer/bonefish/vm/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26384%20-%0A%09haiku/branches/developer/bonefish/vm/src/system/kernel/vm&In-Reply-To=%3C200807112359.m6BNxpFs003645%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26384 -	haiku/branches/developer/bonefish/vm/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Jul 12 01:59:51 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010206.html">[Haiku-commits] r26383 - haiku/trunk/src/kits/app
+</A></li>
+        <LI>Next message: <A HREF="010208.html">[Haiku-commits] r26385 -	haiku/branches/developer/bonefish/vm/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10207">[ date ]</a>
+              <a href="thread.html#10207">[ thread ]</a>
+              <a href="subject.html#10207">[ subject ]</a>
+              <a href="author.html#10207">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-07-12 01:59:50 +0200 (Sat, 12 Jul 2008)
+New Revision: 26384
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26384&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26384&amp;view=rev</A>
+
+Modified:
+   haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.cpp
+   haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.h
+Log:
+Patch by Zhao Shuai:
+* Removed the swap_file_address structure, which was used to refer to an
+  address in the swap space. We do now use a kind of virtual swap
+  address space and assign swap files disjoint ranges of it, so that
+  a swap location can be identified by a single number.
+* Implemented the swapping related part of MergeStore(), i.e. the
+  swapped out pages of the source cache are taken over, respectively
+  freed if shadowed.
+* Some coding style improvements.
+
+
+Modified: haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.cpp
+===================================================================
+--- haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.cpp	2008-07-11 20:07:00 UTC (rev 26383)
++++ haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.cpp	2008-07-11 23:59:50 UTC (rev 26384)
+@@ -28,53 +28,57 @@
+ #	define TRACE(x) ;
+ #endif
+ 
+-
+ #define SWAP_HASH_SIZE  128
+-#define SWAP_HASH_MASK  (SWAP_HASH_SIZE - 1)
+ 
+-#define SWAP_BLOCK_SHIFT 5
+-#define SWAP_BLOCK_PAGES (1 &lt;&lt; SWAP_BLOCK_SHIFT)
++#define SWAP_BLOCK_PAGES 32
++#define SWAP_BLOCK_MASK  (SWAP_BLOCK_PAGES - 1)
+ 
+-#define SWAP_BLOCK_NONE -1
++#define SWAP_PAGE_NONE -1
+ 
++// bitmap allocation macros
++#define MAP_SHIFT  5
++#define NUM_BITS_PER_WORD  32    // number of bits per word       
+ 
++#define TESTBIT(map, i) \
++	(((map)[(i) &gt;&gt; MAP_SHIFT] &amp; (1 &lt;&lt; (i) % NUM_BITS_PER_WORD)))
++#define SETBIT(map, i) \
++	(((map)[(i) &gt;&gt; MAP_SHIFT] |= (1 &lt;&lt; (i) % NUM_BITS_PER_WORD)))
++#define CLEARBIT(map, i) \
++	(((map)[(i) &gt;&gt; MAP_SHIFT] &amp;= ~(1 &lt;&lt; (i) % NUM_BITS_PER_WORD)))
++
++
+ // The stack functionality looks like a good candidate to put into its own
+ // store. I have not done this because once we have a swap file backing up
+ // the memory, it would probably not be a good idea to separate this
+ // anymore.
+ 
+-
+ struct swap_file {
+ 	mutex              lock;
+ 	struct vnode       *vnode;
+ 	dev_t              device;
+ 	ino_t              inode;
+-	int                page_count; 
+-	int                used;   // # of pages used
+-	struct swap_file   *next;
++	int32              first_page; 
++	int32              last_page;
++	int32              used;   // # of pages used
++	struct swap_file   *next;  // next swap file in the list
+ 	int                *maps;  // bitmap for the pages 
+-    int                hint;   // next free page
++	int32              hint;   // next free page
+ };
+ 
+ 
+-struct swap_file_address {
+-	struct swap_file   *swapfile;       
+-	int                page_index;
+-};
+-
+-
+ // Each swap block contains SWAP_BLOCK_PAGES pages
+ struct swap_block {
+ 	struct swap_block  *hash_next;
+-	VMAnonymousCache   *store;
++	VMAnonymousCache   *cache;
+ 	addr_t             cache_offset;
+-//	int                used; 
+-	struct swap_file_address   swap_pages[SWAP_BLOCK_PAGES];
++	int                used; 
++	int                swap_pages[SWAP_BLOCK_PAGES];
+ };
+ 
+ 
+-static status_t swap_space_alloc(int, struct swap_file_address *);
+-static void swap_space_dealloc(struct swap_file_address, int);
++static int32 swap_space_alloc(int32);
++static void swap_space_dealloc(int32, int32);
++static struct swap_file *find_swap_file(int32);
+ 
+ static object_cache * sSwapBlockCache;
+ 
+@@ -88,14 +92,6 @@
+ static struct swap_file *sSwapFileAlloc = NULL; //allocate from here
+ 
+ 
+-// bitmap allocation macros
+-#define MAP_SHIFT  5
+-#define NUM_BITS_PER_WORD  32    // number of bits per word       
+-#define TESTBIT(map, i)  (((map)[(i) &gt;&gt; MAP_SHIFT] &amp; (1 &lt;&lt; (i) % NUM_BITS_PER_WORD)))
+-#define SETBIT(map, i)   (((map)[(i) &gt;&gt; MAP_SHIFT] |= (1 &lt;&lt; (i) % NUM_BITS_PER_WORD)))
+-#define CLEARBIT(map, i) (((map)[(i) &gt;&gt; MAP_SHIFT] &amp;= ~(1 &lt;&lt; (i) % NUM_BITS_PER_WORD)))
+-
+-
+ VMAnonymousCache::~VMAnonymousCache()
+ {
+ 	vm_unreserve_memory(committed_size);
+@@ -164,39 +160,38 @@
+ VMAnonymousCache::Read(off_t offset, const iovec *vecs, size_t count,
+ 	size_t *_numBytes, bool fsReenter)
+ {
+-	status_t status = B_OK;
+-	off_t cache_offset;
+ 	iovec iov;
+-	off_t pos;
+-	struct swap_file_address start_address, address;
+-	int i, j;
++	int32 i, j;
+ 
+-	cache_offset = offset &gt;&gt; PAGE_SHIFT;
++	off_t cacheOffset = offset &gt;&gt; PAGE_SHIFT;
+ 
+-	start_address.swapfile = NULL;
+-	start_address.page_index = SWAP_BLOCK_NONE;
+-	address.swapfile = NULL;
+-	address.page_index = SWAP_BLOCK_NONE;
+-
+-	for (i = 0; i &lt; count; i = j) {
+-		_SwapBlockGetAddress(cache_offset + i, &amp;start_address);
+-		for (j = i+1; j &lt; count; j++) {
+-			_SwapBlockGetAddress(cache_offset + j, &amp;address);
+-			if (address.swapfile != start_address.swapfile ||
+-					address.page_index != start_address.page_index + j - i)
++	for (i = 0; i &lt; (int)count; i = j) {
++		int32 startPageIndex = _SwapBlockGetAddress(cacheOffset + i);
++		for (j = i + 1; j &lt;(int)count; j++) {
++			int32 pageIndex = _SwapBlockGetAddress(cacheOffset + j);
++			if (pageIndex != startPageIndex + j - i)
+ 				break;
+ 		}
+ 		
+-		pos = start_address.page_index * PAGE_SIZE;
++		struct swap_file *swapFile = find_swap_file(startPageIndex);
++		if (swapFile == NULL) {
++			panic(&quot;can't find swap file for page index %ld\n&quot;, startPageIndex);
++			return B_ERROR;
++		}
++
++		off_t pos = (startPageIndex - swapFile-&gt;first_page) * PAGE_SIZE;
+ 		iov.iov_base = (void *)((int)vecs-&gt;iov_base + i * PAGE_SIZE);
+-		iov.iov_len = (j-i) * PAGE_SIZE;
++		iov.iov_len = (j - i) * PAGE_SIZE;
+ 
+-		status = vfs_read_pages(start_address.swapfile-&gt;vnode, NULL, pos, &amp;iov, j-i,
++		status_t status = vfs_read_pages(swapFile-&gt;vnode, NULL, pos, &amp;iov, j - i,
+ 				_numBytes, fsReenter);
+ 		if(status != B_OK)
+ 			return status;
+ 
+-		swap_space_dealloc(start_address, j-i);
++		for (int32 k = i; k &lt; j - i; k++)
++			_SwapBlockFree(cacheOffset + k);
++
++		swap_space_dealloc(startPageIndex, j - i);
+ 	}
+ 
+ 	return B_OK;
+@@ -207,39 +202,42 @@
+ VMAnonymousCache::Write(off_t offset, const iovec *vecs, size_t count,
+ 	size_t *_numBytes, bool fsReenter)
+ {
+-	status_t status = B_OK;
+-	off_t pos;
+ 	iovec iov;
+-    int i, j, n;
+-	struct swap_file_address address;
+-	int page_index;
++	int32 pageIndex;
+ 
+ 	offset &gt;&gt;= PAGE_SHIFT;
+ 	iov.iov_base = vecs-&gt;iov_base;
+ 	iov.iov_len = vecs-&gt;iov_len;
+ 
+-	n = count;
+-	for (i = 0; i &lt; count; i += n) {
++	int32 n = count;
++	for (int32 i = 0; i &lt; (int)count; i += n) {
+ 		//try to allocate n pages, if fail, try to allocate n/2 
+-		while ((status = swap_space_alloc(n, &amp;address)) == B_ERROR	
++		while ((pageIndex = swap_space_alloc(n)) == SWAP_PAGE_NONE	
+ 				&amp;&amp; n &gt;= 2)
+ 			n &gt;&gt;= 1;
+-		if (status == B_ERROR)
++		if (pageIndex == SWAP_PAGE_NONE)
+ 			return B_ERROR;
+ 
+-		for (j = 0; j &lt; n; j++) 
+-			_SwapBlockBuild(offset + i + j, address); 
++		for (int32 j = 0; j &lt; n; j++) 
++			_SwapBlockBuild(offset + i + j, pageIndex + j); 
+ 
+-		pos = address.page_index * PAGE_SIZE;
++		struct swap_file *swapFile = find_swap_file(pageIndex);
++		if (swapFile == NULL) {
++			panic(&quot;can't find swap file for page index %ld\n&quot;, pageIndex);
++			return B_ERROR;
++		}
++
++		off_t pos = (pageIndex - swapFile-&gt;first_page) * PAGE_SIZE;
+ 		iov.iov_base = (void *)((int)vecs-&gt;iov_base + i * PAGE_SIZE);
+ 		iov.iov_len = n * PAGE_SIZE;
+ 
+-		if ((status = vfs_write_pages(address.swapfile-&gt;vnode, NULL, pos,
+-						&amp;iov, n, _numBytes, fsReenter)) != B_OK)
+-			return B_ERROR;
++		status_t status = vfs_write_pages(swapFile-&gt;vnode, NULL, pos, &amp;iov, n, 
++			_numBytes, fsReenter);
++		if (status != B_OK)
++			return status;
+ 	}
+ 
+-	return status;
++	return B_OK;
+ }
+ 
+ 
+@@ -282,6 +280,7 @@
+ 
+ void
+ VMAnonymousCache::MergeStore(VMCache* source)
++//VMAnonymousCache::MergeStore(VMAnonymousCache *source)
+ {
+ 	if (source-&gt;type != CACHE_TYPE_RAM) {
+ 		panic(&quot;VMAnonymousCache::MergeStore(): merge with non-RAM cache %p &quot;
+@@ -298,19 +297,45 @@
+ 		vm_unreserve_memory(committed_size - actualSize);
+ 		committed_size = actualSize;
+ 	}
++
++	int32 sourceSwapIndex = SWAP_PAGE_NONE;  // page index in the swap file
++
++	for (off_t offset = source-&gt;virtual_base; offset &lt; source-&gt;virtual_end;
++			offset += PAGE_SIZE) {
++		sourceSwapIndex = ((VMAnonymousCache *)source)-&gt;
++				_SwapBlockGetAddress(offset);
++		if (sourceSwapIndex == SWAP_PAGE_NONE) // this page is not swapped out
++			continue;
++		else if (LookupPage(offset)) { 
++	 	// this page is shadowed and we can find it in the new cache,
++		// free the swap block and swap space
++			((VMAnonymousCache *)source)-&gt;_SwapBlockFree(offset);
++			swap_space_dealloc(sourceSwapIndex, 1);
++		}
++		else { 
++			int32 swapIndex = _SwapBlockGetAddress(offset);
++			if (swapIndex == SWAP_PAGE_NONE) 
++			// the page is not shadowed, assign the swap address to the new cache
++				_SwapBlockBuild(offset, sourceSwapIndex);
++			else // the page is shadowed but is also swapped out
++				swap_space_dealloc(sourceSwapIndex, 1);
++			((VMAnonymousCache *)source)-&gt;_SwapBlockFree(offset);
++		}
++	}
+ }
+ 
+ 
+ swap_block**
+-VMAnonymousCache::_SwapHash(off_t cache_offset)
++VMAnonymousCache::_SwapHash(off_t cacheOffset)
+ {
+-	struct swap_block **pswap;
+-	struct swap_block *swap;
++	cacheOffset &amp;= ~(off_t)(SWAP_BLOCK_MASK);
+ 
+-	cache_offset &amp;= ~(off_t)(SWAP_HASH_MASK);
+-	pswap = &amp;sSwapHash[(cache_offset ^ (int)(int *)this) &amp; sSwapHashMask];
+-    while ((swap = *pswap) != NULL) {
+-		if (swap-&gt;store == this &amp;&amp; swap-&gt;cache_offset == cache_offset)
++	struct swap_block **pswap = 
++			&amp;sSwapHash[(cacheOffset ^ (int)(int *)this) &amp; sSwapHashMask];
++	struct swap_block *swap = *pswap;
++
++    while (swap != NULL) {
++		if (swap-&gt;cache == this &amp;&amp; swap-&gt;cache_offset == cacheOffset)
+ 			break;
+ 		pswap = &amp;swap-&gt;hash_next;
+ 	}
+@@ -320,17 +345,13 @@
+ 
+ 
+ void
+-VMAnonymousCache::_SwapBlockBuild(off_t cache_offset,
+-	swap_file_address&amp; address)
++VMAnonymousCache::_SwapBlockBuild(off_t cacheOffset, int32 pageIndex)
+ {
+-	struct swap_block *swap;
+-	struct swap_block **pswap;
+-    int index, i;
+-
+ 	mutex_lock(&amp;sSwapHashLock);
+-	pswap = _SwapHash(cache_offset);
+ 
+-	if ((swap = *pswap) == NULL) {
++	struct swap_block **pswap = _SwapHash(cacheOffset);
++	struct swap_block *swap = *pswap;
++	if (swap == NULL) {
+ 		swap = *pswap = (struct swap_block *)object_cache_alloc(sSwapBlockCache, CACHE_DONT_SLEEP);
+ 		if (swap == NULL) {
+ 			mutex_unlock(&amp;sSwapHashLock);
+@@ -338,63 +359,101 @@
+ 		}
+ 
+ 	swap-&gt;hash_next = NULL;
+-	swap-&gt;store = this;
+-	swap-&gt;cache_offset = cache_offset &amp; ~(off_t)(SWAP_BLOCK_PAGES - 1);
+-//	swap-&gt;used = 0;
++	swap-&gt;cache = this;
++	swap-&gt;cache_offset = cacheOffset &amp; ~(off_t)SWAP_BLOCK_MASK;
++	swap-&gt;used = 0;
+ 
+-	for (i = 0; i &lt; SWAP_BLOCK_PAGES; i++)
+-		swap-&gt;swap_pages[i].swapfile = NULL;
+-	    swap-&gt;swap_pages[i].page_index = SWAP_BLOCK_NONE;
++	for (int32 i = 0; i &lt; SWAP_BLOCK_PAGES; i++)
++		swap-&gt;swap_pages[i] = SWAP_PAGE_NONE;
+ 	}
+ 
+-	index = cache_offset &amp; (SWAP_BLOCK_PAGES - 1);
+-	swap-&gt;swap_pages[index].swapfile = address.swapfile;
+-	swap-&gt;swap_pages[index].page_index = address.page_index;
++	int32 blockIndex = cacheOffset &amp; SWAP_BLOCK_MASK;
++	swap-&gt;swap_pages[blockIndex] = pageIndex;
+ 
+-//	swap-&gt;used++;
++	swap-&gt;used++;
+ 
+ 	mutex_unlock(&amp;sSwapHashLock);
+ }
+ 
+ 
+ void
+-VMAnonymousCache::_SwapBlockGetAddress(off_t cache_offset,
+-	swap_file_address *address)
++VMAnonymousCache::_SwapBlockFree(off_t cacheOffset)
+ {
+-	struct swap_block *swap;
+-	struct swap_block **pswap;
+-	int index;
++	mutex_lock(&amp;sSwapHashLock);
+ 
++	struct swap_block **pswap = _SwapHash(cacheOffset);
++	struct swap_block *swap = *pswap;
++	if (swap != NULL) {
++		int32 pageIndex = swap-&gt;swap_pages[cacheOffset &amp; SWAP_BLOCK_MASK];
++		if (pageIndex != SWAP_PAGE_NONE) {
++			swap-&gt;swap_pages[cacheOffset &amp; SWAP_BLOCK_MASK] = SWAP_PAGE_NONE;
++			swap-&gt;used--;
++			if (swap-&gt;used == 0) {
++				*pswap = swap-&gt;hash_next;
++				object_cache_free(sSwapBlockCache, swap);
++			}
++		}
++	}
++	
++	mutex_unlock(&amp;sSwapHashLock);
++}
++
++
++int32
++VMAnonymousCache::_SwapBlockGetAddress(off_t cacheOffset)
++{
++	int32 pageIndex = SWAP_PAGE_NONE;
++
+ 	mutex_lock(&amp;sSwapHashLock);
+-	pswap = _SwapHash(cache_offset);
+ 
+-	if ((swap = *pswap) != NULL) {
+-		index = cache_offset &amp; (off_t)SWAP_HASH_MASK;
+-		address-&gt;swapfile = swap-&gt;swap_pages[index].swapfile;
+-		address-&gt;page_index = swap-&gt;swap_pages[index].page_index;
++	struct swap_block **pswap = _SwapHash(cacheOffset);
++	struct swap_block *swap = *pswap;
++	if (swap != NULL) {
++		int32 blockIndex = cacheOffset &amp; SWAP_BLOCK_MASK;
++		pageIndex = swap-&gt;swap_pages[blockIndex];
+ 	} 
+ 
+ 	mutex_unlock(&amp;sSwapHashLock);
++
++	return pageIndex;
+ }
+ 
+ 
+-static status_t 
+-swap_space_alloc(int npages, struct swap_file_address *address)
++static struct swap_file *
++find_swap_file(int32 pageIndex)
+ {
+-	int hint, i, j;
++	struct swap_file *swapFile = sSwapFileList;
+ 
++	while (swapFile != NULL) {
++		if (pageIndex &gt;= swapFile-&gt;first_page &amp;&amp; 
++				pageIndex &lt; swapFile-&gt;last_page)
++			break;
++		else
++			swapFile = swapFile-&gt;next;
++	}
++
++	return swapFile;
++}
++
++
++static int32 
++swap_space_alloc(int32 npages)
++{
++	int32 hint, j;
++
+ 	for (j = 0; j &lt; sSwapFileCount; j++) { 
+ 		if (sSwapFileAlloc == NULL) {
+ 			sSwapFileAlloc = sSwapFileList-&gt;next;
+ 			if (sSwapFileAlloc == NULL)  // there is no swap_file
+-				return B_ERROR;
++				return SWAP_PAGE_NONE;
+ 		}
+ 
+ 		mutex_lock(&amp;sSwapFileAlloc-&gt;lock);
+ 		hint = sSwapFileAlloc-&gt;hint;
++		int32 pageCount = sSwapFileAlloc-&gt;last_page - sSwapFileAlloc-&gt;first_page;
+ 
+-		i = 0;
+-		while (i &lt; npages &amp;&amp; (hint + npages) &lt; sSwapFileAlloc-&gt;page_count) {
++		int32 i = 0;
++		while (i &lt; npages &amp;&amp; (hint + npages) &lt; pageCount) {
+ 			if (TESTBIT(sSwapFileAlloc-&gt;maps, hint+i))
+ 			{
+ 				hint++;
+@@ -413,61 +472,68 @@
+ 
+ 	if (j == sSwapFileCount) {
+ 		panic(&quot;swap space exhausted\n&quot;);
+-		return B_ERROR;
++		return SWAP_PAGE_NONE;
+ 	}
+ 
+-	address-&gt;swapfile = sSwapFileAlloc;
+-	address-&gt;page_index = hint;
++	int32 pageIndex = sSwapFileAlloc-&gt;first_page + hint;
+ 
+-	for (i = 0; i &lt; npages; i++) 
++	for (int32 i = 0; i &lt; npages; i++) 
+ 		SETBIT(sSwapFileAlloc-&gt;maps, hint + i);
+ 	if (hint == sSwapFileAlloc-&gt;hint)
+-		sSwapFileAlloc-&gt;hint += i;
++		sSwapFileAlloc-&gt;hint += npages;
+ 
+ 	sSwapFileAlloc-&gt;used += npages;
+-    if (sSwapFileAlloc-&gt;used &gt; 9 * sSwapFileAlloc-&gt;page_count / 10)
++
++	// if this swap file has used more than 90% percent of its pages
++	// switch to another
++    if (sSwapFileAlloc-&gt;used &gt; 
++			9 * (sSwapFileAlloc-&gt;last_page - sSwapFileAlloc-&gt;first_page) / 10)
+ 		sSwapFileAlloc = sSwapFileAlloc-&gt;next;
+ 
+ 	mutex_unlock(&amp;sSwapFileAlloc-&gt;lock);
+ 
+-	return B_OK;
++	return pageIndex;
+ }
+ 
+ 
+ static void
+-swap_space_dealloc(struct swap_file_address address, int npages)
++swap_space_dealloc(int32 pageIndex, int32 npages)
+ {
+-	mutex_lock(&amp;address.swapfile-&gt;lock);
++	struct swap_file *swapFile = find_swap_file(pageIndex);
++
++	mutex_lock(&amp;swapFile-&gt;lock);
++
++	pageIndex -= swapFile-&gt;first_page;
+ 	
+-	for (int i = 0; i &lt; npages; i++)
+-		CLEARBIT(address.swapfile-&gt;maps, address.page_index + i);
+-	if (address.swapfile-&gt;hint &gt; address.page_index)
+-		address.swapfile-&gt;hint = address.page_index;
++	for (int32 i = 0; i &lt; npages; i++)
++		CLEARBIT(swapFile-&gt;maps, pageIndex + i);
+ 
+-	address.swapfile-&gt;used -= npages;
++	if (swapFile-&gt;hint &gt; pageIndex)
++		swapFile-&gt;hint = pageIndex;
+ 
+-	mutex_unlock(&amp;address.swapfile-&gt;lock);
++	swapFile-&gt;used -= npages;
++
++	mutex_unlock(&amp;swapFile-&gt;lock);
+ }
+ 
+ 
+-static status_t
++status_t
+ swap_file_add(char *path)
+ {
+ 	vnode *vp = NULL;
+-	status_t status = B_OK;
+-	struct swap_file *swap, *sw;
+-	struct stat st;
+-
+-	if ((status = vfs_get_vnode_from_path(path, true, &amp;vp)) != B_OK)
++	status_t status = vfs_get_vnode_from_path(path, true, &amp;vp);
++	if (status != B_OK)
+ 		return status;
+ 
+-	swap = (struct swap_file *)malloc(sizeof(struct swap_file));
++	struct swap_file *swap = (struct swap_file *)malloc(sizeof(struct swap_file));
+ 	if (swap == NULL)
+ 		return B_NO_MEMORY;
+ 
+ 	mutex_init(&amp;swap-&gt;lock, &quot;swap_file&quot;);
+ 
+-	if ((status = vfs_stat_vnode(vp, &amp;st)) != B_OK) {
++	struct stat st;
++	status = vfs_stat_vnode(vp, &amp;st);
++	if (status != B_OK) {
+ 		free(swap);
+ 		return status;
+     }
+@@ -475,43 +541,101 @@
+ 	swap-&gt;device = st.st_dev;
+ 	swap-&gt;inode = st.st_ino;
+ 
+-	swap-&gt;page_count = st.st_size &gt;&gt; PAGE_SHIFT;
++	int32 pageCount = st.st_size &gt;&gt; PAGE_SHIFT;
+ 	swap-&gt;used = 0;
+ 
+-	swap-&gt;maps = (int *)malloc(swap-&gt;page_count / NUM_BITS_PER_WORD + 1);
++	swap-&gt;next = NULL;
++
++	swap-&gt;maps = (int *)malloc(pageCount / NUM_BITS_PER_WORD + 1);
+ 	if (swap-&gt;maps == NULL) {
+ 		free(swap);
+ 		return B_NO_MEMORY;
+ 	}
+-	memset(swap-&gt;maps, 0, swap-&gt;page_count % 8 + 1);
++	memset(swap-&gt;maps, 0, pageCount % 8 + 1);
+ 	swap-&gt;hint = 0;
+ 	
+-	// add this file to swap file list
++	// set start page index and add this file to swap file list
+ 	mutex_lock(&amp;sSwapFileListLock);
+-	sw = sSwapFileList;
+-	while (sw != NULL)
+-		sw = sw-&gt;next;
+-	sw-&gt;next = swap;
+-	swap-&gt;next = NULL;
++	struct swap_file *sw = sSwapFileList;
++	if (sw == NULL) {
++		swap-&gt;first_page = 0;
++		swap-&gt;last_page = pageCount;
++		sw = swap;
++	} else {		
++		while (sw-&gt;next != NULL)
++			sw = sw-&gt;next;
++		swap-&gt;first_page = sw-&gt;last_page + 1;
++		swap-&gt;last_page = swap-&gt;first_page + pageCount;
++		sw-&gt;next = swap;
++	}
++
++	sSwapFileCount++;
++	
+ 	mutex_unlock(&amp;sSwapFileListLock);
++
++	return B_OK;
++}
++
++
++status_t
++swap_file_delete(char *path)
++{
++	vnode *vp = NULL;
++	status_t status = vfs_get_vnode_from_path(path, true, &amp;vp);
++	if (status != B_OK)
++		return status;
++
++	mutex_lock(&amp;sSwapFileListLock);
+ 	
+-	sSwapFileCount++;
++	struct swap_file *swapFile = sSwapFileList;
++	while (swapFile != NULL) {
++		if (swapFile-&gt;vnode == vp)
++			break;
++		else
++			swapFile = swapFile-&gt;next;
++	}
++	if (swapFile == NULL)
++		return B_ERROR;
++	
++	for (int32 i = 0; i &lt; swapFile-&gt;last_page - swapFile-&gt;first_page; i++)
++		if (TESTBIT(swapFile-&gt;maps, i)) 
++		// this swap file is in use, can't delete
++			return B_ERROR;
+ 
+-	return status;
++	// remove this swap file from swap file list
++	if (swapFile == sSwapFileList)
++		sSwapFileList = swapFile-&gt;next;
++	else {
++		struct swap_file *swapFilePre = sSwapFileList;
++		while (swapFilePre-&gt;next != swapFile)
++			swapFilePre = swapFilePre-&gt;next;
++		swapFilePre-&gt;next = swapFile-&gt;next;
++	}
++
++	sSwapFileCount--;
++
++	mutex_unlock(&amp;sSwapFileListLock);
++
++	mutex_destroy(&amp;swapFile-&gt;lock);
++	free(swapFile-&gt;maps);
++	free(swapFile);
++
++	return B_OK;	
+ }
++	
+ 
+-
+-static void
++void
+ swap_init(void)
+ {
+ 	// create swap block cache
+ 	sSwapBlockCache = create_object_cache(&quot;swapblock&quot;,
+-		sizeof(struct swap_block), sizeof(void*), NULL, NULL, NULL);
++			sizeof(struct swap_block), sizeof(void*), NULL, NULL, NULL);
+ 	if (sSwapBlockCache == NULL)
+ 		panic(&quot;can't create object cache for swap blocks\n&quot;);
+ 
+ 	// init swap hash table
+-	sSwapHash = (struct swap_block **)malloc(sizeof(struct swap_block *) * SWAP_HASH_SIZE);
++	sSwapHash = (struct swap_block **)malloc(sizeof(struct swap_block *) * 
++			SWAP_HASH_SIZE);
+ 	if (sSwapHash == NULL)
+ 		panic(&quot;swap hash table allocation error\n&quot;);
+ 	sSwapHashMask = SWAP_HASH_SIZE - 1;
+
+Modified: haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.h
+===================================================================
+--- haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.h	2008-07-11 20:07:00 UTC (rev 26383)
++++ haiku/branches/developer/bonefish/vm/src/system/kernel/vm/VMAnonymousCache.h	2008-07-11 23:59:50 UTC (rev 26384)
+@@ -13,9 +13,7 @@
+ 
+ 
+ struct swap_block;
+-struct swap_file_address;
+ 
+-
+ class VMAnonymousCache : public VMCache {
+ public:
+ 	virtual				~VMAnonymousCache();
+@@ -36,11 +34,10 @@
+ 	virtual	void		MergeStore(VMCache* source);
+ 
+ private:
+-			swap_block** _SwapHash(off_t cache_offset);
+-			void		_SwapBlockBuild(off_t cache_offset,
+-							swap_file_address&amp; address);
+-			void		_SwapBlockGetAddress(off_t cache_offset,
+-							swap_file_address *address);
++			swap_block** _SwapHash(off_t cacheOffset);
++			void		_SwapBlockBuild(off_t cacheOffset, int32 pageIndex);
++			void        _SwapBlockFree(off_t cacheOffset);
++			int32		_SwapBlockGetAddress(off_t cacheOffset);
+ 
+ private:
+ 	bool	fCanOvercommit;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010206.html">[Haiku-commits] r26383 - haiku/trunk/src/kits/app
+</A></li>
+	<LI>Next message: <A HREF="010208.html">[Haiku-commits] r26385 -	haiku/branches/developer/bonefish/vm/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10207">[ date ]</a>
+              <a href="thread.html#10207">[ thread ]</a>
+              <a href="subject.html#10207">[ subject ]</a>
+              <a href="author.html#10207">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

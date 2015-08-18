@@ -1,0 +1,404 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25458 -	haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25458%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm&In-Reply-To=%3C200805111855.m4BItCip006726%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008768.html">
+   <LINK REL="Next"  HREF="008776.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25458 -	haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25458%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm&In-Reply-To=%3C200805111855.m4BItCip006726%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25458 -	haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun May 11 20:55:12 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008768.html">[Haiku-commits] r25457 - haiku/trunk/src/apps/terminal
+</A></li>
+        <LI>Next message: <A HREF="008776.html">[Haiku-commits] r25458 - haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8774">[ date ]</a>
+              <a href="thread.html#8774">[ thread ]</a>
+              <a href="subject.html#8774">[ subject ]</a>
+              <a href="author.html#8774">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-05-11 20:55:12 +0200 (Sun, 11 May 2008)
+New Revision: 25458
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25458&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25458&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/Driver.h
+   haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/ECMDevice.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/ECMDevice.h
+Log:
+* Added support for device state change notifications and implemented the
+  ETHER_GET_LINK_STATE and ETHER_SET_LINK_STATE_SEM to provide this
+  information and notification.
+* Don't try to clear an endpoint halt in case of a B_CANCELED status in the
+  callbacks as this is triggered by explicitly canceling transfers when the
+  device is closed/removed.
+* Renamed the semaphore members to *Sem to distinguish them better.
+* Some minor other cleanup and some added comments.
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/Driver.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/Driver.h	2008-05-11 18:34:29 UTC (rev 25457)
++++ haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/Driver.h	2008-05-11 18:55:12 UTC (rev 25458)
+@@ -35,6 +35,24 @@
+ 	uint8	num_wakeup_pattern_filters;
+ } _PACKED ethernet_functional_descriptor;
+ 
++/* notification definitions */
++#define CDC_NOTIFY_NETWORK_CONNECTION		0x00
++#define CDC_NOTIFY_CONNECTION_SPEED_CHANGE	0x2a
++
++typedef struct cdc_notification_s {
++	uint8	request_type;
++	uint8	notification_code;
++	uint16	value;
++	uint16	index;
++	uint16	data_length;
++	uint8	data[0];
++} _PACKED cdc_notification;
++
++typedef struct cdc_connection_speed_s {
++	uint32	upstream_speed; /* in bits/s */
++	uint32	downstream_speed; /* in bits/s */
++} _PACKED cdc_connection_speed;
++
+ extern usb_module_info *gUSBModule;
+ 
+ extern &quot;C&quot; {
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/ECMDevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/ECMDevice.cpp	2008-05-11 18:34:29 UTC (rev 25457)
++++ haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/ECMDevice.cpp	2008-05-11 18:55:12 UTC (rev 25458)
+@@ -4,6 +4,7 @@
+ 	Distributed under the terms of the MIT license.
+ */
+ #include &lt;ether_driver.h&gt;
++#include &lt;net/if_media.h&gt;
+ #include &lt;string.h&gt;
+ #include &lt;stdlib.h&gt;
+ 
+@@ -20,9 +21,17 @@
+ 		fDataInterfaceIndex(0),
+ 		fMACAddressIndex(0),
+ 		fMaxSegmentSize(0),
+-		fControlEndpoint(0),
++		fNotifyEndpoint(0),
+ 		fReadEndpoint(0),
+-		fWriteEndpoint(0)
++		fWriteEndpoint(0),
++		fNotifyReadSem(-1),
++		fNotifyWriteSem(-1),
++		fNotifyBuffer(NULL),
++		fNotifyBufferLength(0),
++		fLinkStateChangeSem(-1),
++		fHasConnection(false),
++		fDownstreamSpeed(0),
++		fUpstreamSpeed(0)
+ {
+ 	const usb_device_descriptor *deviceDescriptor
+ 		= gUSBModule-&gt;get_device_descriptor(device);
+@@ -50,6 +59,7 @@
+ 			&amp;&amp; interface-&gt;generic_count &gt; 0) {
+ 			// try to find and interpret the union and ethernet functional
+ 			// descriptors
++			foundUnionDescriptor = foundEthernetDescriptor = false;
+ 			for (size_t j = 0; j &lt; interface-&gt;generic_count; j++) {
+ 				usb_generic_descriptor *generic = &amp;interface-&gt;generic[j]-&gt;generic;
+ 				if (generic-&gt;length &gt;= 5
+@@ -103,8 +113,24 @@
+ 	}
+ 
+ 	fControlInterfaceIndex = controlIndex;
+-	fControlEndpoint = interface-&gt;endpoint[0].handle;
++	fNotifyEndpoint = interface-&gt;endpoint[0].handle;
+ 
++	// setup notify buffer and try to schedule a notification transfer
++	fNotifyBufferLength = 64;
++	fNotifyBuffer = (uint8 *)malloc(fNotifyBufferLength);
++	if (fNotifyBuffer == NULL) {
++		TRACE_ALWAYS(&quot;out of memory for notify buffer allocation\n&quot;);
++		return;
++	}
++
++	if (gUSBModule-&gt;queue_interrupt(fNotifyEndpoint, fNotifyBuffer,
++		fNotifyBufferLength, _NotifyCallback, this) != B_OK) {
++		// we cannot use notifications - hardcode to active connection
++		fHasConnection = true;
++		fDownstreamSpeed = 1000 * 1000 * 10; // 10Mbps
++		fUpstreamSpeed = 1000 * 1000 * 10; // 10Mbps
++	}
++
+ 	if (dataIndex &gt;= config-&gt;interface_count) {
+ 		TRACE_ALWAYS(&quot;data interface index invalid\n&quot;);
+ 		return;
+@@ -126,16 +152,15 @@
+ 	}
+ 
+ 	fDataInterfaceIndex = dataIndex;
+-	fNotifyRead = create_sem(0, DRIVER_NAME&quot;_notify_read&quot;);
+-	if (fNotifyRead &lt; B_OK) {
++	fNotifyReadSem = create_sem(0, DRIVER_NAME&quot;_notify_read&quot;);
++	if (fNotifyReadSem &lt; B_OK) {
+ 		TRACE_ALWAYS(&quot;failed to create read notify sem\n&quot;);
+ 		return;
+ 	}
+ 
+-	fNotifyWrite = create_sem(0, DRIVER_NAME&quot;_notify_write&quot;);
+-	if (fNotifyWrite &lt; B_OK) {
++	fNotifyWriteSem = create_sem(0, DRIVER_NAME&quot;_notify_write&quot;);
++	if (fNotifyWriteSem &lt; B_OK) {
+ 		TRACE_ALWAYS(&quot;failed to create write notify sem\n&quot;);
+-		delete_sem(fNotifyRead);
+ 		return;
+ 	}
+ 
+@@ -145,8 +170,13 @@
+ 
+ ECMDevice::~ECMDevice()
+ {
+-	delete_sem(fNotifyRead);
+-	delete_sem(fNotifyWrite);
++	if (fNotifyReadSem &gt;= B_OK)
++		delete_sem(fNotifyReadSem);
++	if (fNotifyWriteSem &gt;= B_OK)
++		delete_sem(fNotifyWriteSem);
++
++	gUSBModule-&gt;cancel_queued_transfers(fNotifyEndpoint);
++	free(fNotifyBuffer);
+ }
+ 
+ 
+@@ -244,13 +274,13 @@
+ 		return result;
+ 	}
+ 
+-	result = acquire_sem_etc(fNotifyRead, 1, B_CAN_INTERRUPT, 0);
++	result = acquire_sem_etc(fNotifyReadSem, 1, B_CAN_INTERRUPT, 0);
+ 	if (result &lt; B_OK) {
+ 		*numBytes = 0;
+ 		return result;
+ 	}
+ 
+-	if (fStatusRead != B_OK) {
++	if (fStatusRead != B_OK &amp;&amp; fStatusRead != B_CANCELED) {
+ 		TRACE_ALWAYS(&quot;device status error 0x%08lx\n&quot;, fStatusRead);
+ 		result = gUSBModule-&gt;clear_feature(fReadEndpoint,
+ 			USB_FEATURE_ENDPOINT_HALT);
+@@ -281,13 +311,13 @@
+ 		return result;
+ 	}
+ 
+-	result = acquire_sem_etc(fNotifyWrite, 1, B_CAN_INTERRUPT, 0);
++	result = acquire_sem_etc(fNotifyWriteSem, 1, B_CAN_INTERRUPT, 0);
+ 	if (result &lt; B_OK) {
+ 		*numBytes = 0;
+ 		return result;
+ 	}
+ 
+-	if (fStatusWrite != B_OK) {
++	if (fStatusWrite != B_OK &amp;&amp; fStatusWrite != B_CANCELED) {
+ 		TRACE_ALWAYS(&quot;device status error 0x%08lx\n&quot;, fStatusWrite);
+ 		result = gUSBModule-&gt;clear_feature(fWriteEndpoint,
+ 			USB_FEATURE_ENDPOINT_HALT);
+@@ -318,6 +348,22 @@
+ 			*(uint32 *)buffer = fMaxSegmentSize;
+ 			return B_OK;
+ 
++#if HAIKU_TARGET_PLATFORM_HAIKU
++		case ETHER_SET_LINK_STATE_SEM:
++			fLinkStateChangeSem = *(sem_id *)buffer;
++			return B_OK;
++
++		case ETHER_GET_LINK_STATE:
++		{
++			ether_link_state *state = (ether_link_state *)buffer;
++			state-&gt;media = IFM_ETHER | IFM_FULL_DUPLEX
++				| (fHasConnection ? IFM_ACTIVE : 0);
++			state-&gt;quality = 1000;
++			state-&gt;speed = fDownstreamSpeed / 1000;
++			return B_OK;
++		}
++#endif
++
+ 		default:
+ 			TRACE_ALWAYS(&quot;unsupported ioctl %lu\n&quot;, op);
+ 	}
+@@ -367,7 +413,7 @@
+ 	ECMDevice *device = (ECMDevice *)cookie;
+ 	device-&gt;fActualLengthRead = actualLength;
+ 	device-&gt;fStatusRead = status;
+-	release_sem_etc(device-&gt;fNotifyRead, 1, B_DO_NOT_RESCHEDULE);
++	release_sem_etc(device-&gt;fNotifyReadSem, 1, B_DO_NOT_RESCHEDULE);
+ }
+ 
+ 
+@@ -378,5 +424,68 @@
+ 	ECMDevice *device = (ECMDevice *)cookie;
+ 	device-&gt;fActualLengthWrite = actualLength;
+ 	device-&gt;fStatusWrite = status;
+-	release_sem_etc(device-&gt;fNotifyWrite, 1, B_DO_NOT_RESCHEDULE);
++	release_sem_etc(device-&gt;fNotifyWriteSem, 1, B_DO_NOT_RESCHEDULE);
+ }
++
++
++void
++ECMDevice::_NotifyCallback(void *cookie, int32 status, void *data,
++	uint32 actualLength)
++{
++	if (status == B_CANCELED)
++		return;
++
++	ECMDevice *device = (ECMDevice *)cookie;
++	if (status == B_OK &amp;&amp; actualLength &gt;= sizeof(cdc_notification)) {
++		bool linkStateChange = false;
++		cdc_notification *notification
++			= (cdc_notification *)device-&gt;fNotifyBuffer;
++
++		switch (notification-&gt;notification_code) {
++			case CDC_NOTIFY_NETWORK_CONNECTION:
++				TRACE(&quot;connection state change to %d\n&quot;, notification-&gt;value);
++				device-&gt;fHasConnection = notification-&gt;value &gt; 0;
++				linkStateChange = true;
++				break;
++
++			case CDC_NOTIFY_CONNECTION_SPEED_CHANGE:
++			{
++				if (notification-&gt;data_length &lt; sizeof(cdc_connection_speed)
++					|| actualLength &lt; sizeof(cdc_notification)
++					+ sizeof(cdc_connection_speed)) {
++					TRACE_ALWAYS(&quot;not enough data in connection speed change\n&quot;);
++					break;
++				}
++
++				cdc_connection_speed *speed;
++				speed = (cdc_connection_speed *)&amp;notification-&gt;data[0];
++				device-&gt;fUpstreamSpeed = speed-&gt;upstream_speed;
++				device-&gt;fDownstreamSpeed = speed-&gt;downstream_speed;
++				device-&gt;fHasConnection = true;
++				TRACE(&quot;connection speed change to %ld/%ld\n&quot;,
++					speed-&gt;downstream_speed, speed-&gt;upstream_speed);
++				linkStateChange = true;
++				break;
++			}
++
++			default:
++				TRACE_ALWAYS(&quot;unsupported notification 0x%02x\n&quot;,
++					notification-&gt;notification_code);
++				break;
++		}
++
++		if (linkStateChange &amp;&amp; device-&gt;fLinkStateChangeSem &gt;= B_OK)
++			release_sem_etc(device-&gt;fLinkStateChangeSem, 1, B_DO_NOT_RESCHEDULE);
++	}
++
++	if (status != B_OK) {
++		TRACE_ALWAYS(&quot;device status error 0x%08lx\n&quot;, status);
++		if (gUSBModule-&gt;clear_feature(device-&gt;fNotifyEndpoint,
++			USB_FEATURE_ENDPOINT_HALT) != B_OK)
++			TRACE_ALWAYS(&quot;failed to clear halt state\n&quot;);
++	}
++
++	// schedule next notification buffer
++	gUSBModule-&gt;queue_interrupt(device-&gt;fNotifyEndpoint, device-&gt;fNotifyBuffer,
++		device-&gt;fNotifyBufferLength, _NotifyCallback, device);
++}
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/ECMDevice.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/ECMDevice.h	2008-05-11 18:34:29 UTC (rev 25457)
++++ haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm/ECMDevice.h	2008-05-11 18:55:12 UTC (rev 25458)
+@@ -33,31 +33,45 @@
+ 								void *data, uint32 actualLength);
+ static	void				_WriteCallback(void *cookie, int32 status,
+ 								void *data, uint32 actualLength);
++static	void				_NotifyCallback(void *cookie, int32 status,
++								void *data, uint32 actualLength);
+ 
+ 		status_t			_ReadMACAddress();
+ 
++		// state tracking
+ 		status_t			fStatus;
+ 		bool				fOpen;
+ 		bool				fRemoved;
+ 		usb_device			fDevice;
+ 
+-		uint8				fMACAddress[6];
+-
++		// interface and device infos
+ 		uint8				fControlInterfaceIndex;
+ 		uint8				fDataInterfaceIndex;
+ 		uint8				fMACAddressIndex;
+ 		uint16				fMaxSegmentSize;
+ 
+-		usb_pipe			fControlEndpoint;
++		// pipes for notifications and data io
++		usb_pipe			fNotifyEndpoint;
+ 		usb_pipe			fReadEndpoint;
+ 		usb_pipe			fWriteEndpoint;
+ 
++		// data stores for async usb transfers
+ 		uint32				fActualLengthRead;
+ 		uint32				fActualLengthWrite;
+ 		int32				fStatusRead;
+ 		int32				fStatusWrite;
+-		sem_id				fNotifyRead;
+-		sem_id				fNotifyWrite;
++		sem_id				fNotifyReadSem;
++		sem_id				fNotifyWriteSem;
++
++		uint8 *				fNotifyBuffer;
++		uint32				fNotifyBufferLength;
++
++		// connection data
++		sem_id				fLinkStateChangeSem;
++		uint8				fMACAddress[6];
++		bool				fHasConnection;
++		uint32				fDownstreamSpeed;
++		uint32				fUpstreamSpeed;
+ };
+ 
+ #endif //_USB_ECM_DEVICE_H_
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008768.html">[Haiku-commits] r25457 - haiku/trunk/src/apps/terminal
+</A></li>
+	<LI>Next message: <A HREF="008776.html">[Haiku-commits] r25458 - haiku/trunk/src/add-ons/kernel/drivers/network/usb_ecm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8774">[ date ]</a>
+              <a href="thread.html#8774">[ thread ]</a>
+              <a href="subject.html#8774">[ subject ]</a>
+              <a href="author.html#8774">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

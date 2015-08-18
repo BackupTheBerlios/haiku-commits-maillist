@@ -1,0 +1,1088 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21875 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/cache src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21875%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel%20src/system/kernel/cache%20src/system/kernel/vm&In-Reply-To=%3C200708092008.l79K8QeJ000943%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003440.html">
+   <LINK REL="Next"  HREF="003442.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21875 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/cache src/system/kernel/vm</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21875%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel%20src/system/kernel/cache%20src/system/kernel/vm&In-Reply-To=%3C200708092008.l79K8QeJ000943%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21875 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/cache src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug  9 22:08:26 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003440.html">[Haiku-commits] r21874 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="003442.html">[Haiku-commits] r21876 - in haiku/vendor/mesa/current:	glu/libnurbs/interface glu/libnurbs/nurbtess glu/libutil	headers/public src/glapi src/main src/shader src/shader/slang	src/shader/slang/library src/sparc src/swrast src/tnl src/vbo	src/x86 src/x86-64
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3441">[ date ]</a>
+              <a href="thread.html#3441">[ thread ]</a>
+              <a href="subject.html#3441">[ subject ]</a>
+              <a href="author.html#3441">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-08-09 22:08:25 +0200 (Thu, 09 Aug 2007)
+New Revision: 21875
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21875&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21875&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Removed:
+   haiku/trunk/src/system/kernel/vm/vm_page.c
+Modified:
+   haiku/trunk/headers/private/kernel/thread_types.h
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+   haiku/trunk/src/system/kernel/main.c
+   haiku/trunk/src/system/kernel/thread.c
+   haiku/trunk/src/system/kernel/vm/Jamfile
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+Log:
+* Use condition variables when waiting for busy pages or busy caches.
+* Removed a few instances where the page state was set busy directly after 
+  allocating it. This is a no-op, since a page is always busy after 
+  allocation.
+
+
+Modified: haiku/trunk/headers/private/kernel/thread_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/thread_types.h	2007-08-09 20:03:17 UTC (rev 21874)
++++ haiku/trunk/headers/private/kernel/thread_types.h	2007-08-09 20:08:25 UTC (rev 21875)
+@@ -152,6 +152,8 @@
+ 		int32		flags;
+ 	} sem;
+ 
++	struct PrivateConditionVariable *condition_variable;
++
+ 	struct {
+ 		sem_id		write_sem;
+ 		sem_id		read_sem;
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2007-08-09 20:03:17 UTC (rev 21874)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2007-08-09 20:08:25 UTC (rev 21875)
+@@ -133,6 +133,16 @@
+ 	CACHE_TYPE_NULL
+ };
+ 
++#ifdef __cplusplus
++
++#include &lt;condition_variable.h&gt;
++
++struct vm_dummy_page : vm_page {
++	ConditionVariable&lt;vm_page&gt;	busy_condition;
++};
++
++#endif	// __cplusplus
++
+ // vm_cache
+ typedef struct vm_cache {
+ 	mutex				lock;
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-08-09 20:03:17 UTC (rev 21874)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-08-09 20:08:25 UTC (rev 21875)
+@@ -9,13 +9,14 @@
+ #include &lt;KernelExport.h&gt;
+ #include &lt;fs_cache.h&gt;
+ 
++#include &lt;condition_variable.h&gt;
++#include &lt;file_cache.h&gt;
++#include &lt;generic_syscall.h&gt;
+ #include &lt;util/kernel_cpp.h&gt;
+-#include &lt;file_cache.h&gt;
+ #include &lt;vfs.h&gt;
+ #include &lt;vm.h&gt;
+ #include &lt;vm_page.h&gt;
+ #include &lt;vm_cache.h&gt;
+-#include &lt;generic_syscall.h&gt;
+ 
+ #include &lt;unistd.h&gt;
+ #include &lt;stdlib.h&gt;
+@@ -30,7 +31,7 @@
+ #endif
+ 
+ // maximum number of iovecs per request
+-#define MAX_IO_VECS			64	// 256 kB
++#define MAX_IO_VECS			32	// 128 kB
+ #define MAX_FILE_IO_VECS	32
+ #define MAX_TEMP_IO_VECS	8
+ 
+@@ -522,10 +523,13 @@
+ 
+ 	vm_cache *cache = ref-&gt;cache;
+ 
++	// TODO: We're using way too much stack! Rather allocate a sufficiently
++	// large chunk on the heap.
+ 	iovec vecs[MAX_IO_VECS];
+ 	int32 vecCount = 0;
+ 
+ 	vm_page *pages[MAX_IO_VECS];
++	ConditionVariable&lt;vm_page&gt; busyConditions[MAX_IO_VECS];
+ 	int32 pageIndex = 0;
+ 
+ 	// allocate pages for the cache and mark them busy
+@@ -534,7 +538,7 @@
+ 		if (page == NULL)
+ 			panic(&quot;no more pages!&quot;);
+ 
+-		page-&gt;state = PAGE_STATE_BUSY;
++		busyConditions[pageIndex - 1].Publish(page, &quot;page&quot;);
+ 
+ 		vm_cache_insert_page(cache, page, offset + pos);
+ 
+@@ -569,6 +573,7 @@
+ 		mutex_lock(&amp;cache-&gt;lock);
+ 
+ 		for (int32 i = 0; i &lt; pageIndex; i++) {
++			busyConditions[i].Unpublish();
+ 			vm_cache_remove_page(cache, pages[i]);
+ 			vm_page_set_state(pages[i], PAGE_STATE_FREE);
+ 		}
+@@ -599,8 +604,10 @@
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 
+ 	// make the pages accessible in the cache
+-	for (int32 i = pageIndex; i-- &gt; 0;)
++	for (int32 i = pageIndex; i-- &gt; 0;) {
+ 		pages[i]-&gt;state = PAGE_STATE_ACTIVE;
++		busyConditions[i].Unpublish();
++	}
+ 
+ 	return B_OK;
+ }
+@@ -664,11 +671,14 @@
+ write_chunk_to_cache(file_cache_ref *ref, off_t offset, size_t numBytes,
+ 	int32 pageOffset, addr_t buffer, size_t bufferSize)
+ {
++	// TODO: We're using way too much stack! Rather allocate a sufficiently
++	// large chunk on the heap.
+ 	iovec vecs[MAX_IO_VECS];
+ 	int32 vecCount = 0;
+ 	vm_page *pages[MAX_IO_VECS];
+ 	int32 pageIndex = 0;
+ 	status_t status = B_OK;
++	ConditionVariable&lt;vm_page&gt; busyConditions[MAX_IO_VECS];
+ 
+ 	// ToDo: this should be settable somewhere
+ 	bool writeThrough = false;
+@@ -679,7 +689,7 @@
+ 		//	big - shouldn't we better steal the pages directly in that case?
+ 		//	(a working set like approach for the file cache)
+ 		vm_page *page = pages[pageIndex++] = vm_page_allocate_page(PAGE_STATE_FREE);
+-		page-&gt;state = PAGE_STATE_BUSY;
++		busyConditions[pageIndex - 1].Publish(page, &quot;page&quot;);
+ 
+ 		vm_cache_insert_page(ref-&gt;cache, page, offset + pos);
+ 
+@@ -769,6 +779,8 @@
+ 
+ 	// make the pages accessible in the cache
+ 	for (int32 i = pageIndex; i-- &gt; 0;) {
++		busyConditions[i].Unpublish();
++
+ 		if (writeThrough)
+ 			pages[i]-&gt;state = PAGE_STATE_ACTIVE;
+ 		else
+@@ -914,9 +926,10 @@
+ 						return B_NO_MEMORY;
+ 					}
+ 				} else {
++					ConditionVariableEntry&lt;vm_page&gt; entry;
++					entry.Add(page);
+ 					mutex_unlock(&amp;cache-&gt;lock);
+-					// ToDo: don't wait forever!
+-					snooze(20000);
++					entry.Wait();
+ 					mutex_lock(&amp;cache-&gt;lock);
+ 					goto restart;
+ 				}
+@@ -974,9 +987,10 @@
+ 						// we let the other party add our page
+ 						currentPage-&gt;queue_next = page;
+ 					} else {
++						ConditionVariableEntry&lt;vm_page&gt; entry;
++						entry.Add(page);
+ 						mutex_unlock(&amp;cache-&gt;lock);
+-						// ToDo: don't wait forever!
+-						snooze(20000);
++						entry.Wait();
+ 						mutex_lock(&amp;cache-&gt;lock);
+ 						goto restart_dummy_lookup;
+ 					}
+@@ -1113,9 +1127,11 @@
+ 		vm_page *page = vm_cache_lookup_page(cache, offset);
+ 		if (page != NULL) {
+ 			if (page-&gt;state == PAGE_STATE_BUSY) {
+-				// if busy retry again a little later
++				// if busy retry again later
++				ConditionVariableEntry&lt;vm_page&gt; entry;
++				entry.Add(page);
+ 				mutex_unlock(&amp;cache-&gt;lock);
+-				snooze(20000);
++				entry.Wait();
+ 				mutex_lock(&amp;cache-&gt;lock);
+ 
+ 				goto restart;
+
+Modified: haiku/trunk/src/system/kernel/main.c
+===================================================================
+--- haiku/trunk/src/system/kernel/main.c	2007-08-09 20:03:17 UTC (rev 21874)
++++ haiku/trunk/src/system/kernel/main.c	2007-08-09 20:08:25 UTC (rev 21875)
+@@ -14,6 +14,7 @@
+ #include &lt;arch/platform.h&gt;
+ #include &lt;boot_item.h&gt;
+ #include &lt;cbuf.h&gt;
++#include &lt;condition_variable.h&gt;
+ #include &lt;cpu.h&gt;
+ #include &lt;debug.h&gt;
+ #include &lt;elf.h&gt;
+@@ -131,6 +132,7 @@
+ 
+ 		TRACE(&quot;init semaphores\n&quot;);
+ 		sem_init(&amp;sKernelArgs);
++		condition_variable_init();
+ 
+ 		// now we can create and use semaphores
+ 		TRACE(&quot;init VM semaphores\n&quot;);
+
+Modified: haiku/trunk/src/system/kernel/thread.c
+===================================================================
+--- haiku/trunk/src/system/kernel/thread.c	2007-08-09 20:03:17 UTC (rev 21874)
++++ haiku/trunk/src/system/kernel/thread.c	2007-08-09 20:08:25 UTC (rev 21875)
+@@ -210,6 +210,7 @@
+ 	thread-&gt;team = NULL;
+ 	thread-&gt;cpu = cpu;
+ 	thread-&gt;sem.blocking = -1;
++	thread-&gt;condition_variable = NULL;
+ 	thread-&gt;fault_handler = 0;
+ 	thread-&gt;page_faults_allowed = 1;
+ 	thread-&gt;kernel_stack_area = -1;
+@@ -723,6 +724,7 @@
+ 	kprintf(&quot;  sem.count:        0x%lx\n&quot;, thread-&gt;sem.count);
+ 	kprintf(&quot;  sem.acquire_status: 0x%lx\n&quot;, thread-&gt;sem.acquire_status);
+ 	kprintf(&quot;  sem.flags:        0x%lx\n&quot;, thread-&gt;sem.flags);
++	kprintf(&quot;condition variable: %p\n&quot;, thread-&gt;condition_variable);
+ 	kprintf(&quot;fault_handler:      %p\n&quot;, (void *)thread-&gt;fault_handler);
+ 	kprintf(&quot;args:               %p %p\n&quot;, thread-&gt;args1, thread-&gt;args2);
+ 	kprintf(&quot;entry:              %p\n&quot;, (void *)thread-&gt;entry);
+@@ -826,7 +828,8 @@
+ 			kprintf(&quot;ignoring invalid team argument.\n&quot;);
+ 	}
+ 
+-	kprintf(&quot;thread         id  state       sem cpu pri  stack      team  name\n&quot;);
++	kprintf(&quot;thread         id  state        sem/cv cpu pri  stack      team  &quot;
++		&quot;name\n&quot;);
+ 
+ 	hash_open(sThreadHash, &amp;i);
+ 	while ((thread = hash_next(sThreadHash, &amp;i)) != NULL) {
+@@ -840,11 +843,14 @@
+ 		kprintf(&quot;%p %6lx  %-9s&quot;, thread, thread-&gt;id, state_to_text(thread,
+ 			thread-&gt;state));
+ 
+-		// does it block on a semaphore?
+-		if (thread-&gt;state == B_THREAD_WAITING)
+-			kprintf(&quot;%6lx  &quot;, thread-&gt;sem.blocking);
+-		else
+-			kprintf(&quot;     -  &quot;);
++		// does it block on a semaphore or a condition variable?
++		if (thread-&gt;state == B_THREAD_WAITING) {
++			if (thread-&gt;condition_variable)
++				kprintf(&quot;%p  &quot;, thread-&gt;condition_variable);
++			else
++				kprintf(&quot;%10lx  &quot;, thread-&gt;sem.blocking);
++		} else
++			kprintf(&quot;      -     &quot;);
+ 
+ 		// on which CPU does it run?
+ 		if (thread-&gt;cpu)
+
+Modified: haiku/trunk/src/system/kernel/vm/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/Jamfile	2007-08-09 20:03:17 UTC (rev 21874)
++++ haiku/trunk/src/system/kernel/vm/Jamfile	2007-08-09 20:08:25 UTC (rev 21875)
+@@ -6,7 +6,7 @@
+ 	vm_cache.cpp
+ 	vm_daemons.c
+ 	vm_low_memory.cpp
+-	vm_page.c
++	vm_page.cpp
+ 	vm_store_anonymous_noswap.c
+ 	vm_store_device.c
+ 	vm_store_null.c
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-09 20:03:17 UTC (rev 21874)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-09 20:08:25 UTC (rev 21875)
+@@ -22,6 +22,7 @@
+ #include &lt;vm_low_memory.h&gt;
+ #include &lt;file_cache.h&gt;
+ #include &lt;memheap.h&gt;
++#include &lt;condition_variable.h&gt;
+ #include &lt;debug.h&gt;
+ #include &lt;console.h&gt;
+ #include &lt;int.h&gt;
+@@ -3496,11 +3497,13 @@
+ 	away by grabbing a reference to it.
+ */
+ static inline void
+-fault_insert_dummy_page(vm_cache *cache, vm_page &amp;dummyPage, off_t cacheOffset)
++fault_insert_dummy_page(vm_cache *cache, vm_dummy_page &amp;dummyPage,
++	off_t cacheOffset)
+ {
+ 	dummyPage.state = PAGE_STATE_BUSY;
+ 	vm_cache_acquire_ref(cache);
+ 	vm_cache_insert_page(cache, &amp;dummyPage, cacheOffset);
++	dummyPage.busy_condition.Publish(&amp;dummyPage, &quot;page&quot;);
+ }
+ 
+ 
+@@ -3509,7 +3512,7 @@
+ 	the cache.
+ */
+ static inline void
+-fault_remove_dummy_page(vm_page &amp;dummyPage, bool isLocked)
++fault_remove_dummy_page(vm_dummy_page &amp;dummyPage, bool isLocked)
+ {
+ 	vm_cache *cache = dummyPage.cache;
+ 	if (!isLocked)
+@@ -3518,6 +3521,7 @@
+ 	if (dummyPage.state == PAGE_STATE_BUSY) {
+ 		vm_cache_remove_page(cache, &amp;dummyPage);
+ 		dummyPage.state = PAGE_STATE_INACTIVE;
++		dummyPage.busy_condition.Unpublish();
+ 	}
+ 
+ 	if (!isLocked)
+@@ -3537,8 +3541,8 @@
+ */
+ static inline status_t
+ fault_find_page(vm_translation_map *map, vm_cache *topCache,
+-	off_t cacheOffset, bool isWrite, vm_page &amp;dummyPage, vm_cache **_pageCache,
+-	vm_page** _page, bool* _restart)
++	off_t cacheOffset, bool isWrite, vm_dummy_page &amp;dummyPage,
++	vm_cache **_pageCache, vm_page** _page, bool* _restart)
+ {
+ 	*_restart = false;
+ 	vm_cache *cache = topCache;
+@@ -3560,24 +3564,36 @@
+ 		for (;;) {
+ 			page = vm_cache_lookup_page(cache, cacheOffset);
+ 			if (page != NULL &amp;&amp; page-&gt;state != PAGE_STATE_BUSY) {
++				// Note: We set the page state to busy, but we don't need a
++				// condition variable here, since we keep the cache locked
++				// till we mark the page unbusy again (in fault_get_page()
++				// the source page, or in vm_soft_fault() when mapping the
++				// page), so no one will ever know the page was busy in the
++				// first place.
+ 				vm_page_set_state(page, PAGE_STATE_BUSY);
+ 				break;
+ 			}
+ 			if (page == NULL || page == &amp;dummyPage)
+ 				break;
+ 
+-			// page must be busy
+-			// ToDo: don't wait forever!
+-			mutex_unlock(&amp;cache-&gt;lock);
+-			thread_yield();
+-			mutex_lock(&amp;cache-&gt;lock);
++			// page must be busy -- wait for it to become unbusy
++			{
++				ConditionVariableEntry&lt;vm_page&gt; entry;
++				entry.Add(page);
++				mutex_unlock(&amp;cache-&gt;lock);
++				entry.Wait();
++				mutex_lock(&amp;cache-&gt;lock);
++			}
+ 
+ 			if (cache-&gt;busy) {
+ 				// The cache became busy, which means, it is about to be
+ 				// removed by vm_cache_remove_consumer(). We start again with
+ 				// the top cache.
++				ConditionVariableEntry&lt;vm_cache&gt; entry;
++				entry.Add(cache);
+ 				mutex_unlock(&amp;cache-&gt;lock);
+ 				vm_cache_release_ref(cache);
++				entry.Wait();
+ 				*_restart = true;
+ 				return B_OK;
+ 			}
+@@ -3595,9 +3611,11 @@
+ 
+ 			// insert a fresh page and mark it busy -- we're going to read it in
+ 			page = vm_page_allocate_page(PAGE_STATE_FREE);
+-			page-&gt;state = PAGE_STATE_BUSY;
+ 			vm_cache_insert_page(cache, page, cacheOffset);
+ 
++			ConditionVariable&lt;vm_page&gt; busyCondition;
++			busyCondition.Publish(page, &quot;page&quot;);
++
+ 			mutex_unlock(&amp;cache-&gt;lock);
+ 
+ 			// get a virtual address for the page
+@@ -3620,6 +3638,7 @@
+ 				dprintf(&quot;reading page from store %p (cache %p) returned: %s!\n&quot;,
+ 					store, cache, strerror(status));
+ 
++				busyCondition.Unpublish();
+ 				vm_cache_remove_page(cache, page);
+ 				vm_page_set_state(page, PAGE_STATE_FREE);
+ 
+@@ -3628,6 +3647,7 @@
+ 
+ 			// mark the page unbusy again
+ 			page-&gt;state = PAGE_STATE_ACTIVE;
++			busyCondition.Unpublish();
+ 
+ 			break;
+ 		}
+@@ -3651,8 +3671,11 @@
+ 				// The cache became busy, which means, it is about to be
+ 				// removed by vm_cache_remove_consumer(). We start again with
+ 				// the top cache.
++				ConditionVariableEntry&lt;vm_cache&gt; entry;
++				entry.Add(cache);
+ 				mutex_unlock(&amp;cache-&gt;lock);
+ 				vm_cache_release_ref(cache);
++				entry.Wait();
+ 				*_restart = true;
+ 				return B_OK;
+ 			}
+@@ -3682,8 +3705,11 @@
+ 				// The cache became busy, which means, it is about to be
+ 				// removed by vm_cache_remove_consumer(). We start again with
+ 				// the top cache.
++				ConditionVariableEntry&lt;vm_cache&gt; entry;
++				entry.Add(cache);
+ 				mutex_unlock(&amp;cache-&gt;lock);
+ 				vm_cache_release_ref(cache);
++				entry.Wait();
+ 				*_restart = true;
+ 			} else {
+ 				vm_page* newPage = vm_cache_lookup_page(cache, cacheOffset);
+@@ -3718,8 +3744,8 @@
+ 	to it, and has also locked it on exit.
+ */
+ static inline status_t
+-fault_get_page(vm_translation_map *map, vm_cache *topCache,
+-	off_t cacheOffset, bool isWrite, vm_page &amp;dummyPage, vm_cache **_sourceCache,
++fault_get_page(vm_translation_map *map, vm_cache *topCache, off_t cacheOffset,
++	bool isWrite, vm_dummy_page &amp;dummyPage, vm_cache **_sourceCache,
+ 	vm_cache **_copiedSource, vm_page** _page)
+ {
+ 	vm_cache *cache;
+@@ -3848,8 +3874,10 @@
+ 				break;
+ 
+ 			// The page is busy, wait till it becomes unbusy.
++			ConditionVariableEntry&lt;vm_page&gt; entry;
++			entry.Add(newPage);
+ 			mutex_unlock(&amp;topCache-&gt;lock);
+-			snooze(10000);
++			entry.Wait();
+ 			mutex_lock(&amp;topCache-&gt;lock);
+ 		}
+ 
+@@ -3968,7 +3996,7 @@
+ 	// already have the page we're searching for (we're going from top to bottom)
+ 
+ 	vm_translation_map *map = &amp;addressSpace-&gt;translation_map;
+-	vm_page dummyPage;
++	vm_dummy_page dummyPage;
+ 	dummyPage.cache = NULL;
+ 	dummyPage.state = PAGE_STATE_INACTIVE;
+ 	dummyPage.type = PAGE_TYPE_DUMMY;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-08-09 20:03:17 UTC (rev 21874)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-08-09 20:08:25 UTC (rev 21875)
+@@ -6,22 +6,23 @@
+  * Distributed under the terms of the NewOS License.
+  */
+ 
++#include &lt;vm_cache.h&gt;
+ 
++#include &lt;stddef.h&gt;
++#include &lt;stdlib.h&gt;
++
++#include &lt;arch/cpu.h&gt;
++#include &lt;condition_variable.h&gt;
++#include &lt;debug.h&gt;
++#include &lt;int.h&gt;
+ #include &lt;kernel.h&gt;
++#include &lt;lock.h&gt;
++#include &lt;smp.h&gt;
++#include &lt;util/khash.h&gt;
+ #include &lt;vm.h&gt;
++#include &lt;vm_page.h&gt;
+ #include &lt;vm_priv.h&gt;
+-#include &lt;vm_cache.h&gt;
+-#include &lt;vm_page.h&gt;
+-#include &lt;int.h&gt;
+-#include &lt;util/khash.h&gt;
+-#include &lt;lock.h&gt;
+-#include &lt;debug.h&gt;
+-#include &lt;lock.h&gt;
+-#include &lt;smp.h&gt;
+-#include &lt;arch/cpu.h&gt;
+ 
+-#include &lt;stddef.h&gt;
+-#include &lt;stdlib.h&gt;
+ 
+ //#define TRACE_VM_CACHE
+ #ifdef TRACE_VM_CACHE
+@@ -479,9 +480,12 @@
+ 			}
+ 		}
+ 
++		ConditionVariable&lt;vm_cache&gt; busyCondition;
++
+ 		if (merge) {
+ 			// But since we need to keep the locking order upper-&gt;lower cache, we
+ 			// need to unlock our cache now
++			busyCondition.Publish(cache, &quot;cache&quot;);
+ 			cache-&gt;busy = true;
+ 			mutex_unlock(&amp;cache-&gt;lock);
+ 
+@@ -496,6 +500,7 @@
+ 					&quot;not merging it\n&quot;, cache);
+ 				merge = false;
+ 				cache-&gt;busy = false;
++				busyCondition.Unpublish();
+ 				mutex_unlock(&amp;consumer-&gt;lock);
+ 				vm_cache_release_ref(consumer);
+ 			}
+@@ -535,6 +540,7 @@
+ //dprintf(&quot;%ld: merged busy page %p, cache %p, offset %ld\n&quot;, find_thread(NULL), page, cacheRef-&gt;cache, page-&gt;cache_offset);
+ 					vm_cache_remove_page(consumer, consumerPage);
+ 					consumerPage-&gt;state = PAGE_STATE_INACTIVE;
++					((vm_dummy_page*)consumerPage)-&gt;busy_condition.Unpublish();
+ 
+ 					vm_cache_remove_page(cache, page);
+ 					vm_cache_insert_page(consumer, page,
+@@ -582,6 +588,9 @@
+ 			mutex_unlock(&amp;consumer-&gt;lock);
+ 			vm_cache_release_ref(consumer);
+ 		}
++	
++		if (cache-&gt;busy)
++			busyCondition.Unpublish();
+ 	}
+ 
+ 	mutex_unlock(&amp;cache-&gt;lock);
+
+Deleted: haiku/trunk/src/system/kernel/vm/vm_page.c
+
+Copied: haiku/trunk/src/system/kernel/vm/vm_page.cpp (from rev 21851, haiku/trunk/src/system/kernel/vm/vm_page.c)
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.c	2007-08-08 10:29:30 UTC (rev 21851)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-08-09 20:08:25 UTC (rev 21875)
+@@ -0,0 +1,1196 @@
++/*
++ * Copyright 2002-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Distributed under the terms of the MIT License.
++ *
++ * Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.
++ * Distributed under the terms of the NewOS License.
++ */
++
++
++#include &lt;KernelExport.h&gt;
++#include &lt;OS.h&gt;
++
++#include &lt;arch/cpu.h&gt;
++#include &lt;arch/vm_translation_map.h&gt;
++#include &lt;boot/kernel_args.h&gt;
++#include &lt;condition_variable.h&gt;
++#include &lt;kernel.h&gt;
++#include &lt;thread.h&gt;
++#include &lt;vm.h&gt;
++#include &lt;vm_address_space.h&gt;
++#include &lt;vm_priv.h&gt;
++#include &lt;vm_page.h&gt;
++#include &lt;vm_cache.h&gt;
++
++#include &lt;signal.h&gt;
++#include &lt;string.h&gt;
++#include &lt;stdlib.h&gt;
++
++//#define TRACE_VM_PAGE
++#ifdef TRACE_VM_PAGE
++#	define TRACE(x) dprintf x
++#else
++#	define TRACE(x) ;
++#endif
++
++#define SCRUB_SIZE 16
++	// this many pages will be cleared at once in the page scrubber thread
++
++typedef struct page_queue {
++	vm_page *head;
++	vm_page *tail;
++	int count;
++} page_queue;
++
++extern bool trimming_cycle;
++
++static page_queue page_free_queue;
++static page_queue page_clear_queue;
++static page_queue page_modified_queue;
++static page_queue page_active_queue;
++
++static vm_page *sPages;
++static addr_t sPhysicalPageOffset;
++static size_t sNumPages;
++
++static spinlock sPageLock;
++
++static sem_id modified_pages_available;
++
++
++/*!	Dequeues a page from the tail of the given queue */
++static vm_page *
++dequeue_page(page_queue *q)
++{
++	vm_page *page;
++
++	page = q-&gt;tail;
++	if (page != NULL) {
++		if (q-&gt;head == page)
++			q-&gt;head = NULL;
++		if (page-&gt;queue_prev != NULL)
++			page-&gt;queue_prev-&gt;queue_next = NULL;
++
++		q-&gt;tail = page-&gt;queue_prev;
++		q-&gt;count--;
++
++		#ifdef DEBUG_PAGE_QUEUE
++			if (page-&gt;queue != q) {
++				panic(&quot;dequeue_page(queue: %p): page %p thinks it is in queue &quot;
++					&quot;%p&quot;, q, page, page-&gt;queue);
++			}
++
++			page-&gt;queue = NULL;
++		#endif	// DEBUG_PAGE_QUEUE
++	}
++
++	return page;
++}
++
++
++/*!	Enqueues a page to the head of the given queue */
++static void
++enqueue_page(page_queue *q, vm_page *page)
++{
++	#ifdef DEBUG_PAGE_QUEUE
++		if (page-&gt;queue != NULL) {
++			panic(&quot;enqueue_page(queue: %p, page: %p): page thinks it is &quot;
++				&quot;already in queue %p&quot;, q, page, page-&gt;queue);
++		}
++	#endif	// DEBUG_PAGE_QUEUE
++
++	if (q-&gt;head != NULL)
++		q-&gt;head-&gt;queue_prev = page;
++	page-&gt;queue_next = q-&gt;head;
++	q-&gt;head = page;
++	page-&gt;queue_prev = NULL;
++	if (q-&gt;tail == NULL)
++		q-&gt;tail = page;
++	q-&gt;count++;
++
++	#ifdef DEBUG_PAGE_QUEUE
++		page-&gt;queue = q;
++	#endif
++
++	if (q == &amp;page_modified_queue) {
++		if (q-&gt;count == 1)
++			release_sem_etc(modified_pages_available, 1, B_DO_NOT_RESCHEDULE);
++	}
++}
++
++
++static void
++remove_page_from_queue(page_queue *queue, vm_page *page)
++{
++	#ifdef DEBUG_PAGE_QUEUE
++		if (page-&gt;queue != queue) {
++			panic(&quot;remove_page_from_queue(queue: %p, page: %p): page thinks it &quot;
++				&quot;is in queue %p&quot;, queue, page, page-&gt;queue);
++		}
++	#endif	// DEBUG_PAGE_QUEUE
++
++	if (page-&gt;queue_prev != NULL)
++		page-&gt;queue_prev-&gt;queue_next = page-&gt;queue_next;
++	else
++		queue-&gt;head = page-&gt;queue_next;
++
++	if (page-&gt;queue_next != NULL)
++		page-&gt;queue_next-&gt;queue_prev = page-&gt;queue_prev;
++	else
++		queue-&gt;tail = page-&gt;queue_prev;
++
++	queue-&gt;count--;
++
++	#ifdef DEBUG_PAGE_QUEUE
++		page-&gt;queue = NULL;
++	#endif
++}
++
++
++static void
++move_page_to_queue(page_queue *fromQueue, page_queue *toQueue, vm_page *page)
++{
++	if (fromQueue != toQueue) {
++		remove_page_from_queue(fromQueue, page);
++		enqueue_page(toQueue, page);
++	}
++}
++
++
++static int
++dump_free_page_table(int argc, char **argv)
++{
++	dprintf(&quot;not finished\n&quot;);
++	return 0;
++}
++
++
++static int
++find_page(int argc, char **argv)
++{
++	struct vm_page *page;
++	addr_t address;
++	int32 index = 1;
++	int i;
++
++	struct {
++		const char*	name;
++		page_queue*	queue;
++	} pageQueueInfos[] = {
++		{ &quot;free&quot;,		&amp;page_free_queue },
++		{ &quot;clear&quot;,		&amp;page_clear_queue },
++		{ &quot;modified&quot;,	&amp;page_modified_queue },
++		{ &quot;active&quot;,		&amp;page_active_queue },
++		{ NULL, NULL }
++	};
++
++	if (argc &lt; 2
++		|| strlen(argv[index]) &lt;= 2
++		|| argv[index][0] != '0'
++		|| argv[index][1] != 'x') {
++		kprintf(&quot;usage: find_page &lt;address&gt;\n&quot;);
++		return 0;
++	}
++
++	address = strtoul(argv[index], NULL, 0);
++	page = (vm_page*)address;
++
++	for (i = 0; pageQueueInfos[i].name; i++) {
++		vm_page* p = pageQueueInfos[i].queue-&gt;head;
++		while (p) {
++			if (p == page) {
++				kprintf(&quot;found page %p in queue %p (%s)\n&quot;, page,
++					pageQueueInfos[i].queue, pageQueueInfos[i].name);
++				return 0;
++			}
++			p = p-&gt;queue_next;
++		}
++	}
++
++	kprintf(&quot;page %p isn't in any queue\n&quot;, page);
++
++	return 0;
++}
++
++
++static int
++dump_page(int argc, char **argv)
++{
++	struct vm_page *page;
++	addr_t address;
++	bool physical = false;
++	int32 index = 1;
++
++	if (argc &gt; 2) {
++		if (!strcmp(argv[1], &quot;-p&quot;)) {
++			physical = true;
++			index++;
++		} else if (!strcmp(argv[1], &quot;-v&quot;))
++			index++;
++	}
++
++	if (argc &lt; 2
++		|| strlen(argv[index]) &lt;= 2
++		|| argv[index][0] != '0'
++		|| argv[index][1] != 'x') {
++		kprintf(&quot;usage: page [-p|-v] &lt;address&gt;\n&quot;
++			&quot;  -v looks up a virtual address for the page, -p a physical address.\n&quot;
++			&quot;  Default is to look for the page structure address directly\n.&quot;);
++		return 0;
++	}
++
++	address = strtoul(argv[index], NULL, 0);
++
++	if (index == 2) {
++		if (!physical) {
++			vm_address_space *addressSpace = vm_kernel_address_space();
++			uint32 flags;
++
++			if (thread_get_current_thread()-&gt;team-&gt;address_space != NULL)
++				addressSpace = thread_get_current_thread()-&gt;team-&gt;address_space;
++
++			addressSpace-&gt;translation_map.ops-&gt;query_interrupt(
++				&amp;addressSpace-&gt;translation_map, address, &amp;address, &amp;flags);
++
++		}
++		page = vm_lookup_page(address / B_PAGE_SIZE);
++	} else
++		page = (struct vm_page *)address;
++
++	kprintf(&quot;PAGE: %p\n&quot;, page);
++	kprintf(&quot;queue_next,prev: %p, %p\n&quot;, page-&gt;queue_next, page-&gt;queue_prev);
++	kprintf(&quot;hash_next:       %p\n&quot;, page-&gt;hash_next);
++	kprintf(&quot;physical_number: %lx\n&quot;, page-&gt;physical_page_number);
++	kprintf(&quot;cache:           %p\n&quot;, page-&gt;cache);
++	kprintf(&quot;cache_offset:    %ld\n&quot;, page-&gt;cache_offset);
++	kprintf(&quot;cache_next,prev: %p, %p\n&quot;, page-&gt;cache_next, page-&gt;cache_prev);
++	kprintf(&quot;type:            %d\n&quot;, page-&gt;type);
++	kprintf(&quot;state:           %d\n&quot;, page-&gt;state);
++	kprintf(&quot;wired_count:     %u\n&quot;, page-&gt;wired_count);
++	kprintf(&quot;usage_count:     %u\n&quot;, page-&gt;usage_count);
++	#ifdef DEBUG_PAGE_QUEUE
++		kprintf(&quot;queue:           %p\n&quot;, page-&gt;queue);
++	#endif
++	#ifdef DEBUG_PAGE_CACHE_TRANSITIONS
++		kprintf(&quot;debug_flags:     0x%lx\n&quot;, page-&gt;debug_flags);
++		kprintf(&quot;collided page:   %p\n&quot;, page-&gt;collided_page);
++	#endif	// DEBUG_PAGE_CACHE_TRANSITIONS
++	kprintf(&quot;area mappings:\n&quot;);
++
++	vm_page_mappings::Iterator iterator = page-&gt;mappings.GetIterator();
++	vm_page_mapping *mapping;
++	while ((mapping = iterator.Next()) != NULL) {
++		kprintf(&quot;  %p (%#lx)\n&quot;, mapping-&gt;area, mapping-&gt;area-&gt;id);
++		mapping = mapping-&gt;page_link.next;
++	}
++
++	return 0;
++}
++
++
++static int
++dump_page_queue(int argc, char **argv)
++{
++	struct page_queue *queue;
++
++	if (argc &lt; 2) {
++		kprintf(&quot;usage: page_queue &lt;address/name&gt; [list]\n&quot;);
++		return 0;
++	}
++
++	if (strlen(argv[1]) &gt;= 2 &amp;&amp; argv[1][0] == '0' &amp;&amp; argv[1][1] == 'x')
++		queue = (struct page_queue *)strtoul(argv[1], NULL, 16);
++	if (!strcmp(argv[1], &quot;free&quot;))
++		queue = &amp;page_free_queue;
++	else if (!strcmp(argv[1], &quot;clear&quot;))
++		queue = &amp;page_clear_queue;
++	else if (!strcmp(argv[1], &quot;modified&quot;))
++		queue = &amp;page_modified_queue;
++	else if (!strcmp(argv[1], &quot;active&quot;))
++		queue = &amp;page_active_queue;
++	else {
++		kprintf(&quot;page_queue: unknown queue \&quot;%s\&quot;.\n&quot;, argv[1]);
++		return 0;
++	}
++
++	kprintf(&quot;queue = %p, queue-&gt;head = %p, queue-&gt;tail = %p, queue-&gt;count = %d\n&quot;, queue, queue-&gt;head, queue-&gt;tail, queue-&gt;count);
++
++	if (argc == 3) {
++		struct vm_page *page = queue-&gt;head;
++		int i;
++		
++		for (i = 0; page; i++, page = page-&gt;queue_next) {
++			kprintf(&quot;%5d. queue_next = %p, queue_prev = %p, type = %d, state = %d\n&quot;, i, page-&gt;queue_next, page-&gt;queue_prev, page-&gt;type, page-&gt;state);
++		}
++	}
++	return 0;
++}
++
++
++static int
++dump_page_stats(int argc, char **argv)
++{
++	uint32 counter[8];
++	int32 totalActive;
++	addr_t i;
++
++	memset(counter, 0, sizeof(counter));
++
++	for (i = 0; i &lt; sNumPages; i++) {
++		if (sPages[i].state &gt; 7)
++			panic(&quot;page %li at %p has invalid state!\n&quot;, i, &amp;sPages[i]);
++
++		counter[sPages[i].state]++;
++	}
++
++	kprintf(&quot;page stats:\n&quot;);
++	kprintf(&quot;active: %lu\ninactive: %lu\nbusy: %lu\nunused: %lu\n&quot;,
++		counter[PAGE_STATE_ACTIVE], counter[PAGE_STATE_INACTIVE], counter[PAGE_STATE_BUSY], counter[PAGE_STATE_UNUSED]);
++	kprintf(&quot;wired: %lu\nmodified: %lu\nfree: %lu\nclear: %lu\n&quot;,
++		counter[PAGE_STATE_WIRED], counter[PAGE_STATE_MODIFIED], counter[PAGE_STATE_FREE], counter[PAGE_STATE_CLEAR]);
++
++	kprintf(&quot;\nfree_queue: %p, count = %d\n&quot;, &amp;page_free_queue, page_free_queue.count);
++	kprintf(&quot;clear_queue: %p, count = %d\n&quot;, &amp;page_clear_queue, page_clear_queue.count);
++	kprintf(&quot;modified_queue: %p, count = %d\n&quot;, &amp;page_modified_queue, page_modified_queue.count);
++	kprintf(&quot;active_queue: %p, count = %d\n&quot;, &amp;page_active_queue, page_active_queue.count);
++
++	return 0;
++}
++
++
++#if 0
++static int dump_free_page_table(int argc, char **argv)
++{
++	unsigned int i = 0;
++	unsigned int free_start = END_OF_LIST;
++	unsigned int inuse_start = PAGE_INUSE;
++
++	dprintf(&quot;dump_free_page_table():\n&quot;);
++	dprintf(&quot;first_free_page_index = %d\n&quot;, first_free_page_index);
++
++	while(i &lt; free_page_table_size) {
++		if (free_page_table[i] == PAGE_INUSE) {
++			if (inuse_start != PAGE_INUSE) {
++				i++;
++				continue;
++			}
++			if (free_start != END_OF_LIST) {
++				dprintf(&quot;free from %d -&gt; %d\n&quot;, free_start + free_page_table_base, i-1 + free_page_table_base);
++				free_start = END_OF_LIST;
++			}
++			inuse_start = i;
++		} else {
++			if (free_start != END_OF_LIST) {
++				i++;
++				continue;
++			}
++			if (inuse_start != PAGE_INUSE) {
++				dprintf(&quot;inuse from %d -&gt; %d\n&quot;, inuse_start + free_page_table_base, i-1 + free_page_table_base);
++				inuse_start = PAGE_INUSE;
++			}
++			free_start = i;
++		}
++		i++;
++	}
++	if (inuse_start != PAGE_INUSE) {
++		dprintf(&quot;inuse from %d -&gt; %d\n&quot;, inuse_start + free_page_table_base, i-1 + free_page_table_base);
++	}
++	if (free_start != END_OF_LIST) {
++		dprintf(&quot;free from %d -&gt; %d\n&quot;, free_start + free_page_table_base, i-1 + free_page_table_base);
++	}
++/*
++	for (i = 0; i &lt; free_page_table_size; i++) {
++		dprintf(&quot;%d-&gt;%d &quot;, i, free_page_table[i]);
++	}
++*/
++	return 0;
++}
++#endif
++
++
++static status_t
++set_page_state_nolock(vm_page *page, int pageState)
++{
++	page_queue *from_q = NULL;
++	page_queue *to_q = NULL;
++
++	switch (page-&gt;state) {
++		case PAGE_STATE_BUSY:
++		case PAGE_STATE_ACTIVE:
++		case PAGE_STATE_INACTIVE:
++		case PAGE_STATE_WIRED:
++		case PAGE_STATE_UNUSED:
++			from_q = &amp;page_active_queue;
++			break;
++		case PAGE_STATE_MODIFIED:
++			from_q = &amp;page_modified_queue;
++			break;
++		case PAGE_STATE_FREE:
++			from_q = &amp;page_free_queue;
++			break;
++		case PAGE_STATE_CLEAR:
++			from_q = &amp;page_clear_queue;
++			break;
++		default:
++			panic(&quot;vm_page_set_state: vm_page %p in invalid state %d\n&quot;, page, page-&gt;state);
++	}
++
++	if (page-&gt;state == PAGE_STATE_CLEAR || page-&gt;state == PAGE_STATE_FREE) {
++		if (page-&gt;cache != NULL)
++			panic(&quot;free page %p has cache&quot;, page);
++	}
++	if (pageState == PAGE_STATE_CLEAR || pageState == PAGE_STATE_FREE) {
++		if (page-&gt;cache != NULL)
++			panic(&quot;to be freed page %p has cache&quot;, page);
++	}
++
++	switch (pageState) {
++		case PAGE_STATE_BUSY:
++		case PAGE_STATE_ACTIVE:
++		case PAGE_STATE_INACTIVE:
++		case PAGE_STATE_WIRED:
++		case PAGE_STATE_UNUSED:
++			to_q = &amp;page_active_queue;
++			break;
++		case PAGE_STATE_MODIFIED:
++			to_q = &amp;page_modified_queue;
++			break;
++		case PAGE_STATE_FREE:
++			to_q = &amp;page_free_queue;
++			break;
++		case PAGE_STATE_CLEAR:
++			to_q = &amp;page_clear_queue;
+
+[... truncated: 735 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003440.html">[Haiku-commits] r21874 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="003442.html">[Haiku-commits] r21876 - in haiku/vendor/mesa/current:	glu/libnurbs/interface glu/libnurbs/nurbtess glu/libutil	headers/public src/glapi src/main src/shader src/shader/slang	src/shader/slang/library src/sparc src/swrast src/tnl src/vbo	src/x86 src/x86-64
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3441">[ date ]</a>
+              <a href="thread.html#3441">[ thread ]</a>
+              <a href="subject.html#3441">[ subject ]</a>
+              <a href="author.html#3441">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,209 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28368 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28368%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid&In-Reply-To=%3C200810292123.m9TLNNpp029249%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013082.html">
+   <LINK REL="Next"  HREF="013084.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28368 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28368%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid&In-Reply-To=%3C200810292123.m9TLNNpp029249%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28368 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid">stippi at mail.berlios.de
+       </A><BR>
+    <I>Wed Oct 29 22:23:23 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013082.html">[Haiku-commits] r28367 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="013084.html">[Haiku-commits] r28368 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13083">[ date ]</a>
+              <a href="thread.html#13083">[ thread ]</a>
+              <a href="subject.html#13083">[ subject ]</a>
+              <a href="author.html#13083">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2008-10-29 22:23:19 +0100 (Wed, 29 Oct 2008)
+New Revision: 28368
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28368&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28368&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.h
+Log:
+Several problems prevented USB HIDs to be opened, closed and reopened:
+* The first problem was introduced by myself, when I added deleting the
+  transfer semaphore in HIDDevice::Close(). Obviously, I should (re)create it
+  in Open() then, or it won't work another time. (Open() is now the only place
+  where it's created.)
+* The second problem was when transfers have already been scheduled the
+  last time the device was open, but never triggered yet. We need to reset the
+  fTransferUnprocessed flag, or we won't schedule another transfer but
+  wait on the transfer semaphore anyways in Control(). I also added
+  canceling the usb transfers with the stack in Close().
+* The remaining problems were specific to the KeyboardDevice, the repeat
+  key stuff needs to be reset in Open(). I also added unsetting the repeat
+  key when the key release is detected, but this should have already worked,
+  because the semaphore timeout was reset to B_INFINITE_TIMEOUT.
+
+One can now &quot;/system/servers/input_server -q&quot; and everything will be back
+in working order. There may be some remaining problems in the Wacom driver
+which I have not yet looked at.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp	2008-10-29 18:39:58 UTC (rev 28367)
++++ haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/HIDDevice.cpp	2008-10-29 21:23:19 UTC (rev 28368)
+@@ -39,12 +39,6 @@
+ 	if (ringBufferSize &gt; 0)
+ 		fRingBuffer = create_ring_buffer(ringBufferSize);
+ 
+-	fTransferNotifySem = create_sem(0, &quot;hid device transfer notify sem&quot;);
+-	if (fTransferNotifySem &lt; B_OK) {
+-		fStatus = fTransferNotifySem;
+-		return;
+-	}
+-
+ 	fTransferBuffer = (uint8 *)malloc(fTotalReportSize);
+ 	if (fTransferBuffer == NULL) {
+ 		fStatus = B_NO_MEMORY;
+@@ -231,7 +225,17 @@
+ status_t
+ HIDDevice::Open(uint32 flags)
+ {
++	if (fOpen)
++		return B_BUSY;
++
++	if (fTransferNotifySem &lt; 0) {
++		fTransferNotifySem = create_sem(0, &quot;hid device transfer notify sem&quot;);
++		if (fTransferNotifySem &lt; 0)
++			return (status_t)fTransferNotifySem;
++	}
++
+ 	fOpen = true;
++
+ 	return B_OK;
+ }
+ 
+@@ -242,8 +246,10 @@
+ 	fOpen = false;
+ 	// make threads waiting for a transfer bail out
+ 	if (fTransferNotifySem &gt;= 0) {
++		gUSBModule-&gt;cancel_queued_transfers(fInterruptPipe);
+ 		delete_sem(fTransferNotifySem);
+ 		fTransferNotifySem = -1;
++		_SetTransferProcessed();
+ 	}
+ 	return B_OK;
+ }
+@@ -307,6 +313,8 @@
+ status_t
+ HIDDevice::_ScheduleTransfer()
+ {
++	if (fTransferNotifySem &lt; 0)
++		return B_ERROR;
+ 	if (fTransferUnprocessed)
+ 		return B_BUSY;
+ 	if (fRemoved)
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.cpp	2008-10-29 18:39:58 UTC (rev 28367)
++++ haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.cpp	2008-10-29 21:23:19 UTC (rev 28368)
+@@ -44,6 +44,23 @@
+ 
+ 
+ status_t
++KeyboardDevice::Open(uint32 flags)
++{
++	status_t status = HIDDevice::Open(flags);
++	if (status != B_OK) {
++		TRACE_ALWAYS(&quot;keyboard device failed to open: %s\n&quot;,
++			strerror(status));
++		return status;
++	}
++
++	fCurrentRepeatDelay = B_INFINITE_TIMEOUT;
++	fCurrentRepeatKey = 0;
++
++	return B_OK;
++}
++
++
++status_t
+ KeyboardDevice::Control(uint32 op, void *buffer, size_t length)
+ {
+ 	switch (op) {
+@@ -71,6 +88,7 @@
+ 					_WriteKey(fCurrentRepeatKey, true);
+ 					// the next timeout is reduced to the repeat_rate
+ 					fCurrentRepeatDelay = fRepeatRate;
++					break;
+ 				} else if (result == B_INTERRUPTED &amp;&amp; IsOpen()) {
+ 					continue;
+ 				} else
+@@ -346,8 +364,10 @@
+ 					fCurrentRepeatDelay = fRepeatDelay;
+ 				} else {
+ 					// cancel the repeats if they are for this key
+-					if (fCurrentRepeatKey == key)
++					if (fCurrentRepeatKey == key) {
+ 						fCurrentRepeatDelay = B_INFINITE_TIMEOUT;
++						fCurrentRepeatKey = 0;
++					}
+ 				}
+ 			} else
+ 				break;
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.h	2008-10-29 18:39:58 UTC (rev 28367)
++++ haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.h	2008-10-29 21:23:19 UTC (rev 28368)
+@@ -18,6 +18,7 @@
+ 									size_t totalReportSize);
+ virtual							~KeyboardDevice();
+ 
++virtual	status_t				Open(uint32 flags);
+ virtual	status_t				Control(uint32 op, void *buffer, size_t length);
+ 
+ private:
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013082.html">[Haiku-commits] r28367 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="013084.html">[Haiku-commits] r28368 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13083">[ date ]</a>
+              <a href="thread.html#13083">[ thread ]</a>
+              <a href="subject.html#13083">[ subject ]</a>
+              <a href="author.html#13083">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

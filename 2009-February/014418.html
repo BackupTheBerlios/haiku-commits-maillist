@@ -1,0 +1,636 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29249 -	haiku/trunk/src/add-ons/kernel/file_systems/overlay
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29249%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/overlay&In-Reply-To=%3C200902190120.n1J1KCfL001347%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014417.html">
+   <LINK REL="Next"  HREF="014420.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29249 -	haiku/trunk/src/add-ons/kernel/file_systems/overlay</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29249%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/overlay&In-Reply-To=%3C200902190120.n1J1KCfL001347%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29249 -	haiku/trunk/src/add-ons/kernel/file_systems/overlay">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Thu Feb 19 02:20:12 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014417.html">[Haiku-commits] r29248 - in haiku/trunk: headers/os/drivers	src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="014420.html">[Haiku-commits] r29249	-	haiku/trunk/src/add-ons/kernel/file_systems/overlay
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14418">[ date ]</a>
+              <a href="thread.html#14418">[ thread ]</a>
+              <a href="subject.html#14418">[ subject ]</a>
+              <a href="author.html#14418">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-02-19 02:20:10 +0100 (Thu, 19 Feb 2009)
+New Revision: 29249
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29249&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29249&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/overlay/overlay.cpp
+Log:
+* Add preliminary write support to the overlay filesystem when the underlying
+  fs is read-only. Not yet fully working, also directory operations like file
+  creation/removal are yet missing.
+* Add notifications for stat and attribute changes.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/overlay/overlay.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/overlay/overlay.cpp	2009-02-19 01:16:07 UTC (rev 29248)
++++ haiku/trunk/src/add-ons/kernel/file_systems/overlay/overlay.cpp	2009-02-19 01:20:10 UTC (rev 29249)
+@@ -40,31 +40,75 @@
+ class AttributeEntry;
+ 
+ 
++struct open_cookie {
++	int				open_mode;
++	void *			super_cookie;
++};
++
++struct write_buffer {
++	write_buffer *	next;
++	off_t			position;
++	size_t			length;
++	uint8			buffer[1];
++};
++
+ struct attribute_dir_cookie {
+ 	AttributeFile *	file;
+ 	uint32			index;
+ };
+ 
+ 
++class OverlayVolume {
++public:
++							OverlayVolume(fs_volume *volume);
++							~OverlayVolume();
++
++		status_t			AllLayersMounted();
++
++		fs_volume *			SuperVolume() { return fVolume-&gt;super_volume; }
++
++		bool				WriteSupport() { return fWriteSupport; }
++
++private:
++		fs_volume *			fVolume;
++		bool				fWriteSupport;
++};
++
++
+ class OverlayInode {
+ public:
+-							OverlayInode(fs_volume *superVolume,
+-								fs_vnode *superVnode);
++							OverlayInode(OverlayVolume *volume,
++								fs_vnode *superVnode, ino_t inodeNumber);
+ 							~OverlayInode();
+ 
+ 		status_t			InitCheck();
+ 
+-		fs_volume *			SuperVolume() { return fSuperVolume; }
++		fs_volume *			SuperVolume() { return fVolume-&gt;SuperVolume(); }
+ 		fs_vnode *			SuperVnode() { return &fSuperVnode; }
++		ino_t				InodeNumber() { return fInodeNumber; }
+ 
+ 		status_t			GetAttributeFile(AttributeFile **attributeFile);
+ 		status_t			WriteAttributeFile();
+ 
++		status_t			ReadStat(struct stat *stat);
++
++		status_t			Open(int openMode, void **cookie);
++		status_t			Close(void *cookie);
++		status_t			FreeCookie(void *cookie);
++		status_t			Read(void *cookie, off_t position, void *buffer,
++								size_t *length);
++		status_t			Write(void *cookie, off_t position,
++								const void *buffer, size_t *length);
++
+ private:
+-		fs_volume *			fSuperVolume;
++		OverlayVolume *		fVolume;
+ 		fs_vnode			fSuperVnode;
++		ino_t				fInodeNumber;
+ 		AttributeFile *		fAttributeFile;
+-		bool				fAttributeFileMissing;
++		write_buffer *		fWriteBuffers;
++		off_t				fOriginalNodeLength;
++		off_t				fCurrentNodeLength;
++		time_t				fModificationTime;
+ };
+ 
+ 
+@@ -172,14 +216,46 @@
+ };
+ 
+ 
++//	#pragma mark OverlayVolume
++
++
++OverlayVolume::OverlayVolume(fs_volume *volume)
++	:	fVolume(volume),
++		fWriteSupport(false)
++{
++}
++
++
++OverlayVolume::~OverlayVolume()
++{
++}
++
++
++status_t
++OverlayVolume::AllLayersMounted()
++{
++	fs_info info;
++	fs_volume *superVolume = fVolume-&gt;super_volume;
++	if (superVolume-&gt;ops-&gt;read_fs_info != NULL
++		&amp;&amp; superVolume-&gt;ops-&gt;read_fs_info(superVolume, &amp;info) == B_OK)
++		fWriteSupport = (info.flags &amp; B_FS_IS_READONLY) != 0;
++
++	return B_OK;
++}
++
++
+ //	#pragma mark OverlayInode
+ 
+ 
+-OverlayInode::OverlayInode(fs_volume *superVolume, fs_vnode *superVnode)
+-	:	fSuperVolume(superVolume),
++OverlayInode::OverlayInode(OverlayVolume *volume, fs_vnode *superVnode,
++	ino_t inodeNumber)
++	:	fVolume(volume),
+ 		fSuperVnode(*superVnode),
++		fInodeNumber(inodeNumber),
+ 		fAttributeFile(NULL),
+-		fAttributeFileMissing(false)
++		fWriteBuffers(NULL),
++		fOriginalNodeLength(-1),
++		fCurrentNodeLength(-1)
+ {
+ 	TRACE(&quot;inode created\n&quot;);
+ }
+@@ -189,6 +265,13 @@
+ {
+ 	TRACE(&quot;inode destroyed\n&quot;);
+ 	delete fAttributeFile;
++
++	write_buffer *element = fWriteBuffers;
++	while (element) {
++		write_buffer *next = element-&gt;next;
++		free(element);
++		element = next;
++	}
+ }
+ 
+ 
+@@ -203,7 +286,7 @@
+ OverlayInode::GetAttributeFile(AttributeFile **attributeFile)
+ {
+ 	if (fAttributeFile == NULL) {
+-		fAttributeFile = new(std::nothrow) AttributeFile(fSuperVolume,
++		fAttributeFile = new(std::nothrow) AttributeFile(SuperVolume(),
+ 			&amp;fSuperVnode);
+ 		if (fAttributeFile == NULL) {
+ 			TRACE_ALWAYS(&quot;no memory to allocate attribute file\n&quot;);
+@@ -238,10 +321,235 @@
+ 	if (result != B_OK)
+ 		return result;
+ 
+-	return fAttributeFile-&gt;WriteAttributeFile(fSuperVolume, &amp;fSuperVnode);
++	return fAttributeFile-&gt;WriteAttributeFile(SuperVolume(), &amp;fSuperVnode);
+ }
+ 
+ 
++status_t
++OverlayInode::ReadStat(struct stat *stat)
++{
++	if (fSuperVnode.ops-&gt;read_stat == NULL)
++		return B_UNSUPPORTED;
++
++	status_t result = fSuperVnode.ops-&gt;read_stat(SuperVolume(), &amp;fSuperVnode,
++		stat);
++	if (result != B_OK)
++		return result;
++
++	if (fVolume-&gt;WriteSupport() &amp;&amp; fCurrentNodeLength &gt;= 0) {
++		stat-&gt;st_size = fCurrentNodeLength;
++		stat-&gt;st_blocks = (stat-&gt;st_size + stat-&gt;st_blksize - 1)
++			/ stat-&gt;st_blksize;
++		stat-&gt;st_mtime = fModificationTime;
++	}
++
++	return B_OK;
++}
++
++
++status_t
++OverlayInode::Open(int openMode, void **_cookie)
++{
++	if (fSuperVnode.ops-&gt;open == NULL)
++		return B_UNSUPPORTED;
++
++	if (fVolume-&gt;WriteSupport()) {
++		open_cookie *cookie = (open_cookie *)malloc(sizeof(open_cookie));
++		if (cookie == NULL)
++			return B_NO_MEMORY;
++
++		if (fOriginalNodeLength &lt; 0) {
++			struct stat stat;
++			status_t result = fSuperVnode.ops-&gt;read_stat(SuperVolume(),
++				&amp;fSuperVnode, &amp;stat);
++			if (result != B_OK)
++				return result;
++
++			fOriginalNodeLength = stat.st_size;
++			fCurrentNodeLength = stat.st_size;
++			fModificationTime = stat.st_mtime;
++		}
++
++		cookie-&gt;open_mode = openMode;
++		*_cookie = cookie;
++
++		if (openMode &amp; O_TRUNC)
++			fCurrentNodeLength = 0;
++
++		openMode &amp;= ~(O_RDWR | O_WRONLY | O_TRUNC | O_CREAT);
++		return fSuperVnode.ops-&gt;open(SuperVolume(), &amp;fSuperVnode, openMode,
++			&amp;cookie-&gt;super_cookie);
++	}
++
++	return fSuperVnode.ops-&gt;open(SuperVolume(), &amp;fSuperVnode, openMode,
++		_cookie);
++}
++
++
++status_t
++OverlayInode::Close(void *_cookie)
++{
++	if (fVolume-&gt;WriteSupport()) {
++		open_cookie *cookie = (open_cookie *)_cookie;
++		return fSuperVnode.ops-&gt;close(SuperVolume(), &amp;fSuperVnode,
++			cookie-&gt;super_cookie);
++	}
++
++	return fSuperVnode.ops-&gt;close(SuperVolume(), &amp;fSuperVnode, _cookie);
++}
++
++
++status_t
++OverlayInode::FreeCookie(void *_cookie)
++{
++	if (fVolume-&gt;WriteSupport()) {
++		open_cookie *cookie = (open_cookie *)_cookie;
++		status_t result = fSuperVnode.ops-&gt;free_cookie(SuperVolume(),
++			&amp;fSuperVnode, cookie-&gt;super_cookie);
++		free(cookie);
++		return result;
++	}
++
++	return fSuperVnode.ops-&gt;free_cookie(SuperVolume(), &amp;fSuperVnode, _cookie);
++}
++
++
++status_t
++OverlayInode::Read(void *_cookie, off_t position, void *buffer, size_t *length)
++{
++	if (fVolume-&gt;WriteSupport()) {
++		if (position &lt; fOriginalNodeLength) {
++			open_cookie *cookie = (open_cookie *)_cookie;
++			size_t readLength = MIN(fOriginalNodeLength - position, *length);
++			status_t result = fSuperVnode.ops-&gt;read(SuperVolume(), &amp;fSuperVnode,
++				cookie-&gt;super_cookie, position, buffer, &amp;readLength);
++			if (result != B_OK)
++				return result;
++		}
++
++		// overlay the read with whatever chunks we have written
++		write_buffer *element = fWriteBuffers;
++		*length = MIN(fCurrentNodeLength - position, *length);
++		off_t end = position + *length;
++		while (element) {
++			off_t elementEnd = element-&gt;position + element-&gt;length;
++			if (elementEnd &gt; position &amp;&amp; element-&gt;position &lt; end) {
++				off_t copyPosition = MAX(position, element-&gt;position);
++				size_t copyLength = MIN(elementEnd - position, *length);
++				memcpy((uint8 *)buffer + (copyPosition - position),
++					element-&gt;buffer + (copyPosition - element-&gt;position),
++					copyLength);
++			}
++
++			element = element-&gt;next;
++		}
++
++		return B_OK;
++	}
++
++	return fSuperVnode.ops-&gt;read(SuperVolume(), &amp;fSuperVnode, _cookie,
++		position, buffer, length);
++}
++
++
++status_t
++OverlayInode::Write(void *_cookie, off_t position, const void *buffer,
++	size_t *length)
++{
++	if (fVolume-&gt;WriteSupport()) {
++		// find insertion point
++		write_buffer **link = &fWriteBuffers;
++		write_buffer *other = fWriteBuffers;
++		write_buffer *swallow = NULL;
++		off_t newPosition = position;
++		size_t newLength = *length;
++		uint32 swallowCount = 0;
++
++		while (other) {
++			off_t newEnd = newPosition + newLength;
++			off_t otherEnd = other-&gt;position + other-&gt;length;
++			if (otherEnd &lt; newPosition) {
++				// other completely before us
++				link = &amp;other-&gt;next;
++				other = other-&gt;next;
++				continue;
++			}
++
++			if (other-&gt;position &gt; newEnd) {
++				// other is completely past us
++				break;
++			}
++
++			swallowCount++;
++			if (swallow == NULL)
++				swallow = other;
++
++			if (other-&gt;position &lt;= newPosition) {
++				// other chunk overlaps us or is adjacent
++				if (otherEnd &lt; newEnd) {
++					// extend the chunk to completely overlap us
++					newPosition = other-&gt;position;
++					newLength = other-&gt;length + (newEnd - otherEnd);
++				} else {
++					// other chunk completely overlaps us already
++				}
++
++				other = other-&gt;next;
++				continue;
++			}
++
++			// we overlap the other chunk - swallow it
++			if (otherEnd &gt; newEnd)
++				newLength += otherEnd - newEnd;
++
++			other = other-&gt;next;
++		}
++
++		write_buffer *element = (write_buffer *)malloc(sizeof(write_buffer) - 1
++			+ newLength);
++		if (element == NULL)
++			return B_NO_MEMORY;
++
++		element-&gt;next = *link;
++		element-&gt;position = newPosition;
++		element-&gt;length = newLength;
++		*link = element;
++
++		bool sizeChanged = false;
++		off_t newEnd = newPosition + newLength;
++		if (newEnd &gt; fCurrentNodeLength) {
++			fCurrentNodeLength = newEnd;
++			sizeChanged = true;
++		}
++
++		// populate the buffer with the existing chunks
++		if (swallowCount &gt; 0) {
++			while (swallowCount-- &gt; 0) {
++				off_t swallowEnd = swallow-&gt;position + swallow-&gt;length;
++				if (swallow-&gt;position &lt; position || swallowEnd &gt; newEnd) {
++					memcpy(element-&gt;buffer + (swallow-&gt;position - newPosition),
++						swallow-&gt;buffer, swallow-&gt;length);
++				}
++
++				element-&gt;next = swallow-&gt;next;
++				free(swallow);
++			}
++		}
++
++		memcpy(element-&gt;buffer + (position - newPosition), buffer, *length);
++
++		fModificationTime = time(NULL);
++		notify_stat_changed(SuperVolume()-&gt;id, fInodeNumber,
++			B_STAT_MODIFICATION_TIME | (sizeChanged ? B_STAT_SIZE : 0));
++
++		return B_OK;
++	}
++
++	return fSuperVnode.ops-&gt;write(SuperVolume(), &amp;fSuperVnode, _cookie,
++		position, buffer, length);
++}
++
++
+ //	#pragma mark AttributeFile
+ 
+ 
+@@ -696,6 +1004,7 @@
+ 	else
+ 		delete entry;
+ 
++	notify_attribute_changed(fVolumeID, fFileInode, name, B_ATTR_REMOVED);
+ 	return B_OK;
+ }
+ 
+@@ -717,6 +1026,10 @@
+ 
+ 	fEntries = newEntries;
+ 	fEntries[fFile-&gt;entry_count++] = entry;
++
++	notify_attribute_changed(fVolumeID, fFileInode, entry-&gt;Name(),
++		B_ATTR_CREATED);
++
+ 	return B_OK;
+ }
+ 
+@@ -903,6 +1216,8 @@
+ 	}
+ 
+ 	memcpy(fData + position, buffer, *length);
++	notify_attribute_changed(fParent-&gt;VolumeID(), fParent-&gt;FileInode(),
++		fEntry-&gt;name, B_ATTR_CHANGED);
+ 	return B_OK;
+ }
+ 
+@@ -1170,8 +1485,7 @@
+ static status_t
+ overlay_read_stat(fs_volume *volume, fs_vnode *vnode, struct stat *stat)
+ {
+-	OVERLAY_CALL(read_stat, stat)
+-	return B_UNSUPPORTED;
++	return ((OverlayInode *)vnode-&gt;private_node)-&gt;ReadStat(stat);
+ }
+ 
+ 
+@@ -1196,24 +1510,21 @@
+ static status_t
+ overlay_open(fs_volume *volume, fs_vnode *vnode, int openMode, void **cookie)
+ {
+-	OVERLAY_CALL(open, openMode, cookie)
+-	return B_UNSUPPORTED;
++	return ((OverlayInode *)vnode-&gt;private_node)-&gt;Open(openMode, cookie);
+ }
+ 
+ 
+ static status_t
+ overlay_close(fs_volume *volume, fs_vnode *vnode, void *cookie)
+ {
+-	OVERLAY_CALL(close, cookie)
+-	return B_UNSUPPORTED;
++	return ((OverlayInode *)vnode-&gt;private_node)-&gt;Close(cookie);
+ }
+ 
+ 
+ static status_t
+ overlay_free_cookie(fs_volume *volume, fs_vnode *vnode, void *cookie)
+ {
+-	OVERLAY_CALL(free_cookie, cookie)
+-	return B_UNSUPPORTED;
++	return ((OverlayInode *)vnode-&gt;private_node)-&gt;FreeCookie(cookie);
+ }
+ 
+ 
+@@ -1221,8 +1532,8 @@
+ overlay_read(fs_volume *volume, fs_vnode *vnode, void *cookie, off_t pos,
+ 	void *buffer, size_t *length)
+ {
+-	OVERLAY_CALL(read, cookie, pos, buffer, length)
+-	return B_UNSUPPORTED;
++	return ((OverlayInode *)vnode-&gt;private_node)-&gt;Read(cookie, pos, buffer,
++		length);
+ }
+ 
+ 
+@@ -1230,8 +1541,8 @@
+ overlay_write(fs_volume *volume, fs_vnode *vnode, void *cookie, off_t pos,
+ 	const void *buffer, size_t *length)
+ {
+-	OVERLAY_CALL(write, cookie, pos, buffer, length)
+-	return B_UNSUPPORTED;
++	return ((OverlayInode *)vnode-&gt;private_node)-&gt;Write(cookie, pos, buffer,
++		length);
+ }
+ 
+ 
+@@ -1616,9 +1927,13 @@
+ overlay_unmount(fs_volume *volume)
+ {
+ 	TRACE_VOLUME(&quot;relaying volume op: unmount\n&quot;);
+-	if (volume-&gt;super_volume-&gt;ops-&gt;unmount != NULL)
+-		return volume-&gt;super_volume-&gt;ops-&gt;unmount(volume-&gt;super_volume);
+-	return B_UNSUPPORTED;
++	if (volume-&gt;super_volume != NULL
++		&amp;&amp; volume-&gt;super_volume-&gt;ops != NULL
++		&amp;&amp; volume-&gt;super_volume-&gt;ops-&gt;unmount != NULL)
++		volume-&gt;super_volume-&gt;ops-&gt;unmount(volume-&gt;super_volume);
++
++	delete (OverlayVolume *)volume-&gt;private_volume;
++	return B_OK;
+ }
+ 
+ 
+@@ -1633,7 +1948,10 @@
+ 		if (result != B_OK)
+ 			return result;
+ 
+-		info-&gt;flags |= B_FS_HAS_MIME | B_FS_HAS_ATTR | B_FS_HAS_QUERY;
++		OverlayVolume *overlayVolume = (OverlayVolume *)volume-&gt;private_volume;
++		if (overlayVolume-&gt;WriteSupport())
++			info-&gt;flags &amp;= ~B_FS_IS_READONLY;
++		info-&gt;flags |= B_FS_HAS_MIME | B_FS_HAS_ATTR /*| B_FS_HAS_QUERY*/;
+ 		return B_OK;
+ 	}
+ 
+@@ -1672,7 +1990,7 @@
+ 			return status;
+ 
+ 		OverlayInode *node = new(std::nothrow) OverlayInode(
+-			volume-&gt;super_volume, vnode);
++			(OverlayVolume *)volume-&gt;private_volume, vnode, id);
+ 		if (node == NULL) {
+ 			vnode-&gt;ops-&gt;put_vnode(volume-&gt;super_volume, vnode, reenter);
+ 			return B_NO_MEMORY;
+@@ -1802,10 +2120,17 @@
+ 
+ 
+ static status_t
++overlay_all_layers_mounted(fs_volume *volume)
++{
++	return ((OverlayVolume *)volume-&gt;private_volume)-&gt;AllLayersMounted();
++}
++
++
++static status_t
+ overlay_create_sub_vnode(fs_volume *volume, ino_t id, fs_vnode *vnode)
+ {
+-	OverlayInode *node = new(std::nothrow) OverlayInode(volume-&gt;super_volume,
+-		vnode);
++	OverlayInode *node = new(std::nothrow) OverlayInode(
++		(OverlayVolume *)volume-&gt;private_volume, vnode, id);
+ 	if (node == NULL)
+ 		return B_NO_MEMORY;
+ 
+@@ -1853,6 +2178,7 @@
+ 	&amp;overlay_read_query,
+ 	&amp;overlay_rewind_query,
+ 
++	&amp;overlay_all_layers_mounted,
+ 	&amp;overlay_create_sub_vnode,
+ 	&amp;overlay_delete_sub_vnode
+ };
+@@ -1866,6 +2192,10 @@
+ 	const char *args, ino_t *rootID)
+ {
+ 	TRACE_VOLUME(&quot;mounting overlay\n&quot;);
++	volume-&gt;private_volume = new(std::nothrow) OverlayVolume(volume);
++	if (volume-&gt;private_volume == NULL)
++		return B_NO_MEMORY;
++
+ 	volume-&gt;ops = &sOverlayVolumeOps;
+ 	return B_OK;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014417.html">[Haiku-commits] r29248 - in haiku/trunk: headers/os/drivers	src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="014420.html">[Haiku-commits] r29249	-	haiku/trunk/src/add-ons/kernel/file_systems/overlay
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14418">[ date ]</a>
+              <a href="thread.html#14418">[ thread ]</a>
+              <a href="subject.html#14418">[ subject ]</a>
+              <a href="author.html#14418">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

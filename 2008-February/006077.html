@@ -1,0 +1,468 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23953 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23953%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200802122020.m1CKKcqG003518%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006074.html">
+   <LINK REL="Next"  HREF="006078.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23953 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23953%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200802122020.m1CKKcqG003518%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23953 - in haiku/trunk: headers/private/kernel	src/system/kernel">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Tue Feb 12 21:20:38 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006074.html">[Haiku-commits] r23952 - haiku/vendor/bash
+</A></li>
+        <LI>Next message: <A HREF="006078.html">[Haiku-commits] r23954 -	haiku/trunk/src/add-ons/kernel/drivers/bluetooth/h2/h2generic
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6077">[ date ]</a>
+              <a href="thread.html#6077">[ thread ]</a>
+              <a href="subject.html#6077">[ subject ]</a>
+              <a href="author.html#6077">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-02-12 21:20:35 +0100 (Tue, 12 Feb 2008)
+New Revision: 23953
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23953&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23953&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/tracing_config.h
+   haiku/trunk/src/system/kernel/heap.cpp
+Log:
+Adding two debug features to the new heap implementation:
+
+* Tracing of allocations, reallocations and frees
+* Leak checking infrastructure to dump allocations
+
+The leak checking code records the team and thread id when an allocation is
+made as well as stores the originally requested size. It also adds the
+&quot;allocations&quot; debugger command that can dump all current allocations (usually
+a huge list) or filter by either a team or thread id. This way it's easily
+possible to find leftover allocations of no more active teams/threads.
+Combined with the tracing support one might be able to track down the time and
+reason of an allocation and possibly find the corresponding leak if it is one.
+Note that kernel heap leak checking has to be enabled manually by setting the
+KERNEL_HEAP_LEAK_CHECK define to 1.
+
+Modified: haiku/trunk/headers/private/kernel/tracing_config.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/tracing_config.h	2008-02-12 10:07:09 UTC (rev 23952)
++++ haiku/trunk/headers/private/kernel/tracing_config.h	2008-02-12 20:20:35 UTC (rev 23953)
+@@ -18,6 +18,7 @@
+ 
+ //#define BMESSAGE_TRACING
+ //#define BLOCK_CACHE_TRANSACTION_TRACING
++//#define KERNEL_HEAP_TRACING
+ //#define RUNTIME_LOADER_TRACING
+ //#define SIGNAL_TRACING
+ //#define SYSCALL_TRACING
+
+Modified: haiku/trunk/src/system/kernel/heap.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/heap.cpp	2008-02-12 10:07:09 UTC (rev 23952)
++++ haiku/trunk/src/system/kernel/heap.cpp	2008-02-12 20:20:35 UTC (rev 23953)
+@@ -16,6 +16,9 @@
+ #include &lt;malloc.h&gt;
+ #include &lt;signal.h&gt;
+ #include &lt;string.h&gt;
++#include &lt;team.h&gt;
++#include &lt;thread.h&gt;
++#include &lt;tracing.h&gt;
+ #include &lt;vm.h&gt;
+ 
+ //#define TRACE_HEAP
+@@ -31,7 +34,17 @@
+ #define PARANOID_KFREE 1
+ // validate sanity of the heap after each operation (slow!)
+ #define PARANOID_VALIDATION 0
++// store size, thread and team info at the end of each allocation block
++#define KERNEL_HEAP_LEAK_CHECK 0
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++typedef struct heap_leak_check_info_s {
++	size_t		size;
++	thread_id	thread;
++	team_id		team;
++} heap_leak_check_info;
++#endif
++
+ typedef struct heap_page_s {
+ 	uint16			index;
+ 	uint16			bin_index : 5;
+@@ -74,6 +87,83 @@
+ static sem_id sHeapGrownNotify = -1;
+ 
+ 
++// #pragma mark - Tracing
++
++#ifdef KERNEL_HEAP_TRACING
++namespace KernelHeapTracing {
++
++class Allocate : public AbstractTraceEntry {
++	public:
++		Allocate(addr_t address, size_t size)
++			:	fAddress(address),
++				fSize(size)
++		{
++			Initialized();
++		}
++
++		virtual void AddDump(TraceOutput &amp;out)
++		{
++			out.Print(&quot;heap allocate: 0x%08lx (%lu bytes)&quot;, fAddress, fSize);
++		}
++
++	private:
++		addr_t	fAddress;
++		size_t	fSize;
++};
++
++
++class Reallocate : public AbstractTraceEntry {
++	public:
++		Reallocate(addr_t oldAddress, addr_t newAddress, size_t newSize)
++			:	fOldAddress(oldAddress),
++				fNewAddress(newAddress),
++				fNewSize(newSize)
++		{
++			Initialized();
++		};
++
++		virtual void AddDump(TraceOutput &amp;out)
++		{
++			out.Print(&quot;heap reallocate: 0x%08lx -&gt; 0x%08lx (%lu bytes)&quot;,
++				fOldAddress, fNewAddress, fNewSize);
++		}
++
++	private:
++		addr_t	fOldAddress;
++		addr_t	fNewAddress;
++		size_t	fNewSize;
++};
++
++
++class Free : public AbstractTraceEntry {
++	public:
++		Free(addr_t address)
++			:	fAddress(address)
++		{
++			Initialized();
++		};
++
++		virtual void AddDump(TraceOutput &amp;out)
++		{
++			out.Print(&quot;heap free: 0x%08lx&quot;, fAddress);
++		}
++
++	private:
++		addr_t	fAddress;
++};
++
++
++} // namespace KernelHeapTracing
++
++#	define T(x)	if (!kernel_startup) new(std::nothrow) KernelHeapTracing::x;
++#else
++#	define T(x)	;
++#endif
++
++
++// #pragma mark - Debug functions
++
++
+ static void
+ dump_page(heap_page *page)
+ {
+@@ -129,6 +219,104 @@
+ }
+ 
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++static int
++dump_allocations(int argc, char **argv)
++{
++	team_id team = -1;
++	thread_id thread = -1;
++	if (argc == 3) {
++		if (strcmp(argv[1], &quot;team&quot;) == 0)
++			team = strtoul(argv[2], NULL, 0);
++		else if (strcmp(argv[1], &quot;thread&quot;) == 0)
++			thread = strtoul(argv[2], NULL, 0);
++		else {
++			print_debugger_command_usage(argv[0]);
++			return 0;
++		}
++	} else if (argc != 1) {
++		print_debugger_command_usage(argv[0]);
++		return 0;
++	}
++
++	size_t totalSize = 0;
++	uint32 totalCount = 0;
++	heap_allocator *heap = sHeapList;
++	while (heap) {
++		// go through all the pages
++		heap_leak_check_info *info = NULL;
++		for (uint32 i = 0; i &lt; heap-&gt;page_count; i++) {
++			heap_page *page = &amp;heap-&gt;page_table[i];
++			if (!page-&gt;in_use)
++				continue;
++
++			addr_t base = heap-&gt;base + i * B_PAGE_SIZE;
++			if (page-&gt;bin_index &lt; heap-&gt;bin_count) {
++				// page is used by a small allocation bin
++				uint32 elementCount = page-&gt;empty_index;
++				size_t elementSize = heap-&gt;bins[page-&gt;bin_index].element_size;
++				for (uint32 j = 0; j &lt; elementCount; j++, base += elementSize) {
++					// walk the free list to see if this element is in use
++					bool elementInUse = true;
++					for (addr_t *temp = page-&gt;free_list; temp != NULL; temp = (addr_t *)*temp) {
++						if ((addr_t)temp == base) {
++							elementInUse = false;
++							break;
++						}
++					}
++
++					if (!elementInUse)
++						continue;
++
++					info = (heap_leak_check_info *)(base + elementSize
++						- sizeof(heap_leak_check_info));
++
++					if ((team == -1 &amp;&amp; thread == -1)
++						|| (team == -1 &amp;&amp; info-&gt;thread == thread)
++						|| (thread == -1 &amp;&amp; info-&gt;team == team)) {
++						// interesting...
++						dprintf(&quot;team: % 6ld; thread: % 6ld; address: 0x%08lx; size: %lu bytes\n&quot;,
++							info-&gt;team, info-&gt;thread, base, info-&gt;size);
++						totalSize += info-&gt;size;
++						totalCount++;
++					}
++				}
++			} else {
++				// page is used by a big allocation, find the page count
++				uint32 pageCount = 1;
++				while (i + pageCount &lt; heap-&gt;page_count
++					&amp;&amp; heap-&gt;page_table[i + pageCount].in_use
++					&amp;&amp; heap-&gt;page_table[i + pageCount].bin_index == heap-&gt;bin_count
++					&amp;&amp; heap-&gt;page_table[i + pageCount].allocation_id == page-&gt;allocation_id)
++					pageCount++;
++
++				info = (heap_leak_check_info *)(base + pageCount * B_PAGE_SIZE
++					- sizeof(heap_leak_check_info));
++
++				if ((team == -1 &amp;&amp; thread == -1)
++					|| (team == -1 &amp;&amp; info-&gt;thread == thread)
++					|| (thread == -1 &amp;&amp; info-&gt;team == team)) {
++					// interesting...
++					dprintf(&quot;team: % 6ld; thread: % 6ld; address: 0x%08lx; size: %lu bytes\n&quot;,
++						info-&gt;team, info-&gt;thread, base, info-&gt;size);
++					totalSize += info-&gt;size;
++					totalCount++;
++				}
++
++				// skip the allocated pages
++				i += pageCount - 1;
++			}
++		}
++
++		heap = heap-&gt;next;
++	}
++
++	dprintf(&quot;total allocations: %lu; total bytes: %lu\n&quot;, totalCount, totalSize);
++	return 0;
++}
++#endif // KERNEL_HEAP_LEAK_CHECK
++
++
+ #if PARANOID_VALIDATION
+ static void
+ heap_validate_heap(heap_allocator *heap)
+@@ -238,9 +426,12 @@
+ 
+ 	mutex_unlock(&amp;heap-&gt;lock);
+ }
+-#endif
++#endif // PARANOID_VALIDATION
+ 
+ 
++// #pragma mark - Heap functions
++
++
+ heap_allocator *
+ heap_attach(addr_t base, size_t size, bool postSem)
+ {
+@@ -371,6 +562,13 @@
+ 			page-&gt;next = page-&gt;prev = NULL;
+ 		}
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++		heap_leak_check_info *info = (heap_leak_check_info *)((addr_t)address
++			+ bin-&gt;element_size - sizeof(heap_leak_check_info));
++		info-&gt;size = size - sizeof(heap_leak_check_info);
++		info-&gt;thread = (kernel_startup ? 0 : thread_get_current_thread_id());
++		info-&gt;team = (kernel_startup ? 0 : team_get_current_team_id());
++#endif
+ 		return address;
+ 	}
+ 
+@@ -400,6 +598,15 @@
+ 			bin-&gt;page_list = page;
+ 		}
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++		heap_leak_check_info *info = (heap_leak_check_info *)(heap-&gt;base
++			+ page-&gt;index * B_PAGE_SIZE + bin-&gt;element_size
++			- sizeof(heap_leak_check_info));
++		info-&gt;size = size - sizeof(heap_leak_check_info);
++		info-&gt;thread = (kernel_startup ? 0 : thread_get_current_thread_id());
++		info-&gt;team = (kernel_startup ? 0 : team_get_current_team_id());
++#endif
++
+ 		// we return the first slot in this page
+ 		return (void *)(heap-&gt;base + page-&gt;index * B_PAGE_SIZE);
+ 	}
+@@ -441,6 +648,13 @@
+ 		page-&gt;allocation_id = allocationID;
+ 	}
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++	heap_leak_check_info *info = (heap_leak_check_info *)(heap-&gt;base
++		+ (first + pageCount) * B_PAGE_SIZE - sizeof(heap_leak_check_info));
++	info-&gt;size = size - sizeof(heap_leak_check_info);
++	info-&gt;thread = (kernel_startup ? 0 : thread_get_current_thread_id());
++	info-&gt;team = (kernel_startup ? 0 : team_get_current_team_id());
++#endif
+ 	return (void *)(heap-&gt;base + first * B_PAGE_SIZE);
+ }
+ 
+@@ -468,6 +682,10 @@
+ 
+ 	mutex_lock(&amp;heap-&gt;lock);
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++	size += sizeof(heap_leak_check_info);
++#endif
++
+ 	// ToDo: that code &quot;aligns&quot; the buffer because the bins are always
+ 	//	aligned on their bin size
+ 	if (size &lt; alignment)
+@@ -491,6 +709,11 @@
+ 			|| heap-&gt;free_pages-&gt;next-&gt;next == NULL);
+ 	}
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++	size -= sizeof(heap_leak_check_info);
++#endif
++
++	T(Allocate((addr_t)address, size));
+ 	mutex_unlock(&amp;heap-&gt;lock);
+ 	if (address == NULL)
+ 		return address;
+@@ -619,6 +842,7 @@
+ 		}
+ 	}
+ 
++	T(Free((addr_t)address));
+ 	mutex_unlock(&amp;heap-&gt;lock);
+ 	return B_OK;
+ }
+@@ -670,14 +894,32 @@
+ 
+ 	mutex_unlock(&amp;heap-&gt;lock);
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++	newSize += sizeof(heap_leak_check_info);
++#endif
++
+ 	// does the new allocation simply fit in the old allocation?
+ 	if (newSize &gt; minSize &amp;&amp; newSize &lt;= maxSize) {
++#if KERNEL_HEAP_LEAK_CHECK
++		// update the size info (the info is at the end so stays where it is)
++		heap_leak_check_info *info = (heap_leak_check_info *)((addr_t)address + maxSize);
++		info-&gt;size = newSize - sizeof(heap_leak_check_info);
++		newSize -= sizeof(heap_leak_check_info);
++#endif
++
++		T(Reallocate((addr_t)address, (addr_t)address, newSize));
+ 		*newAddress = address;
+ 		return B_OK;
+ 	}
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++	// new leak check info will be created with the malloc below
++	newSize -= sizeof(heap_leak_check_info);
++#endif
++
+ 	// if not, allocate a new chunk of memory
+ 	*newAddress = malloc(newSize);
++	T(Reallocate((addr_t)address, (addr_t)*newAddress, newSize));
+ 	if (*newAddress == NULL) {
+ 		// we tried but it didn't work out, but still the operation is done
+ 		return B_OK;
+@@ -749,7 +991,15 @@
+ 	sHeapList = heap_attach(base, size, false);
+ 
+ 	// set up some debug commands
+-	add_debugger_command(&quot;heap&quot;, &amp;dump_heap_list, &quot;dump stats about the kernel heap(s)&quot;);
++	add_debugger_command(&quot;heap&quot;, &amp;dump_heap_list, &quot;Dump stats about the kernel heap(s)&quot;);
++#if KERNEL_HEAP_LEAK_CHECK
++	add_debugger_command_etc(&quot;allocations&quot;, &amp;dump_allocations,
++		&quot;Dump current allocations&quot;, &quot;[(\&quot;team\&quot; | \&quot;thread\&quot;) &lt;id&gt;]\n&quot;
++		&quot;If no parameters are given, all current alloactions are dumped.\n&quot;
++		&quot;If either \&quot;team\&quot; or \&quot;thread\&quot; is specified as the first argument,\n&quot;
++		&quot;only allocations matching the team or thread id given in the second\n&quot;
++		&quot;argument are printed.\n&quot;, 0);
++#endif
+ 	return B_OK;
+ }
+ 
+@@ -794,7 +1044,7 @@
+ }
+ 
+ 
+-//	#pragma mark -
++//	#pragma mark - Public API
+ 
+ 
+ void *
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006074.html">[Haiku-commits] r23952 - haiku/vendor/bash
+</A></li>
+	<LI>Next message: <A HREF="006078.html">[Haiku-commits] r23954 -	haiku/trunk/src/add-ons/kernel/drivers/bluetooth/h2/h2generic
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6077">[ date ]</a>
+              <a href="thread.html#6077">[ thread ]</a>
+              <a href="subject.html#6077">[ subject ]</a>
+              <a href="author.html#6077">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

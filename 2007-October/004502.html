@@ -1,0 +1,243 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22731 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22731%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200710260915.l9Q9FX6C012882%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004501.html">
+   <LINK REL="Next"  HREF="004503.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22731 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22731%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200710260915.l9Q9FX6C012882%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22731 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Oct 26 11:15:33 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004501.html">[Haiku-commits] r22730 - in buildtools/trunk: binutils	legacy/binutils
+</A></li>
+        <LI>Next message: <A HREF="004503.html">[Haiku-commits] r22732 - in haiku/trunk/headers/build: .	private/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4502">[ date ]</a>
+              <a href="thread.html#4502">[ thread ]</a>
+              <a href="subject.html#4502">[ subject ]</a>
+              <a href="author.html#4502">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-10-26 11:15:33 +0200 (Fri, 26 Oct 2007)
+New Revision: 22731
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22731&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22731&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+Log:
+* The file cache now remembers the last 3 accesses to be able to detect
+  sequential access.
+* This is now used to let the cache free some pages (or schedule them to be
+  written back) before vm_reserve_pages() is called, but only if that cache
+  is not mapped, and there is a memory shortage.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-10-26 01:52:48 UTC (rev 22730)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-10-26 09:15:33 UTC (rev 22731)
+@@ -22,6 +22,7 @@
+ #include &lt;vm.h&gt;
+ #include &lt;vm_page.h&gt;
+ #include &lt;vm_cache.h&gt;
++#include &lt;vm_low_memory.h&gt;
+ 
+ 
+ //#define TRACE_FILE_CACHE
+@@ -40,6 +41,8 @@
+ 	// must be smaller than MAX_FILE_IO_VECS
+ 	// ToDo: find out how much of these are typically used
+ 
++#define LAST_ACCESSES		3
++
+ struct file_extent {
+ 	off_t			offset;
+ 	file_io_vec		disk;
+@@ -67,6 +70,12 @@
+ 	struct vnode	*device;
+ 	void			*cookie;
+ 	file_map		map;
++	off_t			last_access[LAST_ACCESSES];
++		// TODO: it would probably be enough to only store the least
++		//	significant 31 bits, and make this uint32 (one bit for
++		//	write vs. read)
++	int32			last_access_index;
++	bool			last_access_was_write;
+ };
+ 
+ 
+@@ -304,6 +313,85 @@
+ }
+ 
+ 
++static inline bool
++access_is_sequential(file_cache_ref *ref)
++{
++	return ref-&gt;last_access[ref-&gt;last_access_index] != 0;
++}
++
++
++static inline void
++push_access(file_cache_ref *ref, off_t offset, size_t bytes, bool isWrite)
++{
++	TRACE((&quot;%p: push %Ld, %ld, %s\n&quot;, ref, offset, bytes,
++		isWrite ? &quot;write&quot; : &quot;read&quot;));
++
++	int32 index = ref-&gt;last_access_index;
++	int32 previous = index - 1;
++	if (previous &lt; 0)
++		previous = LAST_ACCESSES - 1;
++
++	if (offset != ref-&gt;last_access[previous])
++		ref-&gt;last_access[previous] = 0;
++
++	// we remember writes as negative offsets
++	if (isWrite)
++		ref-&gt;last_access[index] = -offset - bytes;
++	else
++		ref-&gt;last_access[index] = offset + bytes;
++
++	if (++index &gt;= LAST_ACCESSES)
++		index = 0;
++	ref-&gt;last_access_index = index;
++}
++
++
++static void
++reserve_pages(file_cache_ref *ref, size_t reservePages, bool isWrite)
++{
++	if (vm_low_memory_state() != B_NO_LOW_MEMORY) {
++		vm_cache *cache = ref-&gt;cache;
++		mutex_lock(&amp;cache-&gt;lock);
++
++		if (list_is_empty(&amp;cache-&gt;consumers) &amp;&amp; cache-&gt;areas == NULL
++			&amp;&amp; access_is_sequential(ref)) {
++			// we are not mapped, and we're accessed sequentially
++
++			if (isWrite) {
++				// just schedule some pages to be written back
++				for (vm_page *page = cache-&gt;page_list; page != NULL;
++						page = page-&gt;cache_next) {
++					if (page-&gt;state == PAGE_STATE_MODIFIED) {
++						// TODO: for now, we only schedule one
++						vm_page_schedule_write_page(page);
++						break;
++					}
++				}
++			} else {
++				// free some pages from our cache
++				// TODO: start with oldest (requires the page list to be a real list)!
++				uint32 left = reservePages;
++				vm_page *next;
++				for (vm_page *page = cache-&gt;page_list;
++						page != NULL &amp;&amp; left &gt; 0; page = next) {
++					next = page-&gt;cache_next;
++
++					if (page-&gt;state != PAGE_STATE_MODIFIED
++						&amp;&amp; page-&gt;state != PAGE_STATE_BUSY) {
++						vm_cache_remove_page(cache, page);
++						vm_page_set_state(page, PAGE_STATE_FREE);
++						left--;
++					}
++				}
++			}
++		}
++		mutex_unlock(&amp;cache-&gt;lock);
++	}
++
++	vm_page_reserve_pages(reservePages);
++}
++
++
+ /*!
+ 	Does the dirty work of translating the request into actual disk offsets
+ 	and reads to or writes from the supplied iovecs as specified by \a doWrite.
+@@ -320,6 +408,8 @@
+ 	size_t fileVecCount = MAX_FILE_IO_VECS;
+ 	size_t numBytes = *_numBytes;
+ 
++	push_access(ref, offset, numBytes, doWrite);
++
+ 	status_t status = get_file_map(ref, offset, numBytes, fileVecs,
+ 		&amp;fileVecCount);
+ 	if (status &lt; B_OK &amp;&amp; status != B_BUFFER_OVERFLOW) {
+@@ -608,7 +698,7 @@
+ 		}
+ 	}
+ 
+-	vm_page_reserve_pages(reservePages);
++	reserve_pages(ref, reservePages, false);
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 
+ 	// make the pages accessible in the cache
+@@ -733,7 +823,7 @@
+ 	}
+ 
+ 	if (status == B_OK)
+-		vm_page_reserve_pages(reservePages);
++		reserve_pages(ref, reservePages, true);
+ 
+ 	mutex_lock(&amp;ref-&gt;cache-&gt;lock);
+ 
+@@ -840,7 +930,7 @@
+ 		(bytesLeft + B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT);
+ 	size_t reservePages = 0;
+ 
+-	vm_page_reserve_pages(lastReservedPages);
++	reserve_pages(ref, lastReservedPages, doWrite);
+ 	MutexLocker locker(cache-&gt;lock);
+ 
+ 	while (bytesLeft &gt; 0) {
+@@ -1166,6 +1256,9 @@
+ 	if (ref == NULL)
+ 		return NULL;
+ 
++	memset(ref-&gt;last_access, 0, sizeof(ref-&gt;last_access));
++	ref-&gt;last_access_index = 0;
++
+ 	// TODO: delay vm_cache creation until data is
+ 	//	requested/written for the first time? Listing lots of
+ 	//	files in Tracker (and elsewhere) could be slowed down.
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004501.html">[Haiku-commits] r22730 - in buildtools/trunk: binutils	legacy/binutils
+</A></li>
+	<LI>Next message: <A HREF="004503.html">[Haiku-commits] r22732 - in haiku/trunk/headers/build: .	private/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4502">[ date ]</a>
+              <a href="thread.html#4502">[ thread ]</a>
+              <a href="subject.html#4502">[ subject ]</a>
+              <a href="author.html#4502">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

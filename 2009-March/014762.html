@@ -1,0 +1,402 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29458 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29458%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay&In-Reply-To=%3C200903090126.n291Ql6T024625%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014761.html">
+   <LINK REL="Next"  HREF="014763.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29458 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29458%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay&In-Reply-To=%3C200903090126.n291Ql6T024625%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29458 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Mon Mar  9 02:26:47 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014761.html">[Haiku-commits] r29457 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/haiku
+</A></li>
+        <LI>Next message: <A HREF="014763.html">[Haiku-commits] r29459 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/haiku
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14762">[ date ]</a>
+              <a href="thread.html#14762">[ thread ]</a>
+              <a href="subject.html#14762">[ subject ]</a>
+              <a href="author.html#14762">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-03-09 02:26:45 +0100 (Mon, 09 Mar 2009)
+New Revision: 29458
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29458&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29458&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp
+Log:
+* This should mostly complete the write_overlay.
+* Fix memory leaks here and there.
+* Virtualize the dirent list.
+* Handle &quot;.&quot; and &quot;..&quot; ourselfs as at least iso9660 cannot really know them in
+  the readdir call and therefore returns different values than on lookup.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp	2009-03-09 01:11:18 UTC (rev 29457)
++++ haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp	2009-03-09 01:26:45 UTC (rev 29458)
+@@ -87,7 +87,7 @@
+ 							OverlayInode(OverlayVolume *volume,
+ 								fs_vnode *superVnode, ino_t inodeNumber,
+ 								OverlayInode *parentDir = NULL,
+-								mode_t mode = 0);
++								const char *name = NULL, mode_t mode = 0);
+ 							~OverlayInode();
+ 
+ 		status_t			InitCheck();
+@@ -99,7 +99,11 @@
+ 		fs_vnode *			SuperVnode() { return &fSuperVnode; }
+ 		ino_t				InodeNumber() { return fInodeNumber; }
+ 
++		void				SetParentDir(OverlayInode *parentDir);
++		OverlayInode *		ParentDir() { return fParentDir; }
++
+ 		status_t			Lookup(const char *name, ino_t *inodeNumber);
++		status_t			GetName(char *buffer, size_t bufferSize);
+ 
+ 		status_t			ReadStat(struct stat *stat);
+ 		status_t			WriteStat(const struct stat *stat, uint32 statMask);
+@@ -139,6 +143,7 @@
+ 
+ 		OverlayVolume *		fVolume;
+ 		OverlayInode *		fParentDir;
++		const char *		fName;
+ 		fs_vnode			fSuperVnode;
+ 		ino_t				fInodeNumber;
+ 		write_buffer *		fWriteBuffers;
+@@ -157,7 +162,7 @@
+ 
+ OverlayVolume::OverlayVolume(fs_volume *volume)
+ 	:	fVolume(volume),
+-		fCurrentInodeNumber((ino_t)1 &lt;&lt; 32)
++		fCurrentInodeNumber((ino_t)1 &lt;&lt; 60)
+ {
+ }
+ 
+@@ -171,9 +176,10 @@
+ 
+ 
+ OverlayInode::OverlayInode(OverlayVolume *volume, fs_vnode *superVnode,
+-	ino_t inodeNumber, OverlayInode *parentDir, mode_t mode)
++	ino_t inodeNumber, OverlayInode *parentDir, const char *name, mode_t mode)
+ 	:	fVolume(volume),
+ 		fParentDir(parentDir),
++		fName(name),
+ 		fInodeNumber(inodeNumber),
+ 		fWriteBuffers(NULL),
+ 		fOriginalNodeLength(-1),
+@@ -228,32 +234,52 @@
+ }
+ 
+ 
++void
++OverlayInode::SetParentDir(OverlayInode *parentDir)
++{
++	fParentDir = parentDir;
++}
++
++
+ status_t
+ OverlayInode::Lookup(const char *name, ino_t *inodeNumber)
+ {
+-	if (strcmp(name, &quot;.&quot;) == 0) {
+-		*inodeNumber = fInodeNumber;
+-		return get_vnode(SuperVolume(), *inodeNumber, NULL);
+-	}
++	if (!fHasDirents)
++		_PopulateDirents();
+ 
+-	if (fIsVirtual &amp;&amp; strcmp(name, &quot;..&quot;) == 0) {
+-		*inodeNumber = fParentDir-&gt;InodeNumber();
+-		return get_vnode(Volume(), *inodeNumber, NULL);
+-	}
+-
+ 	for (uint32 i = 0; i &lt; fDirentCount; i++) {
+ 		if (strcmp(fDirents[i]-&gt;name, name) == 0) {
+ 			*inodeNumber = fDirents[i]-&gt;inode_number;
+-			return get_vnode(SuperVolume(), *inodeNumber, NULL);
++
++			OverlayInode *node = NULL;
++			status_t result = get_vnode(Volume(), *inodeNumber,
++				(void **)&amp;node);
++			if (result == B_OK &amp;&amp; node != NULL)
++				node-&gt;SetParentDir(this);
++			return result;
+ 		}
+ 	}
+ 
+-	if (!fHasDirents &amp;&amp; !fIsVirtual &amp;&amp; fSuperVnode.ops-&gt;lookup != NULL) {
+-		return fSuperVnode.ops-&gt;lookup(SuperVolume(), &amp;fSuperVnode, name,
+-			inodeNumber);
++	return B_ENTRY_NOT_FOUND;
++}
++
++
++status_t
++OverlayInode::GetName(char *buffer, size_t bufferSize)
++{
++	if (fIsVirtual) {
++		if (fName == NULL)
++			return B_UNSUPPORTED;
++
++		strlcpy(buffer, fName, bufferSize);
++		return B_OK;
+ 	}
+ 
+-	return B_ENTRY_NOT_FOUND;
++	if (fSuperVnode.ops-&gt;get_vnode_name == NULL)
++		return B_UNSUPPORTED;
++
++	return fSuperVnode.ops-&gt;get_vnode_name(SuperVolume(), &amp;fSuperVnode, buffer,
++		bufferSize);
+ }
+ 
+ 
+@@ -617,10 +643,11 @@
+ 
+ 
+ status_t
+-OverlayInode::CreateSymlink(const char *name, const char *path, int perms)
++OverlayInode::CreateSymlink(const char *name, const char *path, int mode)
+ {
+ 	OverlayInode *newNode = NULL;
+-	status_t result = _CreateCommon(name, S_IFLNK, perms, NULL, &amp;newNode);
++	// TODO: find out why mode is ignored
++	status_t result = _CreateCommon(name, S_IFLNK, 0777, NULL, &amp;newNode);
+ 	if (result != B_OK)
+ 		return result;
+ 
+@@ -653,9 +680,12 @@
+ 	if (!fHasDirents)
+ 		_PopulateDirents();
+ 
+-	for (uint32 i = 0; i &lt; fDirentCount; i++)
+-		if (strcmp(fDirents[i]-&gt;name, entry-&gt;name) == 0)
++	for (uint32 i = 0; i &lt; fDirentCount; i++) {
++		if (strcmp(fDirents[i]-&gt;name, entry-&gt;name) == 0) {
++			TRACE(&quot;entry \&quot;%s\&quot; exists\n&quot;, entry-&gt;name);
+ 			return B_FILE_EXISTS;
++		}
++	}
+ 
+ 	overlay_dirent **newDirents = (overlay_dirent **)realloc(fDirents,
+ 		sizeof(overlay_dirent *) * (fDirentCount + 1));
+@@ -709,47 +739,46 @@
+ 	if (fHasDirents)
+ 		return B_OK;
+ 
+-	if (fIsVirtual || fSuperVnode.ops-&gt;open_dir == NULL
+-		|| fSuperVnode.ops-&gt;read_dir == NULL) {
+-		fDirents = (overlay_dirent **)malloc(sizeof(overlay_dirent *) * 2);
+-		if (fDirents == NULL)
++	fDirents = (overlay_dirent **)malloc(sizeof(overlay_dirent *) * 2);
++	if (fDirents == NULL)
++		return B_NO_MEMORY;
++
++	const char *names[] = { &quot;.&quot;, &quot;..&quot; };
++	ino_t inodes[] = { fInodeNumber,
++		fParentDir != NULL ? fParentDir-&gt;InodeNumber() : 0 };
++	for (uint32 i = 0; i &lt; 2; i++) {
++		fDirents[i] = (overlay_dirent *)malloc(sizeof(overlay_dirent));
++		if (fDirents[i] == NULL)
+ 			return B_NO_MEMORY;
+ 
+-		const char *names[] = { &quot;.&quot;, &quot;..&quot; };
+-		ino_t inodes[] = { fInodeNumber,
+-			fParentDir != NULL ? fParentDir-&gt;InodeNumber() : 0 };
+-		for (uint32 i = 0; i &lt; 2; i++) {
+-			fDirents[i] = (overlay_dirent *)malloc(sizeof(overlay_dirent));
+-			if (fDirents[i] == NULL)
+-				return B_NO_MEMORY;
+-
+-			fDirents[i]-&gt;inode_number = inodes[i];
+-			fDirents[i]-&gt;name = strdup(names[i]);
+-			if (fDirents[i]-&gt;name == NULL) {
+-				free(fDirents[i]);
+-				return B_NO_MEMORY;
+-			}
+-
+-			fDirentCount++;
++		fDirents[i]-&gt;inode_number = inodes[i];
++		fDirents[i]-&gt;name = strdup(names[i]);
++		if (fDirents[i]-&gt;name == NULL) {
++			free(fDirents[i]);
++			return B_NO_MEMORY;
+ 		}
+ 
+-		fHasDirents = true;
+-		return B_OK;
++		fDirentCount++;
+ 	}
+ 
+ 	fHasDirents = true;
++	if (fIsVirtual || fSuperVnode.ops-&gt;open_dir == NULL
++		|| fSuperVnode.ops-&gt;read_dir == NULL)
++		return B_OK;
++
++	// we don't really care about errors from here on
+ 	void *superCookie = NULL;
+ 	status_t result = fSuperVnode.ops-&gt;open_dir(SuperVolume(),
+ 		&amp;fSuperVnode, &amp;superCookie);
+ 	if (result != B_OK)
+-		return result;
++		return B_OK;
+ 
+ 	size_t bufferSize = sizeof(struct dirent) + B_FILE_NAME_LENGTH;
+ 	struct dirent *buffer = (struct dirent *)malloc(bufferSize);
+ 	if (buffer == NULL)
+-		return B_NO_MEMORY;
++		goto close_dir;
+ 
+-	while (result == B_OK) {
++	while (true) {
+ 		uint32 num = 1;
+ 		result = fSuperVnode.ops-&gt;read_dir(SuperVolume(),
+ 			&amp;fSuperVnode, superCookie, buffer, bufferSize, &amp;num);
+@@ -758,36 +787,49 @@
+ 
+ 		overlay_dirent **newDirents = (overlay_dirent **)realloc(fDirents,
+ 			sizeof(overlay_dirent *) * (fDirentCount + num));
+-		if (newDirents == NULL)
++		if (newDirents == NULL) {
++			TRACE_ALWAYS(&quot;failed to allocate storage for dirents\n&quot;);
+ 			break;
++		}
+ 
+ 		fDirents = newDirents;
+ 		struct dirent *dirent = buffer;
+ 		for (uint32 i = 0; i &lt; num; i++) {
+-			overlay_dirent *entry = (overlay_dirent *)malloc(
+-				sizeof(overlay_dirent));
+-			if (entry == NULL)
+-				break;
++			if (strcmp(dirent-&gt;d_name, &quot;.&quot;) != 0
++				&amp;&amp; strcmp(dirent-&gt;d_name, &quot;..&quot;) != 0) {
++				overlay_dirent *entry = (overlay_dirent *)malloc(
++					sizeof(overlay_dirent));
++				if (entry == NULL) {
++					TRACE_ALWAYS(&quot;failed to allocate storage for dirent\n&quot;);
++					break;
++				}
+ 
+-			entry-&gt;inode_number = dirent-&gt;d_ino;
+-			entry-&gt;name = strdup(dirent-&gt;d_name);
+-			if (entry-&gt;name == NULL) {
+-				free(entry);
+-				break;
++				entry-&gt;inode_number = dirent-&gt;d_ino;
++				entry-&gt;name = strdup(dirent-&gt;d_name);
++				if (entry-&gt;name == NULL) {
++					TRACE_ALWAYS(&quot;failed to duplicate dirent entry name\n&quot;);
++					free(entry);
++					break;
++				}
++
++				fDirents[fDirentCount++] = entry;
+ 			}
+ 
+-			fDirents[fDirentCount++] = entry;
+ 			dirent = (struct dirent *)((uint8 *)dirent + dirent-&gt;d_reclen);
+ 		}
+ 	}
+ 
++	free(buffer);
++
++close_dir:
+ 	if (fSuperVnode.ops-&gt;close_dir != NULL)
+ 		fSuperVnode.ops-&gt;close_dir(SuperVolume(), &amp;fSuperVnode, superCookie);
+ 
+-	if (fSuperVnode.ops-&gt;free_dir_cookie != NULL)
+-		fSuperVnode.ops-&gt;free_dir_cookie(SuperVolume(), &amp;fSuperVnode, superCookie);
++	if (fSuperVnode.ops-&gt;free_dir_cookie != NULL) {
++		fSuperVnode.ops-&gt;free_dir_cookie(SuperVolume(), &amp;fSuperVnode,
++			superCookie);
++	}
+ 
+-	free(buffer);
+ 	return B_OK;
+ }
+ 
+@@ -815,7 +857,7 @@
+ 	entry-&gt;inode_number = fVolume-&gt;BuildInodeNumber();
+ 
+ 	OverlayInode *node = new(std::nothrow) OverlayInode(fVolume, NULL,
+-		entry-&gt;inode_number, this, perms | type);
++		entry-&gt;inode_number, this, entry-&gt;name, (perms &amp; S_IUMSK) | type);
+ 	if (node == NULL) {
+ 		free(entry-&gt;name);
+ 		free(entry);
+@@ -827,6 +869,7 @@
+ 		free(entry-&gt;name);
+ 		free(entry);
+ 		delete node;
++		return result;
+ 	}
+ 
+ 	result = publish_overlay_vnode(fVolume-&gt;Volume(), entry-&gt;inode_number,
+@@ -941,8 +984,7 @@
+ overlay_get_vnode_name(fs_volume *volume, fs_vnode *vnode, char *buffer,
+ 	size_t bufferSize)
+ {
+-	OVERLAY_CALL(get_vnode_name, buffer, bufferSize)
+-	return B_UNSUPPORTED;
++	return ((OverlayInode *)vnode-&gt;private_node)-&gt;GetName(buffer, bufferSize);
+ }
+ 
+ 
+@@ -1511,6 +1553,11 @@
+ 			return result;
+ 
+ 		info-&gt;flags &amp;= ~B_FS_IS_READONLY;
++
++		// TODO: maybe calculate based on available ram
++		off_t available = 1024 * 1024 * 100 / info-&gt;block_size;
++		info-&gt;total_blocks += available;
++		info-&gt;free_blocks += available;
+ 		return B_OK;
+ 	}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014761.html">[Haiku-commits] r29457 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/haiku
+</A></li>
+	<LI>Next message: <A HREF="014763.html">[Haiku-commits] r29459 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/haiku
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14762">[ date ]</a>
+              <a href="thread.html#14762">[ thread ]</a>
+              <a href="subject.html#14762">[ subject ]</a>
+              <a href="author.html#14762">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

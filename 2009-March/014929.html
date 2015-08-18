@@ -1,0 +1,227 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29576 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29576%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on&In-Reply-To=%3C200903172347.n2HNl0ba004799%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014928.html">
+   <LINK REL="Next"  HREF="014930.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29576 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29576%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on&In-Reply-To=%3C200903172347.n2HNl0ba004799%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29576 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Mar 18 00:47:00 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014928.html">[Haiku-commits] r29575 - in	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server:	beos haiku
+</A></li>
+        <LI>Next message: <A HREF="014930.html">[Haiku-commits] r29577 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14929">[ date ]</a>
+              <a href="thread.html#14929">[ thread ]</a>
+              <a href="subject.html#14929">[ subject ]</a>
+              <a href="author.html#14929">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-03-18 00:46:56 +0100 (Wed, 18 Mar 2009)
+New Revision: 29576
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29576&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29576&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp
+Log:
+Fixed several problems related to vnode reference count tracking:
+* Increment the vnode reference count in NewVNode().
+* Introduced a VNode::published flag that allows PublishVNode() (a) to discard
+  the node on error and (b) not to increment the node's reference count in case
+  the node had been created by NewVNode() before.
+* Added missing fVNodeCountingEnabled check in _RemoveInvalidVNode().
+* _PutAllPendingVNodes():
+  - nodeFound was never reset, so it would loop forever, if there was at
+    least one node that needed to be put.
+  - VNode::useCount needs to be set to 0 explicitely. Since vnode reference
+    count tracking is already disabled PutVNode() doesn't decrement it and
+    thus we would loop forever, respectively cause the VFS to panic() first.
+  - If the node has not been published, we need to publish it before putting
+    it, since otherwise the VFS would complain that the node is busy.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp	2009-03-17 21:51:25 UTC (rev 29575)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp	2009-03-17 23:46:56 UTC (rev 29576)
+@@ -53,6 +53,7 @@
+ 	VNodeOps*	ops;
+ 	int32		useCount;
+ 	bool		valid;
++	bool		published;
+ 
+ 	VNode(ino_t id, void* clientNode, VNodeOps* ops)
+ 		:
+@@ -61,7 +62,8 @@
+ 		fileCache(NULL),
+ 		ops(ops),
+ 		useCount(0),
+-		valid(true)
++		valid(true),
++		published(true)
+ 	{
+ 	}
+ 
+@@ -355,6 +357,8 @@
+ 		RETURN_ERROR(B_NO_MEMORY);
+ 	}
+ 
++	node-&gt;published = false;
++
+ 	locker.Unlock();
+ 
+ 	// tell the VFS
+@@ -368,6 +372,12 @@
+ 	locker.Lock();
+ 	fVNodes-&gt;Insert(node);
+ 
++	// Increment its use count. After new_vnode() the caller has a reference,
++	// but a subsequent publish_vnode() won't get another one. We handle that
++	// there.
++	if (fVNodeCountingEnabled)
++		node-&gt;useCount++;
++
+ 	return B_OK;
+ }
+ 
+@@ -382,7 +392,13 @@
+ 	VNode* node = fVNodes-&gt;Lookup(vnid);
+ 	bool nodeKnown = node != NULL;
+ 
+-	if (!nodeKnown) {
++	if (nodeKnown) {
++		if (node-&gt;published) {
++			WARN((&quot;publish_vnode(): vnode (%ld, %lld) already published!\n&quot;,
++				GetID(), vnid));
++			RETURN_ERROR(B_BAD_VALUE);
++		}
++	} else if (!nodeKnown) {
+ 		// The node is not yet known -- create it.
+ 
+ 		// get the ops vector for the node
+@@ -404,22 +420,30 @@
+ 	status_t error = publish_vnode(fFSVolume, vnid, node, node-&gt;ops-&gt;ops,
+ 		type, flags);
+ 	if (error != B_OK) {
+-// TODO: We should note whether the node was made known via new_vnode(). If so,
+-// we should remove and delete it here!
+-		if (!nodeKnown)
++		if (nodeKnown) {
++			// The node was known, i.e. it had been made known via new_vnode()
++			// and thus already had a use count of 1. Decrement that use count
++			// and remove the node completely.
++			_DecrementVNodeCount(vnid);
++			_RemoveInvalidVNode(vnid);
++		} else
+ 			node-&gt;Delete(this);
+ 		RETURN_ERROR(error);
+ 	}
+ 
+ 	// add the node to our map, if not known yet
+ 	locker.Lock();
+-	if (!nodeKnown)
++	if (nodeKnown) {
++		// The node is now published. Don't increment its use count. It already
++		// has 1 from new_vnode() and this publish_vnode() didn't increment it.
++		node-&gt;published = true;
++	} else {
++		// New node: increment its use count and add it to the map.
++		if (fVNodeCountingEnabled)
++			node-&gt;useCount++;
+ 		fVNodes-&gt;Insert(node);
++	}
+ 
+-	// increments its use count
+-	if (fVNodeCountingEnabled)
+-		node-&gt;useCount++;
+-
+ 	return B_OK;
+ }
+ 
+@@ -4351,8 +4375,10 @@
+ 	locker.Unlock();
+ 
+ 	// release all references acquired so far
+-	for (; vnode-&gt;useCount &gt; 0; vnode-&gt;useCount--)
+-		put_vnode(fFSVolume, vnid);
++	if (fVNodeCountingEnabled) {
++		for (; vnode-&gt;useCount &gt; 0; vnode-&gt;useCount--)
++			put_vnode(fFSVolume, vnid);
++	}
+ 
+ 	vnode-&gt;Delete(this);
+ }
+@@ -4430,17 +4456,28 @@
+ 	// beginning.
+ 	// TODO: Optimize by extracting batches of relevant nodes to an on-stack
+ 	// array.
+-	bool nodeFound = false;
++	bool nodeFound;
+ 	do {
++		nodeFound = false;
++
+ 		// get the next node to put
+ 		for (VNodeMap::Iterator it = fVNodes-&gt;GetIterator();
+ 				VNode* vnode = it.Next();) {
+ 			if (vnode-&gt;useCount &gt; 0) {
+ 				ino_t vnid = vnode-&gt;id;
+ 				int32 count = vnode-&gt;useCount;
++				vnode-&gt;useCount = 0;
++				fs_vnode_ops* ops = vnode-&gt;ops-&gt;ops;
++				bool published = vnode-&gt;published;
+ 
+ 				locker.Unlock();
+ 
++				// If the node has not yet been published, we have to do that
++				// before putting otherwise the VFS will complain that the node
++				// is busy when the last reference is gone.
++				if (!published)
++					publish_vnode(fFSVolume, vnid, vnode, ops, S_IFDIR, 0);
++
+ 				for (int32 i = 0; i &lt; count; i++) {
+ 					PutVNode(vnid);
+ 					putVNodeCount++;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014928.html">[Haiku-commits] r29575 - in	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server:	beos haiku
+</A></li>
+	<LI>Next message: <A HREF="014930.html">[Haiku-commits] r29577 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14929">[ date ]</a>
+              <a href="thread.html#14929">[ thread ]</a>
+              <a href="subject.html#14929">[ subject ]</a>
+              <a href="author.html#14929">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

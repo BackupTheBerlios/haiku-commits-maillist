@@ -1,0 +1,222 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20484 -	haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20484%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial&In-Reply-To=%3C200703312253.l2VMrhcQ013547%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001333.html">
+   <LINK REL="Next"  HREF="001346.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20484 -	haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial</H1>
+    <B>mmu_man at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20484%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial&In-Reply-To=%3C200703312253.l2VMrhcQ013547%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20484 -	haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial">mmu_man at mail.berlios.de
+       </A><BR>
+    <I>Sun Apr  1 00:53:43 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001333.html">[Haiku-commits] r20483 - haiku/trunk/src/system/kernel/cache
+</A></li>
+        <LI>Next message: <A HREF="001346.html">[Haiku-commits] r20484 -	haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1306">[ date ]</a>
+              <a href="thread.html#1306">[ thread ]</a>
+              <a href="subject.html#1306">[ subject ]</a>
+              <a href="author.html#1306">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmu_man
+Date: 2007-04-01 00:53:42 +0200 (Sun, 01 Apr 2007)
+New Revision: 20484
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20484&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20484&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/driver.c
+Log:
+Add select() support for Dano &amp; Haiku (someone will need to write tty bus manager).
+The supported devices list passed to the usb bus manager is now automagically generated from the other list so it's always correct (it was already out of sync).
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/driver.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/driver.c	2007-03-31 22:44:01 UTC (rev 20483)
++++ haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/driver.c	2007-03-31 22:53:42 UTC (rev 20484)
+@@ -24,6 +24,8 @@
+                                  off_t position, void *buf, size_t* num_bytes);
+ static status_t usb_serial_write (void* cookie, off_t position,
+                                   const void* buffer, size_t* num_bytes);
++static status_t usb_serial_select (void* cookie, uint8 event, uint32 ref, selectsync *_sync);
++static status_t usb_serial_deselect (void* cookie, uint8 event, selectsync *_sync);
+ static status_t usb_serial_control (void* cookie, uint32 op, void* arg, size_t len);
+ static status_t usb_serial_close (void* cookie);
+ static status_t usb_serial_free (void* cookie);
+@@ -42,7 +44,13 @@
+   usb_serial_free,            /* -&gt; free cookie */
+   usb_serial_control,         /* -&gt; control entry point */
+   usb_serial_read,            /* -&gt; read entry point */
+-  usb_serial_write            /* -&gt; write entry point */
++  usb_serial_write,            /* -&gt; write entry point */
++#if defined(B_BEOS_VERSION_DANO) || defined(__HAIKU__)
++  usb_serial_select,           /* -&gt; select entry point */
++  usb_serial_deselect         /* -&gt; deselect entry point */
++#endif
++  /* readv / read_pages ??? */
++  /* writev */
+ };
+ /* USB notify hooks */
+ static usb_notify_hooks notify_hooks = {
+@@ -126,6 +134,8 @@
+            &quot;FTDI 8U232AM serial converter&quot;}, 
+ };
+ /* supported devices*/
++usb_support_descriptor *supported_devices;
++#if 0
+ usb_support_descriptor supported_devices[] = {
+   {USB_DEV_CLASS_COMM, 0, 0, 0, 0},
+   {0, 0, 0, VND_PROLIFIC, PROD_PROLIFIC_RSAQ2 },
+@@ -139,6 +149,7 @@
+   {0, 0, 0, VND_FTDI, PROD_8U100AX },
+   {0, 0, 0, VND_FTDI, PROD_8U232AM },
+ };
++#endif
+ /* main devices table locking semaphore */
+ sem_id usb_serial_lock = -1;
+ /* array of pointers to device objects */
+@@ -195,8 +206,28 @@
+         usb_serial_names[0] = NULL;  
+         load_driver_symbols(DRIVER_NAME);
+ 
++        /* XXX: needs more error checking! */
++
++        // build the list of usb supported devices from our own hw list,
++        // so it's always up to date.
++        supported_devices = malloc(sizeof(usb_support_descriptor) * SIZEOF(usb_serial_hw_devices));
++        // ACM devices
++        supported_devices[0].dev_class = USB_DEV_CLASS_COMM;
++        supported_devices[0].dev_subclass = 0;
++        supported_devices[0].dev_protocol = 0;
++        supported_devices[0].vendor = 0;
++        supported_devices[0].product = 0;
++        // other devices
++        for (i = 1; i &lt; SIZEOF(usb_serial_hw_devices); i++){
++          supported_devices[i].dev_class = 0;
++          supported_devices[i].dev_subclass = 0;
++          supported_devices[i].dev_protocol = 0;
++          supported_devices[i].vendor = usb_serial_hw_devices[i].vendor_id;
++          supported_devices[i].product = usb_serial_hw_devices[i].product_id;
++        }
++
+         (*usb_m-&gt;register_driver)(DRIVER_NAME, supported_devices,
+-                                        SIZEOF(supported_devices), DRIVER_NAME);
++                                        SIZEOF(usb_serial_hw_devices), DRIVER_NAME);
+         (*usb_m-&gt;install_notify)(DRIVER_NAME, &amp;notify_hooks);
+   
+         usb_serial_lock = create_sem(1, DRIVER_NAME&quot;_devices_table_lock&quot;);
+@@ -204,9 +235,13 @@
+         status = B_ERROR;
+         TRACE_ALWAYS(&quot;init_driver failed: tty_m:%08x usb_m:%08x&quot;, tty_m, usb_m);
+       } 
++      if (status != B_OK)
++        put_module(B_USB_MODULE_NAME);
+     }else
+       TRACE_ALWAYS(&quot;init_driver failed:%lx cannot get a module %s&quot;, status,
+                                                                B_USB_MODULE_NAME);
++    if (status != B_OK)
++      put_module(B_TTY_MODULE_NAME);
+   }else
+     TRACE_ALWAYS(&quot;init_driver failed:%lx cannot get a module %s&quot;, status,
+                                                                B_TTY_MODULE_NAME);
+@@ -222,6 +257,7 @@
+   TRACE_FUNCALLS(&quot;uninit_driver\n&quot;);
+ 
+   (*usb_m-&gt;uninstall_notify)(DRIVER_NAME);
++  free(supported_devices);
+   acquire_sem(usb_serial_lock);
+   
+   for(i = 0; i &lt; DEVICES_COUNT; i++)
+@@ -618,6 +654,50 @@
+   return status;
+ }
+ 
++#if defined(B_BEOS_VERSION_DANO) || defined(__HAIKU__)
++
++/* usb_serial_select - handle select start */
++static status_t usb_serial_select (void* cookie, uint8 event, uint32 ref, selectsync *_sync){
++  status_t status = B_BAD_VALUE;
++  TRACE_FUNCALLS(&quot;usb_serial_select cookie:%08x event:%08x ref:%08x sync:%p\n&quot;,
++                                                           cookie, event, ref, _sync);
++
++  if(cookie){
++    struct ddrover *ddr = (*tty_m-&gt;ddrstart)(NULL);
++    if(ddr){
++      status = (*tty_m-&gt;ttyselect)(cookie, ddr, event, ref, _sync);
++      (*tty_m-&gt;ddrdone)(ddr);
++    }else
++      status = B_NO_MEMORY;
++  }else
++    status = ENODEV;
++
++  TRACE_FUNCRET(&quot;usb_serial_select returns:%08x\n&quot;, status);
++  return status;
++}
++
++/* usb_serial_deselect - handle select exit */
++static status_t usb_serial_deselect (void* cookie, uint8 event, selectsync *_sync){
++  status_t status = B_BAD_VALUE;
++  TRACE_FUNCALLS(&quot;usb_serial_deselect cookie:%08x event:%08x sync:%p\n&quot;,
++                                                           cookie, event, _sync);
++
++  if(cookie){
++    struct ddrover *ddr = (*tty_m-&gt;ddrstart)(NULL);
++    if(ddr){
++      status = (*tty_m-&gt;ttydeselect)(cookie, ddr, event, _sync);
++      (*tty_m-&gt;ddrdone)(ddr);
++    }else
++      status = B_NO_MEMORY;
++  }else
++    status = ENODEV;
++
++  TRACE_FUNCRET(&quot;usb_serial_deselect returns:%08x\n&quot;, status);
++  return status;
++}
++
++#endif
++
+ /* usb_serial_close - handle close() calls */
+ static status_t usb_serial_close (void* cookie){
+   status_t status = ENODEV;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001333.html">[Haiku-commits] r20483 - haiku/trunk/src/system/kernel/cache
+</A></li>
+	<LI>Next message: <A HREF="001346.html">[Haiku-commits] r20484 -	haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1306">[ date ]</a>
+              <a href="thread.html#1306">[ thread ]</a>
+              <a href="subject.html#1306">[ subject ]</a>
+              <a href="author.html#1306">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,314 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r19742 - haiku/trunk/src/servers/net
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19742%20-%20haiku/trunk/src/servers/net&In-Reply-To=%3C200701081604.l08G4GGr003376%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000108.html">
+   <LINK REL="Next"  HREF="000111.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r19742 - haiku/trunk/src/servers/net</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19742%20-%20haiku/trunk/src/servers/net&In-Reply-To=%3C200701081604.l08G4GGr003376%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r19742 - haiku/trunk/src/servers/net">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Jan  8 17:04:16 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000108.html">[Haiku-commits] r19741 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+        <LI>Next message: <A HREF="000111.html">[Haiku-commits] r19743 -	haiku/trunk/src/system/boot/platform/bios_ia32
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#109">[ date ]</a>
+              <a href="thread.html#109">[ thread ]</a>
+              <a href="subject.html#109">[ subject ]</a>
+              <a href="author.html#109">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-01-08 17:04:16 +0100 (Mon, 08 Jan 2007)
+New Revision: 19742
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=19742&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=19742&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/net/NetServer.cpp
+Log:
+* The networking stack now removes all invalid interfaces during startup (those
+  where there is either no address or MAC address [ethernet only]).
+* _ConfigureInterfaces() now notices if a network device that has a configuration
+  is gone and memorizes this configuration.
+* If a new device pops up, and there is an existing configuration for a device
+  no longer available, that configuration will be used for the new device, allowing
+  you to easily move your Haiku image to a new system without losing its network
+  settings - it does not yet test if the IP address is already in use in the local
+  network, though (in which case a configuration using DHCP would be preferrable).
+
+
+Modified: haiku/trunk/src/servers/net/NetServer.cpp
+===================================================================
+--- haiku/trunk/src/servers/net/NetServer.cpp	2007-01-08 15:41:56 UTC (rev 19741)
++++ haiku/trunk/src/servers/net/NetServer.cpp	2007-01-08 16:04:16 UTC (rev 19742)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2006, Haiku, Inc. All Rights Reserved.
++ * Copyright 2006-2007, Haiku, Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -48,14 +48,17 @@
+ 		virtual void MessageReceived(BMessage* message);
+ 
+ 	private:
++		bool _IsValidInterface(int socket, const char* name);
++		void _RemoveInvalidInterfaces(int socket);
+ 		bool _TestForInterface(int socket, const char* name);
+ 		status_t _ConfigureInterface(int socket, BMessage&amp; interface,
+ 			bool fromMessage = false);
+ 		bool _QuitLooperForDevice(const char* device);
+ 		BLooper* _LooperForDevice(const char* device);
+ 		status_t _ConfigureDevice(int socket, const char* path);
+-		void _ConfigureDevices(int socket, const char* path);
+-		void _ConfigureInterfaces(int socket);
++		void _ConfigureDevices(int socket, const char* path,
++			BMessage* suggestedInterface = NULL);
++		void _ConfigureInterfaces(int socket, BMessage* _missingDevice = NULL);
+ 		void _BringUpInterfaces();
+ 		void _StartServices();
+ 
+@@ -324,7 +327,112 @@
+ }
+ 
+ 
++/*!
++	Checks if an interface is valid, that is, if it has an address in any
++	family, and, in case of ethernet, a hardware MAC address.
++*/
+ bool
++NetServer::_IsValidInterface(int socket, const char* name)
++{
++	ifreq request;
++	if (!prepare_request(request, name))
++		return B_ERROR;
++
++	// check if it has an address
++
++	int32 addresses = 0;
++
++	for (int32 i = 0; kFamilies[i].family &gt;= 0; i++) {
++		int familySocket = ::socket(kFamilies[i].family, SOCK_DGRAM, 0);
++		if (familySocket &lt; 0)
++			continue;
++
++		if (ioctl(familySocket, SIOCGIFADDR, &amp;request, sizeof(struct ifreq)) == 0) {
++			if (request.ifr_addr.sa_family == kFamilies[i].family)
++				addresses++;
++		}
++
++		close(familySocket);
++	}
++
++	if (addresses == 0)
++		return false;
++
++	// check if it has a hardware address, too, in case of ethernet	
++
++	if (ioctl(socket, SIOCGIFPARAM, &amp;request, sizeof(struct ifreq)) &lt; 0)
++		return false;
++
++	int linkSocket = ::socket(AF_LINK, SOCK_DGRAM, 0);
++	if (linkSocket &lt; 0)
++		return false;
++
++	prepare_request(request, request.ifr_parameter.device);
++	if (ioctl(linkSocket, SIOCGIFADDR, &amp;request, sizeof(struct ifreq)) &lt; 0) {
++		close(linkSocket);
++		return false;
++	}
++
++	close(linkSocket);
++
++	sockaddr_dl &amp;link = *(sockaddr_dl *)&amp;request.ifr_addr;
++	if (link.sdl_type == IFT_ETHER &amp;&amp; link.sdl_alen &lt; 6)
++		return false;
++
++	return true;
++}
++
++
++void
++NetServer::_RemoveInvalidInterfaces(int socket)
++{
++	// get a list of all interfaces
++
++	ifconf config;
++	config.ifc_len = sizeof(config.ifc_value);
++	if (ioctl(socket, SIOCGIFCOUNT, &amp;config, sizeof(struct ifconf)) &lt; 0)
++		return;
++
++	uint32 count = (uint32)config.ifc_value;
++	if (count == 0) {
++		// there are no interfaces yet
++		return;
++	}
++
++	void *buffer = malloc(count * sizeof(struct ifreq));
++	if (buffer == NULL) {
++		fprintf(stderr, &quot;%s: Out of memory.\n&quot;, Name());
++		return;
++	}
++
++	config.ifc_len = count * sizeof(struct ifreq);
++	config.ifc_buf = buffer;
++	if (ioctl(socket, SIOCGIFCONF, &amp;config, sizeof(struct ifconf)) &lt; 0)
++		return;
++
++	ifreq *interface = (ifreq *)buffer;
++
++	for (uint32 i = 0; i &lt; count; i++) {
++		if (!_IsValidInterface(socket, interface-&gt;ifr_name)) {
++			// remove invalid interface
++			ifreq request;
++			if (!prepare_request(request, interface-&gt;ifr_name))
++				return;
++
++			if (ioctl(socket, SIOCDIFADDR, &amp;request, sizeof(request)) &lt; 0) {
++				fprintf(stderr, &quot;%s: Could not delete interface %s: %s\n&quot;,
++					Name(), interface-&gt;ifr_name, strerror(errno));
++			}
++		}
++
++		interface = (ifreq *)((addr_t)interface + IF_NAMESIZE + interface-&gt;ifr_addr.sa_len);
++	}
++
++	free(buffer);
++}
++
++
++bool
+ NetServer::_TestForInterface(int socket, const char* name)
+ {
+ 	// get a list of all interfaces
+@@ -642,7 +750,6 @@
+ status_t
+ NetServer::_ConfigureDevice(int socket, const char* path)
+ {
+-
+ 	// bring interface up, but don't configure it just yet
+ 	BMessage interface;
+ 	interface.AddString(&quot;device&quot;, path);
+@@ -656,7 +763,8 @@
+ 
+ 
+ void
+-NetServer::_ConfigureDevices(int socket, const char* startPath)
++NetServer::_ConfigureDevices(int socket, const char* startPath,
++	BMessage* suggestedInterface)
+ {
+ 	BDirectory directory(startPath);
+ 	BEntry entry;
+@@ -670,19 +778,26 @@
+ 			|| entry.GetStat(&amp;stat) != B_OK)
+ 			continue;
+ 
+-		if (S_ISBLK(stat.st_mode) || S_ISCHR(stat.st_mode))
+-			_ConfigureDevice(socket, path.Path());
+-		else if (entry.IsDirectory())
+-			_ConfigureDevices(socket, path.Path());
++		if (S_ISBLK(stat.st_mode) || S_ISCHR(stat.st_mode)) {
++			if (suggestedInterface != NULL
++				&amp;&amp; suggestedInterface-&gt;RemoveName(&quot;device&quot;) == B_OK
++				&amp;&amp; suggestedInterface-&gt;AddString(&quot;device&quot;, path.Path()) == B_OK
++				&amp;&amp; _ConfigureInterface(socket, *suggestedInterface) == B_OK)
++				suggestedInterface = NULL;
++			else
++				_ConfigureDevice(socket, path.Path());
++		} else if (entry.IsDirectory())
++			_ConfigureDevices(socket, path.Path(), suggestedInterface);
+ 	}
+ }
+ 
+ 
+ void
+-NetServer::_ConfigureInterfaces(int socket)
++NetServer::_ConfigureInterfaces(int socket, BMessage* _missingDevice)
+ {
+ 	BMessage interface;
+ 	uint32 cookie = 0;
++	bool missing = false;
+ 	while (fSettings.GetNextInterface(cookie, interface) == B_OK) {
+ 		const char *device;
+ 		if (interface.FindString(&quot;device&quot;, &amp;device) != B_OK)
+@@ -691,8 +806,13 @@
+ 		if (!strncmp(device, &quot;/dev/net/&quot;, 9)) {
+ 			// it's a kernel device, check if it's present
+ 			BEntry entry(device);
+-			if (!entry.Exists())
++			if (!entry.Exists()) {
++				if (!missing &amp;&amp; _missingDevice != NULL) {
++					*_missingDevice = interface;
++					missing = true;
++				}
+ 				continue;
++			}
+ 		}
+ 
+ 		_ConfigureInterface(socket, interface);
+@@ -712,9 +832,12 @@
+ 		return;
+ 	}
+ 
++	_RemoveInvalidInterfaces(socket);
++
+ 	// First, we look into the settings, and try to bring everything up from there
+ 
+-	_ConfigureInterfaces(socket);
++	BMessage missingDevice;
++	_ConfigureInterfaces(socket, &amp;missingDevice);
+ 
+ 	// check configuration
+ 
+@@ -735,7 +858,8 @@
+ 
+ 	if (!_TestForInterface(socket, &quot;/dev/net/&quot;)) {
+ 		// there is no driver configured - see if there is one and try to use it
+-		_ConfigureDevices(socket, &quot;/dev/net&quot;);
++		_ConfigureDevices(socket, &quot;/dev/net&quot;,
++			missingDevice.HasString(&quot;device&quot;) ? &amp;missingDevice : NULL);
+ 	}
+ 
+ 	close(socket);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000108.html">[Haiku-commits] r19741 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+	<LI>Next message: <A HREF="000111.html">[Haiku-commits] r19743 -	haiku/trunk/src/system/boot/platform/bios_ia32
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#109">[ date ]</a>
+              <a href="thread.html#109">[ thread ]</a>
+              <a href="subject.html#109">[ subject ]</a>
+              <a href="author.html#109">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

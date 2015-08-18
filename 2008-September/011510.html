@@ -1,0 +1,381 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27306 - haiku/trunk/src/tests/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27306%20-%20haiku/trunk/src/tests/system/kernel&In-Reply-To=%3C200809031515.m83FFL0N027759%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011509.html">
+   <LINK REL="Next"  HREF="011511.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27306 - haiku/trunk/src/tests/system/kernel</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27306%20-%20haiku/trunk/src/tests/system/kernel&In-Reply-To=%3C200809031515.m83FFL0N027759%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27306 - haiku/trunk/src/tests/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Sep  3 17:15:21 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011509.html">[Haiku-commits] r27305 - haiku/trunk/build/config_headers
+</A></li>
+        <LI>Next message: <A HREF="011511.html">[Haiku-commits] r27307 -	haiku/trunk/src/system/libroot/posix/glibc/arch/m68k
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11510">[ date ]</a>
+              <a href="thread.html#11510">[ thread ]</a>
+              <a href="subject.html#11510">[ subject ]</a>
+              <a href="author.html#11510">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-03 17:15:19 +0200 (Wed, 03 Sep 2008)
+New Revision: 27306
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27306&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27306&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/tests/system/kernel/Jamfile
+   haiku/trunk/src/tests/system/kernel/time_stats.cpp
+Log:
+* Added &quot;-s&quot; option, which uses the new scheduling analysis feature to
+  gather additional information on the threads that were running and
+  what they were doing.
+* Added &quot;-o &lt;output&gt;&quot; option for specifying a file to which to print the
+  statistics to.
+* Some beautifications (usage, help, etc.).
+
+
+Modified: haiku/trunk/src/tests/system/kernel/Jamfile
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/Jamfile	2008-09-03 15:11:41 UTC (rev 27305)
++++ haiku/trunk/src/tests/system/kernel/Jamfile	2008-09-03 15:15:19 UTC (rev 27306)
+@@ -1,6 +1,7 @@
+ SubDir HAIKU_TOP src tests system kernel ;
+ 
+ UsePrivateKernelHeaders ;
++UsePrivateHeaders shared ;
+ 
+ SimpleTest advisory_locking_test : advisory_locking_test.cpp ;
+ 
+
+Modified: haiku/trunk/src/tests/system/kernel/time_stats.cpp
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/time_stats.cpp	2008-09-03 15:11:41 UTC (rev 27305)
++++ haiku/trunk/src/tests/system/kernel/time_stats.cpp	2008-09-03 15:15:19 UTC (rev 27306)
+@@ -4,9 +4,12 @@
+  */
+ 
+ #include &lt;errno.h&gt;
++#include &lt;fcntl.h&gt;
++#include &lt;getopt.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
++#include &lt;sys/stat.h&gt;
+ #include &lt;sys/wait.h&gt;
+ #include &lt;unistd.h&gt;
+ 
+@@ -14,10 +17,33 @@
+ 
+ #include &lt;OS.h&gt;
+ 
++#include &lt;AutoDeleter.h&gt;
+ 
++#include &lt;scheduler_defs.h&gt;
++#include &lt;syscalls.h&gt;
++#include &lt;thread_defs.h&gt;
++
++
+ #define MAX_THREADS	4096
+ 
++#define SCHEDULING_ANALYSIS_BUFFER_SIZE	10 * 1024 * 1024
+ 
++
++extern const char* __progname;
++
++static const char* kUsage =
++	&quot;Usage: %s [ -h ] [ -o &lt;output&gt; ] [ -s ] &lt;command line&gt;\n&quot;
++;
++
++
++static void
++print_usage_and_exit(bool error)
++{
++    fprintf(error ? stderr : stdout, kUsage, __progname);
++    exit(error ? 1 : 0);
++}
++
++
+ struct UsageInfoThreadComparator {
+ 	inline bool operator()(const thread_info&amp; a, const thread_info&amp; b)
+ 	{
+@@ -53,29 +79,19 @@
+ }
+ 
+ 
+-int
+-main(int argc, const char* const* argv)
++static pid_t
++run_child(int argc, const char* const* argv)
+ {
+-	if (argc &lt; 2) {
+-		fprintf(stderr, &quot;Usage:...\n&quot;);
+-		exit(1);
+-	}
+-
+-	// gather initial usage info
+-	thread_info initialUsage[MAX_THREADS];
+-	int32 initialUsageCount = get_usage_infos(initialUsage);
+-
+ 	// fork
+-	bigtime_t startTime = system_time();
+ 	pid_t child = fork();
+ 	if (child &lt; 0) {
+-		fprintf(stderr, &quot;fork() failed: %s\n&quot;, strerror(errno));
++		fprintf(stderr, &quot;Error: fork() failed: %s\n&quot;, strerror(errno));
+ 		exit(1);
+ 	}
+ 
+ 	// exec child process
+ 	if (child == 0) {
+-		execvp(argv[1], (char**)(argv + 1));
++		execvp(argv[0], (char**)argv);
+ 		exit(1);
+ 	}
+ 
+@@ -83,8 +99,128 @@
+ 	int childStatus;
+ 	while (wait(&amp;childStatus) &lt; 0);
+ 
++	return child;
++}
++
++
++static const char*
++wait_object_to_string(scheduling_analysis_wait_object* waitObject, char* buffer)
++{
++	uint32 type = waitObject-&gt;type;
++	void* object = waitObject-&gt;object;
++
++	switch (type) {
++		case THREAD_BLOCK_TYPE_SEMAPHORE:
++			sprintf(buffer, &quot;sem %ld (%s)&quot;, (sem_id)(addr_t)object,
++				waitObject-&gt;name);
++			break;
++		case THREAD_BLOCK_TYPE_CONDITION_VARIABLE:
++			sprintf(buffer, &quot;cvar %p (%s %p)&quot;, object, waitObject-&gt;name,
++				waitObject-&gt;referenced_object);
++			break;
++		case THREAD_BLOCK_TYPE_SNOOZE:
++			strcpy(buffer, &quot;snooze&quot;);
++			break;
++		case THREAD_BLOCK_TYPE_SIGNAL:
++			strcpy(buffer, &quot;signal&quot;);
++			break;
++		case THREAD_BLOCK_TYPE_MUTEX:
++			sprintf(buffer, &quot;mutex %p (%s)&quot;, object, waitObject-&gt;name);
++			break;
++		case THREAD_BLOCK_TYPE_RW_LOCK:
++			sprintf(buffer, &quot;rwlock %p (%s)&quot;, object, waitObject-&gt;name);
++			break;
++		case THREAD_BLOCK_TYPE_OTHER:
++			sprintf(buffer, &quot;other %p&quot;, object);
++			break;
++		default:
++			sprintf(buffer, &quot;unknown %p&quot;, object);
++			break;
++	}
++
++	return buffer;
++}
++
++
++static void
++do_scheduling_analysis(bigtime_t startTime, bigtime_t endTime)
++{
++	printf(&quot;\n&quot;);
++
++	// allocate a chunk of memory for the scheduling analysis
++	void* buffer = malloc(SCHEDULING_ANALYSIS_BUFFER_SIZE);
++	if (buffer == NULL) {
++		fprintf(stderr, &quot;Error: Failed to allocate memory for the scheduling &quot;
++			&quot;analysis.\n&quot;);
++		exit(1);
++	}
++	MemoryDeleter _(buffer);
++
++	// do the scheduling analysis
++	scheduling_analysis analysis;
++	status_t error = _kern_analyze_scheduling(startTime, endTime, buffer,
++		SCHEDULING_ANALYSIS_BUFFER_SIZE, &amp;analysis);
++	if (error != B_OK) {
++		fprintf(stderr, &quot;Error: Scheduling analysis failed: %s\n&quot;,
++			strerror(error));
++		exit(1);
++	}
++
++	printf(&quot;scheduling analysis: %lu threads, %llu wait objects, &quot;
++		&quot;%llu thread wait objects\n&quot;, analysis.thread_count,
++		analysis.wait_object_count, analysis.thread_wait_object_count);
++
++	for (uint32 i = 0; i &lt; analysis.thread_count; i++) {
++		scheduling_analysis_thread* thread = analysis.threads[i];
++
++		// compute total wait time
++		bigtime_t waitTime = 0;
++		scheduling_analysis_thread_wait_object* threadWaitObject
++			= thread-&gt;wait_objects;
++		while (threadWaitObject != NULL) {
++			waitTime += threadWaitObject-&gt;wait_time;
++			threadWaitObject = threadWaitObject-&gt;next_in_list;
++		}
++
++		printf(&quot;\nthread %ld \&quot;%s\&quot;:\n&quot;, thread-&gt;id, thread-&gt;name);
++		printf(&quot;  run time:    %lld us (%lld runs)\n&quot;, thread-&gt;total_run_time,
++			thread-&gt;runs);
++		printf(&quot;  wait time:   %lld us\n&quot;, waitTime);
++		printf(&quot;  latencies:   %lld us (%lld)\n&quot;, thread-&gt;total_latency,
++			thread-&gt;latencies);
++		printf(&quot;  preemptions: %lld us (%lld)\n&quot;, thread-&gt;total_rerun_time,
++			thread-&gt;reruns);
++		printf(&quot;  unspecified: %lld us\n&quot;, thread-&gt;unspecified_wait_time);
++		printf(&quot;  waited on:\n&quot;);
++		threadWaitObject = thread-&gt;wait_objects;
++		while (threadWaitObject != NULL) {
++			scheduling_analysis_wait_object* waitObject
++				= threadWaitObject-&gt;wait_object;
++			char buffer[1024];
++			wait_object_to_string(waitObject, buffer);
++			printf(&quot;    %s: %lld us\n&quot;, buffer, threadWaitObject-&gt;wait_time);
++
++			threadWaitObject = threadWaitObject-&gt;next_in_list;
++		}
++	}
++}
++
++
++static void
++do_timing_analysis(int argc, const char* const* argv, bool schedulingAnalysis,
++	int outFD)
++{
++	// gather initial usage info
++	thread_info initialUsage[MAX_THREADS];
++	int32 initialUsageCount = get_usage_infos(initialUsage);
++
++	// exec child process
++	bigtime_t startTime = system_time();
++	pid_t child = run_child(argc, argv);
++
+ 	// get child usage info
+-	bigtime_t runTime = system_time() - startTime;
++	bigtime_t endTime = system_time();
++	bigtime_t runTime = endTime - startTime;
+ 	team_usage_info childUsage;
+ 	get_team_usage_info(B_CURRENT_TEAM, B_TEAM_USAGE_CHILDREN, &amp;childUsage);
+ 
+@@ -154,6 +290,10 @@
+ 	std::sort(sortedThreads, sortedThreads + sortedThreadCount,
+ 		UsageInfoTimeComparator());
+ 
++	// redirect output, if requested
++	if (outFD &gt;= 0)
++		dup2(outFD, STDOUT_FILENO);
++
+ 	// print results
+ 	printf(&quot;\nTotal run time: %lld us\n&quot;, runTime);
+ 	printf(&quot;Thread time statistics in us:\n\n&quot;);
+@@ -186,5 +326,62 @@
+ 		printf(&quot;%7ld  %-32s  &lt;gone&gt;\n&quot;, info.thread, info.name);
+ 	}
+ 
++	if (schedulingAnalysis)
++		do_scheduling_analysis(startTime, endTime);
++}
++
++
++int
++main(int argc, const char* const* argv)
++{
++	const char* outputFile = NULL;
++	bool schedulingAnalysis = false;
++
++	while (true) {
++		static struct option sLongOptions[] = {
++			{ &quot;help&quot;, no_argument, 0, 'h' },
++			{ &quot;output&quot;, required_argument, 0, 'o' },
++			{ 0, 0, 0, 0 }
++		};
++
++		opterr = 0; // don't print errors
++		int c = getopt_long(argc, (char**)argv, &quot;ho:s&quot;, sLongOptions, NULL);
++		if (c == -1)
++			break;
++
++		switch (c) {
++			case 'h':
++				print_usage_and_exit(false);
++				break;
++			case 'o':
++				outputFile = optarg;
++				break;
++			case 's':
++				schedulingAnalysis = true;
++				break;
++
++			default:
++				print_usage_and_exit(true);
++				break;
++		}
++	}
++
++	if (optind &gt;= argc)
++		print_usage_and_exit(true);
++
++	// open output file, if specified
++	int outFD = -1;
++	if (outputFile != NULL) {
++		outFD = open(outputFile, O_WRONLY | O_CREAT | O_TRUNC,
++			S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP| S_IROTH | S_IWOTH);
++		if (outFD &lt; 0) {
++			fprintf(stderr, &quot;Error: Failed to open \&quot;%s\&quot;: %s\n&quot;, outputFile,
++				strerror(errno));
++			exit(1);
++		}
++	}
++
++	do_timing_analysis(argc - optind, argv + optind, schedulingAnalysis, outFD);
++
+ 	return 0;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011509.html">[Haiku-commits] r27305 - haiku/trunk/build/config_headers
+</A></li>
+	<LI>Next message: <A HREF="011511.html">[Haiku-commits] r27307 -	haiku/trunk/src/system/libroot/posix/glibc/arch/m68k
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11510">[ date ]</a>
+              <a href="thread.html#11510">[ thread ]</a>
+              <a href="subject.html#11510">[ subject ]</a>
+              <a href="author.html#11510">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

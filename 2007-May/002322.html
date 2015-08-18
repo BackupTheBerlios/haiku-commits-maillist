@@ -1,0 +1,955 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21159 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21159%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/audio/hda&In-Reply-To=%3C200705170243.l4H2hDWn001124%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002321.html">
+   <LINK REL="Next"  HREF="002323.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21159 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda</H1>
+    <B>colacoder at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21159%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/audio/hda&In-Reply-To=%3C200705170243.l4H2hDWn001124%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21159 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda">colacoder at mail.berlios.de
+       </A><BR>
+    <I>Thu May 17 04:43:13 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002321.html">[Haiku-commits] r21158 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+</A></li>
+        <LI>Next message: <A HREF="002323.html">[Haiku-commits] r21160 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2322">[ date ]</a>
+              <a href="thread.html#2322">[ thread ]</a>
+              <a href="subject.html#2322">[ subject ]</a>
+              <a href="author.html#2322">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: colacoder
+Date: 2007-05-17 04:43:12 +0200 (Thu, 17 May 2007)
+New Revision: 21159
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21159&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21159&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec.c
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.c
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.c
+Log:
+Fixed:
+	* Prepare code for exposing multi_audio interface on Audio Function Group level
+	* Some minor cleanups.
+Todo:
+	* Publish devfs entries based on available Function Groups instead of HDA cards.
+	* Publish all mixer controls / output busses through multi_audio interface.
+	* Make recording work :)
+	* Check why we need 4096 samples to play ok.
+	* Figure out problems with driver on Haiku... currently only successfully tested on R5.
+
+As you can see, plenty of things left to do, but progressing nicely. At least people can have sound on R5 now!
+
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h	2007-05-16 21:43:15 UTC (rev 21158)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h	2007-05-17 02:43:12 UTC (rev 21159)
+@@ -24,13 +24,15 @@
+ /* values for the class_sub field for class_base = 0x04 (multimedia device) */
+ #define PCI_hd_audio	3
+ 
+-#define MAXWORK				16
++#define HDA_MAXAFGS			15
+ #define HDA_MAXCODECS		15
+ #define HDA_MAXSTREAMS		16
+ #define MAX_CODEC_RESPONSES	10
+ #define MAXINPUTS			32
+ 
+ typedef struct hda_controller_s hda_controller;
++typedef struct hda_codec_s hda_codec;
++typedef struct hda_afg_s hda_afg;
+ 
+ #define STRMAXBUF	10
+ #define STRMINBUF	2
+@@ -40,6 +42,12 @@
+ 	STRM_RECORD
+ };
+ 
++/* hda_stream_info
++ *
++ * This structure describes a single stream of audio data,
++ * which is can have multiple channels (for stereo or better).
++ */
++
+ typedef struct hda_stream_info_s {
+ 	uint32		id;						/* HDA controller stream # */
+ 	uint32		off;					/* HDA I/O/B descriptor offset */
+@@ -68,27 +76,29 @@
+ 	uint32		bdl_pa;					/* BDL physical address */
+ } hda_stream;
+ 
+-typedef struct hda_codec_s {
+-	uint16	vendor_id;
+-	uint16	product_id;
+-	uint8	hda_rev;
+-	uint16	rev_stepping;		
+-	uint8	addr;
++/* hda_afg
++ *
++ * This structure describes a single Audio Function Group. An afg
++ * is a group of audio widgets which can be used to configure multiple
++ * streams of audio either from the HDA Link to an output device (= playback)
++ * or from an input device to the HDA link (= recording).
++ */
+ 
+-	sem_id	response_sem;
+-	uint32	responses[MAX_CODEC_RESPONSES];
+-	uint32	response_count;
++struct hda_afg_s {
++	hda_codec*		codec;
+ 
+ 	/* Multi Audio API data */
+-	hda_stream*	playback_stream;
+-	hda_stream*	record_stream;
++	hda_stream*		playback_stream;
++	hda_stream*		record_stream;
++
+ 	
+-	/* Function Group Data */
+-	uint32	afg_nid;
+-	uint32	afg_wid_start, afg_wid_count;
+-	uint32	afg_deffmts;
+-	uint32	afg_defrates;
+-	uint32	afg_defpm;
++	uint32				root_nid,
++						wid_start,
++						wid_count;
++						
++	uint32				deffmts,
++						defrates,
++						defpm;
+ 
+ 	struct {
+ 		uint32			num_inputs;
+@@ -116,11 +126,44 @@
+ 				pin_dev_type	device;
+ 			} pin;
+ 		} d;
+-	} *afg_widgets;
++	} *widgets;
++};
+ 
++/* hda_codec
++ *
++ * This structure describes a single codec module in the
++ * HDA compliant device. This is a discrete component, which
++ * can contain both Audio Function Groups, Modem Function Groups,
++ * and other customized (vendor specific) Function Groups.
++ *
++ * NOTE: Atm, only Audio Function Groups are supported.
++ */
++
++struct hda_codec_s {
++	uint16	vendor_id;
++	uint16	product_id;
++	uint8	hda_rev;
++	uint16	rev_stepping;		
++	uint8	addr;
++
++	sem_id	response_sem;
++	uint32	responses[MAX_CODEC_RESPONSES];
++	uint32	response_count;
++
++	hda_afg*	afgs[HDA_MAXAFGS];
++	uint32		num_afgs;
++	
+ 	struct hda_controller_s* ctrlr;
+-} hda_codec;
++};
+ 
++/* hda_controller
++ *
++ * This structure describes a single HDA compliant 
++ * controller. It contains a list of available streams
++ * for use by the codecs contained, and the messaging queue
++ * (verb/response) buffers for communication.
++ */
++
+ struct hda_controller_s {
+ 	pci_info	pcii;
+ 	vuint32		opened;
+@@ -149,21 +192,27 @@
+ 	hda_stream*		streams[HDA_MAXSTREAMS];
+ };
+ 
++/* driver.c */
+ extern device_hooks driver_hooks;
+-
+ extern pci_module_info* pci;
+-
+ extern hda_controller cards[MAXCARDS];
+ extern uint32 num_cards;
+ 
++/* hda_codec.c */
++hda_codec* hda_codec_new(hda_controller* ctrlr, uint32 cad);
++
++/* hda_multi_audio.c */
++status_t multi_audio_control(void* cookie, uint32 op, void* arg, size_t len);
++
++/* hda_controller.c: Basic controller support */
+ status_t hda_hw_init(hda_controller* ctrlr);
+ void hda_hw_stop(hda_controller* ctrlr);
+ void hda_hw_uninit(hda_controller* ctrlr);
+-hda_codec* hda_codec_new(hda_controller* ctrlr, uint32 cad);
+ status_t hda_send_verbs(hda_codec* codec, corb_t* verbs, uint32* responses, int count);
+-status_t multi_audio_control(void* cookie, uint32 op, void* arg, size_t len);
++
++/* hda_controller.c: Stream support */
+ hda_stream* hda_stream_alloc(hda_controller* ctrlr, int type);
+-status_t hda_stream_setup_buffers(hda_codec* codec, hda_stream* s, const char* desc);
++status_t hda_stream_setup_buffers(hda_afg* afg, hda_stream* s, const char* desc);
+ status_t hda_stream_start(hda_controller* ctrlr, hda_stream* s);
+ status_t hda_stream_stop(hda_controller* ctrlr, hda_stream* s);
+ status_t hda_stream_check_intr(hda_controller* ctrlr, hda_stream* s);
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec.c	2007-05-16 21:43:15 UTC (rev 21158)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec.c	2007-05-17 02:43:12 UTC (rev 21159)
+@@ -101,20 +101,20 @@
+ }
+ 
+ static status_t
+-hda_codec_parse_afg(hda_codec* codec, uint32 afg_nid)
++hda_codec_parse_afg(hda_afg* afg)
+ {
+ 	corb_t verbs[6];
+ 	uint32 resp[6];
+ 	uint32 widx;
+ 
+-	hda_widget_get_stream_support(codec, afg_nid, &amp;codec-&gt;afg_deffmts, &amp;codec-&gt;afg_defrates);
+-	hda_widget_get_pm_support(codec, afg_nid, &amp;codec-&gt;afg_defpm);
++	hda_widget_get_stream_support(afg-&gt;codec, afg-&gt;root_nid, &amp;afg-&gt;deffmts, &amp;afg-&gt;defrates);
++	hda_widget_get_pm_support(afg-&gt;codec, afg-&gt;root_nid, &amp;afg-&gt;defpm);
+ 
+-	verbs[0] = MAKE_VERB(codec-&gt;addr,afg_nid,VID_GET_PARAM,PID_AUDIO_FG_CAP);
+-	verbs[1] = MAKE_VERB(codec-&gt;addr,afg_nid,VID_GET_PARAM,PID_GPIO_COUNT);
+-	verbs[2] = MAKE_VERB(codec-&gt;addr,afg_nid,VID_GET_PARAM,PID_SUBORD_NODE_COUNT);
++	verbs[0] = MAKE_VERB(afg-&gt;codec-&gt;addr,afg-&gt;root_nid,VID_GET_PARAM,PID_AUDIO_FG_CAP);
++	verbs[1] = MAKE_VERB(afg-&gt;codec-&gt;addr,afg-&gt;root_nid,VID_GET_PARAM,PID_GPIO_COUNT);
++	verbs[2] = MAKE_VERB(afg-&gt;codec-&gt;addr,afg-&gt;root_nid,VID_GET_PARAM,PID_SUBORD_NODE_COUNT);
+ 
+-	if (hda_send_verbs(codec, verbs, resp, 3) == B_OK) {
++	if (hda_send_verbs(afg-&gt;codec, verbs, resp, 3) == B_OK) {
+ 		dprintf(&quot;%s: Output delay: %ld samples, Input delay: %ld samples, Beep Generator: %s\n&quot;, __func__,
+ 			resp[0] &amp; 0xf, (resp[0] &gt;&gt; 8) &amp; 0xf, (resp[0] &amp; (1 &lt;&lt; 16)) ? &quot;yes&quot; : &quot;no&quot;);
+ 
+@@ -123,30 +123,27 @@
+ 			(resp[1] &amp; (1 &lt;&lt; 30)) ? &quot;yes&quot; : &quot;no&quot;,
+ 			(resp[1] &amp; (1 &lt;&lt; 31)) ? &quot;yes&quot; : &quot;no&quot;);
+ 
+-		codec-&gt;afg_wid_start = resp[2] &gt;&gt; 16;
+-		codec-&gt;afg_wid_count = resp[2] &amp; 0xFF;
++		afg-&gt;wid_start = resp[2] &gt;&gt; 16;
++		afg-&gt;wid_count = resp[2] &amp; 0xFF;
+ 
+-		codec-&gt;afg_widgets = calloc(sizeof(*codec-&gt;afg_widgets), codec-&gt;afg_wid_count);
+-		if (codec-&gt;afg_widgets == NULL) {
++		afg-&gt;widgets = calloc(sizeof(*afg-&gt;widgets), afg-&gt;wid_count);
++		if (afg-&gt;widgets == NULL) {
+ 			dprintf(&quot;ERROR: Not enough memory!\n&quot;);
+ 			return B_NO_MEMORY;
+ 		}
+ 
+-		/* Only now mark the AFG as found and used */
+-		codec-&gt;afg_nid = afg_nid;
+-
+ 		/* Iterate over all Widgets and collect info */
+-		for (widx=0; widx &lt; codec-&gt;afg_wid_count; widx++) {
+-			uint32 wid = codec-&gt;afg_wid_start + widx;
++		for (widx=0; widx &lt; afg-&gt;wid_count; widx++) {
++			uint32 wid = afg-&gt;wid_start + widx;
+ 			char buf[256];
+ 			int off;
+ 			
+-			verbs[0] = MAKE_VERB(codec-&gt;addr,wid,VID_GET_PARAM,PID_AUDIO_WIDGET_CAP);
+-			verbs[1] = MAKE_VERB(codec-&gt;addr,wid,VID_GET_PARAM,PID_CONNLIST_LEN);
+-			hda_send_verbs(codec, verbs, resp, 2);
++			verbs[0] = MAKE_VERB(afg-&gt;codec-&gt;addr,wid,VID_GET_PARAM,PID_AUDIO_WIDGET_CAP);
++			verbs[1] = MAKE_VERB(afg-&gt;codec-&gt;addr,wid,VID_GET_PARAM,PID_CONNLIST_LEN);
++			hda_send_verbs(afg-&gt;codec, verbs, resp, 2);
+ 			
+-			codec-&gt;afg_widgets[widx].type = resp[0] &gt;&gt; 20;
+-			codec-&gt;afg_widgets[widx].num_inputs = resp[1] &amp; 0x7F;
++			afg-&gt;widgets[widx].type = resp[0] &gt;&gt; 20;
++			afg-&gt;widgets[widx].num_inputs = resp[1] &amp; 0x7F;
+ 
+ 			off = 0;
+ 			if (resp[0] &amp; (1 &lt;&lt; 11)) off += sprintf(buf+off, &quot;[L-R Swap] &quot;);
+@@ -161,48 +158,48 @@
+ 			if (resp[0] &amp; (1 &lt;&lt; 1)) off += sprintf(buf+off, &quot;[In Amp] &quot;);
+ 			if (resp[0] &amp; (1 &lt;&lt; 0)) off += sprintf(buf+off, &quot;[Stereo] &quot;);
+ 
+-			switch(codec-&gt;afg_widgets[widx].type) {
++			switch(afg-&gt;widgets[widx].type) {
+ 				case WT_AUDIO_OUTPUT:
+ 					dprintf(&quot;%ld:\tAudio Output\n&quot;, wid);
+-					hda_widget_get_stream_support(codec, wid,
+-						&amp;codec-&gt;afg_widgets[widx].d.input.formats,
+-						&amp;codec-&gt;afg_widgets[widx].d.input.rates);
+-					hda_widget_get_amplifier_capabilities(codec, wid);
++					hda_widget_get_stream_support(afg-&gt;codec, wid,
++						&amp;afg-&gt;widgets[widx].d.input.formats,
++						&amp;afg-&gt;widgets[widx].d.input.rates);
++					hda_widget_get_amplifier_capabilities(afg-&gt;codec, wid);
+ 					break;
+ 				case WT_AUDIO_INPUT:
+ 					dprintf(&quot;%ld:\tAudio Input\n&quot;, wid);
+-					hda_widget_get_stream_support(codec, wid,
+-						&amp;codec-&gt;afg_widgets[widx].d.input.formats,
+-						&amp;codec-&gt;afg_widgets[widx].d.input.rates);
+-					hda_widget_get_amplifier_capabilities(codec, wid);
++					hda_widget_get_stream_support(afg-&gt;codec, wid,
++						&amp;afg-&gt;widgets[widx].d.input.formats,
++						&amp;afg-&gt;widgets[widx].d.input.rates);
++					hda_widget_get_amplifier_capabilities(afg-&gt;codec, wid);
+ 					break;
+ 				case WT_AUDIO_MIXER:
+ 					dprintf(&quot;%ld:\tAudio Mixer\n&quot;, wid);
+-					hda_widget_get_amplifier_capabilities(codec, wid);
++					hda_widget_get_amplifier_capabilities(afg-&gt;codec, wid);
+ 					break;
+ 				case WT_AUDIO_SELECTOR:
+ 					dprintf(&quot;%ld:\tAudio Selector\n&quot;, wid);
+-					hda_widget_get_amplifier_capabilities(codec, wid);
++					hda_widget_get_amplifier_capabilities(afg-&gt;codec, wid);
+ 					break;
+ 				case WT_PIN_COMPLEX:
+ 					dprintf(&quot;%ld:\tPin Complex\n&quot;, wid);
+-					verbs[0] = MAKE_VERB(codec-&gt;addr,wid,VID_GET_PARAM,PID_PIN_CAP);
+-					if (hda_send_verbs(codec, verbs, resp, 1) == B_OK) {
+-						codec-&gt;afg_widgets[widx].d.pin.input = resp[0] &amp; (1 &lt;&lt; 5);
+-						codec-&gt;afg_widgets[widx].d.pin.output = resp[0] &amp; (1 &lt;&lt; 4);
++					verbs[0] = MAKE_VERB(afg-&gt;codec-&gt;addr,wid,VID_GET_PARAM,PID_PIN_CAP);
++					if (hda_send_verbs(afg-&gt;codec, verbs, resp, 1) == B_OK) {
++						afg-&gt;widgets[widx].d.pin.input = resp[0] &amp; (1 &lt;&lt; 5);
++						afg-&gt;widgets[widx].d.pin.output = resp[0] &amp; (1 &lt;&lt; 4);
+ 					}
+ 
+-					verbs[0] = MAKE_VERB(codec-&gt;addr,wid,VID_GET_CFGDEFAULT,0);
+-					if (hda_send_verbs(codec, verbs, resp, 1) == B_OK) {
+-						codec-&gt;afg_widgets[widx].d.pin.device = (resp[0] &gt;&gt; 20) &amp; 0xF;
++					verbs[0] = MAKE_VERB(afg-&gt;codec-&gt;addr,wid,VID_GET_CFGDEFAULT,0);
++					if (hda_send_verbs(afg-&gt;codec, verbs, resp, 1) == B_OK) {
++						afg-&gt;widgets[widx].d.pin.device = (resp[0] &gt;&gt; 20) &amp; 0xF;
+ 						dprintf(&quot;\t%s, %s, %s, %s\n&quot;,
+ 							portcon[resp[0] &gt;&gt; 30],	
+-							defdev[codec-&gt;afg_widgets[widx].d.pin.device],
++							defdev[afg-&gt;widgets[widx].d.pin.device],
+ 							conntype[(resp[0] &gt;&gt; 16) &amp; 0xF],
+ 							jcolor[(resp[0] &gt;&gt; 12) &amp; 0xF]);
+ 					}
+ 					
+-					hda_widget_get_amplifier_capabilities(codec, wid);
++					hda_widget_get_amplifier_capabilities(afg-&gt;codec, wid);
+ 					break;
+ 				case WT_POWER:
+ 					dprintf(&quot;%ld:\tPower\n&quot;, wid);
+@@ -222,37 +219,37 @@
+ 
+ 			dprintf(&quot;\t%s\n&quot;, buf);
+ 
+-			hda_widget_get_pm_support(codec, wid, &amp;codec-&gt;afg_widgets[widx].pm);
++			hda_widget_get_pm_support(afg-&gt;codec, wid, &amp;afg-&gt;widgets[widx].pm);
+ 			
+-			if (codec-&gt;afg_widgets[widx].num_inputs) {
++			if (afg-&gt;widgets[widx].num_inputs) {
+ 				int idx;
+ 
+ 				off = 0;
+ 
+-				if (codec-&gt;afg_widgets[widx].num_inputs &gt; 1) {
+-					verbs[0] = MAKE_VERB(codec-&gt;addr,wid,VID_GET_CONNSEL,0);
+-					if (hda_send_verbs(codec, verbs, resp, 1) == B_OK)
+-						codec-&gt;afg_widgets[widx].active_input = resp[0] &amp; 0xFF;
++				if (afg-&gt;widgets[widx].num_inputs &gt; 1) {
++					verbs[0] = MAKE_VERB(afg-&gt;codec-&gt;addr,wid,VID_GET_CONNSEL,0);
++					if (hda_send_verbs(afg-&gt;codec, verbs, resp, 1) == B_OK)
++						afg-&gt;widgets[widx].active_input = resp[0] &amp; 0xFF;
+ 					else
+-						codec-&gt;afg_widgets[widx].active_input = -1;
++						afg-&gt;widgets[widx].active_input = -1;
+ 				} else 
+-					codec-&gt;afg_widgets[widx].active_input = -1;
++					afg-&gt;widgets[widx].active_input = -1;
+ 				
+-				for (idx=0; idx &lt; codec-&gt;afg_widgets[widx].num_inputs; idx ++) {
++				for (idx=0; idx &lt; afg-&gt;widgets[widx].num_inputs; idx ++) {
+ 					if (!(idx % 4)) {
+-						verbs[0] = MAKE_VERB(codec-&gt;addr,wid,VID_GET_CONNLENTRY,idx);
+-						if (hda_send_verbs(codec, verbs, resp, 1) != B_OK) {
++						verbs[0] = MAKE_VERB(afg-&gt;codec-&gt;addr,wid,VID_GET_CONNLENTRY,idx);
++						if (hda_send_verbs(afg-&gt;codec, verbs, resp, 1) != B_OK) {
+ 							dprintf(&quot;%s: Error parsing inputs for widget %ld!\n&quot;, __func__, wid);
+ 							break;
+ 						}
+ 					}
+ 
+-					if (idx != codec-&gt;afg_widgets[widx].active_input)
++					if (idx != afg-&gt;widgets[widx].active_input)
+ 						off += sprintf(buf+off, &quot;%ld &quot;, (resp[0] &gt;&gt; (8*(idx%4))) &amp; 0xFF);
+ 					else
+ 						off += sprintf(buf+off, &quot;(%ld) &quot;, (resp[0] &gt;&gt; (8*(idx%4))) &amp; 0xFF);
+ 
+-					codec-&gt;afg_widgets[widx].inputs[idx] = (resp[0] &gt;&gt; (8*(idx%4))) &amp; 0xFF;
++					afg-&gt;widgets[widx].inputs[idx] = (resp[0] &gt;&gt; (8*(idx%4))) &amp; 0xFF;
+ 				}
+ 				
+ 				dprintf(&quot;\t[ %s]\n&quot;, buf);
+@@ -264,32 +261,32 @@
+ }
+ 
+ static uint32
+-hda_codec_afg_find_dac_path(hda_codec* codec, uint32 wid, uint32 depth)
++hda_codec_afg_find_dac_path(hda_afg* afg, uint32 wid, uint32 depth)
+ {
+-	int widx = wid - codec-&gt;afg_wid_start;
++	int widx = wid - afg-&gt;wid_start;
+ 	int idx;
+ 
+-	switch(codec-&gt;afg_widgets[widx].type) {
++	switch(afg-&gt;widgets[widx].type) {
+ 		case WT_AUDIO_OUTPUT:
+ 			return wid;
+ 
+ 		case WT_AUDIO_MIXER:
+-			for (idx=0; idx &lt; codec-&gt;afg_widgets[widx].num_inputs; idx++) {
+-				if (hda_codec_afg_find_dac_path(codec, codec-&gt;afg_widgets[widx].inputs[idx], depth +1)) {
+-					if (codec-&gt;afg_widgets[widx].active_input == -1)
+-						codec-&gt;afg_widgets[widx].active_input = idx;
++			for (idx=0; idx &lt; afg-&gt;widgets[widx].num_inputs; idx++) {
++				if (hda_codec_afg_find_dac_path(afg, afg-&gt;widgets[widx].inputs[idx], depth +1)) {
++					if (afg-&gt;widgets[widx].active_input == -1)
++						afg-&gt;widgets[widx].active_input = idx;
+ 
+-					return codec-&gt;afg_widgets[widx].inputs[idx];
++					return afg-&gt;widgets[widx].inputs[idx];
+ 				}
+ 			}
+ 			break;
+ 
+ 		case WT_AUDIO_SELECTOR:
+ 			{
+-				int idx = codec-&gt;afg_widgets[widx].active_input;
++				int idx = afg-&gt;widgets[widx].active_input;
+ 				if (idx != -1) {
+-					uint32 wid = codec-&gt;afg_widgets[widx].inputs[idx];
+-					if (hda_codec_afg_find_dac_path(codec, wid, depth +1)) {
++					uint32 wid = afg-&gt;widgets[widx].inputs[idx];
++					if (hda_codec_afg_find_dac_path(afg, wid, depth +1)) {
+ 						return wid;
+ 					}
+ 				}
+@@ -303,41 +300,52 @@
+ 	return 0;
+ }
+ 
+-static void
+-hda_codec_audiofg_new(hda_codec* codec, uint32 afg_nid)
++static status_t
++hda_codec_afg_new(hda_codec* codec, uint32 afg_nid)
+ {
++	hda_afg* afg;
++	status_t rc;
+ 	uint32 idx;
+-						
+-	/* FIXME: Bail if this isn't the first Audio Function Group we find... */
+-	if (codec-&gt;afg_nid != 0) {
+-		dprintf(&quot;SORRY: This driver currently only supports a single Audio Function Group!\n&quot;);
+-		return;
++
++	if ((afg=calloc(1, sizeof(hda_afg))) == NULL) {
++		rc =  B_NO_MEMORY;
++		goto done;
+ 	}
+ 
++	/* Setup minimal info needed by hda_codec_parse_afg */
++	afg-&gt;root_nid = afg_nid;
++	afg-&gt;codec = codec;
++
+ 	/* Parse all widgets in Audio Function Group */
+-	hda_codec_parse_afg(codec, afg_nid);
++	rc = hda_codec_parse_afg(afg);
++	if (rc != B_OK)
++		goto free_afg;
+ 
++	/* Setup for worst-case scenario;
++		we cannot find any output Pin Widgets */
++	rc = ENODEV;
++
+ 	/* Try to locate all output channels */
+-	for (idx=0; idx &lt; codec-&gt;afg_wid_count; idx++) {
++	for (idx=0; idx &lt; afg-&gt;wid_count; idx++) {
+ 		uint32 iidx, output_wid = 0;
+ 
+-		if (codec-&gt;afg_widgets[idx].type != WT_PIN_COMPLEX)
++		if (afg-&gt;widgets[idx].type != WT_PIN_COMPLEX)
+ 			continue;
+-		if (codec-&gt;afg_widgets[idx].d.pin.output)
++		if (afg-&gt;widgets[idx].d.pin.output)
+ 			continue;
+-		if 	(codec-&gt;afg_widgets[idx].d.pin.device != PIN_DEV_HP_OUT &amp;&amp;
+-			codec-&gt;afg_widgets[idx].d.pin.device != PIN_DEV_SPEAKER &amp;&amp;
+-			codec-&gt;afg_widgets[idx].d.pin.device != PIN_DEV_LINE_OUT)
++		if 	(afg-&gt;widgets[idx].d.pin.device != PIN_DEV_HP_OUT &amp;&amp;
++			afg-&gt;widgets[idx].d.pin.device != PIN_DEV_SPEAKER &amp;&amp;
++			afg-&gt;widgets[idx].d.pin.device != PIN_DEV_LINE_OUT)
+ 			continue;
+ 
+-		iidx = codec-&gt;afg_widgets[idx].active_input;
++		iidx = afg-&gt;widgets[idx].active_input;
+ 		if (iidx != -1) {
+-			output_wid = hda_codec_afg_find_dac_path(codec, codec-&gt;afg_widgets[idx].inputs[iidx], 0);
++			output_wid = hda_codec_afg_find_dac_path(afg, afg-&gt;widgets[idx].inputs[iidx], 0);
+ 		} else {
+-			for (iidx=0; iidx &lt; codec-&gt;afg_widgets[idx].num_inputs; iidx++) {
+-				output_wid = hda_codec_afg_find_dac_path(codec, codec-&gt;afg_widgets[idx].inputs[iidx], 0);
++			for (iidx=0; iidx &lt; afg-&gt;widgets[idx].num_inputs; iidx++) {
++				output_wid = hda_codec_afg_find_dac_path(afg, afg-&gt;widgets[idx].inputs[iidx], 0);
+ 				if (output_wid) {
+-					corb_t verb = MAKE_VERB(codec-&gt;addr,idx+codec-&gt;afg_wid_start,VID_SET_CONNSEL,iidx);
++					corb_t verb = MAKE_VERB(codec-&gt;addr,idx+afg-&gt;wid_start,VID_SET_CONNSEL,iidx);
+ 					if (hda_send_verbs(codec, &amp;verb, NULL, 1) != B_OK)
+ 						dprintf(&quot;%s: Setting output selector failed!\n&quot;, __func__);
+ 					break;
+@@ -348,25 +356,43 @@
+ 		if (output_wid) {
+ 			corb_t verb;
+ 
+-			codec-&gt;playback_stream-&gt;pin_wid = idx + codec-&gt;afg_wid_start;
+-			codec-&gt;playback_stream-&gt;io_wid = output_wid;
++			/* Setup playback/record streams for Multi Audio API */
++			afg-&gt;playback_stream = hda_stream_alloc(afg-&gt;codec-&gt;ctrlr, STRM_PLAYBACK);
++			afg-&gt;record_stream = hda_stream_alloc(afg-&gt;codec-&gt;ctrlr, STRM_RECORD);
+ 
++			afg-&gt;playback_stream-&gt;pin_wid = idx + afg-&gt;wid_start;
++			afg-&gt;playback_stream-&gt;io_wid = output_wid;
++
+ 			dprintf(&quot;%s: Found output PIN (%s) connected to output CONV wid:%ld\n&quot;, 
+-				__func__, defdev[codec-&gt;afg_widgets[idx].d.pin.device], output_wid);
++				__func__, defdev[afg-&gt;widgets[idx].d.pin.device], output_wid);
+ 
+ 			/* FIXME: Force Pin Widget to unmute */
+-			verb = MAKE_VERB(codec-&gt;addr, codec-&gt;playback_stream-&gt;pin_wid,
++			verb = MAKE_VERB(codec-&gt;addr, afg-&gt;playback_stream-&gt;pin_wid,
+ 				VID_SET_AMPGAINMUTE, (1 &lt;&lt; 15) | (1 &lt;&lt; 13) | (1 &lt;&lt; 12));
+ 			hda_send_verbs(codec, &amp;verb, NULL, 1);
++			
++			rc = B_OK;
+ 			break;
+ 		}
+ 	}
++
++	/* If we found any valid output channels, we're in the clear */
++	if (rc == B_OK) {
++		codec-&gt;afgs[codec-&gt;num_afgs++] = afg;
++		goto done;
++	}
++
++free_afg:
++	free(afg);
++
++done:
++	return rc;
+ }
+ 
+ hda_codec*
+ hda_codec_new(hda_controller* ctrlr, uint32 cad)
+ {
+-	hda_codec* codec = calloc(sizeof(hda_codec),1);
++	hda_codec* codec = calloc(1, sizeof(hda_codec));
+ 	if (codec) {
+ 		uint32 responses[3];
+ 		corb_t verbs[3];
+@@ -377,13 +403,8 @@
+ 		codec-&gt;addr = cad;
+ 		codec-&gt;response_count = 0;
+ 		codec-&gt;response_sem = create_sem(0, &quot;hda_codec_response_sem&quot;);
+-		codec-&gt;afg_nid = 0;
+ 		ctrlr-&gt;codecs[cad] = codec;
+ 	
+-		/* Setup playback/record streams for Multi Audio API */
+-		codec-&gt;playback_stream = hda_stream_alloc(ctrlr, STRM_PLAYBACK);
+-		codec-&gt;record_stream = hda_stream_alloc(ctrlr, STRM_RECORD);
+-
+ 		verbs[0] = MAKE_VERB(cad,0,VID_GET_PARAM,PID_VENDORID);
+ 		verbs[1] = MAKE_VERB(cad,0,VID_GET_PARAM,PID_REVISIONID);
+ 		verbs[2] = MAKE_VERB(cad,0,VID_GET_PARAM,PID_SUBORD_NODE_COUNT);
+@@ -398,11 +419,13 @@
+ 				uint32 resp;
+ 				verbs[0] = MAKE_VERB(cad,nid,VID_GET_PARAM,PID_FUNCGRP_TYPE);
+ 				
+-				if ((rc=hda_send_verbs(codec, verbs, &amp;resp, 1)) == B_OK &amp;&amp; (resp&amp;0xFF) == 1) {
++				if ((rc=hda_send_verbs(codec, verbs, &amp;resp, 1)) == B_OK &amp;&amp;
++					(resp&amp;0xFF) == 1 &amp;&amp;
++					(rc=hda_codec_afg_new(codec, nid)) == B_OK) {
+ 					/* Found an Audio Function Group! */
+-					hda_codec_audiofg_new(codec, nid);
+-				} else
++				} else {
+ 					dprintf(&quot;%s: FG %ld: %s\n&quot;, __func__, nid, strerror(rc));
++				}
+ 			}	
+ 		}
+ 	}
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.c	2007-05-16 21:43:15 UTC (rev 21158)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.c	2007-05-17 02:43:12 UTC (rev 21159)
+@@ -93,7 +93,7 @@
+ }
+ 
+ status_t
+-hda_stream_setup_buffers(hda_codec* codec, hda_stream* s, const char* desc)
++hda_stream_setup_buffers(hda_afg* afg, hda_stream* s, const char* desc)
+ {
+ 	uint32 buffer_size, buffer_pa, alloc;
+ 	uint32 response[2], idx;
+@@ -200,17 +200,17 @@
+ 		default:			dprintf(&quot;%s: Invalid sample rate: 0x%lx\n&quot;, __func__, s-&gt;samplerate); break;
+ 	}
+ 
+-	OREG16(codec-&gt;ctrlr,s-&gt;off,FMT) = wfmt;
+-	OREG32(codec-&gt;ctrlr,s-&gt;off,BDPL) = s-&gt;bdl_pa;
+-	OREG32(codec-&gt;ctrlr,s-&gt;off,BDPU) = 0;
+-	OREG16(codec-&gt;ctrlr,s-&gt;off,LVI) = s-&gt;num_buffers -1;
+-	OREG32(codec-&gt;ctrlr,s-&gt;off,CBL) = s-&gt;num_channels * s-&gt;num_buffers;
+-	OREG8(codec-&gt;ctrlr,s-&gt;off,CTL0) = CTL0_IOCE | CTL0_FEIE | CTL0_DEIE;
+-	OREG8(codec-&gt;ctrlr,s-&gt;off,CTL2) = s-&gt;id &lt;&lt; 4;
++	OREG16(afg-&gt;codec-&gt;ctrlr,s-&gt;off,FMT) = wfmt;
++	OREG32(afg-&gt;codec-&gt;ctrlr,s-&gt;off,BDPL) = s-&gt;bdl_pa;
++	OREG32(afg-&gt;codec-&gt;ctrlr,s-&gt;off,BDPU) = 0;
++	OREG16(afg-&gt;codec-&gt;ctrlr,s-&gt;off,LVI) = s-&gt;num_buffers -1;
++	OREG32(afg-&gt;codec-&gt;ctrlr,s-&gt;off,CBL) = s-&gt;num_channels * s-&gt;num_buffers;
++	OREG8(afg-&gt;codec-&gt;ctrlr,s-&gt;off,CTL0) = CTL0_IOCE | CTL0_FEIE | CTL0_DEIE;
++	OREG8(afg-&gt;codec-&gt;ctrlr,s-&gt;off,CTL2) = s-&gt;id &lt;&lt; 4;
+ 
+-	verb[0] = MAKE_VERB(codec-&gt;addr, s-&gt;io_wid, VID_SET_CONVFORMAT, wfmt);
+-	verb[1] = MAKE_VERB(codec-&gt;addr, s-&gt;io_wid, VID_SET_CVTSTRCHN, s-&gt;id &lt;&lt; 4);
+-	rc = hda_send_verbs(codec, verb, response, 2);
++	verb[0] = MAKE_VERB(afg-&gt;codec-&gt;addr, s-&gt;io_wid, VID_SET_CONVFORMAT, wfmt);
++	verb[1] = MAKE_VERB(afg-&gt;codec-&gt;addr, s-&gt;io_wid, VID_SET_CVTSTRCHN, s-&gt;id &lt;&lt; 4);
++	rc = hda_send_verbs(afg-&gt;codec, verb, response, 2);
+ 
+ 	return rc;	
+ }
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.c	2007-05-16 21:43:15 UTC (rev 21158)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.c	2007-05-17 02:43:12 UTC (rev 21159)
+@@ -34,7 +34,7 @@
+ }
+ 
+ static status_t
+-get_description(hda_codec* codec, multi_description* data)
++get_description(hda_afg* afg, multi_description* data)
+ {
+ 	data-&gt;interface_version = B_CURRENT_INTERFACE_VERSION;
+ 	data-&gt;interface_minimum = B_CURRENT_INTERFACE_VERSION;
+@@ -55,8 +55,8 @@
+ 	}
+ 
+ 	/* determine output/input rates */	
+-	data-&gt;output_rates = codec-&gt;afg_defrates;
+-	data-&gt;input_rates = codec-&gt;afg_defrates;
++	data-&gt;output_rates = afg-&gt;defrates;
++	data-&gt;input_rates = afg-&gt;defrates;
+ 
+ 	/* force existance of 48kHz if variable rates are not supported */
+ 	if (data-&gt;output_rates == 0)
+@@ -67,8 +67,8 @@
+ 	data-&gt;max_cvsr_rate = 0;
+ 	data-&gt;min_cvsr_rate = 0;
+ 
+-	data-&gt;output_formats = codec-&gt;afg_deffmts;
+-	data-&gt;input_formats = codec-&gt;afg_deffmts;
++	data-&gt;output_formats = afg-&gt;deffmts;
++	data-&gt;input_formats = afg-&gt;deffmts;
+ 	data-&gt;lock_sources = B_MULTI_LOCK_INTERNAL;
+ 	data-&gt;timecode_sources = 0;
+ 	data-&gt;interface_flags = B_MULTI_INTERFACE_PLAYBACK /* | B_MULTI_INTERFACE_RECORD */;
+@@ -80,7 +80,7 @@
+ }
+ 
+ static status_t
+-get_enabled_channels(hda_codec* codec, multi_channel_enable* data)
++get_enabled_channels(hda_afg* afg, multi_channel_enable* data)
+ {
+ 	B_SET_CHANNEL(data-&gt;enable_bits, 0, true);
+ 	B_SET_CHANNEL(data-&gt;enable_bits, 1, true);
+@@ -92,59 +92,59 @@
+ }
+ 
+ static status_t
+-get_global_format(hda_codec* codec, multi_format_info* data)
++get_global_format(hda_afg* afg, multi_format_info* data)
+ {
+ 	data-&gt;output_latency = 0;
+ 	data-&gt;input_latency = 0;
+ 	data-&gt;timecode_kind = 0;
+ 
+-	data-&gt;output.format = codec-&gt;playback_stream-&gt;sampleformat;
+-	data-&gt;output.rate = codec-&gt;playback_stream-&gt;samplerate;
++	data-&gt;output.format = afg-&gt;playback_stream-&gt;sampleformat;
++	data-&gt;output.rate = afg-&gt;playback_stream-&gt;samplerate;
+ 
+-	data-&gt;input.format = codec-&gt;record_stream-&gt;sampleformat;
+-	data-&gt;input.rate = codec-&gt;record_stream-&gt;sampleformat;
++	data-&gt;input.format = afg-&gt;record_stream-&gt;sampleformat;
++	data-&gt;input.rate = afg-&gt;record_stream-&gt;sampleformat;
+ 
+ 	return B_OK;
+ }
+ 
+ static status_t
+-set_global_format(hda_codec* codec, multi_format_info* data)
++set_global_format(hda_afg* afg, multi_format_info* data)
+ {
+-	codec-&gt;playback_stream-&gt;sampleformat = data-&gt;output.format;
+-	codec-&gt;playback_stream-&gt;samplerate = data-&gt;output.rate;
+-	codec-&gt;playback_stream-&gt;sample_size = format2size(codec-&gt;playback_stream-&gt;sampleformat);
++	afg-&gt;playback_stream-&gt;sampleformat = data-&gt;output.format;
++	afg-&gt;playback_stream-&gt;samplerate = data-&gt;output.rate;
++	afg-&gt;playback_stream-&gt;sample_size = format2size(afg-&gt;playback_stream-&gt;sampleformat);
+ 
+-	codec-&gt;record_stream-&gt;samplerate = data-&gt;input.rate;
+-	codec-&gt;record_stream-&gt;sampleformat = data-&gt;input.format;
+-	codec-&gt;record_stream-&gt;sample_size = format2size(codec-&gt;record_stream-&gt;sampleformat);
++	afg-&gt;record_stream-&gt;samplerate = data-&gt;input.rate;
++	afg-&gt;record_stream-&gt;sampleformat = data-&gt;input.format;
++	afg-&gt;record_stream-&gt;sample_size = format2size(afg-&gt;record_stream-&gt;sampleformat);
+ 
+ 	return B_OK;
+ }
+ 
+ static status_t
+-list_mix_controls(hda_codec* codec, multi_mix_control_info * data)
++list_mix_controls(hda_afg* afg, multi_mix_control_info * data)
+ {
+ 	return B_OK;
+ }
+ 
+ static status_t
+-list_mix_connections(hda_codec* codec, multi_mix_connection_info * data)
++list_mix_connections(hda_afg* afg, multi_mix_connection_info * data)
+ {
+ 	data-&gt;actual_count = 0;
+ 	return B_OK;
+ }
+ 
+ static status_t
+-list_mix_channels(hda_codec* codec, multi_mix_channel_info *data)
++list_mix_channels(hda_afg* afg, multi_mix_channel_info *data)
+ {
+ 	return B_OK;
+ }
+ 
+ static status_t
+-get_buffers(hda_codec* codec, multi_buffer_list* data)
++get_buffers(hda_afg* afg, multi_buffer_list* data)
+ {
+-	uint32 playback_sample_size = codec-&gt;playback_stream-&gt;sample_size;
+-	uint32 record_sample_size = codec-&gt;record_stream-&gt;sample_size;
++	uint32 playback_sample_size = afg-&gt;playback_stream-&gt;sample_size;
++	uint32 record_sample_size = afg-&gt;record_stream-&gt;sample_size;
+ 	uint32 cidx, bidx;
+ 	status_t rc;
+ 
+@@ -163,18 +163,18 @@
+ 	data-&gt;flags = 0;
+ 
+ 	/* Copy the requested settings into the streams */
+-	codec-&gt;playback_stream-&gt;num_buffers = data-&gt;request_playback_buffers;
+-	codec-&gt;playback_stream-&gt;num_channels = data-&gt;request_playback_channels;
+-	codec-&gt;playback_stream-&gt;buffer_length = data-&gt;request_playback_buffer_size;
+-	if ((rc=hda_stream_setup_buffers(codec, codec-&gt;playback_stream, &quot;Playback&quot;)) != B_OK) {
++	afg-&gt;playback_stream-&gt;num_buffers = data-&gt;request_playback_buffers;
++	afg-&gt;playback_stream-&gt;num_channels = data-&gt;request_playback_channels;
++	afg-&gt;playback_stream-&gt;buffer_length = data-&gt;request_playback_buffer_size;
++	if ((rc=hda_stream_setup_buffers(afg, afg-&gt;playback_stream, &quot;Playback&quot;)) != B_OK) {
+ 		dprintf(&quot;%s: Error setting up playback buffers (%s)\n&quot;, __func__, strerror(rc));
+ 		return rc;
+ 	}
+ 
+-	codec-&gt;record_stream-&gt;num_buffers = data-&gt;request_record_buffers;
+-	codec-&gt;record_stream-&gt;num_channels = data-&gt;request_record_channels;
+-	codec-&gt;record_stream-&gt;buffer_length = data-&gt;request_record_buffer_size;
+-	if ((rc=hda_stream_setup_buffers(codec, codec-&gt;record_stream, &quot;Recording&quot;)) != B_OK) {
++	afg-&gt;record_stream-&gt;num_buffers = data-&gt;request_record_buffers;
++	afg-&gt;record_stream-&gt;num_channels = data-&gt;request_record_channels;
++	afg-&gt;record_stream-&gt;buffer_length = data-&gt;request_record_buffer_size;
++	if ((rc=hda_stream_setup_buffers(afg, afg-&gt;record_stream, &quot;Recording&quot;)) != B_OK) {
+ 		dprintf(&quot;%s: Error setting up recording buffers (%s)\n&quot;, __func__, strerror(rc));
+ 		return rc;
+ 	}
+@@ -186,7 +186,7 @@
+ 
+ 	for (bidx=0; bidx &lt; data-&gt;return_playback_buffers; bidx++) {
+ 		for (cidx=0; cidx &lt; data-&gt;return_playback_channels; cidx++) {
+-			data-&gt;playback_buffers[bidx][cidx].base = codec-&gt;playback_stream-&gt;buffers[bidx] + (playback_sample_size * cidx);
++			data-&gt;playback_buffers[bidx][cidx].base = afg-&gt;playback_stream-&gt;buffers[bidx] + (playback_sample_size * cidx);
+ 			data-&gt;playback_buffers[bidx][cidx].stride = playback_sample_size * data-&gt;return_playback_channels;
+ 		}
+ 	}
+@@ -197,7 +197,7 @@
+ 
+ 	for (bidx=0; bidx &lt; data-&gt;return_record_buffers; bidx++) {
+ 		for (cidx=0; cidx &lt; data-&gt;return_record_channels; cidx++) {
+-			data-&gt;record_buffers[bidx][cidx].base = codec-&gt;record_stream-&gt;buffers[bidx] + (record_sample_size * cidx);
++			data-&gt;record_buffers[bidx][cidx].base = afg-&gt;record_stream-&gt;buffers[bidx] + (record_sample_size * cidx);
+ 			data-&gt;record_buffers[bidx][cidx].stride = record_sample_size * data-&gt;return_record_channels;
+ 		}
+ 	}
+@@ -206,17 +206,17 @@
+ }
+ 
+ static status_t
+-buffer_exchange(hda_codec* codec, multi_buffer_info* data)
++buffer_exchange(hda_afg* afg, multi_buffer_info* data)
+ {
+ 	static int debug_buffers_exchanged = 0;
+ 	cpu_status status;
+ 	status_t rc;
+ 
+-	if (!codec-&gt;playback_stream-&gt;running)
+-		hda_stream_start(codec-&gt;ctrlr, codec-&gt;playback_stream);
++	if (!afg-&gt;playback_stream-&gt;running)
++		hda_stream_start(afg-&gt;codec-&gt;ctrlr, afg-&gt;playback_stream);
+ 
+ 	/* do playback */
+-	rc=acquire_sem(codec-&gt;playback_stream-&gt;buffer_ready_sem);
++	rc=acquire_sem(afg-&gt;playback_stream-&gt;buffer_ready_sem);
+ 	if (rc != B_OK) {
+ 		dprintf(&quot;%s: Error waiting for playback buffer to finish (%s)!\n&quot;, __func__,
+ 			strerror(rc));
+@@ -224,13 +224,13 @@
+ 	}
+ 
+ 	status = disable_interrupts();
+-	acquire_spinlock(&amp;codec-&gt;playback_stream-&gt;lock);
++	acquire_spinlock(&amp;afg-&gt;playback_stream-&gt;lock);
+ 
+-	data-&gt;playback_buffer_cycle = codec-&gt;playback_stream-&gt;buffer_cycle;
+-	data-&gt;played_real_time = codec-&gt;playback_stream-&gt;real_time;
+-	data-&gt;played_frames_count = codec-&gt;playback_stream-&gt;frames_count;
++	data-&gt;playback_buffer_cycle = afg-&gt;playback_stream-&gt;buffer_cycle;
++	data-&gt;played_real_time = afg-&gt;playback_stream-&gt;real_time;
++	data-&gt;played_frames_count = afg-&gt;playback_stream-&gt;frames_count;
+ 
+-	release_spinlock(&amp;codec-&gt;playback_stream-&gt;lock);
++	release_spinlock(&amp;afg-&gt;playback_stream-&gt;lock);
+ 	restore_interrupts(status);
+ 
+ 	debug_buffers_exchanged++;
+@@ -242,13 +242,13 @@
+ }
+ 
+ static status_t
+-buffer_force_stop(hda_codec* codec)
++buffer_force_stop(hda_afg* afg)
+ {
+-	hda_stream_stop(codec-&gt;ctrlr, codec-&gt;playback_stream);
+-	hda_stream_stop(codec-&gt;ctrlr, codec-&gt;record_stream);
++	hda_stream_stop(afg-&gt;codec-&gt;ctrlr, afg-&gt;playback_stream);
++	hda_stream_stop(afg-&gt;codec-&gt;ctrlr, afg-&gt;record_stream);
+ 
+-	delete_sem(codec-&gt;playback_stream-&gt;buffer_ready_sem);
+-//	delete_sem(codec-&gt;record_stream-&gt;buffer_ready_sem);
++	delete_sem(afg-&gt;playback_stream-&gt;buffer_ready_sem);
++//	delete_sem(afg-&gt;record_stream-&gt;buffer_ready_sem);
+ 
+ 	return B_OK;
+ }
+@@ -257,28 +257,35 @@
+ multi_audio_control(void* cookie, uint32 op, void* arg, size_t len)
+ {
+ 	hda_codec* codec = (hda_codec*)cookie;
++	hda_afg* afg;
+ 
++	/* FIXME: Make sure we have a valid codec &amp; afg... */
++	if (!codec || codec-&gt;num_afgs == 0)
++		return ENODEV;
++
++	afg = codec-&gt;afgs[0];
++
+ 	switch(op) {
+-		case B_MULTI_GET_DESCRIPTION:			return get_description(codec, arg);
++		case B_MULTI_GET_DESCRIPTION:			return get_description(afg, arg);
+ 		case B_MULTI_GET_EVENT_INFO:			return B_ERROR;
+ 		case B_MULTI_SET_EVENT_INFO:			return B_ERROR;
+ 		case B_MULTI_GET_EVENT:					return B_ERROR;
+-		case B_MULTI_GET_ENABLED_CHANNELS:		return get_enabled_channels(codec, arg);
++		case B_MULTI_GET_ENABLED_CHANNELS:		return get_enabled_channels(afg, arg);
+ 		case B_MULTI_SET_ENABLED_CHANNELS:		return B_OK;
+-		case B_MULTI_GET_GLOBAL_FORMAT:			return get_global_format(codec, arg);
+-		case B_MULTI_SET_GLOBAL_FORMAT:			return set_global_format(codec, arg);
++		case B_MULTI_GET_GLOBAL_FORMAT:			return get_global_format(afg, arg);
++		case B_MULTI_SET_GLOBAL_FORMAT:			return set_global_format(afg, arg);
+ 		case B_MULTI_GET_CHANNEL_FORMATS:		return B_ERROR;
+ 		case B_MULTI_SET_CHANNEL_FORMATS:		return B_ERROR;
+ 		case B_MULTI_GET_MIX:					return B_ERROR;
+ 		case B_MULTI_SET_MIX:					return B_ERROR;
+-		case B_MULTI_LIST_MIX_CHANNELS:			return list_mix_channels(codec, arg);
+-		case B_MULTI_LIST_MIX_CONTROLS:			return list_mix_controls(codec, arg);
+-		case B_MULTI_LIST_MIX_CONNECTIONS:		return list_mix_connections(codec, arg);
+-		case B_MULTI_GET_BUFFERS:				return get_buffers(codec, arg);
++		case B_MULTI_LIST_MIX_CHANNELS:			return list_mix_channels(afg, arg);
++		case B_MULTI_LIST_MIX_CONTROLS:			return list_mix_controls(afg, arg);
++		case B_MULTI_LIST_MIX_CONNECTIONS:		return list_mix_connections(afg, arg);
++		case B_MULTI_GET_BUFFERS:				return get_buffers(afg, arg);
+ 		case B_MULTI_SET_BUFFERS:				return B_ERROR;
+ 		case B_MULTI_SET_START_TIME:			return B_ERROR;
+-		case B_MULTI_BUFFER_EXCHANGE:			return buffer_exchange(codec, arg);
+-		case B_MULTI_BUFFER_FORCE_STOP:			return buffer_force_stop(codec);
++		case B_MULTI_BUFFER_EXCHANGE:			return buffer_exchange(afg, arg);
++		case B_MULTI_BUFFER_FORCE_STOP:			return buffer_force_stop(afg);
+ 	}
+ 
+ 	return B_BAD_VALUE;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002321.html">[Haiku-commits] r21158 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+</A></li>
+	<LI>Next message: <A HREF="002323.html">[Haiku-commits] r21160 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2322">[ date ]</a>
+              <a href="thread.html#2322">[ thread ]</a>
+              <a href="subject.html#2322">[ subject ]</a>
+              <a href="author.html#2322">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

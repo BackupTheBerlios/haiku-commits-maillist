@@ -1,0 +1,184 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27071 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27071%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808192343.m7JNhgbe002886%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011112.html">
+   <LINK REL="Next"  HREF="011116.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27071 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27071%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808192343.m7JNhgbe002886%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27071 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Aug 20 01:43:42 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011112.html">[Haiku-commits] r27070 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+        <LI>Next message: <A HREF="011116.html">[Haiku-commits] r27072 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11115">[ date ]</a>
+              <a href="thread.html#11115">[ thread ]</a>
+              <a href="subject.html#11115">[ subject ]</a>
+              <a href="author.html#11115">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-20 01:43:41 +0200 (Wed, 20 Aug 2008)
+New Revision: 27071
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27071&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27071&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+Log:
+* Added &quot;swap&quot; debugger command printing some info on the swap space.
+* Fixed lock leak in Write().
+* Fixed bug in _Commit(): swap_space_reserve() was fed with the wrong
+  value (could even be negative).
+* swap_free_page_swap_space(): Removed incrementing of sAvailSwapSpace.
+  The function is only supposed to deallocate swap space, not to
+  unreserve it.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-19 21:37:16 UTC (rev 27070)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-19 23:43:41 UTC (rev 27071)
+@@ -135,6 +135,37 @@
+ static object_cache *sSwapBlockCache;
+ 
+ 
++static int
++dump_swap_info(int argc, char** argv)
++{
++	swap_addr_t totalSwapPages = 0;
++	swap_addr_t usedSwapPages = 0;
++
++	kprintf(&quot;swap files:\n&quot;);
++
++	for (SwapFileList::Iterator it = sSwapFileList.GetIterator();
++			swap_file* file = it.Next();) {
++		swap_addr_t total = file-&gt;last_slot - file-&gt;first_slot;
++		kprintf(&quot;  vnode: %p, pages: total: %lu, used: %lu\n&quot;,
++			file-&gt;vnode, total, file-&gt;used);
++
++		totalSwapPages += total;
++		usedSwapPages += file-&gt;used;
++	}
++
++	kprintf(&quot;\n&quot;);
++	kprintf(&quot;swap space in pages:\n&quot;);
++	kprintf(&quot;total:     %9lu\n&quot;, totalSwapPages);
++	kprintf(&quot;available: %9llu\n&quot;, sAvailSwapSpace / B_PAGE_SIZE);
++	kprintf(&quot;reserved:  %9llu\n&quot;,
++		totalSwapPages - sAvailSwapSpace / B_PAGE_SIZE);
++	kprintf(&quot;used:      %9lu\n&quot;, usedSwapPages);
++	kprintf(&quot;free:      %9lu\n&quot;, totalSwapPages - usedSwapPages);
++
++	return 0;
++}
++
++
+ static swap_addr_t
+ swap_slot_alloc(uint32 count)
+ {
+@@ -388,7 +419,8 @@
+ {
+ 	off_t pageIndex = offset &gt;&gt; PAGE_SHIFT;
+ 
+-	Lock();
++	AutoLocker&lt;VMCache&gt; locker(this);
++
+ 	for (uint32 i = 0; i &lt; count; i++) {
+ 		swap_addr_t slotIndex = _SwapBlockGetAddress(pageIndex + i);
+ 		if (slotIndex != SWAP_SLOT_NONE) {
+@@ -402,7 +434,7 @@
+ 		return B_ERROR;
+ 
+ 	fAllocatedSwapSize += count * B_PAGE_SIZE;
+-	Unlock();
++	locker.Unlock();
+ 
+ 	uint32 n = count;
+ 	for (uint32 i = 0; i &lt; count; i += n) {
+@@ -420,9 +452,9 @@
+ 		status_t status = vfs_write_pages(swapFile-&gt;vnode, NULL, pos, vecs + i,
+ 				n, flags, _numBytes);
+ 		if (status != B_OK) {
+-			Lock();
++			locker.Lock();
+ 			fAllocatedSwapSize -= n * B_PAGE_SIZE;
+-			Unlock();
++			locker.Unlock();
+ 
+ 			swap_slot_dealloc(slotIndex, n);
+ 			return status;
+@@ -625,7 +657,7 @@
+ 	// we always try to reserve as much as possible of the final commitment
+ 	// in the swap space.
+ 	if (size &gt; fCommittedSwapSize) {
+-		fCommittedSwapSize += swap_space_reserve(size - committed_size);
++		fCommittedSwapSize += swap_space_reserve(size - fCommittedSwapSize);
+ 		committed_size = fCommittedSwapSize + committedMemory;
+ 	}
+ 
+@@ -797,6 +829,11 @@
+ 	// init available swap space
+ 	mutex_init(&amp;sAvailSwapSpaceLock, &quot;avail swap space&quot;);
+ 	sAvailSwapSpace = 0;
++
++	add_debugger_command_etc(&quot;swap&quot;, &amp;dump_swap_info,
++		&quot;Print infos about the swap usage&quot;,
++		&quot;\n&quot;
++		&quot;Print infos about the swap usage.\n&quot;, 0);
+ }
+ 
+ 
+@@ -860,10 +897,6 @@
+ 	cache-&gt;fAllocatedSwapSize -= B_PAGE_SIZE;
+ 	cache-&gt;_SwapBlockFree(page-&gt;cache_offset, 1);
+ 
+-	mutex_lock(&amp;sAvailSwapSpaceLock);
+-	sAvailSwapSpace += B_PAGE_SIZE;
+-	mutex_unlock(&amp;sAvailSwapSpaceLock);
+-
+   	return true;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011112.html">[Haiku-commits] r27070 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+	<LI>Next message: <A HREF="011116.html">[Haiku-commits] r27072 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11115">[ date ]</a>
+              <a href="thread.html#11115">[ thread ]</a>
+              <a href="subject.html#11115">[ subject ]</a>
+              <a href="author.html#11115">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

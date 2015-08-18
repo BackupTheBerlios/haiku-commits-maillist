@@ -1,0 +1,312 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25094 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25094%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/debug&In-Reply-To=%3C200804221452.m3MEqnqr012112%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008037.html">
+   <LINK REL="Next"  HREF="008040.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25094 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25094%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/debug&In-Reply-To=%3C200804221452.m3MEqnqr012112%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25094 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Apr 22 16:52:49 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008037.html">[Haiku-commits] r25093 -	haiku/trunk/src/add-ons/kernel/file_systems/nfs
+</A></li>
+        <LI>Next message: <A HREF="008040.html">[Haiku-commits] r25095 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8039">[ date ]</a>
+              <a href="thread.html#8039">[ thread ]</a>
+              <a href="subject.html#8039">[ subject ]</a>
+              <a href="author.html#8039">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-04-22 16:52:48 +0200 (Tue, 22 Apr 2008)
+New Revision: 25094
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25094&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25094&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/tracing.h
+   haiku/trunk/src/system/kernel/debug/tracing.cpp
+Log:
+Made dump_tracing() (the &quot;traced&quot; command function) available in the
+kernel and added a WrapperTraceFilter* parameter, which allows for
+additional filtering. This way other commands can print tracing output
+with special filtering. 
+
+
+Modified: haiku/trunk/headers/private/kernel/tracing.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/tracing.h	2008-04-22 04:41:30 UTC (rev 25093)
++++ haiku/trunk/headers/private/kernel/tracing.h	2008-04-22 14:52:48 UTC (rev 25094)
+@@ -88,6 +88,48 @@
+ 		bigtime_t	fTime;
+ };
+ 
++class LazyTraceOutput : public TraceOutput {
++public:
++	LazyTraceOutput(char* buffer, size_t bufferSize, uint32 flags)
++		: TraceOutput(buffer, bufferSize, flags)
++	{
++	}
++
++	const char* DumpEntry(const TraceEntry* entry)
++	{
++		if (Size() == 0) {
++			const_cast&lt;TraceEntry*&gt;(entry)-&gt;Dump(*this);
++				// Dump() should probably be const
++		}
++
++		return Buffer();
++	}
++};
++
++class TraceFilter {
++public:
++	virtual ~TraceFilter();
++
++	virtual bool Filter(const TraceEntry* entry, LazyTraceOutput&amp; out);
++
++public:
++	union {
++		thread_id	fThread;
++		team_id		fTeam;
++		const char*	fString;
++		uint64		fValue;
++		struct {
++			TraceFilter*	first;
++			TraceFilter*	second;
++		} fSubFilters;
++	};
++};
++
++class WrapperTraceFilter : public TraceFilter {
++public:
++	virtual void Init(TraceFilter* filter, int direction, bool continued) = 0;
++};
++
+ #endif	// __cplusplus
+ 
+ #ifdef __cplusplus
+@@ -98,6 +140,7 @@
+ uint8* alloc_tracing_buffer_memcpy(const void* source, size_t size, bool user);
+ char* alloc_tracing_buffer_strcpy(const char* source, size_t maxSize,
+ 			bool user);
++int dump_tracing(int argc, char** argv, WrapperTraceFilter* wrapperFilter);
+ status_t tracing_init(void);
+ 
+ void _user_ktrace_output(const char *message);
+
+Modified: haiku/trunk/src/system/kernel/debug/tracing.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/tracing.cpp	2008-04-22 04:41:30 UTC (rev 25093)
++++ haiku/trunk/src/system/kernel/debug/tracing.cpp	2008-04-22 14:52:48 UTC (rev 25094)
+@@ -386,50 +386,19 @@
+ //	#pragma mark - trace filters
+ 
+ 
+-class LazyTraceOutput : public TraceOutput {
+-public:
+-	LazyTraceOutput(char* buffer, size_t bufferSize, uint32 flags)
+-		: TraceOutput(buffer, bufferSize, flags)
+-	{
+-	}
++TraceFilter::~TraceFilter()
++{
++}
+ 
+-	const char* DumpEntry(const TraceEntry* entry)
+-	{
+-		if (Size() == 0) {
+-			const_cast&lt;TraceEntry*&gt;(entry)-&gt;Dump(*this);
+-				// Dump() should probably be const
+-		}
+ 
+-		return Buffer();
+-	}
+-};
++bool
++TraceFilter::Filter(const TraceEntry* entry, LazyTraceOutput&amp; out)
++{
++	return false;
++}
+ 
+ 
+-class TraceFilter {
+-public:
+-	virtual ~TraceFilter()
+-	{
+-	}
+ 
+-	virtual bool Filter(const TraceEntry* entry, LazyTraceOutput&amp; out)
+-	{
+-		return false;
+-	}
+-
+-public:
+-	union {
+-		thread_id	fThread;
+-		team_id		fTeam;
+-		const char*	fString;
+-		uint64		fValue;
+-		struct {
+-			TraceFilter*	first;
+-			TraceFilter*	second;
+-		} fSubFilters;
+-	};
+-};
+-
+-
+ class ThreadTraceFilter : public TraceFilter {
+ public:
+ 	virtual bool Filter(const TraceEntry* _entry, LazyTraceOutput&amp; out)
+@@ -544,9 +513,9 @@
+ 		return fTokenIndex == fTokenCount &amp;&amp; filter != NULL;
+ 	}
+ 
+-	bool Filter(const TraceEntry* entry, LazyTraceOutput&amp; out)
++	TraceFilter* Filter()
+ 	{
+-		return fFilters[0].Filter(entry, out);
++		return &amp;fFilters[0];
+ 	}
+ 
+ private:
+@@ -782,7 +751,7 @@
+ 
+ 
+ int
+-dump_tracing(int argc, char** argv)
++dump_tracing_internal(int argc, char** argv, WrapperTraceFilter* wrapperFilter)
+ {
+ 	int argi = 1;
+ 
+@@ -934,7 +903,16 @@
+ 	int32 firstToDump = firstToCheck;
+ 	int32 lastToDump = lastToCheck;
+ 
+-	if (direction &lt; 0 &amp;&amp; hasFilter &amp;&amp; lastToCheck - firstToCheck &gt;= count) {
++	TraceFilter* filter = NULL;
++	if (hasFilter)
++		filter = TraceFilterParser::Default()-&gt;Filter();
++
++	if (wrapperFilter != NULL) {
++		wrapperFilter-&gt;Init(filter, direction, cont != 0);
++		filter = wrapperFilter;
++	}
++
++	if (direction &lt; 0 &amp;&amp; filter &amp;&amp; lastToCheck - firstToCheck &gt;= count) {
+ 		// iteration direction is backwards
+ 		markedMatching = true;
+ 
+@@ -952,7 +930,7 @@
+ 			TraceEntry* entry = iterator.Previous();
+ 			if ((entry-&gt;flags &amp; ENTRY_INITIALIZED) != 0) {
+ 				out.Clear();
+-				if (TraceFilterParser::Default()-&gt;Filter(entry, out)) {
++				if (filter-&gt;Filter(entry, out)) {
+ 					entry-&gt;flags |= FILTER_MATCH;
+ 					if (lastToDump == -1)
+ 						lastToDump = iterator.Index();
+@@ -994,9 +972,9 @@
+ 
+ 		if ((entry-&gt;flags &amp; ENTRY_INITIALIZED) != 0) {
+ 			out.Clear();
+-			if (hasFilter &amp;&amp;  (markedMatching
++			if (filter &amp;&amp;  (markedMatching
+ 					? (entry-&gt;flags &amp; FILTER_MATCH) == 0
+-					: !TraceFilterParser::Default()-&gt;Filter(entry, out))) {
++					: !filter-&gt;Filter(entry, out))) {
+ 				continue;
+ 			}
+ 
+@@ -1007,7 +985,7 @@
+ 				len--;
+ 
+ 			kprintf(&quot;%5ld. %.*s\n&quot;, index, len, dump);
+-		} else if (!hasFilter)
++		} else if (!filter)
+ 			kprintf(&quot;%5ld. ** uninitialized entry **\n&quot;, index);
+ 
+ 		dumped++;
+@@ -1032,6 +1010,13 @@
+ }
+ 
+ 
++static int
++dump_tracing_command(int argc, char** argv)
++{
++	return dump_tracing_internal(argc, argv, NULL);
++}
++
++
+ #endif	// ENABLE_TRACING
+ 
+ 
+@@ -1104,6 +1089,17 @@
+ }
+ 
+ 
++int
++dump_tracing(int argc, char** argv, WrapperTraceFilter* wrapperFilter)
++{
++#if	ENABLE_TRACING
++	return dump_tracing_internal(argc, argv, wrapperFilter);
++#else
++	return 0;
++#endif
++}
++
++
+ extern &quot;C&quot; status_t
+ tracing_init(void)
+ {
+@@ -1117,7 +1113,7 @@
+ 	sFirstEntry = sBuffer;
+ 	sAfterLastEntry = sBuffer;
+ 
+-	add_debugger_command_etc(&quot;traced&quot;, &amp;dump_tracing,
++	add_debugger_command_etc(&quot;traced&quot;, &amp;dump_tracing_command,
+ 		&quot;Dump recorded trace entries&quot;,
+ 		&quot;[ \&quot;--printteam\&quot; ] [ \&quot;--difftime\&quot; ] (\&quot;forward\&quot; | \&quot;backward\&quot;) &quot;
+ 			&quot;| ([ &lt;start&gt; [ &lt;count&gt; [ &lt;range&gt; ] ] ] &quot;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008037.html">[Haiku-commits] r25093 -	haiku/trunk/src/add-ons/kernel/file_systems/nfs
+</A></li>
+	<LI>Next message: <A HREF="008040.html">[Haiku-commits] r25095 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8039">[ date ]</a>
+              <a href="thread.html#8039">[ thread ]</a>
+              <a href="subject.html#8039">[ subject ]</a>
+              <a href="author.html#8039">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

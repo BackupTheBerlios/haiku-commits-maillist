@@ -1,0 +1,561 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21636 - in haiku/trunk: headers/libs/usb	src/add-ons/kernel/busses/usb	src/add-ons/kernel/drivers/bus/usb src/libs/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21636%20-%20in%20haiku/trunk%3A%20headers/libs/usb%0A%09src/add-ons/kernel/busses/usb%0A%09src/add-ons/kernel/drivers/bus/usb%20src/libs/usb&In-Reply-To=%3C200707172000.l6HK0t8h007075%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003080.html">
+   <LINK REL="Next"  HREF="003082.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21636 - in haiku/trunk: headers/libs/usb	src/add-ons/kernel/busses/usb	src/add-ons/kernel/drivers/bus/usb src/libs/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21636%20-%20in%20haiku/trunk%3A%20headers/libs/usb%0A%09src/add-ons/kernel/busses/usb%0A%09src/add-ons/kernel/drivers/bus/usb%20src/libs/usb&In-Reply-To=%3C200707172000.l6HK0t8h007075%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21636 - in haiku/trunk: headers/libs/usb	src/add-ons/kernel/busses/usb	src/add-ons/kernel/drivers/bus/usb src/libs/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Tue Jul 17 22:00:55 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003080.html">[Haiku-commits] r21635 - haiku/trunk/src/kits
+</A></li>
+        <LI>Next message: <A HREF="003082.html">[Haiku-commits] r21637 - in haiku/trunk/src: servers/app	tests/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3081">[ date ]</a>
+              <a href="thread.html#3081">[ thread ]</a>
+              <a href="subject.html#3081">[ subject ]</a>
+              <a href="author.html#3081">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2007-07-17 22:00:53 +0200 (Tue, 17 Jul 2007)
+New Revision: 21636
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21636&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21636&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/libs/usb/USBKit.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+   haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
+   haiku/trunk/src/libs/usb/USBEndpoint.cpp
+Log:
+Patches by Salvatore Benedetto to fix changes made by me and also the underlaying problem that caused high CPU usage in the isochronous finisher thread. Also includes patches to support isochronous support through USBKit / usb_raw. Thanks!
+
+Modified: haiku/trunk/headers/libs/usb/USBKit.h
+===================================================================
+--- haiku/trunk/headers/libs/usb/USBKit.h	2007-07-17 19:54:38 UTC (rev 21635)
++++ haiku/trunk/headers/libs/usb/USBKit.h	2007-07-17 20:00:53 UTC (rev 21636)
+@@ -10,6 +10,7 @@
+ #define _USBKIT_H
+ 
+ #include &lt;SupportDefs.h&gt;
++#include &lt;USB3.h&gt;
+ #include &lt;USB_spec.h&gt;
+ 
+ 
+@@ -257,7 +258,7 @@
+ 
+ 
+ /*	The BUSBEndpoint represent a device endpoint that can be used to send or
+-	receive data. It also alows to query endpoint characteristics like
++	receive data. It also allows to query endpoint characteristics like
+ 	endpoint type or direction. */
+ class BUSBEndpoint {
+ public:
+@@ -299,6 +300,10 @@
+ 										size_t length) const;
+ 		ssize_t						BulkTransfer(void *data,
+ 										size_t length) const;
++		ssize_t						IsochronousTransfer(void *data,
++										size_t length,
++										usb_iso_packet_descriptor *packetDescriptors,
++										uint32 packetCount)	const;
+ 
+ private:
+ friend	class BUSBInterface;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2007-07-17 19:54:38 UTC (rev 21635)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2007-07-17 20:00:53 UTC (rev 21636)
+@@ -304,6 +304,8 @@
+ 		fStopFinishThread(false),
+ 		fFirstIsochronousTransfer(NULL),
+ 		fLastIsochronousTransfer(NULL),
++		fFinishIsochronousThread(-1),
++		fStopFinishIsochronousThread(false),
+ 		fRootHub(NULL),
+ 		fRootHubAddress(0),
+ 		fPortResetChange(0)
+@@ -396,9 +398,18 @@
+ 	// Create the array that will keep bandwidth information
+ 	fFrameBandwidth = new(std::nothrow) uint16[NUMBER_OF_FRAMES];
+ 
+-	// Create lists for managing isochronous transfer descriptors
++	// create lists for managing isochronous transfer descriptors
+ 	fFirstIsochronousDescriptor = new(std::nothrow) uhci_td *[NUMBER_OF_FRAMES];
++	if (!fFirstIsochronousDescriptor) {
++		TRACE_ERROR((&quot;usb_uhci: cannot allocate memory\n&quot;));
++		return;
++	}
+ 	fLastIsochronousDescriptor = new(std::nothrow) uhci_td *[NUMBER_OF_FRAMES];
++	if (!fLastIsochronousDescriptor) {
++		TRACE_ERROR((&quot;usb_uhci: cannot allocate memory\n&quot;));
++		delete [] fFirstIsochronousDescriptor;
++		return;
++	}
+ 
+ 	for (int32 i = 0; i &lt; NUMBER_OF_FRAMES; i++) {
+ 		fFrameList[i] =	fQueues[UHCI_INTERRUPT_QUEUE]-&gt;PhysicalAddress()
+@@ -426,6 +437,20 @@
+ 		return;
+ 	}
+ 
++	// Create semaphore the isochronous finisher thread will wait for
++	fFinishIsochronousTransfersSem = create_sem(0,
++		&quot;UHCI Isochronous Finish Transfers&quot;);
++	if (fFinishIsochronousTransfersSem &lt; B_OK) {
++		TRACE_ERROR((&quot;usb_uhci: failed to create semaphore\n&quot;));
++		return;
++	}
++
++	// Create the isochronous finisher service thread
++	fFinishIsochronousThread = spawn_kernel_thread(FinishIsochronousThread,
++		&quot;uhci isochronous finish thread&quot;, B_URGENT_DISPLAY_PRIORITY,
++		(void *)this);
++	resume_thread(fFinishIsochronousThread);
++
+ 	// Install the interrupt handler
+ 	TRACE((&quot;usb_uhci: installing interrupt handler\n&quot;));
+ 	install_io_interrupt_handler(fPCIInfo-&gt;u.h0.interrupt_line,
+@@ -444,8 +469,11 @@
+ {
+ 	int32 result = 0;
+ 	fStopFinishThread = true;
++	fStopFinishIsochronousThread = true;
+ 	delete_sem(fFinishTransfersSem);
++	delete_sem(fFinishIsochronousTransfersSem);
+ 	wait_for_thread(fFinishThread, &amp;result);
++	wait_for_thread(fFinishIsochronousThread, &amp;result);
+ 
+ 	LockIsochronous();
+ 	isochronous_transfer_data *isoTransfer = fFirstIsochronousTransfer;
+@@ -627,7 +655,7 @@
+ 			// Set the active bit off on every descriptor in order to prevent
+ 			// the controller from processing them. Then set off the is_active
+ 			// field of the transfer in order to make the finisher thread skip
+-			// the transfer. FinishIsochronousTransfers will do the rest.
++			// the transfer. The FinishIsochronousThread will do the rest.
+ 			for (int32 i = 0; i &lt; packetCount; i++)
+ 				current-&gt;descriptors[i]-&gt;status &amp;= ~TD_STATUS_ACTIVE;
+ 			current-&gt;is_active = false;
+@@ -815,10 +843,6 @@
+ 	TRACE((&quot;usb_uhci: isochronous transfer descriptor bandwdith = %d\n&quot;,
+ 		bandwidth));
+ 
+-	// TODO: If direction is out set every descriptor data
+-	if (!directionIn)
+-		return B_ERROR;
+-
+ 	// The following holds the list of transfer descriptor of the
+ 	// isochronous request. It is used to quickly remove all the isochronous
+ 	// descriptors from the frame list, as descriptors are not link to each
+@@ -841,16 +865,23 @@
+ 	isoRequest[isochronousData-&gt;packet_count - 1]-&gt;token &amp;= ~TD_TOKEN_DATA1;
+ 	isoRequest[isochronousData-&gt;packet_count - 1]-&gt;status |= TD_CONTROL_IOC;
+ 
++	// If direction is out set every descriptor data
++	if (!directionIn) {
++		iovec *vector = transfer-&gt;Vector();
++		WriteIsochronousDescriptorChain(isoRequest,
++			isochronousData-&gt;packet_count, vector);
++	} else {
++		// Initialize the packet descriptors
++		for (uint32 i = 0; i &lt; isochronousData-&gt;packet_count; i++) {
++			isochronousData-&gt;packet_descriptors[i].actual_length = 0;
++			isochronousData-&gt;packet_descriptors[i].status = B_NO_INIT;
++		}
++	}
++
+ 	TRACE((&quot;usb_uhci: isochronous submitted size=%ld bytes, TDs=%ld, &quot;
+ 		&quot;packetSize=%ld, restSize=%ld\n&quot;, transfer-&gt;DataLength(),
+ 		isochronousData-&gt;packet_count, packetSize, restSize));
+ 
+-	// Initialize the packet descriptors
+-	for (uint32 i = 0; i &lt; isochronousData-&gt;packet_count; i++) {
+-		isochronousData-&gt;packet_descriptors[i].actual_length = 0;
+-		isochronousData-&gt;packet_descriptors[i].status = B_NO_INIT;
+-	}
+-
+ 	// Find the entry where to start inserting the first Isochronous descriptor
+ 	if (isochronousData-&gt;flags &amp; USB_ISO_ASAP ||
+ 		isochronousData-&gt;starting_frame_number == NULL) {
+@@ -911,6 +942,9 @@
+ 		currentFrame = (currentFrame + 1) % NUMBER_OF_FRAMES;
+ 	}
+ 
++	// Wake up the isochronous finisher thread
++	release_sem_etc(fFinishIsochronousTransfersSem, 1, B_DO_NOT_RESCHEDULE);
++
+ 	return B_OK;
+ }
+ 
+@@ -991,9 +1025,6 @@
+ 		if (semCount &gt; 0)
+ 			acquire_sem_etc(fFinishTransfersSem, semCount, B_RELATIVE_TIMEOUT, 0);
+ 
+-		// give the isochronous transfers a chance
+-		FinishIsochronousTransfers();
+-
+ 		if (!Lock())
+ 			continue;
+ 
+@@ -1155,82 +1186,102 @@
+ }
+ 
+ 
++int32
++UHCI::FinishIsochronousThread(void *data)
++{
++       ((UHCI *)data)-&gt;FinishIsochronousTransfers();
++       return B_OK;
++}
++
++
+ void
+ UHCI::FinishIsochronousTransfers()
+ {
+-	if (!LockIsochronous())
+-		return;
++	/* This thread stays one position behind the controller and processes every
++	 * isochronous descriptor. Once it finds the last isochronous descriptor
++	 * of a transfer, it processes the entire transfer.
++	 */
+ 
+-	for (uint16 frame = 0; frame &lt; NUMBER_OF_FRAMES; frame++) {
+-		uhci_td *current = fFirstIsochronousDescriptor[frame];
++	while (!fStopFinishIsochronousThread) {
++		// Go to sleep if there are not isochronous transfer to process
++		if (acquire_sem(fFinishIsochronousTransfersSem) &lt; B_OK)
++			return;
+ 
+-		while (current) {
+-			if (current-&gt;status &amp; TD_STATUS_ACTIVE) {
+-				// The transfer descriptor is still active
+-				current = (uhci_td *)current-&gt;link_log;
+-				continue;
+-			}
++		bool transferDone = false;
++		uint16 currentFrame = ReadReg16(UHCI_FRNUM);
++		
++		// Process the frame list until one transfer is processed
++		while (!transferDone) {
++			// wait 1ms in order to be sure to be one position behind
++			// the controller
++			if (currentFrame == ReadReg16(UHCI_FRNUM))
++				snooze(1000);
+ 
+-			UnlinkIsochronousDescriptor(current, frame);
+-			if (!(current-&gt;status &amp; TD_CONTROL_IOC)) {
+-				current = (uhci_td *)current-&gt;link_log;
+-				continue;
+-			}
++			// Process the frame till it has isochronous descriptors in it.
++			while (!(fFrameList[currentFrame] &amp; FRAMELIST_NEXT_IS_QH)) {
++				uhci_td *current = fFirstIsochronousDescriptor[currentFrame];
++				UnlinkIsochronousDescriptor(current, currentFrame);
+ 
+-			// Process the transfer if we found the last descriptor
+-			isochronous_transfer_data *transfer
+-				= FindIsochronousTransfer(current);
++				// Process the transfer if we found the last descriptor
++				if (current-&gt;status &amp; TD_CONTROL_IOC) {
++					isochronous_transfer_data *transfer
++						= FindIsochronousTransfer(current);
+ 
+-			// The following should NEVER happen
+-			if (!transfer) {
+-				TRACE_ERROR((&quot;usb_uhci: Isochronous transfer not found in&quot;
+-					&quot; the finisher thread!\n&quot;));
+-				return;
+-			} else if (transfer-&gt;is_active
+-				&amp;&amp; (current-&gt;status &amp; TD_TOKEN_IN)) {
+-				// Process the descriptors only if it is still active and
+-				// belongs to an inbound transfer. If the transfer is not
+-				// active, it means the request has been removed, so simply
+-				// remove the descriptors.
+-				iovec *vector = transfer-&gt;transfer-&gt;Vector();
+-				transfer-&gt;transfer-&gt;PrepareKernelAccess();
+-				ReadIsochronousDescriptorChain(transfer, vector);
++					// The following should NEVER happen
++					if (!transfer) {
++						TRACE_ERROR((&quot;usb_uhci: Isochronous transfer not found&quot;
++							&quot; in the finisher thread!\n&quot;));
++						return;
+ 
+-				// Remove the transfer
+-				if (transfer == fFirstIsochronousTransfer) {
+-					fFirstIsochronousTransfer = transfer-&gt;link;
+-				} else {
+-					isochronous_transfer_data *temp
+-						= fFirstIsochronousTransfer;
+-					while (transfer != temp-&gt;link)
+-						temp = temp-&gt;link;
++					// Process the descriptors only if it is still active and
++					// belongs to an inbound transfer. If the transfer is not
++					// active, it means the request has been removed, so simply
++					// remove the descriptors.
++					} else if (transfer-&gt;is_active
++						&amp;&amp; (current-&gt;status &amp; TD_TOKEN_IN)) {
++						iovec *vector = transfer-&gt;transfer-&gt;Vector();
++						transfer-&gt;transfer-&gt;PrepareKernelAccess();
++						ReadIsochronousDescriptorChain(transfer, vector);
+ 
+-					if (transfer == fLastIsochronousTransfer)
+-						fLastIsochronousTransfer = temp;
+-					temp-&gt;link = temp-&gt;link-&gt;link;
+-				}
++						// Remove the transfer
++						if (LockIsochronous()) {
++							if (transfer == fFirstIsochronousTransfer)
++								fFirstIsochronousTransfer = transfer-&gt;link;
++							else {
++								isochronous_transfer_data *temp
++									= fFirstIsochronousTransfer;
++								while (transfer != temp-&gt;link)
++									temp = temp-&gt;link;
+ 
+-				transfer-&gt;transfer-&gt;Finished(B_OK, 0);
+-			} else if (!transfer-&gt;is_active)
+-				transfer-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++								if (transfer == fLastIsochronousTransfer)
++									fLastIsochronousTransfer = temp;
++								temp-&gt;link = temp-&gt;link-&gt;link;
++							}
+ 
+-			uint32 packetCount =
+-				transfer-&gt;transfer-&gt;IsochronousData()-&gt;packet_count;
+-			for (uint32 i = 0; i &lt; packetCount; i++)
+-				FreeDescriptor(transfer-&gt;descriptors[i]);
++							UnlockIsochronous();
++						}
+ 
+-			uint16 bandwidth = transfer-&gt;transfer-&gt;Bandwidth() / packetCount;
+-			fFrameBandwidth[frame] += bandwidth;
++					transfer-&gt;transfer-&gt;Finished(B_OK, 0);
+ 
+-			delete [] transfer-&gt;descriptors;
+-			delete transfer-&gt;transfer;
+-			delete transfer;
++					uint32 packetCount =
++						transfer-&gt;transfer-&gt;IsochronousData()-&gt;packet_count;
++					for (uint32 i = 0; i &lt; packetCount; i++)
++						FreeDescriptor(transfer-&gt;descriptors[i]);
+ 
+-			current = (uhci_td *)current-&gt;link_log;
++					delete [] transfer-&gt;descriptors;
++					delete transfer-&gt;transfer;
++					delete transfer;
++					transferDone = true;
++					}
++				}
++			}
++
++			// Make sure to reset the frame bandwidth
++			fFrameBandwidth[currentFrame] = MAX_AVAILABLE_BANDWIDTH;
++			currentFrame = (currentFrame + 1) % NUMBER_OF_FRAMES;
+ 		}
+ 	}
+ 
+-	UnlockIsochronous();
+ }
+ 
+ 
+@@ -1890,6 +1941,20 @@
+ 
+ 
+ void
++UHCI::WriteIsochronousDescriptorChain(uhci_td **isoRequest, uint32 packetCount,
++	iovec *vector)
++{
++	size_t vectorOffset = 0;
++	for (uint32 i = 0; i &lt; packetCount; i++) {
++		size_t bufferSize = isoRequest[i]-&gt;buffer_size;
++		memcpy((uint8 *)isoRequest[i]-&gt;buffer_log,
++			(uint8 *)vector-&gt;iov_base + vectorOffset, bufferSize);
++		vectorOffset += bufferSize;
++	}
++}
++
++
++void
+ UHCI::ReadIsochronousDescriptorChain(isochronous_transfer_data *transfer,
+ 	iovec *vector)
+ {
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2007-07-17 19:54:38 UTC (rev 21635)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2007-07-17 20:00:53 UTC (rev 21636)
+@@ -133,6 +133,7 @@
+ 										uhci_qh **_transferQueue);
+ 
+ 		// Isochronous transfer functions
++static int32						FinishIsochronousThread(void *data);
+ 		void						FinishIsochronousTransfers();
+ 		isochronous_transfer_data	*FindIsochronousTransfer(uhci_td *descriptor);
+ 
+@@ -173,6 +174,10 @@
+ 										uint8 *lastDataToggle);
+ 		size_t						ReadActualLength(uhci_td *topDescriptor,
+ 										uint8 *lastDataToggle);
++		void						WriteIsochronousDescriptorChain(
++										uhci_td **isoRequest,
++										uint32 packetCount,
++										iovec *vector);
+ 		void						ReadIsochronousDescriptorChain(
+ 										isochronous_transfer_data *transfer,
+ 										iovec *vector);
+@@ -219,7 +224,10 @@
+ 		// Maintain a linked list of isochronous transfers
+ 		isochronous_transfer_data	*fFirstIsochronousTransfer;
+ 		isochronous_transfer_data	*fLastIsochronousTransfer;
++		sem_id						fFinishIsochronousTransfersSem;
++		thread_id					fFinishIsochronousThread;
+ 		benaphore					fIsochronousLock;
++		bool						fStopFinishIsochronousThread;
+ 
+ 		// Root hub
+ 		UHCIRootHub					*fRootHub;
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp	2007-07-17 19:54:38 UTC (rev 21635)
++++ haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp	2007-07-17 20:00:53 UTC (rev 21636)
+@@ -467,7 +467,8 @@
+ 		}
+ 
+ 		case RAW_COMMAND_INTERRUPT_TRANSFER:
+-		case RAW_COMMAND_BULK_TRANSFER: {
++		case RAW_COMMAND_BULK_TRANSFER:
++		case RAW_COMMAND_ISOCHRONOUS_TRANSFER: {
+ 			const usb_configuration_info *configurationInfo =
+ 				gUSBModule-&gt;get_configuration(device-&gt;device);
+ 			if (!configurationInfo) {
+@@ -506,10 +507,16 @@
+ 				status = gUSBModule-&gt;queue_interrupt(endpointInfo-&gt;handle,
+ 					command-&gt;transfer.data, command-&gt;transfer.length,
+ 					usb_raw_callback, device);
+-			} else {
++			} else if (op == RAW_COMMAND_BULK_TRANSFER) {
+ 				status = gUSBModule-&gt;queue_bulk(endpointInfo-&gt;handle,
+ 					command-&gt;transfer.data, command-&gt;transfer.length,
+ 					usb_raw_callback, device);
++			} else {
++				status = gUSBModule-&gt;queue_isochronous(endpointInfo-&gt;handle,
++					command-&gt;isochronous.data, command-&gt;isochronous.length,
++					command-&gt;isochronous.packet_descriptors,
++					command-&gt;isochronous.packet_count, NULL, 0,
++					usb_raw_callback, device);
+ 			}
+ 
+ 			if (status &lt; B_OK) {
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.h	2007-07-17 19:54:38 UTC (rev 21635)
++++ haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.h	2007-07-17 20:00:53 UTC (rev 21636)
+@@ -32,7 +32,8 @@
+ 
+ 	RAW_COMMAND_CONTROL_TRANSFER = 0x4000,
+ 	RAW_COMMAND_INTERRUPT_TRANSFER,
+-	RAW_COMMAND_BULK_TRANSFER
++	RAW_COMMAND_BULK_TRANSFER,
++	RAW_COMMAND_ISOCHRONOUS_TRANSFER
+ } raw_command_id;
+ 
+ 
+@@ -127,6 +128,16 @@
+ 		void							*data;
+ 		size_t							length;
+ 	} transfer;
++
++	struct {
++		status_t						status;
++		uint32							interface;
++		uint32							endpoint;
++		void							*data;
++		size_t							length;
++		usb_iso_packet_descriptor		*packet_descriptors;
++		uint32							packet_count;
++	} isochronous;
+ } raw_command;
+ 
+ 
+
+Modified: haiku/trunk/src/libs/usb/USBEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/libs/usb/USBEndpoint.cpp	2007-07-17 19:54:38 UTC (rev 21635)
++++ haiku/trunk/src/libs/usb/USBEndpoint.cpp	2007-07-17 20:00:53 UTC (rev 21636)
+@@ -189,3 +189,27 @@
+ 
+ 	return command.transfer.length;
+ }
++
++
++ssize_t
++BUSBEndpoint::IsochronousTransfer(void *data, size_t length,
++	usb_iso_packet_descriptor *packetDescriptors, uint32 packetCount) const
++{
++	if (length &gt; 0 &amp;&amp; data == NULL)
++		return B_BAD_VALUE;
++
++	raw_command command;
++	command.isochronous.interface = fInterface-&gt;Index();
++	command.isochronous.endpoint = fIndex;
++	command.isochronous.data = data;
++	command.isochronous.length = length;
++	command.isochronous.packet_descriptors = packetDescriptors;
++	command.isochronous.packet_count = packetCount;
++
++	if (ioctl(fRawFD, RAW_COMMAND_ISOCHRONOUS_TRANSFER, &amp;command, sizeof(command))
++		|| command.isochronous.status != RAW_STATUS_SUCCESS) {
++		return B_ERROR;
++	}
++
++	return command.isochronous.length;
++}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003080.html">[Haiku-commits] r21635 - haiku/trunk/src/kits
+</A></li>
+	<LI>Next message: <A HREF="003082.html">[Haiku-commits] r21637 - in haiku/trunk/src: servers/app	tests/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3081">[ date ]</a>
+              <a href="thread.html#3081">[ thread ]</a>
+              <a href="subject.html#3081">[ subject ]</a>
+              <a href="author.html#3081">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

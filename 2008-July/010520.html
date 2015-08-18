@@ -1,0 +1,249 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26594 -	haiku/trunk/src/system/kernel/device_manager
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26594%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200807232256.m6NMuu79019967%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010552.html">
+   <LINK REL="Next"  HREF="010524.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26594 -	haiku/trunk/src/system/kernel/device_manager</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26594%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200807232256.m6NMuu79019967%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26594 -	haiku/trunk/src/system/kernel/device_manager">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Jul 24 00:56:56 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010552.html">[Haiku-commits] r26593 - in haiku/trunk/src: apps/drivesetup	kits/tracker
+</A></li>
+        <LI>Next message: <A HREF="010524.html">[Haiku-commits] r26595 - haiku/trunk/src/kits/tracker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10520">[ date ]</a>
+              <a href="thread.html#10520">[ thread ]</a>
+              <a href="subject.html#10520">[ subject ]</a>
+              <a href="author.html#10520">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-07-24 00:56:51 +0200 (Thu, 24 Jul 2008)
+New Revision: 26594
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26594&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26594&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp
+   haiku/trunk/src/system/kernel/device_manager/IOScheduler.h
+Log:
+* Fixed race condition between OperationCompleted() and the scheduler
+  thread. Interrupting a thread only works when it is already waiting.
+  We do now use a flag to indicate whether the scheduler thread is
+  waiting (avoids thread_interrupt() calls when the thread is in driver
+  code). Furthermore before starting to wait, we check whether any
+  finisher work has to be done -- we do that (and the addition of the
+  entry to the condition variable) with the finisher lock being held to
+  avoid the race condition.
+* Moved waiting for and getting the next unscheduled request into new
+  method _GetNextUnscheduledRequest().
+
+
+Modified: haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp	2008-07-23 22:55:00 UTC (rev 26593)
++++ haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp	2008-07-23 22:56:51 UTC (rev 26594)
+@@ -22,7 +22,8 @@
+ 
+ IOScheduler::IOScheduler(DMAResource* resource)
+ 	:
+-	fDMAResource(resource)
++	fDMAResource(resource),
++	fWaiting(false)
+ {
+ 	mutex_init(&amp;fLock, &quot;I/O scheduler&quot;);
+ 	B_INITIALIZE_SPINLOCK(&amp;fFinisherLock);
+@@ -98,8 +99,7 @@
+ void
+ IOScheduler::OperationCompleted(IOOperation* operation, status_t status)
+ {
+-	InterruptsLocker _;
+-	SpinLocker locker(fFinisherLock);
++	InterruptsSpinLocker _(fFinisherLock);
+ 
+ 	// finish operation only once
+ 	if (operation-&gt;Status() &lt;= 0)
+@@ -108,10 +108,11 @@
+ 	operation-&gt;SetStatus(status);
+ 
+ 	fCompletedOperations.Add(operation);
+-	locker.Unlock();
+ 
+-	locker.SetTo(thread_spinlock, false);
+-	thread_interrupt(thread_get_thread_struct_locked(fThread), false);
++	if (fWaiting) {
++		SpinLocker _2(thread_spinlock);
++		thread_interrupt(thread_get_thread_struct_locked(fThread), false);
++	}
+ }
+ 
+ 
+@@ -143,6 +144,15 @@
+ }
+ 
+ 
++/*!	Called with \c fFinisherLock held.
++*/
++bool
++IOScheduler::_FinisherWorkPending()
++{
++	return !fCompletedOperations.IsEmpty();
++}
++
++
+ IOOperation*
+ IOScheduler::_GetOperation()
+ {
+@@ -153,38 +163,72 @@
+ 		if (operation != NULL)
+ 			return operation;
+ 
++		// Wait for new operations. First check whether any finisher work has
++		// to be done.
++		InterruptsSpinLocker finisherLocker(fFinisherLock);
++		if (_FinisherWorkPending()) {
++			finisherLocker.Unlock();
++			locker.Unlock();
++			_Finisher();
++			continue;
++		}
++
+ 		ConditionVariableEntry entry;
+ 		fFinishedOperationCondition.Add(&amp;entry);
++		fWaiting = true;
+ 
++		finisherLocker.Unlock();
+ 		locker.Unlock();
+ 
+-		entry.Wait();
++		entry.Wait(B_CAN_INTERRUPT);
++		fWaiting = false;
+ 		_Finisher();
+ 	}
+ }
+ 
+ 
+-status_t
+-IOScheduler::_Scheduler()
++IORequest*
++IOScheduler::_GetNextUnscheduledRequest()
+ {
+-// TODO: This is a no-op scheduler. Implement something useful!
+ 	while (true) {
+ 		MutexLocker locker(fLock);
+ 		IORequest* request = fUnscheduledRequests.RemoveHead();
+ 
+-		if (request == NULL) {
+-			ConditionVariableEntry entry;
+-			fNewRequestCondition.Add(&amp;entry);
++		if (request != NULL)
++			return request;
++
++		// Wait for new requests. First check whether any finisher work has
++		// to be done.
++		InterruptsSpinLocker finisherLocker(fFinisherLock);
++		if (_FinisherWorkPending()) {
++			finisherLocker.Unlock();
+ 			locker.Unlock();
+-
+-			if (entry.Wait(B_CAN_INTERRUPT) != B_OK)
+-				_Finisher();
+-
++			_Finisher();
+ 			continue;
+ 		}
+ 
++		// Wait for new requests.
++		ConditionVariableEntry entry;
++		fNewRequestCondition.Add(&amp;entry);
++		fWaiting = true;
++
++		finisherLocker.Unlock();
+ 		locker.Unlock();
+ 
++		entry.Wait(B_CAN_INTERRUPT);
++		fWaiting = false;
++		_Finisher();
++	}
++}
++
++
++status_t
++IOScheduler::_Scheduler()
++{
++// TODO: This is a no-op scheduler. Implement something useful!
++	while (true) {
++		IORequest* request = _GetNextUnscheduledRequest();
++
+ 		if (fDMAResource != NULL) {
+ 			while (request-&gt;RemainingBytes() &gt; 0) {
+ 				IOOperation* operation = _GetOperation();
+
+Modified: haiku/trunk/src/system/kernel/device_manager/IOScheduler.h
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/IOScheduler.h	2008-07-23 22:55:00 UTC (rev 26593)
++++ haiku/trunk/src/system/kernel/device_manager/IOScheduler.h	2008-07-23 22:56:51 UTC (rev 26594)
+@@ -46,10 +46,13 @@
+ 
+ private:
+ 			void				_Finisher();
++			bool				_FinisherWorkPending();
+ 			IOOperation*		_GetOperation();
++			IORequest*			_GetNextUnscheduledRequest();
+ 			status_t			_Scheduler();
+ 	static	status_t			_SchedulerThread(void* self);
+ 
++
+ private:
+ 			DMAResource*		fDMAResource;
+ 			spinlock			fFinisherLock;
+@@ -62,6 +65,7 @@
+ 			ConditionVariable	fFinishedOperationCondition;
+ 			IOOperationList		fUnusedOperations;
+ 			IOOperationList		fCompletedOperations;
++			bool				fWaiting;
+ };
+ 
+ #endif	// IO_SCHEDULER_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010552.html">[Haiku-commits] r26593 - in haiku/trunk/src: apps/drivesetup	kits/tracker
+</A></li>
+	<LI>Next message: <A HREF="010524.html">[Haiku-commits] r26595 - haiku/trunk/src/kits/tracker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10520">[ date ]</a>
+              <a href="thread.html#10520">[ thread ]</a>
+              <a href="subject.html#10520">[ subject ]</a>
+              <a href="author.html#10520">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,1092 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26556 - in haiku/trunk/src:	system/kernel/device_manager tests/system/kernel/device_manager
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26556%20-%20in%20haiku/trunk/src%3A%0A%09system/kernel/device_manager%20tests/system/kernel/device_manager&In-Reply-To=%3C200807220043.m6M0h2rc032128%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010452.html">
+   <LINK REL="Next"  HREF="010454.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26556 - in haiku/trunk/src:	system/kernel/device_manager tests/system/kernel/device_manager</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26556%20-%20in%20haiku/trunk/src%3A%0A%09system/kernel/device_manager%20tests/system/kernel/device_manager&In-Reply-To=%3C200807220043.m6M0h2rc032128%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26556 - in haiku/trunk/src:	system/kernel/device_manager tests/system/kernel/device_manager">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Jul 22 02:43:02 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010452.html">[Haiku-commits] r26555 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+</A></li>
+        <LI>Next message: <A HREF="010454.html">[Haiku-commits] r26557 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10453">[ date ]</a>
+              <a href="thread.html#10453">[ thread ]</a>
+              <a href="subject.html#10453">[ subject ]</a>
+              <a href="author.html#10453">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-07-22 02:43:01 +0200 (Tue, 22 Jul 2008)
+New Revision: 26556
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26556&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26556&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/device_manager/dma_resources.cpp
+   haiku/trunk/src/system/kernel/device_manager/dma_resources.h
+   haiku/trunk/src/system/kernel/device_manager/io_requests.cpp
+   haiku/trunk/src/system/kernel/device_manager/io_requests.h
+   haiku/trunk/src/tests/system/kernel/device_manager/dma_resource_test.cpp
+Log:
+* Enabled all DMA tests, wrote some more.
+* Moved data buffer creation to a TestSuiteContext class.
+* Added checks if the I/O operation does the correct thing, ie. reads/writes
+  the data to the right offset.
+* Rearranged DMA translation: we now handle the partial write case correctly
+  (bounce buffer must always span over the whole block), and are able to join
+  adjacent bounce buffers together.
+* The new _AddBounceBuffer() method also respects boundary and segment size
+  restrictions for bounce buffers.
+* IOOperation now prepares the outgoing vecs/offset/length to contain the
+  right data for the current phase (partial read begin/end/do-all); it will
+  also make sure that the lengths of the vecs are of the same size than the
+  whole request.
+* All tests are now passed, the I/O request implementation seems to be ready
+  for integration now.
+
+
+Modified: haiku/trunk/src/system/kernel/device_manager/dma_resources.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/dma_resources.cpp	2008-07-22 00:27:01 UTC (rev 26555)
++++ haiku/trunk/src/system/kernel/device_manager/dma_resources.cpp	2008-07-22 00:43:01 UTC (rev 26556)
+@@ -12,6 +12,14 @@
+ #include &quot;io_requests.h&quot;
+ 
+ 
++#define TRACE_DMA_RESOURCE
++#ifdef TRACE_DMA_RESOURCE
++#	define TRACE(x...) dprintf(x)
++#else
++#	define TRACE(x...) ;
++#endif
++
++
+ const size_t kMaxBounceBufferSize = 4 * B_PAGE_SIZE;
+ 
+ 
+@@ -58,6 +66,18 @@
+ }
+ 
+ 
++bool
++DMABuffer::UsesBounceBufferAt(uint32 index)
++{
++	if (index &gt;= fVecCount)
++		return false;
++
++	return (addr_t)fVecs[index].iov_base &gt;= fPhysicalBounceBuffer
++		&amp;&amp; (addr_t)fVecs[index].iov_base
++				&lt; fPhysicalBounceBuffer + fBounceBufferSize;
++}
++
++
+ //	#pragma mark -
+ 
+ 
+@@ -95,10 +115,12 @@
+ 		fRestrictions.max_segment_size = ~(size_t)0;
+ 
+ 	if (_NeedsBoundsBuffers()) {
+-// TODO: Enforce that the bounce buffer size won't cross boundaries.
+-		fBounceBufferSize = fRestrictions.max_segment_size;
++		fBounceBufferSize = fRestrictions.max_segment_size
++			* min_c(fRestrictions.max_segment_count, 4);
+ 		if (fBounceBufferSize &gt; kMaxBounceBufferSize)
+-			fBounceBufferSize = max_c(kMaxBounceBufferSize, fBlockSize);
++			fBounceBufferSize = kMaxBounceBufferSize;
++		TRACE(&quot;DMAResource::Init(): chose bounce buffer size %lu\n&quot;,
++			fBounceBufferSize);
+ 	}
+ 
+ 	fScratchVecs = (iovec*)malloc(
+@@ -183,6 +205,106 @@
+ }
+ 
+ 
++void
++DMAResource::_CutBuffer(DMABuffer&amp; buffer, addr_t&amp; physicalBounceBuffer,
++	size_t&amp; bounceLeft, size_t toCut)
++{
++	int32 vecCount = buffer.VecCount();
++	for (int32 i = vecCount - 1; toCut &gt; 0 &amp;&amp; i &gt;= 0; i--) {
++		iovec&amp; vec = buffer.VecAt(i);
++		size_t length = vec.iov_len;
++		bool inBounceBuffer = buffer.UsesBounceBufferAt(i);
++
++		if (length &lt;= toCut) {
++			vecCount--;
++			toCut -= length;
++
++			if (inBounceBuffer) {
++				bounceLeft += length;
++				physicalBounceBuffer -= length;
++			}
++		} else {
++			vec.iov_len -= toCut;
++
++			if (inBounceBuffer) {
++				bounceLeft += toCut;
++				physicalBounceBuffer -= toCut;
++			}
++			break;
++		}
++	}
++
++	buffer.SetVecCount(vecCount);
++}
++
++
++/*!	Adds \a length bytes from the bounce buffer to the DMABuffer \a buffer.
++	Takes care of boundary, and segment restrictions. \a length must be aligned.
++	If \a fixedLength is requested, this function will fail if it cannot
++	satisfy the request.
++
++	\return 0 if the request cannot be satisfied. There could have been some
++		additions to the DMA buffer, and you will need to cut them back.
++	TODO: is that what we want here?
++	\return &gt;0 the number of bytes added to the buffer.
++*/
++size_t
++DMAResource::_AddBounceBuffer(DMABuffer&amp; buffer, addr_t&amp; physicalBounceBuffer,
++	size_t&amp; bounceLeft, size_t length, bool fixedLength)
++{
++	if (bounceLeft &lt; length) {
++		if (fixedLength)
++			return 0;
++
++		length = bounceLeft;
++	}
++
++	size_t bounceUsed = 0;
++
++	uint32 vecCount = buffer.VecCount();
++	if (vecCount &gt; 0) {
++		// see if we can join the bounce buffer with the previously last vec
++		iovec&amp; vec = buffer.VecAt(vecCount - 1);
++		addr_t vecBase = (addr_t)vec.iov_base;
++		size_t vecLength = vec.iov_len;
++
++		if (vecBase + vecLength == physicalBounceBuffer) {
++			vecLength += length;
++			_RestrictBoundaryAndSegmentSize(vecBase, vecLength);
++
++			size_t lengthDiff = vecLength - vec.iov_len;
++			length -= lengthDiff;
++
++			physicalBounceBuffer += lengthDiff;
++			bounceLeft -= lengthDiff;
++			bounceUsed += lengthDiff;
++
++			vec.iov_len = vecLength;
++		}
++	}
++
++	while (length &gt; 0) {
++		// We need to add another bounce vec
++
++		if (vecCount == fRestrictions.max_segment_count)
++			return fixedLength ? 0 : bounceUsed;
++
++		addr_t vecLength = length;
++		_RestrictBoundaryAndSegmentSize(physicalBounceBuffer, vecLength);
++
++		buffer.AddVec((void*)physicalBounceBuffer, vecLength);
++		vecCount++;
++
++		physicalBounceBuffer += vecLength;
++		bounceLeft -= vecLength;
++		bounceUsed += vecLength;
++		length -= vecLength;
++	}
++
++	return bounceUsed;
++}
++
++
+ status_t
+ DMAResource::TranslateNext(IORequest* request, IOOperation* operation)
+ {
+@@ -208,21 +330,22 @@
+ 	iovec* vecs = NULL;
+ 	uint32 segmentCount = 0;
+ 
+-	bool partialBegin = (offset &amp; (fBlockSize - 1)) != 0;
+-dprintf(&quot;  offset %Ld, block size %lu -&gt; %s\n&quot;, offset, fBlockSize, partialBegin ? &quot;partial&quot; : &quot;whole&quot;);
++	size_t partialBegin = offset &amp; (fBlockSize - 1);
++	TRACE(&quot;  offset %Ld, block size %lu -&gt; partial: %lu\n&quot;, offset, fBlockSize,
++		partialBegin);
+ 
+ 	if (buffer-&gt;IsVirtual()) {
+ 		// Unless we need the bounce buffer anyway, we have to translate the
+ 		// virtual addresses to physical addresses, so we can check the DMA
+ 		// restrictions.
+-dprintf(&quot;  IS VIRTUAL\n&quot;);
++		TRACE(&quot;  buffer is virtual\n&quot;);
++		// TODO: !partialOperation || totalLength &gt;= fBlockSize
++		// TODO: Maybe enforce fBounceBufferSize &gt;= 2 * fBlockSize.
+ 		if (true) {
+-// TODO: !partialOperation || totalLength &gt;= fBlockSize
+-// TODO: Maybe enforce fBounceBufferSize &gt;= 2 * fBlockSize.
+ 			size_t transferLeft = totalLength;
+ 			vecs = fScratchVecs;
+ 
+-dprintf(&quot;  CREATE PHYSICAL MAP %ld\n&quot;, buffer-&gt;VecCount());
++			TRACE(&quot;  create physical map (for %ld vecs)\n&quot;, buffer-&gt;VecCount());
+ 			for (uint32 i = vecIndex; i &lt; buffer-&gt;VecCount(); i++) {
+ 				iovec&amp; vec = buffer-&gt;VecAt(i);
+ 				addr_t base = (addr_t)vec.iov_base + vecOffset;
+@@ -230,7 +353,6 @@
+ 				vecOffset = 0;
+ 				if (size &gt; transferLeft)
+ 					size = transferLeft;
+-dprintf(&quot;  size = %lu\n&quot;, size);
+ 
+ 				while (size &gt; 0 &amp;&amp; segmentCount
+ 						&lt; fRestrictions.max_segment_count) {
+@@ -262,33 +384,44 @@
+ 			fRestrictions.max_segment_count);
+ 	}
+ 
+-dprintf(&quot;  physical count %lu\n&quot;, segmentCount);
+-for (uint32 i = 0; i &lt; segmentCount; i++) {
+-	dprintf(&quot;    [%lu] %p, %lu\n&quot;, i, vecs[i].iov_base, vecs[i].iov_len);
+-}
++#ifdef TRACE_DMA_RESOURCE
++	TRACE(&quot;  physical count %lu\n&quot;, segmentCount);
++	for (uint32 i = 0; i &lt; segmentCount; i++) {
++		TRACE(&quot;    [%lu] %p, %lu\n&quot;, i, vecs[i].iov_base, vecs[i].iov_len);
++	}
++#endif
++
+ 	// check alignment, boundaries, etc. and set vecs in DMA buffer
+ 
+ 	size_t dmaLength = 0;
+ 	addr_t physicalBounceBuffer = dmaBuffer-&gt;PhysicalBounceBuffer();
+ 	size_t bounceLeft = fBounceBufferSize;
++	size_t transferLeft = totalLength;
+ 
+ 	// If the offset isn't block-aligned, use the bounce buffer to bridge the
+ 	// gap to the start of the vec.
+-	if (partialBegin) {
+-		off_t diff = offset &amp; (fBlockSize - 1);
+-		addr_t base = physicalBounceBuffer;
+-		size_t length = (diff + fRestrictions.alignment - 1)
+-			&amp; ~(fRestrictions.alignment - 1);
++	if (partialBegin &gt; 0) {
++		size_t length;
++		if (request-&gt;IsWrite()) {
++			// we always need to read in a whole block for the partial write
++			length = fBlockSize;
++		} else {
++			length = (partialBegin + fRestrictions.alignment - 1)
++				&amp; ~(fRestrictions.alignment - 1);
++		}
+ 
+-		physicalBounceBuffer += length;
+-		bounceLeft -= length;
++		if (_AddBounceBuffer(*dmaBuffer, physicalBounceBuffer, bounceLeft,
++				length, true) == 0) {
++			TRACE(&quot;  adding partial begin failed, length %lu!\n&quot;, length);
++			return B_BAD_VALUE;
++		}
+ 
+-		dmaBuffer-&gt;AddVec((void*)base, length);
+ 		dmaLength += length;
+ 
+-		vecOffset += length - diff;
+-		offset -= diff;
+-dprintf(&quot;  partial begin, using bounce buffer: offset: %lld, length: %lu\n&quot;, offset, length);
++		vecOffset += length - partialBegin;
++		offset -= partialBegin;
++		TRACE(&quot;  partial begin, using bounce buffer: offset: %lld, length: &quot;
++			&quot;%lu\n&quot;, offset, length);
+ 	}
+ 
+ 	for (uint32 i = vecIndex; i &lt; segmentCount;) {
+@@ -304,99 +437,110 @@
+ 
+ 		addr_t base = (addr_t)vec.iov_base + vecOffset;
+ 		size_t length = vec.iov_len - vecOffset;
++		if (length &gt; transferLeft)
++			length = transferLeft;
+ 
+ 		// Cut the vec according to transfer size, segment size, and boundary.
+ 
+-		if (dmaLength + length &gt; fRestrictions.max_transfer_size)
+-{
++		if (dmaLength + length &gt; fRestrictions.max_transfer_size) {
+ 			length = fRestrictions.max_transfer_size - dmaLength;
+-dprintf(&quot;  vec %lu: restricting length to %lu due to transfer size limit\n&quot;, i, length);
+-}
++			TRACE(&quot;  vec %lu: restricting length to %lu due to transfer size &quot;
++				&quot;limit\n&quot;, i, length);
++		}
+ 		_RestrictBoundaryAndSegmentSize(base, length);
+ 
+-		size_t useBounceBuffer = 0;
++		size_t useBounceBufferSize = 0;
+ 
+ 		// Check low address: use bounce buffer for range to low address.
+ 		// Check alignment: if not aligned, use bounce buffer for complete vec.
+-		if (base &lt; fRestrictions.low_address)
+-{
+-			useBounceBuffer = fRestrictions.low_address - base;
+-dprintf(&quot;  vec %lu: below low address, using bounce buffer: %lu\n&quot;, i, useBounceBuffer);
+-}
+-		else if (base &amp; (fRestrictions.alignment - 1))
+-{
+-			useBounceBuffer = length;
+-dprintf(&quot;  vec %lu: misalignment, using bounce buffer: %lu\n&quot;, i, useBounceBuffer);
+-}
++		if (base &lt; fRestrictions.low_address) {
++			useBounceBufferSize = fRestrictions.low_address - base;
++			TRACE(&quot;  vec %lu: below low address, using bounce buffer: %lu\n&quot;, i,
++				useBounceBufferSize);
++		} else if (base &amp; (fRestrictions.alignment - 1)) {
++			useBounceBufferSize = length;
++			TRACE(&quot;  vec %lu: misalignment, using bounce buffer: %lu\n&quot;, i,
++				useBounceBufferSize);
++		}
+ 
+-// TODO: Enforce high address restriction!
++		// Enforce high address restriction
++		if (base &gt; fRestrictions.high_address)
++			useBounceBufferSize = length;
++		else if (base + length &gt; fRestrictions.high_address)
++			length = fRestrictions.high_address - base;
+ 
++		// Align length as well
++		if (useBounceBufferSize == 0)
++			length &amp;= ~(fRestrictions.alignment - 1);
++
+ 		// If length is 0, use bounce buffer for complete vec.
+ 		if (length == 0) {
+ 			length = vec.iov_len - vecOffset;
+-			useBounceBuffer = length;
+-dprintf(&quot;  vec %lu: 0 length, using bounce buffer: %lu\n&quot;, i, useBounceBuffer);
++			useBounceBufferSize = length;
++			TRACE(&quot;  vec %lu: 0 length, using bounce buffer: %lu\n&quot;, i,
++				useBounceBufferSize);
+ 		}
+ 
+-		if (useBounceBuffer &gt; 0) {
+-			if (bounceLeft == 0) {
+-dprintf(&quot;  vec %lu: out of bounce buffer space\n&quot;, i);
++		if (useBounceBufferSize &gt; 0) {
++			// alignment could still be wrong (we round up here)
++			useBounceBufferSize = (useBounceBufferSize
++				+ fRestrictions.alignment - 1) &amp; ~(fRestrictions.alignment - 1);
++
++			length = _AddBounceBuffer(*dmaBuffer, physicalBounceBuffer,
++				bounceLeft, useBounceBufferSize, false);
++			if (length == 0) {
++				TRACE(&quot;  vec %lu: out of bounce buffer space\n&quot;, i);
+ 				// We don't have any bounce buffer space left, we need to move
+ 				// this request to the next I/O operation.
+ 				break;
+ 			}
+-
+-			base = physicalBounceBuffer;
+-
+-			if (useBounceBuffer &gt; length)
+-				useBounceBuffer = length;
+-			if (useBounceBuffer &gt; bounceLeft)
+-				useBounceBuffer = bounceLeft;
+-			length = useBounceBuffer;
++			TRACE(&quot;  vec %lu: final bounce length: %lu\n&quot;, i, length);
++		} else {
++			TRACE(&quot;  vec %lu: final length restriction: %lu\n&quot;, i, length);
++			dmaBuffer-&gt;AddVec((void*)base, length);
+ 		}
+ 
+-		// check boundary and max segment size.
+-		_RestrictBoundaryAndSegmentSize(base, length);
+-dprintf(&quot;  vec %lu: final length restriction: %lu\n&quot;, i, length);
++		dmaLength += length;
++		vecOffset += length;
++		transferLeft -= length;
++	}
+ 
+-		if (useBounceBuffer) {
+-			// alignment could still be wrong
+-			if (useBounceBuffer &amp; (fRestrictions.alignment - 1)) {
+-				useBounceBuffer
+-					= (useBounceBuffer + fRestrictions.alignment - 1)
+-						&amp; ~(fRestrictions.alignment - 1);
+-				if (dmaLength + useBounceBuffer
+-						&gt; fRestrictions.max_transfer_size) {
+-					useBounceBuffer = (fRestrictions.max_transfer_size
+-						- dmaLength) &amp; ~(fRestrictions.alignment - 1);
+-				}
+-			}
++	// If we're writing partially, we always need to have a block sized bounce
++	// buffer (or else we would overwrite memory to be written on the read in
++	// the first phase).
++	if (request-&gt;IsWrite() &amp;&amp; (dmaLength &amp; (fBlockSize - 1)) != 0) {
++		size_t diff = dmaLength  &amp; (fBlockSize - 1);
++		TRACE(&quot;  partial end write: %lu, diff %lu\n&quot;, dmaLength, diff);
+ 
+-			physicalBounceBuffer += useBounceBuffer;
+-			bounceLeft -= useBounceBuffer;
+-		}
++		_CutBuffer(*dmaBuffer, physicalBounceBuffer, bounceLeft, diff);
++		dmaLength -= diff;
+ 
+-		vecOffset += length;
+-
+-		// TODO: we might be able to join the vec with its preceding vec
+-		// (but then we'd need to take the segment size into account again)
+-		dmaBuffer-&gt;AddVec((void*)base, length);
+-		dmaLength += length;
++		if (_AddBounceBuffer(*dmaBuffer, physicalBounceBuffer,
++				bounceLeft, fBlockSize, true) == 0) {
++			// If we cannot write anything, we can't process the request at all
++			TRACE(&quot;  adding bounce buffer failed!!!\n&quot;);
++			if (dmaLength == 0)
++				return B_BAD_VALUE;
++		} else
++			dmaLength += fBlockSize;
+ 	}
+ 
+-	// If total length not block aligned, use bounce buffer for padding.
+-	if ((dmaLength &amp; (fBlockSize - 1)) != 0) {
+-dprintf(&quot;  dmaLength not block aligned: %lu\n&quot;, dmaLength);
+-		size_t length = (dmaLength + fBlockSize - 1) &amp; ~(fBlockSize - 1);
++	// If total length not block aligned, use bounce buffer for padding (read
++	// case only).
++	while ((dmaLength &amp; (fBlockSize - 1)) != 0) {
++		TRACE(&quot;  dmaLength not block aligned: %lu\n&quot;, dmaLength);
++			size_t length = (dmaLength + fBlockSize - 1) &amp; ~(fBlockSize - 1);
+ 
+ 		// If total length &gt; max transfer size, segment count &gt; max segment
+ 		// count, truncate.
++		// TODO: sometimes we can replace the last vec with the bounce buffer
++		// to let it match the restrictions.
+ 		if (length &gt; fRestrictions.max_transfer_size
+ 			|| dmaBuffer-&gt;VecCount() == fRestrictions.max_segment_count
+ 			|| bounceLeft &lt; length - dmaLength) {
+ 			// cut the part of dma length
+-dprintf(&quot;  can't align length due to max transfer size, segment count &quot;
+-&quot;restrictions, or lacking bounce buffer space\n&quot;);
++			TRACE(&quot;  can't align length due to max transfer size, segment &quot;
++				&quot;count restrictions, or lacking bounce buffer space\n&quot;);
+ 			size_t toCut = dmaLength
+ 				&amp; (max_c(fBlockSize, fRestrictions.alignment) - 1);
+ 			dmaLength -= toCut;
+@@ -410,36 +554,33 @@
+ 					&amp; ~(max_c(fBlockSize, fRestrictions.alignment) - 1);
+ 				_RestrictBoundaryAndSegmentSize(base, dmaLength);
+ 				dmaBuffer-&gt;AddVec((void*)base, dmaLength);
++
++				physicalBounceBuffer = base + dmaLength;
++				bounceLeft = fBounceBufferSize - dmaLength;
+ 			} else {
+-				int32 dmaVecCount = dmaBuffer-&gt;VecCount();
+-				for (int32 i = dmaVecCount - 1; toCut &gt; 0 &amp;&amp; i &gt;= 0; i--) {
+-					iovec&amp; vec = dmaBuffer-&gt;VecAt(i);
+-					size_t length = vec.iov_len;
+-					if (length &lt;= toCut) {
+-						dmaVecCount--;
+-						toCut -= length;
+-					} else {
+-						vec.iov_len -= toCut;
+-						break;
+-					}
+-				}
+-
+-				dmaBuffer-&gt;SetVecCount(dmaVecCount);
++				_CutBuffer(*dmaBuffer, physicalBounceBuffer, bounceLeft, toCut);
+ 			}
+ 		} else {
+-dprintf(&quot;  adding %lu bytes final bounce buffer\n&quot;, length - dmaLength);
+-			dmaBuffer-&gt;AddVec((void*)physicalBounceBuffer, length - dmaLength);
+-			dmaLength = length;
++			TRACE(&quot;  adding %lu bytes final bounce buffer\n&quot;,
++				length - dmaLength);
++			length -= dmaLength;
++			length = _AddBounceBuffer(*dmaBuffer, physicalBounceBuffer,
++				bounceLeft, length, true);
++			if (length == 0)
++				panic(&quot;don't do this to me!&quot;);
++			dmaLength += length;
+ 		}
+ 	}
+ 
++	off_t requestEnd = request-&gt;Offset() + request-&gt;Length();
++
+ 	operation-&gt;SetBuffer(dmaBuffer);
++	operation-&gt;SetBlockSize(fBlockSize);
+ 	operation-&gt;SetOriginalRange(originalOffset,
+-		min_c(offset + dmaLength, request-&gt;Offset() + request-&gt;Length())
+-			- originalOffset);
++		min_c(offset + dmaLength, requestEnd) - originalOffset);
+ 	operation-&gt;SetRange(offset, dmaLength);
+-	operation-&gt;SetPartial(partialBegin,
+-		offset + dmaLength &gt; request-&gt;Offset() + request-&gt;Length());
++	operation-&gt;SetPartial(partialBegin != 0, offset + dmaLength &gt; requestEnd);
++	operation-&gt;SetUsesBounceBuffer(bounceLeft &lt; fBounceBufferSize);
+ 
+ 	status_t error = operation-&gt;SetRequest(request);
+ 	if (error != B_OK)
+
+Modified: haiku/trunk/src/system/kernel/device_manager/dma_resources.h
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/dma_resources.h	2008-07-22 00:27:01 UTC (rev 26555)
++++ haiku/trunk/src/system/kernel/device_manager/dma_resources.h	2008-07-22 00:43:01 UTC (rev 26556)
+@@ -47,11 +47,8 @@
+ 			size_t				BounceBufferSize() const
+ 									{ return fBounceBufferSize; }
+ 
++			bool				UsesBounceBufferAt(uint32 index);
+ 			void				SetToBounceBuffer(size_t length);
+-			bool				UsesBounceBuffer() const
+-									{ return fVecCount &gt;= 1
+-										&amp;&amp; (addr_t)fVecs[0].iov_base
+-											== fPhysicalBounceBuffer; }
+ 
+ private:
+ 			void*				fBounceBuffer;
+@@ -87,6 +84,13 @@
+ 			bool				_NeedsBoundsBuffers() const;
+ 			void				_RestrictBoundaryAndSegmentSize(addr_t base,
+ 									addr_t&amp; length);
++			void				_CutBuffer(DMABuffer&amp; buffer,
++									addr_t&amp; physicalBounceBuffer,
++									size_t&amp; bounceLeft, size_t toCut);
++			size_t				_AddBounceBuffer(DMABuffer&amp; buffer,
++									addr_t&amp; physicalBounceBuffer,
++									size_t&amp; bounceLeft, size_t length,
++									bool fixedLength);
+ 
+ 			mutex				fLock;
+ 			dma_restrictions	fRestrictions;
+
+Modified: haiku/trunk/src/system/kernel/device_manager/io_requests.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/io_requests.cpp	2008-07-22 00:27:01 UTC (rev 26555)
++++ haiku/trunk/src/system/kernel/device_manager/io_requests.cpp	2008-07-22 00:43:01 UTC (rev 26556)
+@@ -14,6 +14,14 @@
+ #include &quot;dma_resources.h&quot;
+ 
+ 
++#define TRACE_IO_REQUEST
++#ifdef TRACE_IO_REQUEST
++#	define TRACE(x...) dprintf(x)
++#else
++#	define TRACE(x...) ;
++#endif
++
++
+ // partial I/O operation phases
+ enum {
+ 	PHASE_READ_BEGIN	= 0,
+@@ -105,12 +113,15 @@
+ bool
+ IOOperation::Finish()
+ {
+-dprintf(&quot;IOOperation::Finish()\n&quot;);
++	TRACE(&quot;IOOperation::Finish()\n&quot;);
+ 	if (fStatus == B_OK) {
+ 		if (fParent-&gt;IsWrite()) {
+-dprintf(&quot;  is write\n&quot;);
++			TRACE(&quot;  is write\n&quot;);
+ 			if (fPhase == PHASE_READ_BEGIN) {
+-dprintf(&quot;  phase read begin\n&quot;);
++				TRACE(&quot;  phase read begin\n&quot;);
++				// repair phase adjusted vec
++				fDMABuffer-&gt;VecAt(fSavedVecIndex).iov_len = fSavedVecLength;
++
+ 				// partial write: copy partial begin to bounce buffer
+ 				bool skipReadEndPhase;
+ 				status_t error = _CopyPartialBegin(true, skipReadEndPhase);
+@@ -119,6 +130,7 @@
+ 					// Get ready for next phase...
+ 					fPhase = HasPartialEnd() &amp;&amp; !skipReadEndPhase
+ 						? PHASE_READ_END : PHASE_DO_ALL;
++					_PrepareVecs();
+ 					SetStatus(1);
+ 						// TODO: Is there a race condition, if the request is
+ 						// aborted at the same time?
+@@ -127,7 +139,13 @@
+ 
+ 				SetStatus(error);
+ 			} else if (fPhase == PHASE_READ_END) {
+-dprintf(&quot;  phase read end\n&quot;);
++				TRACE(&quot;  phase read end\n&quot;);
++				// repair phase adjusted vec
++				iovec&amp; vec = fDMABuffer-&gt;VecAt(fSavedVecIndex);
++				vec.iov_base = (uint8*)vec.iov_base
++					+ vec.iov_len - fSavedVecLength;
++				vec.iov_len = fSavedVecLength;
++
+ 				// partial write: copy partial end to bounce buffer
+ 				status_t error = _CopyPartialEnd(true);
+ 				if (error == B_OK) {
+@@ -146,7 +164,7 @@
+ 	}
+ 
+ 	if (fParent-&gt;IsRead() &amp;&amp; UsesBounceBuffer()) {
+-dprintf(&quot;  read with bounce buffer\n&quot;);
++		TRACE(&quot;  read with bounce buffer\n&quot;);
+ 		// copy the bounce buffer segments to the final location
+ 		uint8* bounceBuffer = (uint8*)fDMABuffer-&gt;BounceBuffer();
+ 		addr_t bounceBufferStart = fDMABuffer-&gt;PhysicalBounceBuffer();
+@@ -155,32 +173,42 @@
+ 
+ 		const iovec* vecs = fDMABuffer-&gt;Vecs();
+ 		uint32 vecCount = fDMABuffer-&gt;VecCount();
+-		uint32 i = 0;
+ 
+-		off_t offset = Offset();
+-
+ 		status_t error = B_OK;
+-		bool partialBlockOnly = false;
+-		if (HasPartialBegin()) {
+-			error = _CopyPartialBegin(false, partialBlockOnly);
+-			offset += vecs[0].iov_len;
+-			i++;
+-		}
+ 
+-		if (error == B_OK &amp;&amp; HasPartialEnd() &amp;&amp; !partialBlockOnly) {
+-			error = _CopyPartialEnd(false);
+-			vecCount--;
+-		}
++		off_t offset = fOffset;
++		off_t startOffset = fOriginalOffset;
++		off_t endOffset = fOriginalOffset + fOriginalLength;
+ 
+-		for (; error == B_OK &amp;&amp; i &lt; vecCount; i++) {
++		for (uint32 i = 0; error == B_OK &amp;&amp; i &lt; vecCount; i++) {
+ 			const iovec&amp; vec = vecs[i];
+ 			addr_t base = (addr_t)vec.iov_base;
++			size_t length = vec.iov_len;
++
++			if (offset &lt; startOffset) {
++				if (offset + length &lt;= startOffset) {
++					offset += length;
++					continue;
++				}
++
++				size_t diff = startOffset - offset;
++				base += diff;
++				length -= diff;
++			}
++
++			if (offset + length &gt; endOffset) {
++				if (offset &gt;= endOffset)
++					break;
++
++				length = endOffset - offset;
++			}
++
+ 			if (base &gt;= bounceBufferStart &amp;&amp; base &lt; bounceBufferEnd) {
+ 				error = fParent-&gt;CopyData(
+-					bounceBuffer + (base - bounceBufferStart), offset,
+-					vec.iov_len);
++					bounceBuffer + (base - bounceBufferStart), offset, length);
+ 			}
+-			offset += vec.iov_len;
++
++			offset += length;
+ 		}
+ 
+ 		if (error != B_OK)
+@@ -208,15 +236,10 @@
+ 	// set initial phase
+ 	fPhase = PHASE_DO_ALL;
+ 	if (fParent-&gt;IsWrite()) {
+-		if (HasPartialBegin())
+-			fPhase = PHASE_READ_BEGIN;
+-		else if (HasPartialEnd())
+-			fPhase = PHASE_READ_END;
+-
+ 		// Copy data to bounce buffer segments, save the partial begin/end vec,
+ 		// which will be copied after their respective read phase.
+ 		if (UsesBounceBuffer()) {
+-dprintf(&quot;  write with bounce buffer\n&quot;);
++			TRACE(&quot;  write with bounce buffer\n&quot;);
+ 			uint8* bounceBuffer = (uint8*)fDMABuffer-&gt;BounceBuffer();
+ 			addr_t bounceBufferStart = fDMABuffer-&gt;PhysicalBounceBuffer();
+ 			addr_t bounceBufferEnd = bounceBufferStart
+@@ -224,30 +247,67 @@
+ 
+ 			const iovec* vecs = fDMABuffer-&gt;Vecs();
+ 			uint32 vecCount = fDMABuffer-&gt;VecCount();
++			size_t vecOffset = 0;
+ 			uint32 i = 0;
+ 
+-			off_t offset = Offset();
++			off_t offset = fOffset;
++			off_t endOffset = fOffset + fLength;
+ 
+ 			if (HasPartialBegin()) {
+-				offset += vecs[0].iov_len;
+-				i++;
++				// skip first block
++				size_t toSkip = fBlockSize;
++				while (toSkip &gt; 0) {
++					if (vecs[i].iov_len &lt;= toSkip) {
++						toSkip -= vecs[i].iov_len;
++						i++;
++					} else {
++						vecOffset = toSkip;
++						break;
++					}
++				}
++
++				offset += fBlockSize;
+ 			}
+ 
+-			if (HasPartialEnd())
+-				vecCount--;
++			if (HasPartialEnd()) {
++				// skip last block
++				size_t toSkip = fBlockSize;
++				while (toSkip &gt; 0) {
++					if (vecs[vecCount - 1].iov_len &lt;= toSkip) {
++						toSkip -= vecs[vecCount - 1].iov_len;
++						vecCount--;
++					} else
++						break;
++				}
+ 
++				endOffset -= fBlockSize;
++			}
++
+ 			for (; i &lt; vecCount; i++) {
+ 				const iovec&amp; vec = vecs[i];
+-				addr_t base = (addr_t)vec.iov_base;
++				addr_t base = (addr_t)vec.iov_base + vecOffset;
++				size_t length = vec.iov_len - vecOffset;
++				vecOffset = 0;
++
+ 				if (base &gt;= bounceBufferStart &amp;&amp; base &lt; bounceBufferEnd) {
++					if (offset + length &gt; endOffset)
++						length = endOffset - offset;
+ 					status_t error = fParent-&gt;CopyData(offset,
+-						bounceBuffer + (base - bounceBufferStart), vec.iov_len);
++						bounceBuffer + (base - bounceBufferStart), length);
+ 					if (error != B_OK)
+ 						return error;
+ 				}
+-				offset += vec.iov_len;
++
++				offset += length;
+ 			}
+ 		}
++
++		if (HasPartialBegin())
++			fPhase = PHASE_READ_BEGIN;
++		else if (HasPartialEnd())
++			fPhase = PHASE_READ_END;
++
++		_PrepareVecs();
+ 	}
+ 
+ 	fStatus = 1;
+@@ -275,12 +335,26 @@
+ }
+ 
+ 
++off_t
++IOOperation::Offset() const
++{
++	return fPhase == PHASE_READ_END ? fOffset + fLength - fBlockSize : fOffset;
++}
++
++
++size_t
++IOOperation::Length() const
++{
++	return fPhase == PHASE_DO_ALL ? fLength : fBlockSize;
++}
++
++
+ iovec*
+ IOOperation::Vecs() const
+ {
+ 	switch (fPhase) {
+ 		case PHASE_READ_END:
+-			return fDMABuffer-&gt;Vecs() + (fDMABuffer-&gt;VecCount() - 1);
++			return fDMABuffer-&gt;Vecs() + fSavedVecIndex;
+ 		case PHASE_READ_BEGIN:
+ 		case PHASE_DO_ALL:
+ 		default:
+@@ -294,8 +368,9 @@
+ {
+ 	switch (fPhase) {
+ 		case PHASE_READ_BEGIN:
++			return fSavedVecIndex + 1;
+ 		case PHASE_READ_END:
+-			return 1;
++			return fDMABuffer-&gt;VecCount() - fSavedVecIndex;
+ 		case PHASE_DO_ALL:
+ 		default:
+ 			return fDMABuffer-&gt;VecCount();
+@@ -306,6 +381,7 @@
+ void
+ IOOperation::SetPartial(bool partialBegin, bool partialEnd)
+ {
++	TRACE(&quot;partial begin %d, end %d\n&quot;, partialBegin, partialEnd);
+ 	fPartialBegin = partialBegin;
+ 	fPartialEnd = partialEnd;
+ }
+@@ -314,7 +390,7 @@
+ bool
+ IOOperation::IsWrite() const
+ {
+-	return fParent-&gt;IsWrite() &amp;&amp; fPhase != PHASE_DO_ALL;
++	return fParent-&gt;IsWrite() &amp;&amp; fPhase == PHASE_DO_ALL;
+ }
+ 
+ 
+@@ -325,24 +401,64 @@
+ }
+ 
+ 
++void
++IOOperation::_PrepareVecs()
++{
++	// we need to prepare the vecs for consumption by the drivers
++	if (fPhase == PHASE_READ_BEGIN) {
++		iovec* vecs = fDMABuffer-&gt;Vecs();
++		uint32 vecCount = fDMABuffer-&gt;VecCount();
++		size_t vecLength = fBlockSize;
++		for (uint32 i = 0; i &lt; vecCount; i++) {
++			iovec&amp; vec = vecs[i];
++			if (vec.iov_len &gt;= vecLength) {
++				fSavedVecIndex = i;
++				fSavedVecLength = vec.iov_len;
++				vec.iov_len = vecLength;
++				break;
++			}
++			vecLength -= vec.iov_len;
++		}
++	} else if (fPhase == PHASE_READ_END) {
++		iovec* vecs = fDMABuffer-&gt;Vecs();
++		uint32 vecCount = fDMABuffer-&gt;VecCount();
++		size_t vecLength = fBlockSize;
++		for (int32 i = vecCount - 1; i &gt;= 0; i--) {
++			iovec&amp; vec = vecs[i];
++			if (vec.iov_len &gt;= vecLength) {
++				fSavedVecIndex = i;
++				fSavedVecLength = vec.iov_len;
++				vec.iov_base = (uint8*)vec.iov_base
++					+ vec.iov_len - vecLength;
++				vec.iov_len = vecLength;
++				break;
++			}
++			vecLength -= vec.iov_len;
++		}
++	}
++}
++
++
+ status_t
+-IOOperation::_CopyPartialBegin(bool isWrite, bool&amp; partialBlockOnly)
++IOOperation::_CopyPartialBegin(bool isWrite, bool&amp; singleBlockOnly)
+ {
+-	size_t relativeOffset = OriginalOffset() - Offset();
+-	size_t length = fDMABuffer-&gt;VecAt(0).iov_len;
++	size_t relativeOffset = OriginalOffset() - fOffset;
++	size_t length = fBlockSize - relativeOffset;
+ 
+-	partialBlockOnly = relativeOffset + OriginalLength() &lt;= length;
+-	if (partialBlockOnly)
+-		length = relativeOffset + OriginalLength();
++	singleBlockOnly = length &gt;= OriginalLength();
++	if (singleBlockOnly)
++		length = OriginalLength();
+ 
++	TRACE(&quot;_CopyPartialBegin(%s, single only %d)\n&quot;,
++		isWrite ? &quot;write&quot; : &quot;read&quot;, singleBlockOnly);
++
+ 	if (isWrite) {
+ 		return fParent-&gt;CopyData(OriginalOffset(),
+-			(uint8*)fDMABuffer-&gt;BounceBuffer() + relativeOffset,
+-			length - relativeOffset);
++			(uint8*)fDMABuffer-&gt;BounceBuffer() + relativeOffset, length);
+ 	} else {
+ 		return fParent-&gt;CopyData(
+ 			(uint8*)fDMABuffer-&gt;BounceBuffer() + relativeOffset,
+-			OriginalOffset(), length - relativeOffset);
++			OriginalOffset(), length);
+ 	}
+ }
+ 
+@@ -350,20 +466,20 @@
+ status_t
+ IOOperation::_CopyPartialEnd(bool isWrite)
+ {
++	TRACE(&quot;_CopyPartialEnd(%s)\n&quot;, isWrite ? &quot;write&quot; : &quot;read&quot;);
++
+ 	const iovec&amp; lastVec = fDMABuffer-&gt;VecAt(fDMABuffer-&gt;VecCount() - 1);
+-	off_t lastVecPos = Offset() + Length() - lastVec.iov_len;
+-	if (isWrite) {
+-		return fParent-&gt;CopyData(lastVecPos,
+-			(uint8*)fDMABuffer-&gt;BounceBuffer()
+-				+ ((addr_t)lastVec.iov_base
+-					- fDMABuffer-&gt;PhysicalBounceBuffer()),
+-			OriginalOffset() + OriginalLength() - lastVecPos);
+-	} else {
+-		return fParent-&gt;CopyData((uint8*)fDMABuffer-&gt;BounceBuffer()
+-				+ ((addr_t)lastVec.iov_base
+-					- fDMABuffer-&gt;PhysicalBounceBuffer()),
+-			lastVecPos, OriginalOffset() + OriginalLength() - lastVecPos);
+-	}
++	off_t lastVecPos = fOffset + fLength - fBlockSize;
++	uint8* base = (uint8*)fDMABuffer-&gt;BounceBuffer() + ((addr_t)lastVec.iov_base
++		+ lastVec.iov_len - fBlockSize - fDMABuffer-&gt;PhysicalBounceBuffer());
++		// NOTE: this won't work if we don't use the bounce buffer contiguously
++		// (because of boundary alignments).
++	size_t length = OriginalOffset() + OriginalLength() - lastVecPos;
++
++	if (isWrite)
++		return fParent-&gt;CopyData(lastVecPos, base, length);
++
++	return fParent-&gt;CopyData(base, lastVecPos, length);
+ }
+ 
+ 
+@@ -435,8 +551,8 @@
+ void
+ IORequest::Advance(size_t bySize)
+ {
+-dprintf(&quot;IORequest::Advance(%lu): remaining: %lu -&gt; %lu\n&quot;, bySize,
+-fRemainingBytes, fRemainingBytes - bySize);
++	TRACE(&quot;IORequest::Advance(%lu): remaining: %lu -&gt; %lu\n&quot;, bySize,
++		fRemainingBytes, fRemainingBytes - bySize);
+ 	fRemainingBytes -= bySize;
+ 
+ 	iovec* vecs = fBuffer-&gt;Vecs();
+@@ -540,7 +656,8 @@
+ IORequest::_CopySimple(void* bounceBuffer, void* external, size_t size,
+ 	bool copyIn)
+ {
+-dprintf(&quot;  IORequest::_CopySimple(%p, %p, %lu, %d)\n&quot;, bounceBuffer, external, size, copyIn);
++	TRACE(&quot;  IORequest::_CopySimple(%p, %p, %lu, %d)\n&quot;, bounceBuffer, external,
++		size, copyIn);
+ 	if (copyIn)
+ 		memcpy(bounceBuffer, external, size);
+ 	else
+
+Modified: haiku/trunk/src/system/kernel/device_manager/io_requests.h
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/io_requests.h	2008-07-22 00:27:01 UTC (rev 26555)
++++ haiku/trunk/src/system/kernel/device_manager/io_requests.h	2008-07-22 00:43:01 UTC (rev 26556)
+@@ -105,8 +105,9 @@
+ 									// also sets range
+ 			void				SetRange(off_t offset, size_t length);
+ 
+-			off_t				Offset() const	{ return fOffset; }
+-			size_t				Length() const	{ return fLength; }
++// TODO: Fix Offset() and Length() for partial write phases!
++			off_t				Offset() const;
++			size_t				Length() const;
+ 			off_t				OriginalOffset() const
+ 									{ return fOriginalOffset; }
+ 			size_t				OriginalLength() const
+@@ -123,26 +124,36 @@
+ 			bool				IsWrite() const;
+ 			bool				IsRead() const;
+ 
++			void				SetBlockSize(size_t blockSize)
++									{ fBlockSize  = blockSize; }
++
+ 			bool				UsesBounceBuffer() const
+-									{ return fDMABuffer-&gt;UsesBounceBuffer(); }
++									{ return fUsesBounceBuffer; }
++			void				SetUsesBounceBuffer(bool uses)
++									{ fUsesBounceBuffer = uses; }
+ 
+ 			DMABuffer*			Buffer() const { return fDMABuffer; }
+ 			void				SetBuffer(DMABuffer* buffer)
+ 									{ fDMABuffer = buffer; }
+ 
+ protected:
++			void				_PrepareVecs();
+ 			status_t			_CopyPartialBegin(bool isWrite,
+ 									bool&amp; partialBlockOnly);
+ 			status_t			_CopyPartialEnd(bool isWrite);
+ 
+ 			DMABuffer*			fDMABuffer;
+ 			off_t				fOffset;
++			off_t				fOriginalOffset;
+ 			size_t				fLength;
+-			off_t				fOriginalOffset;
+ 			size_t				fOriginalLength;
+-			uint32				fPhase;
++			size_t				fBlockSize;
++			uint16				fSavedVecIndex;
++			uint16				fSavedVecLength;
++			uint8				fPhase;
+ 			bool				fPartialBegin;
+ 			bool				fPartialEnd;
++			bool				fUsesBounceBuffer;
+ };
+ 
+ typedef IOOperation io_operation;
+
+Modified: haiku/trunk/src/tests/system/kernel/device_manager/dma_resource_test.cpp
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/device_manager/dma_resource_test.cpp	2008-07-22 00:27:01 UTC (rev 26555)
++++ haiku/trunk/src/tests/system/kernel/device_manager/dma_resource_test.cpp	2008-07-22 00:43:01 UTC (rev 26556)
+@@ -9,6 +9,8 @@
+ 
+ #include &lt;device_manager.h&gt;
+ 
++#include &lt;vm.h&gt;
++
+ #include &quot;dma_resources.h&quot;
+ #include &quot;io_requests.h&quot;
+ 
+@@ -16,18 +18,36 @@
+ #define DMA_TEST_BLOCK_SIZE	512
+ 
+ 
+-struct device_manager_info* sDeviceManager;
+
+[... truncated: 819 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010452.html">[Haiku-commits] r26555 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+</A></li>
+	<LI>Next message: <A HREF="010454.html">[Haiku-commits] r26557 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10453">[ date ]</a>
+              <a href="thread.html#10453">[ thread ]</a>
+              <a href="subject.html#10453">[ subject ]</a>
+              <a href="author.html#10453">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

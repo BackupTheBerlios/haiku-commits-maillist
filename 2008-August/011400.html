@@ -1,0 +1,187 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27248 -	haiku/trunk/src/system/kernel/device_manager
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27248%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200808310043.m7V0hmxA017901%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011399.html">
+   <LINK REL="Next"  HREF="011401.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27248 -	haiku/trunk/src/system/kernel/device_manager</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27248%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200808310043.m7V0hmxA017901%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27248 -	haiku/trunk/src/system/kernel/device_manager">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Aug 31 02:43:48 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011399.html">[Haiku-commits] r27247 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="011401.html">[Haiku-commits] r27249 - haiku/trunk/src/tests/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11400">[ date ]</a>
+              <a href="thread.html#11400">[ thread ]</a>
+              <a href="subject.html#11400">[ subject ]</a>
+              <a href="author.html#11400">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-31 02:43:46 +0200 (Sun, 31 Aug 2008)
+New Revision: 27248
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27248&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27248&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp
+   haiku/trunk/src/system/kernel/device_manager/io_requests.cpp
+   haiku/trunk/src/system/kernel/device_manager/io_requests.h
+Log:
+* Also add the creating thread to an IORequest and let child requests
+  inherit it.
+* IOScheduler::ScheduleRequest() uses the request's thread and team now
+  instead of the current one. Otherwise for requests processed
+  iteratively this would always be the I/O scheduler's notifier thread.
+* Also get the thread's I/O priority now. It's still ignored later,
+  though.
+
+
+Modified: haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp	2008-08-31 00:37:02 UTC (rev 27247)
++++ haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp	2008-08-31 00:43:46 UTC (rev 27248)
+@@ -144,6 +144,7 @@
+ 		IORequestOwner&amp; owner = fAllocatedRequestOwners[i];
+ 		owner.team = -1;
+ 		owner.thread = -1;
++		owner.priority = B_IDLE_PRIORITY;
+ 		fUnusedRequestOwners.Add(&amp;owner);
+ 	}
+ 
+@@ -217,8 +218,7 @@
+ 
+ 	MutexLocker locker(fLock);
+ 
+-	struct thread* thread = thread_get_current_thread();
+-	IORequestOwner* owner = _GetRequestOwner(thread-&gt;team-&gt;id, thread-&gt;id,
++	IORequestOwner* owner = _GetRequestOwner(request-&gt;Team(), request-&gt;Thread(),
+ 		true);
+ 	if (owner == NULL) {
+ 		panic(&quot;IOScheduler: Out of request owners!\n&quot;);
+@@ -231,8 +231,10 @@
+ 	bool wasActive = owner-&gt;IsActive();
+ 	request-&gt;SetOwner(owner);
+ 	owner-&gt;requests.Add(request);
+-	owner-&gt;priority = thread-&gt;priority;
+-		// TODO: Use the I/O priority instead!
++
++	int32 priority = thread_get_io_priority(request-&gt;Thread());
++	if (priority &gt;= 0)
++		owner-&gt;priority = priority;
+ //dprintf(&quot;  request %p -&gt; owner %p (thread %ld, active %d)\n&quot;, request, owner, owner-&gt;thread, wasActive);
+ 
+ 	if (!wasActive)
+@@ -753,6 +755,7 @@
+ 				fRequestOwners-&gt;RemoveUnchecked(owner);
+ 			owner-&gt;team = team;
+ 			owner-&gt;thread = thread;
++			owner-&gt;priority = B_IDLE_PRIORITY;
+ 			fRequestOwners-&gt;InsertUnchecked(owner);
+ 			break;
+ 		}
+
+Modified: haiku/trunk/src/system/kernel/device_manager/io_requests.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/io_requests.cpp	2008-08-31 00:37:02 UTC (rev 27247)
++++ haiku/trunk/src/system/kernel/device_manager/io_requests.cpp	2008-08-31 00:43:46 UTC (rev 27248)
+@@ -12,7 +12,7 @@
+ #include &lt;debug.h&gt;
+ #include &lt;heap.h&gt;
+ #include &lt;kernel.h&gt;
+-#include &lt;team.h&gt;
++#include &lt;thread.h&gt;
+ #include &lt;util/AutoLock.h&gt;
+ #include &lt;vm.h&gt;
+ 
+@@ -640,7 +640,9 @@
+ 	fRelativeParentOffset = 0;
+ 	fTransferSize = 0;
+ 	fFlags = flags;
+-	fTeam = team_get_current_team_id();
++	struct thread* thread = thread_get_current_thread();
++	fTeam = thread-&gt;team-&gt;id;
++	fThread = thread-&gt;id;
+ 	fIsWrite = write;
+ 	fPartialTransfer = 0;
+ 
+@@ -703,6 +705,8 @@
+ 	}
+ 
+ 	subRequest-&gt;fRelativeParentOffset = parentOffset - fOffset;
++	subRequest-&gt;fTeam = fTeam;
++	subRequest-&gt;fThread = fThread;
+ 
+ 	_subRequest = subRequest;
+ 	subRequest-&gt;SetParent(this);
+@@ -1183,6 +1187,7 @@
+ 	kprintf(&quot;  pending children:  %ld\n&quot;, fPendingChildren);
+ 	kprintf(&quot;  flags:             %#lx\n&quot;, fFlags);
+ 	kprintf(&quot;  team:              %ld\n&quot;, fTeam);
++	kprintf(&quot;  thread:            %ld\n&quot;, fThread);
+ 	kprintf(&quot;  r/w:               %s\n&quot;, fIsWrite ? &quot;write&quot; : &quot;read&quot;);
+ 	kprintf(&quot;  partial transfer:  %s\n&quot;, fPartialTransfer ? &quot;yes&quot; : &quot;no&quot;);
+ 	kprintf(&quot;  finished cvar:     %p\n&quot;, &amp;fFinishedCondition);
+
+Modified: haiku/trunk/src/system/kernel/device_manager/io_requests.h
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/io_requests.h	2008-08-31 00:37:02 UTC (rev 27247)
++++ haiku/trunk/src/system/kernel/device_manager/io_requests.h	2008-08-31 00:43:46 UTC (rev 27248)
+@@ -267,6 +267,7 @@
+ 			bool				IsWrite() const	{ return fIsWrite; }
+ 			bool				IsRead() const	{ return !fIsWrite; }
+ 			team_id				Team() const	{ return fTeam; }
++			thread_id			Thread() const	{ return fThread; }
+ 			uint32				Flags() const	{ return fFlags; }
+ 
+ 			IOBuffer*			Buffer() const	{ return fBuffer; }
+@@ -321,6 +322,7 @@
+ 			int32				fPendingChildren;
+ 			uint32				fFlags;
+ 			team_id				fTeam;
++			thread_id			fThread;
+ 			bool				fIsWrite;
+ 			bool				fPartialTransfer;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011399.html">[Haiku-commits] r27247 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="011401.html">[Haiku-commits] r27249 - haiku/trunk/src/tests/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11400">[ date ]</a>
+              <a href="thread.html#11400">[ thread ]</a>
+              <a href="subject.html#11400">[ subject ]</a>
+              <a href="author.html#11400">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

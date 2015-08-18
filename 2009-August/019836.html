@@ -1,0 +1,378 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32625 - haiku/trunk/src/servers/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32625%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200908230708.n7N78gYW022917%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019835.html">
+   <LINK REL="Next"  HREF="019837.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32625 - haiku/trunk/src/servers/app</H1>
+    <B>jackburton at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32625%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200908230708.n7N78gYW022917%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32625 - haiku/trunk/src/servers/app">jackburton at mail.berlios.de
+       </A><BR>
+    <I>Sun Aug 23 09:08:42 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019835.html">[Haiku-commits] r32624 - haiku/trunk/src/kits/game
+</A></li>
+        <LI>Next message: <A HREF="019837.html">[Haiku-commits] r32626 -	haiku/trunk/docs/userguide/en/images/gui-images
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19836">[ date ]</a>
+              <a href="thread.html#19836">[ thread ]</a>
+              <a href="subject.html#19836">[ subject ]</a>
+              <a href="author.html#19836">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: jackburton
+Date: 2009-08-23 09:08:39 +0200 (Sun, 23 Aug 2009)
+New Revision: 32625
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32625&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32625&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/DirectWindowSupport.cpp
+   haiku/trunk/src/servers/app/DirectWindowSupport.h
+   haiku/trunk/src/servers/app/ServerWindow.cpp
+   haiku/trunk/src/servers/app/Window.cpp
+Log:
+More encapsulation of directwindow stuff into DirectWindowData.
+I changed lot of code (while trying to fix ticket #4311), reverted some old
+changes and probably messed up a lot. It's very much a work in progress.
+Anyway, DirectWindowStars still work correctly, but Chart (and GLTeapot) do
+not. I suspect a race condition between the DirectWindow creation and
+the activation of the direct mode on the server, maybe exposed more easily 
+by the changes in the scheduler.
+
+
+Modified: haiku/trunk/src/servers/app/DirectWindowSupport.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/DirectWindowSupport.cpp	2009-08-23 06:55:18 UTC (rev 32624)
++++ haiku/trunk/src/servers/app/DirectWindowSupport.cpp	2009-08-23 07:08:39 UTC (rev 32625)
+@@ -9,8 +9,15 @@
+ 
+ #include &quot;DirectWindowSupport.h&quot;
+ 
++#include &lt;Autolock.h&gt;
++
++#include &quot;RenderingBuffer.h&quot;
++#include &quot;clipping.h&quot;
++
+ #include &lt;string.h&gt;
++#include &lt;syslog.h&gt;
+ 
++
+ DirectWindowData::DirectWindowData()
+ 	:
+ 	buffer_info(NULL),
+@@ -89,55 +96,76 @@
+ 
+ bool
+ DirectWindowData::SetState(const direct_buffer_state&amp; bufferState,
+-	const direct_driver_state&amp; driverState)
+-{
+-	BufferState inputState(bufferState);
+-	BufferState currentState(buffer_info-&gt;buffer_state);
++	const direct_driver_state&amp; driverState, RenderingBuffer *buffer,
++	const BRect&amp; windowFrame, const BRegion&amp; clipRegion)
++{	
++	bool wasStopped = fTransition &lt;= 0;
+ 	
+-	bool handle = false;
++	if ((bufferState &amp; B_DIRECT_MODE_MASK) == B_DIRECT_STOP)
++		fTransition--;
++	else if ((bufferState &amp; B_DIRECT_MODE_MASK) == B_DIRECT_START)
++		fTransition++;
++	
++	bool isStopped = fTransition &lt;= 0;
+ 		
+-	if (inputState.Action() == B_DIRECT_STOP)
+-		handle = _HandleStop(bufferState);
+-	else if (inputState.Action() == B_DIRECT_START)
+-		handle = _HandleStart(bufferState);
+-	else if (inputState.Action() == B_DIRECT_MODIFY)
+-		handle = _HandleModify(bufferState);
++	if (wasStopped &amp;&amp; isStopped)
++		return false;
++						
++	buffer_info-&gt;buffer_state = bufferState;
+ 		
+ 	if (driverState != -1)
+ 		buffer_info-&gt;driver_state = driverState;
+ 
+-	return handle;
+-}
++	if ((bufferState &amp; B_DIRECT_MODE_MASK) != B_DIRECT_STOP) {
++		buffer_info-&gt;bits = buffer-&gt;Bits();
++		buffer_info-&gt;pci_bits = NULL; // TODO
++		buffer_info-&gt;bytes_per_row = buffer-&gt;BytesPerRow();
+ 
++		switch (buffer-&gt;ColorSpace()) {
++			case B_RGB32:
++			case B_RGBA32:
++			case B_RGB32_BIG:
++			case B_RGBA32_BIG:
++				buffer_info-&gt;bits_per_pixel = 32;
++				break;
++			case B_RGB24:
++			case B_RGB24_BIG:
++				buffer_info-&gt;bits_per_pixel = 24;
++				break;
++			case B_RGB16:
++			case B_RGB16_BIG:
++			case B_RGB15:
++			case B_RGB15_BIG:
++				buffer_info-&gt;bits_per_pixel = 16;
++				break;
++			case B_CMAP8:
++			case B_GRAY8:
++				buffer_info-&gt;bits_per_pixel = 8;
++				break;
++			default:
++				syslog(LOG_ERR,
++					&quot;unknown colorspace in DirectWindowData::SetState()!\n&quot;);
++				buffer_info-&gt;bits_per_pixel = 0;
++				break;
++		}
+ 
+-bool
+-DirectWindowData::_HandleStop(const direct_buffer_state&amp; state)
+-{
+-	buffer_info-&gt;buffer_state = B_DIRECT_STOP;
+-	if (fTransition-- &gt;= 1)
+-		return true;
+-	return false;
+-}
++		buffer_info-&gt;pixel_format = buffer-&gt;ColorSpace();
++		buffer_info-&gt;layout = B_BUFFER_NONINTERLEAVED;
++		buffer_info-&gt;orientation = B_BUFFER_TOP_TO_BOTTOM;
++			// TODO
++		buffer_info-&gt;window_bounds = to_clipping_rect(windowFrame);
+ 
++		// TODO: Review this
++		const int32 kMaxClipRectsCount = (DIRECT_BUFFER_INFO_AREA_SIZE
++			- sizeof(direct_buffer_info)) / sizeof(clipping_rect);
+ 
+-bool
+-DirectWindowData::_HandleStart(const direct_buffer_state&amp; state)
+-{
+-	buffer_info-&gt;buffer_state = (direct_buffer_state)
+-		(BufferState(buffer_info-&gt;buffer_state).Reason() | state);
+-	if (fTransition++ &gt;= 0)
+-		return true;
+-	
+-	return false;
+-}
++		buffer_info-&gt;clip_list_count = min_c(clipRegion.CountRects(),
++			kMaxClipRectsCount);
++		buffer_info-&gt;clip_bounds = clipRegion.FrameInt();
+ 
+-
+-bool
+-DirectWindowData::_HandleModify(const direct_buffer_state&amp; state)
+-{
+-	buffer_info-&gt;buffer_state = state;
+-	if (fTransition &gt; 0)
+-		return true;
++		for (uint32 i = 0; i &lt; buffer_info-&gt;clip_list_count; i++)
++			buffer_info-&gt;clip_list[i] = clipRegion.RectAtInt(i);
++	}
+ 	
+-	return false;
++	return true;
+ }
+
+Modified: haiku/trunk/src/servers/app/DirectWindowSupport.h
+===================================================================
+--- haiku/trunk/src/servers/app/DirectWindowSupport.h	2009-08-23 06:55:18 UTC (rev 32624)
++++ haiku/trunk/src/servers/app/DirectWindowSupport.h	2009-08-23 07:08:39 UTC (rev 32625)
+@@ -4,10 +4,13 @@
+  *
+  */
+ 
++#include &lt;Autolock.h&gt;
+ #include &lt;DirectWindow.h&gt;
+ 
+ #include &lt;DirectWindowPrivate.h&gt;
+ 
++class RenderingBuffer;
++
+ struct BufferState {
+ 	BufferState(const direct_buffer_state&amp; state)
+ 		:
+@@ -41,8 +44,11 @@
+ 			status_t			SyncronizeWithClient();
+ 
+ 			bool				SetState(const direct_buffer_state&amp; bufferState,
+-									const direct_driver_state&amp; driverState);
+-
++									const direct_driver_state&amp; driverState,
++									RenderingBuffer *renderingBuffer,
++									const BRect&amp; windowFrame,
++									const BRegion&amp; clipRegion);
++			
+ 			BRect				old_window_frame;
+ 			direct_buffer_info*	buffer_info;
+ 			bool				full_screen;
+@@ -50,11 +56,11 @@
+ private:
+ 			bool 				_HandleStop(const direct_buffer_state&amp; state);
+ 			bool 				_HandleStart(const direct_buffer_state&amp; state);
+-			bool 				_HandleModify(const direct_buffer_state&amp; state);
+ 		
+ 			sem_id				fSem;
+ 			sem_id				fAcknowledgeSem;
+ 			area_id				fBufferArea;
++			direct_buffer_state		fPreviousState;
+ 			int32				fTransition;
+ };
+ 
+
+Modified: haiku/trunk/src/servers/app/ServerWindow.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ServerWindow.cpp	2009-08-23 06:55:18 UTC (rev 32624)
++++ haiku/trunk/src/servers/app/ServerWindow.cpp	2009-08-23 07:08:39 UTC (rev 32625)
+@@ -3483,79 +3483,26 @@
+ 	if (fDirectWindowData == NULL)
+ 		return;
+ 
+-	if (!fDirectWindowData-&gt;SetState((direct_buffer_state)bufferState,
+-			(direct_driver_state)driverState))
+-		return;
+-
+-	if ((bufferState &amp; B_DIRECT_MODE_MASK) != B_DIRECT_STOP) {
+-		// TODO: Locking ?
+-		RenderingBuffer *buffer = fDesktop-&gt;HWInterface()-&gt;FrontBuffer();
+-		fDirectWindowData-&gt;buffer_info-&gt;bits = buffer-&gt;Bits();
+-		fDirectWindowData-&gt;buffer_info-&gt;pci_bits = NULL; // TODO
+-		fDirectWindowData-&gt;buffer_info-&gt;bytes_per_row = buffer-&gt;BytesPerRow();
+-
+-		switch (buffer-&gt;ColorSpace()) {
+-			case B_RGB32:
+-			case B_RGBA32:
+-			case B_RGB32_BIG:
+-			case B_RGBA32_BIG:
+-				fDirectWindowData-&gt;buffer_info-&gt;bits_per_pixel = 32;
+-				break;
+-			case B_RGB24:
+-			case B_RGB24_BIG:
+-				fDirectWindowData-&gt;buffer_info-&gt;bits_per_pixel = 24;
+-				break;
+-			case B_RGB16:
+-			case B_RGB16_BIG:
+-			case B_RGB15:
+-			case B_RGB15_BIG:
+-				fDirectWindowData-&gt;buffer_info-&gt;bits_per_pixel = 16;
+-				break;
+-			case B_CMAP8:
+-			case B_GRAY8:
+-				fDirectWindowData-&gt;buffer_info-&gt;bits_per_pixel = 8;
+-				break;
+-			default:
+-				syslog(LOG_ERR,
+-					&quot;unknown colorspace in HandleDirectConnection()!\n&quot;);
+-				fDirectWindowData-&gt;buffer_info-&gt;bits_per_pixel = 0;
+-				break;
++	if (fDesktop-&gt;LockSingleWindow()) {
++		if (!fDirectWindowData-&gt;SetState((direct_buffer_state)bufferState,
++				(direct_driver_state)driverState,
++				fDesktop-&gt;HWInterface()-&gt;FrontBuffer(), fWindow-&gt;Frame(),
++				fWindow-&gt;VisibleContentRegion())) {
++			fDesktop-&gt;UnlockSingleWindow();
++			return;
+ 		}
++	
++		status_t status = fDirectWindowData-&gt;SyncronizeWithClient();
+ 
+-		fDirectWindowData-&gt;buffer_info-&gt;pixel_format = buffer-&gt;ColorSpace();
+-		fDirectWindowData-&gt;buffer_info-&gt;layout = B_BUFFER_NONINTERLEAVED;
+-		fDirectWindowData-&gt;buffer_info-&gt;orientation = B_BUFFER_TOP_TO_BOTTOM;
+-			// TODO
+-		fDirectWindowData-&gt;buffer_info-&gt;window_bounds
+-			= to_clipping_rect(fWindow-&gt;Frame());
+-
+-		// TODO: Review this
+-		const int32 kMaxClipRectsCount = (DIRECT_BUFFER_INFO_AREA_SIZE
+-			- sizeof(direct_buffer_info)) / sizeof(clipping_rect);
+-
+-		// We just want the region inside the window, border excluded.
+-		BRegion clipRegion = fWindow-&gt;VisibleContentRegion();
+-
+-		fDirectWindowData-&gt;buffer_info-&gt;clip_list_count
+-			= min_c(clipRegion.CountRects(), kMaxClipRectsCount);
+-		fDirectWindowData-&gt;buffer_info-&gt;clip_bounds = clipRegion.FrameInt();
+-
+-		for (uint32 i = 0; i &lt; fDirectWindowData-&gt;buffer_info-&gt;clip_list_count;
+-				i++) {
+-			fDirectWindowData-&gt;buffer_info-&gt;clip_list[i]
+-				= clipRegion.RectAtInt(i);
++		if (status != B_OK) {
++			// The client application didn't release the semaphore
++			// within the given timeout. Or something else went wrong.
++			// Deleting this member should make it crash.
++			delete fDirectWindowData;
++			fDirectWindowData = NULL;
+ 		}
++		fDesktop-&gt;UnlockSingleWindow();
+ 	}
+-
+-	status_t status = fDirectWindowData-&gt;SyncronizeWithClient();
+-
+-	if (status != B_OK) {
+-		// The client application didn't release the semaphore
+-		// within the given timeout. Or something else went wrong.
+-		// Deleting this member should make it crash.
+-		delete fDirectWindowData;
+-		fDirectWindowData = NULL;
+-	}
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/servers/app/Window.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/Window.cpp	2009-08-23 06:55:18 UTC (rev 32624)
++++ haiku/trunk/src/servers/app/Window.cpp	2009-08-23 07:08:39 UTC (rev 32625)
+@@ -214,7 +214,6 @@
+ 	fVisibleContentRegionValid = false;
+ 	fEffectiveDrawingRegionValid = false;
+ 
+-	// TODO: review this!
+ 	fWindow-&gt;HandleDirectConnection(B_DIRECT_MODIFY | B_CLIPPING_MODIFIED);
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019835.html">[Haiku-commits] r32624 - haiku/trunk/src/kits/game
+</A></li>
+	<LI>Next message: <A HREF="019837.html">[Haiku-commits] r32626 -	haiku/trunk/docs/userguide/en/images/gui-images
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19836">[ date ]</a>
+              <a href="thread.html#19836">[ thread ]</a>
+              <a href="subject.html#19836">[ subject ]</a>
+              <a href="author.html#19836">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

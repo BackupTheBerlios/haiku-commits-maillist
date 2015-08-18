@@ -1,0 +1,624 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22156 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22156%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200709031541.l83FfFAt000456%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003781.html">
+   <LINK REL="Next"  HREF="003783.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22156 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22156%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200709031541.l83FfFAt000456%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22156 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Sep  3 17:41:15 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003781.html">[Haiku-commits] r22155 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="003783.html">[Haiku-commits] r22157 - haiku/trunk/build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3782">[ date ]</a>
+              <a href="thread.html#3782">[ thread ]</a>
+              <a href="subject.html#3782">[ subject ]</a>
+              <a href="author.html#3782">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-09-03 17:41:14 +0200 (Mon, 03 Sep 2007)
+New Revision: 22156
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22156&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22156&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+Removed:
+   haiku/trunk/src/system/kernel/vm/vm_daemons.c
+Modified:
+   haiku/trunk/headers/private/kernel/vm.h
+   haiku/trunk/headers/private/kernel/vm_priv.h
+   haiku/trunk/src/system/kernel/vm/Jamfile
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_address_space.c
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+Log:
+* sMappingLock is now a mutex instead of a spinlock.
+* The vm_translation_map is now correctly held in all of the vm_ mapping
+  functions.
+* Removed the old vm_daemons.c file - there is now a new vm_daemons.cpp
+  which contains the beginnings of our new page daemon.
+  So far, it's pretty static and not much tested. What it currently does
+  is to rescan all pages in the system with a two-handed clock algorithm
+  and push pages into the modified and inactive lists.
+* These inactive pages aren't really stolen yet, even though their mappings
+  are removed (ie. their next access will cause a page fault). This should
+  slow down Haiku a bit more, great, huh? :-)
+* The page daemon currently only runs on low memory situations, though.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm.h	2007-09-03 15:35:09 UTC (rev 22155)
++++ haiku/trunk/headers/private/kernel/vm.h	2007-09-03 15:41:14 UTC (rev 22156)
+@@ -69,7 +69,7 @@
+ vm_area *vm_area_lookup(vm_address_space *addressSpace, addr_t address);
+ status_t vm_set_area_memory_type(area_id id, addr_t physicalBase, uint32 type);
+ status_t vm_get_page_mapping(team_id team, addr_t vaddr, addr_t *paddr);
+-int32 vm_test_map_activation(vm_page *page);
++int32 vm_test_map_activation(vm_page *page, bool *_modified);
+ void vm_clear_map_activation(vm_page *page);
+ void vm_remove_all_page_mappings(vm_page *page);
+ status_t vm_unmap_pages(vm_area *area, addr_t base, size_t length);
+
+Modified: haiku/trunk/headers/private/kernel/vm_priv.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_priv.h	2007-09-03 15:35:09 UTC (rev 22155)
++++ haiku/trunk/headers/private/kernel/vm_priv.h	2007-09-03 15:41:14 UTC (rev 22156)
+@@ -44,15 +44,12 @@
+ #endif
+ 
+ // Should only be used by vm internals
+-status_t vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite, bool isUser, addr_t *newip);
++status_t vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite,
++	bool isUser, addr_t *newip);
+ void vm_unreserve_memory(size_t bytes);
+ status_t vm_try_reserve_memory(size_t bytes);
+ status_t vm_daemon_init(void);
+ 
+-// used by the page daemon to walk the list of address spaces
+-void vm_address_space_walk_start(struct hash_iterator *i);
+-vm_address_space *vm_address_space_walk_next(struct hash_iterator *i);
+-
+ #ifdef __cplusplus
+ }
+ #endif
+
+Modified: haiku/trunk/src/system/kernel/vm/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/Jamfile	2007-09-03 15:35:09 UTC (rev 22155)
++++ haiku/trunk/src/system/kernel/vm/Jamfile	2007-09-03 15:41:14 UTC (rev 22156)
+@@ -6,7 +6,7 @@
+ 	vm.cpp
+ 	vm_address_space.c
+ 	vm_cache.cpp
+-	vm_daemons.c
++	vm_daemons.cpp
+ 	vm_low_memory.cpp
+ 	vm_page.cpp
+ 	vm_store_anonymous_noswap.c
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-09-03 15:35:09 UTC (rev 22155)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-09-03 15:41:14 UTC (rev 22156)
+@@ -191,7 +191,7 @@
+ static area_id sNextAreaID;
+ static hash_table *sAreaHash;
+ static sem_id sAreaHashLock;
+-static spinlock sMappingLock;
++static mutex sMappingLock;
+ static mutex sAreaCacheLock;
+ 
+ static off_t sAvailableMemory;
+@@ -2354,13 +2354,12 @@
+ 
+ 
+ int32
+-vm_test_map_activation(vm_page *page)
++vm_test_map_activation(vm_page *page, bool *_modified)
+ {
+ 	int32 activation = 0;
++	bool modified = false;
+ 
+-	// TODO: this can't work... (we need to lock the map, so this has to be a mutex)
+-	cpu_status state = disable_interrupts();
+-	acquire_spinlock(&amp;sMappingLock);
++	MutexLocker locker(sMappingLock);
+ 
+ 	vm_page_mappings::Iterator iterator = page-&gt;mappings.GetIterator();
+ 	vm_page_mapping *mapping;
+@@ -2370,17 +2369,19 @@
+ 
+ 		addr_t physicalAddress;
+ 		uint32 flags;
+-//		map-&gt;ops-&gt;lock(map);
++		map-&gt;ops-&gt;lock(map);
+ 		addr_t address = area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+ 		map-&gt;ops-&gt;query_interrupt(map, address, &amp;physicalAddress, &amp;flags);
+-//		map-&gt;ops-&gt;unlock(map);
++		map-&gt;ops-&gt;unlock(map);
+ 
+ 		if (flags &amp; PAGE_ACCESSED)
+ 			activation++;
++		if (flags &amp; PAGE_MODIFIED)
++			modified = true;
+ 	}
+ 
+-	release_spinlock(&amp;sMappingLock);
+-	restore_interrupts(state);
++	if (_modified != NULL)
++		*_modified = modified;
+ 
+ 	return activation;
+ }
+@@ -2389,9 +2390,7 @@
+ void
+ vm_clear_map_activation(vm_page *page)
+ {
+-	// TODO: this can't work... (we need to lock the map, so this has to be a mutex)
+-	cpu_status state = disable_interrupts();
+-	acquire_spinlock(&amp;sMappingLock);
++	MutexLocker locker(sMappingLock);
+ 
+ 	vm_page_mappings::Iterator iterator = page-&gt;mappings.GetIterator();
+ 	vm_page_mapping *mapping;
+@@ -2399,23 +2398,18 @@
+ 		vm_area *area = mapping-&gt;area;
+ 		vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
+ 
+-//		map-&gt;ops-&gt;lock(map);
++		map-&gt;ops-&gt;lock(map);
+ 		addr_t address = area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+ 		map-&gt;ops-&gt;clear_flags(map, address, PAGE_ACCESSED);
+-//		map-&gt;ops-&gt;unlock(map);
++		map-&gt;ops-&gt;unlock(map);
+ 	}
+-
+-	release_spinlock(&amp;sMappingLock);
+-	restore_interrupts(state);
+ }
+ 
+ 
+ void
+ vm_remove_all_page_mappings(vm_page *page)
+ {
+-	// TODO: this can't work... (we need to lock the map, so this has to be a mutex)
+-	cpu_status state = disable_interrupts();
+-	acquire_spinlock(&amp;sMappingLock);
++	MutexLocker locker(sMappingLock);
+ 
+ 	vm_page_mappings queue;
+ 	queue.MoveFrom(&amp;page-&gt;mappings);
+@@ -2426,16 +2420,15 @@
+ 		vm_area *area = mapping-&gt;area;
+ 		vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
+ 
+-//		map-&gt;ops-&gt;lock(map);
++		map-&gt;ops-&gt;lock(map);
+ 		addr_t base = area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+ 		map-&gt;ops-&gt;unmap(map, base, base + (B_PAGE_SIZE - 1));
+-//		map-&gt;ops-&gt;unlock(map);
++		map-&gt;ops-&gt;unlock(map);
+ 
+ 		area-&gt;mappings.Remove(mapping);
+ 	}
+ 
+-	release_spinlock(&amp;sMappingLock);
+-	restore_interrupts(state);
++	locker.Unlock();
+ 
+ 	// free now unused mappings
+ 
+@@ -2476,6 +2469,7 @@
+ 	}
+ 
+ 	map-&gt;ops-&gt;unmap(map, base, end);
++	map-&gt;ops-&gt;unlock(map);
+ 
+ 	if (area-&gt;wiring == B_NO_LOCK) {
+ 		uint32 startOffset = (area-&gt;cache_offset + base - area-&gt;base)
+@@ -2484,15 +2478,16 @@
+ 		vm_page_mapping *mapping;
+ 		vm_area_mappings queue;
+ 
+-		cpu_status state = disable_interrupts();
+-		acquire_spinlock(&amp;sMappingLock);
++		mutex_lock(&amp;sMappingLock);
++		map-&gt;ops-&gt;lock(map);
+ 
+ 		vm_area_mappings::Iterator iterator = area-&gt;mappings.GetIterator();
+ 		while (iterator.HasNext()) {
+ 			mapping = iterator.Next();
+ 
+ 			vm_page *page = mapping-&gt;page;
+-			if (page-&gt;cache_offset &lt; startOffset || page-&gt;cache_offset &gt;= endOffset)
++			if (page-&gt;cache_offset &lt; startOffset
++				|| page-&gt;cache_offset &gt;= endOffset)
+ 				continue;
+ 
+ 			mapping-&gt;page-&gt;mappings.Remove(mapping);
+@@ -2501,15 +2496,14 @@
+ 			queue.Add(mapping);
+ 		}
+ 
+-		release_spinlock(&amp;sMappingLock);
+-		restore_interrupts(state);
++		map-&gt;ops-&gt;unlock(map);
++		mutex_unlock(&amp;sMappingLock);
+ 
+ 		while ((mapping = queue.RemoveHead()) != NULL) {
+ 			free(mapping);
+ 		}
+ 	}
+ 
+-	map-&gt;ops-&gt;unlock(map);
+ 	return B_OK;
+ }
+ 
+@@ -2532,24 +2526,19 @@
+ 	map-&gt;ops-&gt;lock(map);
+ 	map-&gt;ops-&gt;map(map, address, page-&gt;physical_page_number * B_PAGE_SIZE,
+ 		protection);
++	map-&gt;ops-&gt;unlock(map);
+ 
+ 	if (area-&gt;wiring != B_NO_LOCK) {
+ 		page-&gt;wired_count++;
+ 			// TODO: needs to be atomic on all platforms!
+ 	} else {
+ 		// insert mapping into lists
+-		cpu_status state = disable_interrupts();
+-		acquire_spinlock(&amp;sMappingLock);
++		MutexLocker locker(sMappingLock);
+ 
+ 		page-&gt;mappings.Add(mapping);
+ 		area-&gt;mappings.Add(mapping);
+-
+-		release_spinlock(&amp;sMappingLock);
+-		restore_interrupts(state);
+ 	}
+ 
+-	map-&gt;ops-&gt;unlock(map);
+-
+ 	if (page-&gt;state != PAGE_STATE_MODIFIED)
+ 		vm_page_set_state(page, PAGE_STATE_ACTIVE);
+ 
+@@ -3519,6 +3508,7 @@
+ 
+ 	sAreaHashLock = create_sem(WRITE_COUNT, &quot;area hash&quot;);
+ 	mutex_init(&amp;sAreaCacheLock, &quot;area-&gt;cache&quot;);
++	mutex_init(&amp;sMappingLock, &quot;page mappings&quot;);
+ 
+ 	slab_init_post_sem();
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_address_space.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_address_space.c	2007-09-03 15:35:09 UTC (rev 22155)
++++ haiku/trunk/src/system/kernel/vm/vm_address_space.c	2007-09-03 15:41:14 UTC (rev 22156)
+@@ -313,27 +313,6 @@
+ }
+ 
+ 
+-void
+-vm_address_space_walk_start(struct hash_iterator *iterator)
+-{
+-	hash_open(sAddressSpaceTable, iterator);
+-}
+-
+-
+-vm_address_space *
+-vm_address_space_walk_next(struct hash_iterator *iterator)
+-{
+-	vm_address_space *aspace;
+-
+-	acquire_sem_etc(sAddressSpaceHashSem, READ_COUNT, 0, 0);
+-	aspace = hash_next(sAddressSpaceTable, iterator);
+-	if (aspace)
+-		atomic_add(&amp;aspace-&gt;ref_count, 1);
+-	release_sem_etc(sAddressSpaceHashSem, READ_COUNT, 0);
+-	return aspace;
+-}
+-
+-
+ status_t
+ vm_address_space_init(void)
+ {
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-09-03 15:35:09 UTC (rev 22155)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-09-03 15:41:14 UTC (rev 22156)
+@@ -327,6 +327,7 @@
+ 	cache-&gt;page_count++;
+ 
+ 	page-&gt;cache = cache;
++	page-&gt;usage_count = 2;
+ 
+ 	state = disable_interrupts();
+ 	acquire_spinlock(&amp;sPageCacheTableLock);
+
+Deleted: haiku/trunk/src/system/kernel/vm/vm_daemons.c
+
+Added: haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-09-03 15:35:09 UTC (rev 22155)
++++ haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-09-03 15:41:14 UTC (rev 22156)
+@@ -0,0 +1,233 @@
++/*
++ * Copyright 2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include &lt;signal.h&gt;
++
++#include &lt;OS.h&gt;
++
++#include &lt;vm.h&gt;
++#include &lt;vm_priv.h&gt;
++#include &lt;vm_cache.h&gt;
++#include &lt;vm_low_memory.h&gt;
++#include &lt;vm_page.h&gt;
++
++
++static sem_id sPageDaemonSem;
++static uint32 sScanPagesCount;
++static uint32 sNumPages;
++static bigtime_t sScanWaitInterval;
++
++
++class PageCacheLocker {
++public:
++	PageCacheLocker(vm_page* page);
++	~PageCacheLocker();
++
++	bool IsLocked() { return fPage != NULL; }
++
++	bool Lock(vm_page* page);
++	void Unlock();
++
++private:
++	bool _IgnorePage(vm_page* page);
++
++	vm_page*	fPage;
++};
++
++
++PageCacheLocker::PageCacheLocker(vm_page* page)
++	:
++	fPage(NULL)
++{
++	Lock(page);
++}
++
++
++PageCacheLocker::~PageCacheLocker()
++{
++	Unlock();
++}
++
++
++bool
++PageCacheLocker::_IgnorePage(vm_page* page)
++{
++	if (page-&gt;state == PAGE_STATE_WIRED || page-&gt;state == PAGE_STATE_BUSY
++		|| page-&gt;state == PAGE_STATE_FREE || page-&gt;state == PAGE_STATE_CLEAR
++		|| page-&gt;state == PAGE_STATE_UNUSED || page-&gt;cache == NULL)
++		return true;
++
++	return false;
++}
++
++
++bool
++PageCacheLocker::Lock(vm_page* page)
++{
++	if (_IgnorePage(page))
++		return false;
++
++	vm_cache* cache = page-&gt;cache;
++
++	// Grab a reference to this cache - the page does not own a reference
++	// to its cache, so we can't just acquire it the easy way
++	while (true) {
++		int32 count = cache-&gt;ref_count;
++		if (count == 0) {
++			cache = NULL;
++			break;
++		}
++
++		if (atomic_test_and_set(&amp;cache-&gt;ref_count, count + 1, count) == count)
++			break;
++	}
++
++	if (cache == NULL)
++		return false;
++
++	mutex_lock(&amp;cache-&gt;lock);
++
++	if (cache != page-&gt;cache || _IgnorePage(page)) {
++		mutex_unlock(&amp;cache-&gt;lock);
++		vm_cache_release_ref(cache);
++		return false;
++	}
++
++	fPage = page;
++	return true;
++}
++
++
++void
++PageCacheLocker::Unlock()
++{
++	if (fPage == NULL)
++		return;
++
++	vm_cache* cache = fPage-&gt;cache;
++	mutex_unlock(&amp;cache-&gt;lock);
++	vm_cache_release_ref(cache);
++
++	fPage = NULL;
++}
++
++
++//	#pragma mark -
++
++
++static void
++clear_page_activation(int32 index)
++{
++	vm_page *page = vm_page_at_index(index);
++	PageCacheLocker locker(page);
++	if (!locker.IsLocked())
++		return;
++
++	if (page-&gt;state == PAGE_STATE_ACTIVE)
++		vm_clear_map_activation(page);
++}
++
++
++static bool
++check_page_activation(int32 index)
++{
++	vm_page *page = vm_page_at_index(index);
++	PageCacheLocker locker(page);
++	if (!locker.IsLocked())
++		return false;
++
++	bool modified;
++	int32 activation = vm_test_map_activation(page, &amp;modified);
++	if (modified &amp;&amp; page-&gt;state != PAGE_STATE_MODIFIED) {
++		//dprintf(&quot;page %p -&gt; move to modified\n&quot;, page);
++		vm_page_set_state(page, PAGE_STATE_MODIFIED);
++	}
++
++	if (activation &gt; 0) {
++		// page is still in active use
++		if (page-&gt;usage_count &lt; 0) {
++			if (page-&gt;state != PAGE_STATE_MODIFIED)
++				vm_page_set_state(page, PAGE_STATE_ACTIVE);
++			page-&gt;usage_count = 1;
++			//dprintf(&quot;page %p -&gt; move to active\n&quot;, page);
++		} else if (page-&gt;usage_count &lt; 127)
++			page-&gt;usage_count++;
++
++		return false;
++	}
++
++	if (page-&gt;usage_count &gt; -128)
++		page-&gt;usage_count--;
++
++	if (page-&gt;usage_count &lt; 0) {
++		vm_remove_all_page_mappings(page);
++		if (page-&gt;state == PAGE_STATE_MODIFIED) {
++			// TODO: schedule to write back!
++		} else
++			vm_page_set_state(page, PAGE_STATE_INACTIVE);
++		//dprintf(&quot;page %p -&gt; move to inactive\n&quot;, page);
++	}
++
++	return true;
++}
++
++
++static status_t 
++page_daemon(void *unused)
++{
++	uint32 clearPage = 0;
++	uint32 checkPage = sNumPages / 2;
++
++	while (true) {
++		acquire_sem_etc(sPageDaemonSem, 1, B_RELATIVE_TIMEOUT,
++			sScanWaitInterval);
++
++		if (vm_low_memory_state() &lt; B_LOW_MEMORY_NOTE) {
++			// don't do anything if we have enough free memory left
++			continue;
++		}
++
++		uint32 leftToFree = 32;
++			// TODO: make this depending on the low memory state
++
++		for (uint32 i = 0; i &lt; sScanPagesCount &amp;&amp; leftToFree &gt; 0; i++) {
++			if (clearPage == 0)
++				dprintf(&quot;clear through\n&quot;);
++			if (checkPage == 0)
++				dprintf(&quot;check through\n&quot;);
++			clear_page_activation(clearPage);
++
++			if (check_page_activation(checkPage))
++				leftToFree--;
++
++			if (++clearPage == sNumPages)
++				clearPage = 0;
++			if (++checkPage == sNumPages)
++				checkPage = 0;
++		}
++	}
++	return B_OK;
++}
++
++
++status_t
++vm_daemon_init()
++{
++	sPageDaemonSem = create_sem(0, &quot;page daemon&quot;);
++
++	sNumPages = vm_page_num_pages();
++	// TODO: compute those depending on sNumPages and memory pressure!
++	sScanPagesCount = 512;
++	sScanWaitInterval = 1000000;
++
++	// create a kernel thread to select pages for pageout
++	thread_id thread = spawn_kernel_thread(&amp;page_daemon, &quot;page daemon&quot;,
++		B_LOW_PRIORITY, NULL);
++	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
++
++	return B_OK;
++}
++
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003781.html">[Haiku-commits] r22155 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="003783.html">[Haiku-commits] r22157 - haiku/trunk/build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3782">[ date ]</a>
+              <a href="thread.html#3782">[ thread ]</a>
+              <a href="subject.html#3782">[ subject ]</a>
+              <a href="author.html#3782">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

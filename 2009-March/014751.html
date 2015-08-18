@@ -1,0 +1,364 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29448 -	haiku/trunk/src/tests/add-ons/kernel/kernelland_emu
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29448%20-%0A%09haiku/trunk/src/tests/add-ons/kernel/kernelland_emu&In-Reply-To=%3C200903081827.n28IR7Zg015830%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014750.html">
+   <LINK REL="Next"  HREF="014752.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29448 -	haiku/trunk/src/tests/add-ons/kernel/kernelland_emu</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29448%20-%0A%09haiku/trunk/src/tests/add-ons/kernel/kernelland_emu&In-Reply-To=%3C200903081827.n28IR7Zg015830%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29448 -	haiku/trunk/src/tests/add-ons/kernel/kernelland_emu">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Mar  8 19:27:07 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014750.html">[Haiku-commits] r29447 - in haiku/trunk/src/tests/add-ons/kernel: .	file_systems/userlandfs/bfs kernelland_emu
+</A></li>
+        <LI>Next message: <A HREF="014752.html">[Haiku-commits] r29449 - haiku/trunk/src/bin/screenmode
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14751">[ date ]</a>
+              <a href="thread.html#14751">[ thread ]</a>
+              <a href="subject.html#14751">[ subject ]</a>
+              <a href="author.html#14751">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-03-08 19:27:06 +0100 (Sun, 08 Mar 2009)
+New Revision: 29448
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29448&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29448&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/condition_variable.cpp
+   haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/thread.h
+Removed:
+   haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/condition_variable.cpp
+Log:
+* Replaced the broken condition variable implementation (the
+  sConditionVariablesLock is needed) with the one I used for the UserlandFS,
+  which is a slightly adjusted kernel version.
+* Got rid of sThreadsLock. It's not necessary and didn't work like used anyway.
+
+
+Deleted: haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/condition_variable.cpp
+
+Copied: haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/condition_variable.cpp (from rev 29443, haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/haiku/condition_variable.cpp)
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/haiku/condition_variable.cpp	2009-03-08 16:08:03 UTC (rev 29443)
++++ haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/condition_variable.cpp	2009-03-08 18:27:06 UTC (rev 29448)
+@@ -0,0 +1,244 @@
++/*
++ * Copyright 2007-2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++
++#include &quot;condition_variable.h&quot;
++
++#include &lt;new&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++
++#include &lt;Debug.h&gt;
++#include &lt;KernelExport.h&gt;
++
++// libroot
++#include &lt;user_thread.h&gt;
++
++// system
++#include &lt;syscalls.h&gt;
++#include &lt;user_thread_defs.h&gt;
++
++#include &lt;lock.h&gt;
++#include &lt;util/AutoLock.h&gt;
++
++#include &quot;thread.h&quot;
++
++
++#define STATUS_ADDED	1
++#define STATUS_WAITING	2
++
++
++static const int kConditionVariableHashSize = 512;
++
++
++struct ConditionVariableHashDefinition {
++	typedef const void* KeyType;
++	typedef	ConditionVariable ValueType;
++
++	size_t HashKey(const void* key) const
++		{ return (size_t)key; }
++	size_t Hash(ConditionVariable* variable) const
++		{ return (size_t)variable-&gt;fObject; }
++	bool Compare(const void* key, ConditionVariable* variable) const
++		{ return key == variable-&gt;fObject; }
++	HashTableLink&lt;ConditionVariable&gt;* GetLink(ConditionVariable* variable) const
++		{ return variable; }
++};
++
++typedef OpenHashTable&lt;ConditionVariableHashDefinition&gt; ConditionVariableHash;
++static ConditionVariableHash sConditionVariableHash;
++static mutex sConditionVariablesLock = MUTEX_INITIALIZER(&quot;condition variables&quot;);
++
++
++// #pragma mark - ConditionVariableEntry
++
++
++bool
++ConditionVariableEntry::Add(const void* object)
++{
++	ASSERT(object != NULL);
++
++	fThread = get_current_thread();
++
++	MutexLocker _(sConditionVariablesLock);
++
++	fVariable = sConditionVariableHash.Lookup(object);
++
++	if (fVariable == NULL) {
++		fWaitStatus = B_ENTRY_NOT_FOUND;
++		return false;
++	}
++
++	fWaitStatus = STATUS_ADDED;
++	fVariable-&gt;fEntries.Add(this);
++
++	return true;
++}
++
++
++status_t
++ConditionVariableEntry::Wait(uint32 flags, bigtime_t timeout)
++{
++	MutexLocker conditionLocker(sConditionVariablesLock);
++
++	if (fVariable == NULL)
++		return fWaitStatus;
++
++	user_thread* userThread = get_user_thread();
++
++	userThread-&gt;wait_status = 1;
++	fWaitStatus = STATUS_WAITING;
++
++	conditionLocker.Unlock();
++
++	status_t error;
++	while ((error = _kern_block_thread(flags, timeout)) == B_INTERRUPTED) {
++	}
++
++	conditionLocker.Lock();
++
++	// remove entry from variable, if not done yet
++	if (fVariable != NULL) {
++		fVariable-&gt;fEntries.Remove(this);
++		fVariable = NULL;
++	}
++
++	return error;
++}
++
++
++status_t
++ConditionVariableEntry::Wait(const void* object, uint32 flags,
++	bigtime_t timeout)
++{
++	if (Add(object))
++		return Wait(flags, timeout);
++	return B_ENTRY_NOT_FOUND;
++}
++
++
++inline void
++ConditionVariableEntry::AddToVariable(ConditionVariable* variable)
++{
++	fThread = get_current_thread();
++
++	MutexLocker _(sConditionVariablesLock);
++
++	fVariable = variable;
++	fWaitStatus = STATUS_ADDED;
++	fVariable-&gt;fEntries.Add(this);
++}
++
++
++// #pragma mark - ConditionVariable
++
++
++/*!	Initialization method for anonymous (unpublished) condition variables.
++*/
++void
++ConditionVariable::Init(const void* object, const char* objectType)
++{
++	fObject = object;
++	fObjectType = objectType;
++	new(&amp;fEntries) EntryList;
++}
++
++
++void
++ConditionVariable::Publish(const void* object, const char* objectType)
++{
++	ASSERT(object != NULL);
++
++	fObject = object;
++	fObjectType = objectType;
++	new(&amp;fEntries) EntryList;
++
++	MutexLocker locker(sConditionVariablesLock);
++
++	ASSERT(sConditionVariableHash.Lookup(object) == NULL);
++
++	sConditionVariableHash.InsertUnchecked(this);
++}
++
++
++void
++ConditionVariable::Unpublish(bool threadsLocked)
++{
++	ASSERT(fObject != NULL);
++
++	MutexLocker locker(sConditionVariablesLock);
++
++	sConditionVariableHash.RemoveUnchecked(this);
++	fObject = NULL;
++	fObjectType = NULL;
++
++	if (!fEntries.IsEmpty())
++		_NotifyChecked(true, B_ENTRY_NOT_FOUND);
++}
++
++
++void
++ConditionVariable::Add(ConditionVariableEntry* entry)
++{
++	entry-&gt;AddToVariable(this);
++}
++
++
++status_t
++ConditionVariable::Wait(uint32 flags, bigtime_t timeout)
++{
++	ConditionVariableEntry entry;
++	Add(&amp;entry);
++	return entry.Wait(flags, timeout);
++}
++
++
++void
++ConditionVariable::_Notify(bool all, bool threadsLocked)
++{
++	MutexLocker locker(sConditionVariablesLock);
++
++	if (!fEntries.IsEmpty())
++		_NotifyChecked(all, B_OK);
++}
++
++
++/*! Called with interrupts disabled and the condition variable spinlock and
++	thread lock held.
++*/
++void
++ConditionVariable::_NotifyChecked(bool all, status_t result)
++{
++	// dequeue and wake up the blocked threads
++	while (ConditionVariableEntry* entry = fEntries.RemoveHead()) {
++		entry-&gt;fVariable = NULL;
++
++		if (entry-&gt;fWaitStatus &lt;= 0)
++			continue;
++
++		if (entry-&gt;fWaitStatus == STATUS_WAITING)
++			_kern_unblock_thread(get_thread_id(entry-&gt;fThread), result);
++
++		entry-&gt;fWaitStatus = result;
++
++		if (!all)
++			break;
++	}
++}
++
++
++// #pragma mark -
++
++
++status_t
++condition_variable_init()
++{
++	status_t error = sConditionVariableHash.Init(kConditionVariableHashSize);
++	if (error != B_OK) {
++		panic(&quot;condition_variable_init(): Failed to init hash table: %s&quot;,
++			strerror(error));
++	}
++
++	return error;
++}
+
+Added: haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/thread.h
+===================================================================
+--- haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/thread.h	2009-03-08 17:55:36 UTC (rev 29447)
++++ haiku/trunk/src/tests/add-ons/kernel/kernelland_emu/thread.h	2009-03-08 18:27:06 UTC (rev 29448)
+@@ -0,0 +1,28 @@
++/*
++ * Copyright 2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef THREAD_H
++#define THREAD_H
++
++#include &lt;OS.h&gt;
++
++
++struct thread;
++
++
++static inline struct thread*
++get_current_thread()
++{
++	return (struct thread*)find_thread(NULL);
++}
++
++
++static inline thread_id
++get_thread_id(struct thread* thread)
++{
++	return (thread_id)thread;
++}
++
++
++#endif	// THREAD_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014750.html">[Haiku-commits] r29447 - in haiku/trunk/src/tests/add-ons/kernel: .	file_systems/userlandfs/bfs kernelland_emu
+</A></li>
+	<LI>Next message: <A HREF="014752.html">[Haiku-commits] r29449 - haiku/trunk/src/bin/screenmode
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14751">[ date ]</a>
+              <a href="thread.html#14751">[ thread ]</a>
+              <a href="subject.html#14751">[ subject ]</a>
+              <a href="author.html#14751">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

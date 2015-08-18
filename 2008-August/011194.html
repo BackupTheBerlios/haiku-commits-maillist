@@ -1,0 +1,333 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27122 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27122%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200808220113.m7M1DKR9010547%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011193.html">
+   <LINK REL="Next"  HREF="011195.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27122 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27122%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200808220113.m7M1DKR9010547%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27122 - in haiku/trunk: headers/private/kernel	src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Aug 22 03:13:20 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011193.html">[Haiku-commits] r27121 - haiku/trunk/headers/private/kernel/util
+</A></li>
+        <LI>Next message: <A HREF="011195.html">[Haiku-commits] r27123 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11194">[ date ]</a>
+              <a href="thread.html#11194">[ thread ]</a>
+              <a href="subject.html#11194">[ subject ]</a>
+              <a href="author.html#11194">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-22 03:13:18 +0200 (Fri, 22 Aug 2008)
+New Revision: 27122
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27122&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27122&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/kernel_daemon.h
+   haiku/trunk/src/system/kernel/kernel_daemon.cpp
+Log:
+* Refactored the kernel daemon code into a class.
+* Added a second kernel daemon service, resource resizer, which is
+  mainly supposed to be used for resizing allocations asynchrounously.
+
+
+Modified: haiku/trunk/headers/private/kernel/kernel_daemon.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/kernel_daemon.h	2008-08-22 01:10:24 UTC (rev 27121)
++++ haiku/trunk/headers/private/kernel/kernel_daemon.h	2008-08-22 01:13:18 UTC (rev 27122)
+@@ -6,12 +6,21 @@
+ #define _KERNEL_DAEMON_H
+ 
+ 
+-#include &lt;OS.h&gt;
++#include &lt;KernelExport.h&gt;
+ 
+ 
+ #ifdef __cplusplus
+-extern &quot;C&quot;
++extern &quot;C&quot; {
+ #endif
++
++status_t register_resource_resizer(daemon_hook function, void* arg,
++			int frequency);
++status_t unregister_resource_resizer(daemon_hook function, void* arg);
++
+ status_t kernel_daemon_init(void);
+ 
++#ifdef __cplusplus
++}
++#endif
++
+ #endif	/* _KERNEL_DAEMON_H */
+
+Modified: haiku/trunk/src/system/kernel/kernel_daemon.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/kernel_daemon.cpp	2008-08-22 01:10:24 UTC (rev 27121)
++++ haiku/trunk/src/system/kernel/kernel_daemon.cpp	2008-08-22 01:13:18 UTC (rev 27122)
+@@ -33,46 +33,90 @@
+ 
+ typedef DoublyLinkedList&lt;struct daemon&gt; DaemonList;
+ 
+-static mutex sDaemonMutex = MUTEX_INITIALIZER(&quot;kernel daemon&quot;);
+-static DaemonList sDaemons;
+ 
++class KernelDaemon {
++public:
++			status_t			Init(const char* name);
+ 
+-static status_t
+-kernel_daemon(void* data)
++			status_t			Register(daemon_hook function, void* arg,
++									int frequency);
++			status_t			Unregister(daemon_hook function, void* arg);
++
++private:
++	static	status_t			_DaemonThreadEntry(void* data);
++			status_t			_DaemonThread();
++
++private:
++			mutex				fLock;
++			DaemonList			fDaemons;
++			thread_id			fThread;
++};
++
++
++static KernelDaemon sKernelDaemon;
++static KernelDaemon sResourceResizer;
++
++
++status_t
++KernelDaemon::Init(const char* name)
+ {
+-	int32 iteration = 0;
++	new(&amp;fDaemons) DaemonList;
++	mutex_init(&amp;fLock, name);
+ 
+-	while (true) {
+-		mutex_lock(&amp;sDaemonMutex);
++	fThread = spawn_kernel_thread(&amp;_DaemonThreadEntry, name, B_LOW_PRIORITY,
++		this);
++	if (fThread &lt; 0)
++		return fThread;
+ 
+-		DaemonList::Iterator iterator = sDaemons.GetIterator();
++	send_signal_etc(fThread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 
+-		// iterate through the list and execute each daemon if needed
++	return B_OK;
++}
++
++
++status_t
++KernelDaemon::Register(daemon_hook function, void* arg, int frequency)
++{
++	if (function == NULL || frequency &lt; 1)
++		return B_BAD_VALUE;
++
++	struct daemon* daemon = new(std::nothrow) struct ::daemon;
++	if (daemon == NULL)
++		return B_NO_MEMORY;
++
++	daemon-&gt;function = function;
++	daemon-&gt;arg = arg;
++	daemon-&gt;frequency = frequency;
++
++	MutexLocker _(fLock);
++
++	if (frequency &gt; 1) {
++		// we try to balance the work-load for each daemon run
++		// (beware, it's a very simple algorithm, yet effective)
++
++		DaemonList::Iterator iterator = fDaemons.GetIterator();
++		int32 num = 0;
++
+ 		while (iterator.HasNext()) {
+-			struct daemon* daemon = iterator.Next();
+-
+-			if (((iteration + daemon-&gt;offset) % daemon-&gt;frequency) == 0)
+-				daemon-&gt;function(daemon-&gt;arg, iteration);
++			if (iterator.Next()-&gt;frequency == frequency)
++				num++;
+ 		}
+-		mutex_unlock(&amp;sDaemonMutex);
+ 
+-		iteration++;
+-		snooze(100000);	// 0.1 seconds
+-	}
++		daemon-&gt;offset = num % frequency;
++	} else
++		daemon-&gt;offset = 0;
+ 
++	fDaemons.Add(daemon);
+ 	return B_OK;
+ }
+ 
+ 
+-//	#pragma mark -
+-
+-
+-extern &quot;C&quot; status_t
+-unregister_kernel_daemon(daemon_hook function, void* arg)
++status_t
++KernelDaemon::Unregister(daemon_hook function, void* arg)
+ {
+-	MutexLocker _(sDaemonMutex);
++	MutexLocker _(fLock);
+ 
+-	DaemonList::Iterator iterator = sDaemons.GetIterator();
++	DaemonList::Iterator iterator = fDaemons.GetIterator();
+ 
+ 	// search for the daemon and remove it from the list
+ 	while (iterator.HasNext()) {
+@@ -90,51 +134,81 @@
+ }
+ 
+ 
+-extern &quot;C&quot; status_t
+-register_kernel_daemon(daemon_hook function, void* arg, int frequency)
++/*static*/ status_t
++KernelDaemon::_DaemonThreadEntry(void* data)
+ {
+-	if (function == NULL || frequency &lt; 1)
+-		return B_BAD_VALUE;
++	return ((KernelDaemon*)data)-&gt;_DaemonThread();
++}
+ 
+-	struct daemon* daemon = new(std::nothrow) struct daemon();
+-	if (daemon == NULL)
+-		return B_NO_MEMORY;
+ 
+-	daemon-&gt;function = function;
+-	daemon-&gt;arg = arg;
+-	daemon-&gt;frequency = frequency;
++status_t
++KernelDaemon::_DaemonThread()
++{
++	int32 iteration = 0;
+ 
+-	MutexLocker _(sDaemonMutex);
+-	
+-	if (frequency &gt; 1) {
+-		// we try to balance the work-load for each daemon run
+-		// (beware, it's a very simple algorithm, yet effective)
++	while (true) {
++		mutex_lock(&amp;fLock);
+ 
+-		DaemonList::Iterator iterator = sDaemons.GetIterator();
+-		int32 num = 0;
++		DaemonList::Iterator iterator = fDaemons.GetIterator();
+ 
++		// iterate through the list and execute each daemon if needed
+ 		while (iterator.HasNext()) {
+-			if (iterator.Next()-&gt;frequency == frequency)
+-				num++;
++			struct daemon* daemon = iterator.Next();
++
++			if (((iteration + daemon-&gt;offset) % daemon-&gt;frequency) == 0)
++				daemon-&gt;function(daemon-&gt;arg, iteration);
+ 		}
++		mutex_unlock(&amp;fLock);
+ 
+-		daemon-&gt;offset = num % frequency;
+-	} else
+-		daemon-&gt;offset = 0;
++		iteration++;
++		snooze(100000);	// 0.1 seconds
++	}
+ 
+-	sDaemons.Add(daemon);
+ 	return B_OK;
+ }
+ 
+ 
++//	#pragma mark -
++
++
+ extern &quot;C&quot; status_t
++register_kernel_daemon(daemon_hook function, void* arg, int frequency)
++{
++	return sKernelDaemon.Register(function, arg, frequency);
++}
++
++
++extern &quot;C&quot; status_t
++unregister_kernel_daemon(daemon_hook function, void* arg)
++{
++	return sKernelDaemon.Unregister(function, arg);
++}
++
++
++extern &quot;C&quot; status_t
++register_resource_resizer(daemon_hook function, void* arg, int frequency)
++{
++	return sResourceResizer.Register(function, arg, frequency);
++}
++
++
++extern &quot;C&quot; status_t
++unregister_resource_resizer(daemon_hook function, void* arg)
++{
++	return sResourceResizer.Unregister(function, arg);
++}
++
++
++extern &quot;C&quot; status_t
+ kernel_daemon_init(void)
+ {
+-	new(&amp;sDaemons) DaemonList;
++	new(&amp;sKernelDaemon) KernelDaemon;
++	if (sKernelDaemon.Init(&quot;kernel daemon&quot;) != B_OK)
++		panic(&quot;kernel_daemon_init(): failed to init kernel daemon&quot;);
+ 
+-	thread_id thread = spawn_kernel_thread(&amp;kernel_daemon, &quot;kernel daemon&quot;,
+-		B_LOW_PRIORITY, NULL);
+-	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
++	new(&amp;sResourceResizer) KernelDaemon;
++	if (sResourceResizer.Init(&quot;resource resizer&quot;) != B_OK)
++		panic(&quot;kernel_daemon_init(): failed to init resource resizer&quot;);
+ 
+ 	return B_OK;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011193.html">[Haiku-commits] r27121 - haiku/trunk/headers/private/kernel/util
+</A></li>
+	<LI>Next message: <A HREF="011195.html">[Haiku-commits] r27123 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11194">[ date ]</a>
+              <a href="thread.html#11194">[ thread ]</a>
+              <a href="subject.html#11194">[ subject ]</a>
+              <a href="author.html#11194">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

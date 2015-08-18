@@ -1,0 +1,172 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22186 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22186%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200709060203.l8623iUF014386%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003822.html">
+   <LINK REL="Next"  HREF="003824.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22186 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22186%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200709060203.l8623iUF014386%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22186 - in haiku/trunk: headers/private/kernel	src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Sep  6 04:03:44 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003822.html">[Haiku-commits] r22185 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="003824.html">[Haiku-commits] r22187 - in haiku/trunk: headers/posix	headers/private/kernel src/add-ons/kernel/drivers/tty	src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3823">[ date ]</a>
+              <a href="thread.html#3823">[ thread ]</a>
+              <a href="subject.html#3823">[ subject ]</a>
+              <a href="author.html#3823">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-09-06 04:03:43 +0200 (Thu, 06 Sep 2007)
+New Revision: 22186
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22186&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22186&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/ksignal.h
+   haiku/trunk/src/system/kernel/signal.cpp
+Log:
+* Added is_signal_blocked() convenience function.
+* Defined flag SIGNAL_FLAG_TEAMS_LOCKED for send_signal_etc(), so it can
+  be called with the team lock being held.
+
+
+Modified: haiku/trunk/headers/private/kernel/ksignal.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/ksignal.h	2007-09-05 19:36:38 UTC (rev 22185)
++++ haiku/trunk/headers/private/kernel/ksignal.h	2007-09-06 02:03:43 UTC (rev 22186)
+@@ -14,7 +14,11 @@
+ 
+ #define SIGNAL_TO_MASK(signal)	(1LL &lt;&lt; (signal - 1))
+ 
++// additional send_signal_etc() flag
++#define SIGNAL_FLAG_TEAMS_LOCKED	(0x10000)
++	// interrupts are disabled and team lock is held
+ 
++
+ #ifdef __cplusplus
+ extern &quot;C&quot; {
+ #endif
+@@ -22,6 +26,7 @@
+ extern bool handle_signals(struct thread *thread);
+ extern bool is_kill_signal_pending(void);
+ extern int has_signals_pending(void *_thread);
++extern bool is_signal_blocked(int signal);
+ 
+ extern int sigaction_etc(thread_id threadID, int signal,
+ 	const struct sigaction *newAction, struct sigaction *oldAction);
+
+Modified: haiku/trunk/src/system/kernel/signal.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/signal.cpp	2007-09-05 19:36:38 UTC (rev 22185)
++++ haiku/trunk/src/system/kernel/signal.cpp	2007-09-06 02:03:43 UTC (rev 22186)
+@@ -265,6 +265,14 @@
+ }
+ 
+ 
++bool
++is_signal_blocked(int signal)
++{
++	return (atomic_get(&amp;thread_get_current_thread()-&gt;sig_block_mask)
++		&amp; SIGNAL_TO_MASK(signal)) != 0;
++}
++
++
+ /*!	Tries to interrupt a thread waiting for a semaphore or a condition variable.
+ 	Interrupts must be disabled, the thread lock be held. Note, that the thread
+ 	lock may temporarily be released.
+@@ -360,12 +368,13 @@
+ {
+ 	status_t status = B_BAD_THREAD_ID;
+ 	struct thread *thread;
+-	cpu_status state;
++	cpu_status state = 0;
+ 
+ 	if (signal &lt; 0 || signal &gt; MAX_SIGNO)
+ 		return B_BAD_VALUE;
+ 
+-	state = disable_interrupts();
++	if ((flags &amp; SIGNAL_FLAG_TEAMS_LOCKED) == 0)
++		state = disable_interrupts();
+ 	
+ 	if (id &gt; 0) {
+ 		// send a signal to the specified thread
+@@ -388,7 +397,8 @@
+ 		} else
+ 			id = -id;
+ 
+-		GRAB_TEAM_LOCK();
++		if ((flags &amp; SIGNAL_FLAG_TEAMS_LOCKED) == 0)
++			GRAB_TEAM_LOCK();
+ 
+ 		group = team_get_process_group_locked(NULL, id);
+ 		if (group != NULL) {
+@@ -413,18 +423,22 @@
+ 			}
+ 		}
+ 
+-		RELEASE_TEAM_LOCK();
++		if ((flags &amp; SIGNAL_FLAG_TEAMS_LOCKED) == 0)
++			RELEASE_TEAM_LOCK();
++
+ 		GRAB_THREAD_LOCK();
+ 	}		
+ 
+ 	// ToDo: maybe the scheduler should only be invoked if there is reason to do it?
+ 	//	(ie. deliver_signal() moved some threads in the running queue?)
+-	if ((flags &amp; B_DO_NOT_RESCHEDULE) == 0)
++	if ((flags &amp; (B_DO_NOT_RESCHEDULE | SIGNAL_FLAG_TEAMS_LOCKED)) == 0)
+ 		scheduler_reschedule();
+ 
+ 	RELEASE_THREAD_LOCK();
+-	restore_interrupts(state);
+ 
++	if ((flags &amp; SIGNAL_FLAG_TEAMS_LOCKED) == 0)
++		restore_interrupts(state);
++
+ 	return status;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003822.html">[Haiku-commits] r22185 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="003824.html">[Haiku-commits] r22187 - in haiku/trunk: headers/posix	headers/private/kernel src/add-ons/kernel/drivers/tty	src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3823">[ date ]</a>
+              <a href="thread.html#3823">[ thread ]</a>
+              <a href="subject.html#3823">[ subject ]</a>
+              <a href="author.html#3823">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,306 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29220 - haiku/trunk/src/servers/app/drawing/Painter
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29220%20-%20haiku/trunk/src/servers/app/drawing/Painter&In-Reply-To=%3C200902151814.n1FIEaNZ023329%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014364.html">
+   <LINK REL="Next"  HREF="014366.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29220 - haiku/trunk/src/servers/app/drawing/Painter</H1>
+    <B>stippi at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29220%20-%20haiku/trunk/src/servers/app/drawing/Painter&In-Reply-To=%3C200902151814.n1FIEaNZ023329%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29220 - haiku/trunk/src/servers/app/drawing/Painter">stippi at mail.berlios.de
+       </A><BR>
+    <I>Sun Feb 15 19:14:36 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014364.html">[Haiku-commits] r29219 - haiku/trunk/data/boot_cd
+</A></li>
+        <LI>Next message: <A HREF="014366.html">[Haiku-commits] r29221 - in haiku/trunk: headers/os/interface	src/apps/launchbox src/kits/interface src/kits/tracker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14365">[ date ]</a>
+              <a href="thread.html#14365">[ thread ]</a>
+              <a href="subject.html#14365">[ subject ]</a>
+              <a href="author.html#14365">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-02-15 19:14:35 +0100 (Sun, 15 Feb 2009)
+New Revision: 29220
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29220&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29220&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/drawing/Painter/Painter.cpp
+   haiku/trunk/src/servers/app/drawing/Painter/Painter.h
+Log:
+Finished the optimization for vertical gradients. This code is about
+8.3 times faster than using the AGG pipeline, but about 3 times slower
+than drawing a solid color square. It can probably still be improved.
+The second version of _MakeGradient() is more powerful than the old one
+and should replace it. It handles some corner cases, which the other
+one does not.
+
+
+Modified: haiku/trunk/src/servers/app/drawing/Painter/Painter.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/Painter/Painter.cpp	2009-02-15 18:11:56 UTC (rev 29219)
++++ haiku/trunk/src/servers/app/drawing/Painter/Painter.cpp	2009-02-15 18:14:35 UTC (rev 29220)
+@@ -864,20 +864,36 @@
+ 	BPoint b(max_c(r.left, r.right), max_c(r.top, r.bottom));
+ 	_Transform(&amp;a, false);
+ 	_Transform(&amp;b, false);
+-	
++
++	// first, try an optimized version
++	if (gradient.GetType() == BGradient::TYPE_LINEAR
++		&amp;&amp; (fDrawingMode == B_OP_COPY || fDrawingMode == B_OP_OVER)) {
++		const BGradientLinear* linearGradient
++			= dynamic_cast&lt;const BGradientLinear*&gt;(&amp;gradient);
++		if (linearGradient-&gt;Start().x == linearGradient-&gt;End().x
++			// TODO: Remove this second check once the optimized method
++			// handled &quot;upside down&quot; gradients as well...
++			&amp;&amp; linearGradient-&gt;Start().y &lt;= linearGradient-&gt;End().y) {
++			// a vertical gradient
++			BRect rect(a, b);
++			FillRectVerticalGradient(rect, *linearGradient);
++			return _Clipped(rect);
++		}
++	}
++
+ 	// account for stricter interpretation of coordinates in AGG
+ 	// the rectangle ranges from the top-left (.0, .0)
+ 	// to the bottom-right (.9999, .9999) corner of pixels
+ 	b.x += 1.0;
+ 	b.y += 1.0;
+-	
++
+ 	fPath.remove_all();
+ 	fPath.move_to(a.x, a.y);
+ 	fPath.line_to(b.x, a.y);
+ 	fPath.line_to(b.x, b.y);
+ 	fPath.line_to(a.x, b.y);
+ 	fPath.close_polygon();
+-	
++
+ 	return _FillPath(fPath, gradient);
+ }
+ 
+@@ -920,32 +936,37 @@
+ 	} while (fBaseRenderer.next_clip_box());
+ }
+ 
+-#if 0
+ // FillRectVerticalGradient
+ void
+-Painter::FillRectVerticalGradient(const BRect&amp; r,
++Painter::FillRectVerticalGradient(BRect r,
+ 	const BGradientLinear&amp; gradient) const
+ {
+ 	if (!fValidClipping)
+ 		return;
+ 
++	// Make sure the color array is no larger than the screen height.
++	r = r &amp; fClippingRegion-&gt;Frame();
++
+ 	int32 gradientArraySize = r.IntegerHeight() + 1;
+-	rgb_color gradientArray[gradientArraySize];
+-	for (int32 i = 0; i &lt; gradientArraySize; i++) {
++	uint32 gradientArray[gradientArraySize];
++	int32 gradientTop = gradient.Start().y;
++	int32 gradientBottom = gradient.End().y;
++	int32 colorCount = gradientBottom - gradientTop + 1;
++	if (colorCount &lt; 0) {
++		// Gradient is upside down. That's currently not supported by this
++		// method.
++		return;
+ 	}
+ 
++	_MakeGradient(gradient, colorCount, gradientArray,
++		gradientTop - (int32)r.top, gradientArraySize);
++	
+ 	uint8* dst = fBuffer.row_ptr(0);
+ 	uint32 bpr = fBuffer.stride();
+ 	int32 left = (int32)r.left;
+ 	int32 top = (int32)r.top;
+ 	int32 right = (int32)r.right;
+ 	int32 bottom = (int32)r.bottom;
+-	// get a 32 bit pixel ready with the color
+-	pixel32 color;
+-	color.data8[0] = c.blue;
+-	color.data8[1] = c.green;
+-	color.data8[2] = c.red;
+-	color.data8[3] = c.alpha;
+ 	// fill rects, iterate over clipping boxes
+ 	fBaseRenderer.first_clip_box();
+ 	do {
+@@ -958,14 +979,13 @@
+ 			for (; y1 &lt;= y2; y1++) {
+ //					uint32* handle = (uint32*)(offset + y1 * bpr);
+ //					for (int32 x = x1; x &lt;= x2; x++) {
+-//						*handle++ = color.data32;
++//						*handle++ = gradientArray[y1 - top];
+ //					}
+-gfxset32(offset + y1 * bpr, color.data32, (x2 - x1 + 1) * 4);
++gfxset32(offset + y1 * bpr, gradientArray[y1 - top], (x2 - x1 + 1) * 4);
+ 			}
+ 		}
+ 	} while (fBaseRenderer.next_clip_box());
+ }
+-#endif
+ 
+ // FillRectNoClipping
+ void
+@@ -2609,6 +2629,85 @@
+ }
+ 
+ // _MakeGradient
++void
++Painter::_MakeGradient(const BGradient&amp; gradient, int32 colorCount,
++	uint32* colors, int32 arrayOffset, int32 arraySize) const
++{
++	BGradient::ColorStop* from = gradient.ColorStopAt(0);
++
++	if (!from)
++		return;
++
++	// current index into &quot;colors&quot; array
++//	int32 index = (int32)floorf(colorCount * from-&gt;offset + 0.5)
++//		+ arrayOffset;
++	int32 index = (int32)floorf(colorCount * from-&gt;offset / 255 + 0.5)
++		+ arrayOffset;
++	if (index &gt; arraySize)
++		index = arraySize;
++	// Make sure we fill the entire array in case the gradient is outside.
++	if (index &gt; 0) {
++		uint8* c = (uint8*)&amp;colors[0];
++		for (int32 i = 0; i &lt; index; i++) {
++			c[0] = from-&gt;color.blue;
++			c[1] = from-&gt;color.green;
++			c[2] = from-&gt;color.red;
++			c[3] = from-&gt;color.alpha;
++			c += 4;
++		}
++	}
++
++	// interpolate &quot;from&quot; to &quot;to&quot;
++	int32 stopCount = gradient.CountColorStops();
++	for (int32 i = 1; i &lt; stopCount; i++) {
++		// find the step with the next offset
++		BGradient::ColorStop* to = gradient.ColorStopAtFast(i);
++
++		// interpolate
++//		int32 offset = (int32)floorf((colorCount - 1) * to-&gt;offset + 0.5);
++		int32 offset = (int32)floorf((colorCount - 1)
++			* to-&gt;offset / 255 + 0.5);
++		if (offset &gt; colorCount - 1)
++			offset = colorCount - 1;
++		offset += arrayOffset;
++		int32 dist = offset - index;
++		if (dist &gt;= 0) {
++			int32 startIndex = max_c(index, 0);
++			int32 stopIndex = min_c(offset, arraySize - 1);
++			uint8* c = (uint8*)&amp;colors[startIndex];
++			for (int32 i = startIndex; i &lt;= stopIndex; i++) {
++				float f = (float)(offset - i) / (float)(dist + 1);
++				float t = 1.0 - f;
++				c[0] = (uint8)floorf(from-&gt;color.blue * f
++					+ to-&gt;color.blue * t + 0.5);
++				c[1] = (uint8)floorf(from-&gt;color.green * f
++					+ to-&gt;color.green * t + 0.5);
++				c[2] = (uint8)floorf(from-&gt;color.red * f
++					+ to-&gt;color.red * t + 0.5);
++				c[3] = (uint8)floorf(from-&gt;color.alpha * f
++					+ to-&gt;color.alpha * t + 0.5);
++				c += 4;
++			}
++		}
++		index = offset + 1;
++		// the current &quot;to&quot; will be the &quot;from&quot; in the next interpolation
++		from = to;
++	}
++	//  make sure we fill the entire array
++	if (index &lt; arraySize - 1) {
++		int32 startIndex = max_c(index, 0);
++		uint8* c = (uint8*)&amp;colors[startIndex];
++		for (int32 i = startIndex; i &lt; arraySize; i++) {
++			c[0] = from-&gt;color.red;
++			c[1] = from-&gt;color.green;
++			c[2] = from-&gt;color.blue;
++			c[3] = from-&gt;color.alpha;
++			c += 4;
++		}
++	}
++}
++
++// _MakeGradient
+ template&lt;class Array&gt;
+ void
+ Painter::_MakeGradient(Array&amp; array, const BGradient&amp; gradient) const
+
+Modified: haiku/trunk/src/servers/app/drawing/Painter/Painter.h
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/Painter/Painter.h	2009-02-15 18:11:56 UTC (rev 29219)
++++ haiku/trunk/src/servers/app/drawing/Painter/Painter.h	2009-02-15 18:14:35 UTC (rev 29220)
+@@ -144,6 +144,14 @@
+ 			// fills a solid rect with color c, no blending
+ 			void				FillRect(const BRect&amp; r,
+ 									const rgb_color&amp; c) const;
++			
++			// fills a rect with a linear gradient, the caller should be
++			// sure that the gradient is indeed vertical. The start point of
++			// the gradient should be above the end point, or this function
++			// will not draw anything.
++			void				FillRectVerticalGradient(BRect r,
++									const BGradientLinear&amp; gradient) const;
++			
+ 			// fills a solid rect with color c, no blending, no clipping
+ 			void				FillRectNoClipping(const clipping_rect&amp; r,
+ 									const rgb_color&amp; c) const;
+@@ -278,6 +286,11 @@
+ 			void				_CalcLinearGradientTransform(BPoint startPoint,
+ 									BPoint endPoint, agg::trans_affine&amp; mtx,
+ 									float gradient_d2 = 100.0f) const;
++
++			void				_MakeGradient(const BGradient&amp; gradient,
++									int32 colorCount, uint32* colors,
++									int32 arrayOffset, int32 arraySize) const;
++			
+ 			template&lt;class Array&gt;
+ 			void				_MakeGradient(Array&amp; array,
+ 									const BGradient&amp; gradient) const;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014364.html">[Haiku-commits] r29219 - haiku/trunk/data/boot_cd
+</A></li>
+	<LI>Next message: <A HREF="014366.html">[Haiku-commits] r29221 - in haiku/trunk: headers/os/interface	src/apps/launchbox src/kits/interface src/kits/tracker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14365">[ date ]</a>
+              <a href="thread.html#14365">[ thread ]</a>
+              <a href="subject.html#14365">[ subject ]</a>
+              <a href="author.html#14365">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

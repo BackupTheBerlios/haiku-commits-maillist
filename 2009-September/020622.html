@@ -1,0 +1,234 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r33129 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r33129%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200909140626.n8E6Qv6d022582%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020621.html">
+   <LINK REL="Next"  HREF="020624.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r33129 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r33129%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200909140626.n8E6Qv6d022582%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r33129 - haiku/trunk/src/add-ons/kernel/busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Mon Sep 14 08:26:57 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020621.html">[Haiku-commits] r33128 -	haiku/branches/components/gallium3d/src/libs/drm
+</A></li>
+        <LI>Next message: <A HREF="020624.html">[Haiku-commits] r33130 -	haiku/trunk/src/add-ons/kernel/drivers/network/ipw2100
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20622">[ date ]</a>
+              <a href="thread.html#20622">[ thread ]</a>
+              <a href="subject.html#20622">[ subject ]</a>
+              <a href="author.html#20622">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-09-14 08:26:54 +0200 (Mon, 14 Sep 2009)
+New Revision: 33129
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=33129&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=33129&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/Jamfile
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+Log:
+When submitting transfers there is a race condition between adding the pending
+transfer to the transfer list and scheduling the transfer descriptors on the
+controller by switching the endpoint tail. Since we only check that the endpoint
+head is equal to the endpoint tail to conclude that there are no active
+transfers, we need to ensure that we don't accidently do that check before the
+transfer descriptors are scheduled. Otherwise we could happen to processed a not
+yet started transfer and finishing it before an actual transfer has taken place.
+This would then lead to 0 byte transfers and toggle mismatches. To fix this we
+now protect the transfer addition and tail switching as well as the check in the
+finisher with a per-endpoint mutex. Note that we allocate the lock on the heap
+and only store the pointer in the endpoint structure as this one is allocated
+from the precious physical memory pool. Could fix #4067.
+Also switched the Jamfile to UsePrivateKernelHeaders (for the MutexLocker) and
+removed BeOS compatibility.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/Jamfile
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/Jamfile	2009-09-14 05:28:34 UTC (rev 33128)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/Jamfile	2009-09-14 06:26:54 UTC (rev 33129)
+@@ -1,14 +1,9 @@
+ SubDir HAIKU_TOP src add-ons kernel busses usb ;
+ 
+-SetSubDirSupportedPlatformsBeOSCompatible ;
+-
+ SubDirC++Flags -fno-rtti ;
+ 
+-UsePrivateHeaders [ FDirName kernel ] ; 
++UsePrivateKernelHeaders ; 
+ UseHeaders [ FDirName $(HAIKU_TOP) src add-ons kernel bus_managers usb ] ;
+-if $(TARGET_PLATFORM) != haiku {
+-	UsePublicHeaders [ FDirName drivers ] ;
+-}
+ 
+ KernelAddon &lt;usb&gt;uhci :
+ 	uhci.cpp
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2009-09-14 05:28:34 UTC (rev 33128)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2009-09-14 06:26:54 UTC (rev 33129)
+@@ -12,6 +12,7 @@
+ #include &lt;PCI.h&gt;
+ #include &lt;USB3.h&gt;
+ #include &lt;KernelExport.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ 
+ #include &quot;ohci.h&quot;
+ 
+@@ -886,9 +887,11 @@
+ 		while (transfer) {
+ 			bool transferDone = false;
+ 			ohci_general_td *descriptor = transfer-&gt;first_descriptor;
++			ohci_endpoint_descriptor *endpoint = transfer-&gt;endpoint;
+ 			status_t callbackStatus = B_OK;
+ 
+-			ohci_endpoint_descriptor *endpoint = transfer-&gt;endpoint;
++			MutexLocker endpointLocker(endpoint-&gt;lock);
++
+ 			if ((endpoint-&gt;head_physical_descriptor &amp; OHCI_ENDPOINT_HEAD_MASK)
+ 				!= endpoint-&gt;tail_physical_descriptor) {
+ 				// there are still active transfers on this endpoint, we need
+@@ -900,6 +903,8 @@
+ 				continue;
+ 			}
+ 
++			endpointLocker.Unlock();
++
+ 			while (descriptor &amp;&amp; !transfer-&gt;canceled) {
+ 				uint32 status = OHCI_TD_GET_CONDITION_CODE(descriptor-&gt;flags);
+ 				if (status == OHCI_TD_CONDITION_NOT_ACCESSED) {
+@@ -1148,6 +1153,8 @@
+ 	// Add to the transfer list
+ 	ohci_endpoint_descriptor *endpoint
+ 		= (ohci_endpoint_descriptor *)transfer-&gt;TransferPipe()-&gt;ControllerCookie();
++
++	MutexLocker endpointLocker(endpoint-&gt;lock);
+ 	result = _AddPendingTransfer(transfer, endpoint, setupDescriptor,
+ 		dataDescriptor, statusDescriptor, directionIn);
+ 	if (result &lt; B_OK) {
+@@ -1158,6 +1165,7 @@
+ 
+ 	// Add the descriptor chain to the endpoint
+ 	_SwitchEndpointTail(endpoint, setupDescriptor, statusDescriptor);
++	endpointLocker.Unlock();
+ 
+ 	// Tell the controller to process the control list
+ 	endpoint-&gt;flags &amp;= ~OHCI_ENDPOINT_SKIP;
+@@ -1199,6 +1207,8 @@
+ 	// Add to the transfer list
+ 	ohci_endpoint_descriptor *endpoint
+ 		= (ohci_endpoint_descriptor *)pipe-&gt;ControllerCookie();
++
++	MutexLocker endpointLocker(endpoint-&gt;lock);
+ 	result = _AddPendingTransfer(transfer, endpoint, firstDescriptor,
+ 		firstDescriptor, lastDescriptor, directionIn);
+ 	if (result &lt; B_OK) {
+@@ -1209,8 +1219,9 @@
+ 
+ 	// Add the descriptor chain to the endpoint
+ 	_SwitchEndpointTail(endpoint, firstDescriptor, lastDescriptor);
++	endpointLocker.Unlock();
++
+ 	endpoint-&gt;flags &amp;= ~OHCI_ENDPOINT_SKIP;
+-
+ 	if (pipe-&gt;Type() &amp; USB_OBJECT_BULK_PIPE) {
+ 		// Tell the controller to process the bulk list
+ 		_WriteReg(OHCI_COMMAND_STATUS, OHCI_BULK_LIST_FILLED);
+@@ -1306,13 +1317,22 @@
+ 	ohci_endpoint_descriptor *endpoint;
+ 	void *physicalAddress;
+ 
++	mutex *lock = (mutex *)malloc(sizeof(mutex));
++	if (lock == NULL) {
++		TRACE_ERROR(&quot;no memory to allocate endpoint lock\n&quot;);
++		return NULL;
++	}
++
+ 	// Allocate memory chunk
+ 	if (fStack-&gt;AllocateChunk((void **)&amp;endpoint, &amp;physicalAddress,
+ 		sizeof(ohci_endpoint_descriptor)) &lt; B_OK) {
+ 		TRACE_ERROR(&quot;failed to allocate endpoint descriptor\n&quot;);
++		free(lock);
+ 		return NULL;
+ 	}
+ 
++	mutex_init(lock, &quot;ohci endpoint lock&quot;);
++
+ 	endpoint-&gt;flags = OHCI_ENDPOINT_SKIP;
+ 	endpoint-&gt;physical_address = (addr_t)physicalAddress;
+ 	endpoint-&gt;head_physical_descriptor = 0;
+@@ -1320,6 +1340,7 @@
+ 	endpoint-&gt;tail_physical_descriptor = 0;
+ 	endpoint-&gt;next_logical_endpoint = NULL;
+ 	endpoint-&gt;next_physical_endpoint = 0;
++	endpoint-&gt;lock = lock;
+ 	return endpoint;
+ }
+ 
+@@ -1330,6 +1351,9 @@
+ 	if (!endpoint)
+ 		return;
+ 
++	mutex_destroy(endpoint-&gt;lock);
++	free(endpoint-&gt;lock);
++
+ 	fStack-&gt;FreeChunk((void *)endpoint, (void *)endpoint-&gt;physical_address,
+ 		sizeof(ohci_endpoint_descriptor));
+ }
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2009-09-14 05:28:34 UTC (rev 33128)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2009-09-14 06:26:54 UTC (rev 33129)
+@@ -304,6 +304,7 @@
+ 	addr_t	physical_address;			// Physical pointer to this address
+ 	void	*tail_logical_descriptor;	// Queue tail logical pointer
+ 	void	*next_logical_endpoint;		// Logical pointer to the next endpoint
++	mutex	*lock;						// Protects tail changes and checks
+ } ohci_endpoint_descriptor;
+ 
+ #define	OHCI_ENDPOINT_ADDRESS_MASK				0x0000007f
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020621.html">[Haiku-commits] r33128 -	haiku/branches/components/gallium3d/src/libs/drm
+</A></li>
+	<LI>Next message: <A HREF="020624.html">[Haiku-commits] r33130 -	haiku/trunk/src/add-ons/kernel/drivers/network/ipw2100
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20622">[ date ]</a>
+              <a href="thread.html#20622">[ thread ]</a>
+              <a href="subject.html#20622">[ subject ]</a>
+              <a href="author.html#20622">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

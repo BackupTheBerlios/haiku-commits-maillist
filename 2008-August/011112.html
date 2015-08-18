@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27070 -	haiku/trunk/src/system/kernel/device_manager
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27070%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200808192137.m7JLbI7O002606%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011111.html">
+   <LINK REL="Next"  HREF="011115.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27070 -	haiku/trunk/src/system/kernel/device_manager</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27070%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200808192137.m7JLbI7O002606%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27070 -	haiku/trunk/src/system/kernel/device_manager">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Aug 19 23:37:18 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011111.html">[Haiku-commits] r27069 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+        <LI>Next message: <A HREF="011115.html">[Haiku-commits] r27071 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11112">[ date ]</a>
+              <a href="thread.html#11112">[ thread ]</a>
+              <a href="subject.html#11112">[ subject ]</a>
+              <a href="author.html#11112">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-19 23:37:16 +0200 (Tue, 19 Aug 2008)
+New Revision: 27070
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27070&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27070&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp
+   haiku/trunk/src/system/kernel/device_manager/IOScheduler.h
+Log:
+* Added &quot;bool wait&quot; parameter to _GetOperation(). If false and no unused
+  operation is available ATM, it will return NULL.
+* _Finisher() does now re-schedule a request, if all of its operations
+  finished successfully, but there are still remaining bytes.
+* _Scheduler() does now operate in two passes. First it creates as many
+  operations for a given request as possible, then it executes the
+  operations. This fixes bug #2644. The problem was that by creating and
+  executing the operations in a single loop, an operation could be
+  finished before the next one was added. The request would thus be
+  considered finished and the request owner be notified. This would
+  usually lead to the destruction of the request while it was still in
+  use.
+* _Scheduler(): In case we don't have a DMA resource also advance the
+  request.
+
+
+Modified: haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp	2008-08-19 21:17:36 UTC (rev 27069)
++++ haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp	2008-08-19 21:37:16 UTC (rev 27070)
+@@ -209,7 +209,12 @@
+ 
+ 		// If the request is done, we need to perform its notifications.
+ 		if (request-&gt;IsFinished()) {
+-			if (request-&gt;HasCallbacks()) {
++			if (request-&gt;Status() == B_OK &amp;&amp; request-&gt;RemainingBytes() &gt; 0) {
++				// The request has been processed OK so far, but it isn't really
++				// finished yet.
++				fUnscheduledRequests.Add(request);
++				fNewRequestCondition.NotifyAll();
++			} else if (request-&gt;HasCallbacks()) {
+ 				// The request has callbacks that may take some time to perform,
+ 				// so we hand it over to the request notifier.
+ 				fFinishedRequests.Add(request);
+@@ -233,13 +238,13 @@
+ 
+ 
+ IOOperation*
+-IOScheduler::_GetOperation()
++IOScheduler::_GetOperation(bool wait)
+ {
+ 	while (true) {
+ 		MutexLocker locker(fLock);
+ 
+ 		IOOperation* operation = fUnusedOperations.RemoveHead();
+-		if (operation != NULL)
++		if (operation != NULL || !wait)
+ 			return operation;
+ 
+ 		// Wait for new operations. First check whether any finisher work has
+@@ -311,16 +316,26 @@
+ 		TRACE(&quot;IOScheduler::_Scheduler(): request: %p\n&quot;, request);
+ 
+ 		if (fDMAResource != NULL) {
++			IOOperationList operations;
+ 			while (request-&gt;RemainingBytes() &gt; 0) {
+-				IOOperation* operation = _GetOperation();
++				IOOperation* operation = _GetOperation(operations.IsEmpty());
++				if (operation == NULL)
++					break;
+ 
+ 				status_t status = fDMAResource-&gt;TranslateNext(request,
+ 					operation);
+ 				if (status != B_OK) {
++// TODO: Handle correctly! E.g. B_BUSY just means that some resource (e.g.
++// DMA buffers) isn't available ATM. We should execute the operations we have
++// so far and wait for resources to become available again.
+ 					AbortRequest(request, status);
+ 					break;
+ 				}
+ 
++				operations.Add(operation);
++			}
++
++			while (IOOperation* operation = operations.RemoveHead()) {
+ 				TRACE(&quot;IOScheduler::_Scheduler(): calling callback for &quot;
+ 					&quot;operation: %p\n&quot;, operation);
+ 
+@@ -329,9 +344,10 @@
+ 		} else {
+ // TODO: If the device has block size restrictions, we might need to use a
+ // bounce buffer.
+-			IOOperation* operation = _GetOperation();
++			IOOperation* operation = _GetOperation(true);
+ 			operation-&gt;Prepare(request);
+ 			operation-&gt;SetOriginalRange(request-&gt;Offset(), request-&gt;Length());
++			request-&gt;Advance(request-&gt;Length());
+ 			fIOCallback(fIOCallbackData, operation);
+ 		}
+ 	}
+
+Modified: haiku/trunk/src/system/kernel/device_manager/IOScheduler.h
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/IOScheduler.h	2008-08-19 21:17:36 UTC (rev 27069)
++++ haiku/trunk/src/system/kernel/device_manager/IOScheduler.h	2008-08-19 21:37:16 UTC (rev 27070)
+@@ -47,7 +47,7 @@
+ private:
+ 			void				_Finisher();
+ 			bool				_FinisherWorkPending();
+-			IOOperation*		_GetOperation();
++			IOOperation*		_GetOperation(bool wait);
+ 			IORequest*			_GetNextUnscheduledRequest();
+ 			status_t			_Scheduler();
+ 	static	status_t			_SchedulerThread(void* self);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011111.html">[Haiku-commits] r27069 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+	<LI>Next message: <A HREF="011115.html">[Haiku-commits] r27071 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11112">[ date ]</a>
+              <a href="thread.html#11112">[ thread ]</a>
+              <a href="subject.html#11112">[ subject ]</a>
+              <a href="author.html#11112">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

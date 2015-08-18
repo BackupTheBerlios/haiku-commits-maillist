@@ -1,0 +1,185 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26124 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26124%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200806242100.m5OL00qr028374%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009843.html">
+   <LINK REL="Next"  HREF="009845.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26124 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26124%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200806242100.m5OL00qr028374%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26124 - haiku/trunk/src/system/kernel/fs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Jun 24 23:00:00 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009843.html">[Haiku-commits] r26123 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+        <LI>Next message: <A HREF="009845.html">[Haiku-commits] r26125 -	haiku/trunk/src/add-ons/media/media-add-ons/opensound
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9844">[ date ]</a>
+              <a href="thread.html#9844">[ thread ]</a>
+              <a href="subject.html#9844">[ subject ]</a>
+              <a href="author.html#9844">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-06-24 22:59:59 +0200 (Tue, 24 Jun 2008)
+New Revision: 26124
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26124&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26124&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+Log:
+* dec_vnode_ref_count() can now also directly free the vnode if requested
+  (and if it isn't used anymore).
+* vnode_low_memory_handler() now just calls it this way, so it doesn't have
+  to use two passes anymore, and can always write back vnodes without having
+  the busy flag set.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-06-24 18:48:49 UTC (rev 26123)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-06-24 20:59:59 UTC (rev 26124)
+@@ -297,7 +297,8 @@
+ static status_t fd_and_path_to_vnode(int fd, char *path, bool traverseLeafLink,
+ 	struct vnode **_vnode, ino_t *_parentID, bool kernel);
+ static void inc_vnode_ref_count(struct vnode *vnode);
+-static status_t dec_vnode_ref_count(struct vnode *vnode, bool reenter);
++static status_t dec_vnode_ref_count(struct vnode *vnode, bool alwaysFree,
++	bool reenter);
+ static inline void put_vnode(struct vnode *vnode);
+ static status_t fs_unmount(char *path, dev_t mountID, uint32 flags,
+ 	bool kernel);
+@@ -792,7 +793,7 @@
+ 	\return \c B_OK, if everything went fine, an error code otherwise.
+ */
+ static status_t
+-dec_vnode_ref_count(struct vnode *vnode, bool reenter)
++dec_vnode_ref_count(struct vnode *vnode, bool alwaysFree, bool reenter)
+ {
+ 	mutex_lock(&amp;sVnodeMutex);
+ 
+@@ -810,7 +811,7 @@
+ 
+ 		// Just insert the vnode into an unused list if we don't need
+ 		// to delete it
+-		if (vnode-&gt;remove) {
++		if (vnode-&gt;remove || alwaysFree) {
+ 			vnode-&gt;busy = true;
+ 			freeNode = true;
+ 		} else {
+@@ -1012,7 +1013,7 @@
+ static inline void
+ put_vnode(struct vnode *vnode)
+ {
+-	dec_vnode_ref_count(vnode, false);
++	dec_vnode_ref_count(vnode, false, false);
+ }
+ 
+ 
+@@ -1039,7 +1040,7 @@
+ 	if (count &gt; sUnusedVnodes)
+ 		count = sUnusedVnodes;
+ 
+-	// first, write back the modified pages of some unused vnodes
++	// Write back the modified pages of some unused vnodes and free them
+ 
+ 	uint32 freeCount = count;
+ 
+@@ -1060,33 +1061,9 @@
+ 		if (vnode-&gt;cache != NULL)
+ 			vm_cache_write_modified(vnode-&gt;cache, false);
+ 
+-		dec_vnode_ref_count(vnode, false);
++		dec_vnode_ref_count(vnode, true, false);
++			// this should free the vnode when it's still unused
+ 	}
+-
+-	// and then free them
+-
+-	for (uint32 i = 0; i &lt; freeCount; i++) {
+-		mutex_lock(&amp;sVnodeMutex);
+-
+-		// We're removing vnodes from the tail of the list - hoping it's
+-		// one of those we have just written back; otherwise we'll write
+-		// back the vnode with the busy flag turned on, and that might
+-		// take some time.
+-		struct vnode *vnode = (struct vnode *)list_remove_tail_item(
+-			&amp;sUnusedVnodeList);
+-		if (vnode == NULL) {
+-			mutex_unlock(&amp;sVnodeMutex);
+-			break;
+-		}
+-		TRACE((&quot;  free vnode %ld:%Ld (%p)\n&quot;, vnode-&gt;device, vnode-&gt;id, vnode));
+-
+-		vnode-&gt;busy = true;
+-		sUnusedVnodes--;
+-
+-		mutex_unlock(&amp;sVnodeMutex);
+-
+-		free_vnode(vnode, false);
+-	}
+ }
+ 
+ 
+@@ -3236,7 +3213,7 @@
+ 	mutex_unlock(&amp;sVnodeMutex);
+ 
+ 	if (vnode)
+-		dec_vnode_ref_count(vnode, true);
++		dec_vnode_ref_count(vnode, false, true);
+ 
+ 	return B_OK;
+ }
+@@ -4218,10 +4195,10 @@
+ 	uint32 i;
+ 
+ 	if (context-&gt;root)
+-		dec_vnode_ref_count(context-&gt;root, false);
++		put_vnode(context-&gt;root);
+ 
+ 	if (context-&gt;cwd)
+-		dec_vnode_ref_count(context-&gt;cwd, false);
++		put_vnode(context-&gt;cwd);
+ 
+ 	mutex_lock(&amp;context-&gt;io_mutex);
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009843.html">[Haiku-commits] r26123 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+	<LI>Next message: <A HREF="009845.html">[Haiku-commits] r26125 -	haiku/trunk/src/add-ons/media/media-add-ons/opensound
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9844">[ date ]</a>
+              <a href="thread.html#9844">[ thread ]</a>
+              <a href="subject.html#9844">[ subject ]</a>
+              <a href="author.html#9844">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

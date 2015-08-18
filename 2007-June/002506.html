@@ -1,0 +1,1078 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21283 - haiku/trunk/src/system/runtime_loader
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21283%20-%20haiku/trunk/src/system/runtime_loader&In-Reply-To=%3C200706010646.l516kwCh015815%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002505.html">
+   <LINK REL="Next"  HREF="002507.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21283 - haiku/trunk/src/system/runtime_loader</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21283%20-%20haiku/trunk/src/system/runtime_loader&In-Reply-To=%3C200706010646.l516kwCh015815%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21283 - haiku/trunk/src/system/runtime_loader">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Jun  1 08:46:58 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002505.html">[Haiku-commits] r21282 - haiku/trunk/src/servers/app/drawing
+</A></li>
+        <LI>Next message: <A HREF="002507.html">[Haiku-commits] r21284 - haiku/trunk/src/data/beos_mime/application
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2506">[ date ]</a>
+              <a href="thread.html#2506">[ thread ]</a>
+              <a href="subject.html#2506">[ subject ]</a>
+              <a href="author.html#2506">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-06-01 08:46:57 +0200 (Fri, 01 Jun 2007)
+New Revision: 21283
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21283&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21283&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/runtime_loader/elf.cpp
+Removed:
+   haiku/trunk/src/system/runtime_loader/elf.c
+Modified:
+   haiku/trunk/src/system/runtime_loader/Jamfile
+Log:
+elf.c -&gt; elf.cpp
+
+
+Modified: haiku/trunk/src/system/runtime_loader/Jamfile
+===================================================================
+--- haiku/trunk/src/system/runtime_loader/Jamfile	2007-05-31 22:39:16 UTC (rev 21282)
++++ haiku/trunk/src/system/runtime_loader/Jamfile	2007-06-01 06:46:57 UTC (rev 21283)
+@@ -58,7 +58,7 @@
+ 
+ Objects
+ 	runtime_loader.c
+-	elf.c
++	elf.cpp
+ 	export.c
+ 	heap.cpp
+ 	utility.cpp
+
+Deleted: haiku/trunk/src/system/runtime_loader/elf.c
+
+Copied: haiku/trunk/src/system/runtime_loader/elf.cpp (from rev 21282, haiku/trunk/src/system/runtime_loader/elf.c)
+===================================================================
+--- haiku/trunk/src/system/runtime_loader/elf.c	2007-05-31 22:39:16 UTC (rev 21282)
++++ haiku/trunk/src/system/runtime_loader/elf.cpp	2007-06-01 06:46:57 UTC (rev 21283)
+@@ -0,0 +1,1558 @@
++/*
++ * Copyright 2003-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Distributed under the terms of the MIT License.
++ *
++ * Copyright 2002, Manuel J. Petit. All rights reserved.
++ * Copyright 2001, Travis Geiselbrecht. All rights reserved.
++ * Distributed under the terms of the NewOS License.
++ */
++
++
++#include &quot;runtime_loader_private.h&quot;
++
++#include &lt;OS.h&gt;
++
++#include &lt;elf32.h&gt;
++#include &lt;user_runtime.h&gt;
++#include &lt;syscalls.h&gt;
++#include &lt;vm_types.h&gt;
++#include &lt;arch/cpu.h&gt;
++#include &lt;sem.h&gt;
++#include &lt;runtime_loader.h&gt;
++
++#include &lt;string.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++
++
++//#define TRACE_RLD
++#ifdef TRACE_RLD
++#	define TRACE(x) dprintf x
++#else
++#	define TRACE(x) ;
++#endif
++
++
++// ToDo: implement better locking strategy
++// ToDo: implement lazy binding
++
++#define	PAGE_MASK (B_PAGE_SIZE - 1)
++
++#define	PAGE_OFFSET(x) ((x) &amp; (PAGE_MASK))
++#define	PAGE_BASE(x) ((x) &amp; ~(PAGE_MASK))
++#define TO_PAGE_SIZE(x) ((x + (PAGE_MASK)) &amp; ~(PAGE_MASK))
++
++#define RLD_PROGRAM_BASE 0x00200000
++	/* keep in sync with app ldscript */
++
++enum {
++	RFLAG_RW					= 0x0001,
++	RFLAG_ANON					= 0x0002,
++
++	RFLAG_TERMINATED			= 0x0200,
++	RFLAG_INITIALIZED			= 0x0400,
++	RFLAG_SYMBOLIC				= 0x0800,
++	RFLAG_RELOCATED				= 0x1000,
++	RFLAG_PROTECTED				= 0x2000,
++	RFLAG_DEPENDENCIES_LOADED	= 0x4000,
++	RFLAG_REMAPPED				= 0x8000
++};
++
++
++#define IMAGE_TYPE_TO_MASK(type)	(1 &lt;&lt; ((type) - 1))
++#define ALL_IMAGE_TYPES				(IMAGE_TYPE_TO_MASK(B_APP_IMAGE) \
++									| IMAGE_TYPE_TO_MASK(B_LIBRARY_IMAGE) \
++									| IMAGE_TYPE_TO_MASK(B_ADD_ON_IMAGE) \
++									| IMAGE_TYPE_TO_MASK(B_SYSTEM_IMAGE))
++#define APP_OR_LIBRARY_TYPE			(IMAGE_TYPE_TO_MASK(B_APP_IMAGE) \
++									| IMAGE_TYPE_TO_MASK(B_LIBRARY_IMAGE))
++
++typedef void (*init_term_function)(image_id);
++
++static image_queue_t sLoadedImages = {0, 0};
++static image_queue_t sLoadingImages = {0, 0};
++static image_queue_t sDisposableImages = {0, 0};
++static uint32 sLoadedImageCount = 0;
++static image_t *sProgramImage;
++
++// a recursive lock
++static sem_id rld_sem;
++static thread_id rld_sem_owner;
++static int32 rld_sem_count;
++
++
++#ifdef TRACE_RLD
++#	define FATAL(x...) dprintf(&quot;runtime_loader: &quot; x);
++
++void
++dprintf(const char *format, ...)
++{
++	char buffer[1024];
++
++	va_list list;
++	va_start(list, format);
++	
++	vsnprintf(buffer, sizeof(buffer), format, list);
++	_kern_debug_output(buffer);
++
++	va_end(list);
++}
++#else
++#	define FATAL(x...) printf(&quot;runtime_loader: &quot; x);
++#endif
++
++
++static void
++rld_unlock()
++{
++	if (rld_sem_count-- == 1) {
++		rld_sem_owner = -1;
++		release_sem(rld_sem);
++	}
++}
++
++
++static void
++rld_lock()
++{
++	thread_id self = find_thread(NULL);
++	if (self != rld_sem_owner) {
++		acquire_sem(rld_sem);
++		rld_sem_owner = self;
++	}
++	rld_sem_count++;
++}
++
++
++static void
++enqueue_image(image_queue_t *queue, image_t *image)
++{
++	image-&gt;next = 0;
++
++	image-&gt;prev = queue-&gt;tail;
++	if (queue-&gt;tail)
++		queue-&gt;tail-&gt;next = image;
++
++	queue-&gt;tail = image;
++	if (!queue-&gt;head)
++		queue-&gt;head = image;
++}
++
++
++static void
++dequeue_image(image_queue_t *queue, image_t *image)
++{
++	if (image-&gt;next)
++		image-&gt;next-&gt;prev = image-&gt;prev;
++	else
++		queue-&gt;tail = image-&gt;prev;
++
++	if (image-&gt;prev)
++		image-&gt;prev-&gt;next = image-&gt;next;
++	else
++		queue-&gt;head = image-&gt;next;
++
++	image-&gt;prev = 0;
++	image-&gt;next = 0;
++}
++
++
++static uint32
++elf_hash(const uint8 *name)
++{
++	uint32 hash = 0;
++	uint32 temp;
++
++	while (*name) {
++		hash = (hash &lt;&lt; 4) + *name++;
++		if ((temp = hash &amp; 0xf0000000)) {
++			hash ^= temp &gt;&gt; 24;
++		}
++		hash &amp;= ~temp;
++	}
++	return hash;
++}
++
++
++static image_t *
++find_image_in_queue(image_queue_t *queue, const char *name, bool isPath,
++	uint32 typeMask)
++{
++	image_t *image;
++
++	for (image = queue-&gt;head; image; image = image-&gt;next) {
++		const char *imageName = isPath ? image-&gt;path : image-&gt;name;
++		int length = isPath ? sizeof(image-&gt;path) : sizeof(image-&gt;name);
++
++		if (!strncmp(imageName, name, length)
++			&amp;&amp; (typeMask &amp; IMAGE_TYPE_TO_MASK(image-&gt;type)) != 0) {
++			return image;
++		}
++	}
++
++	return NULL;
++}
++
++
++static image_t *
++find_image(char const *name, uint32 typeMask)
++{
++	bool isPath = (strchr(name, '/') != NULL);
++	image_t *image;
++
++	image = find_image_in_queue(&amp;sLoadedImages, name, isPath, typeMask);
++	if (image == NULL)
++		image = find_image_in_queue(&amp;sLoadingImages, name, isPath, typeMask);
++
++	return image;
++}
++
++
++static image_t *
++find_loaded_image_by_id(image_id id)
++{
++	image_t *image;
++
++	for (image = sLoadedImages.head; image; image = image-&gt;next) {
++		if (image-&gt;id == id)
++			return image;
++	}
++
++	// For the termination routine, we need to look into the list of
++	// disposable images as well
++	for (image = sDisposableImages.head; image; image = image-&gt;next) {
++		if (image-&gt;id == id)
++			return image;
++	}
++
++	return NULL;
++}
++
++
++static status_t
++parse_elf_header(struct Elf32_Ehdr *eheader, int32 *_pheaderSize, int32 *_sheaderSize)
++{
++	if (memcmp(eheader-&gt;e_ident, ELF_MAGIC, 4) != 0)
++		return B_NOT_AN_EXECUTABLE;
++
++	if (eheader-&gt;e_ident[4] != ELFCLASS32)
++		return B_NOT_AN_EXECUTABLE;
++
++	if (eheader-&gt;e_phoff == 0)
++		return B_NOT_AN_EXECUTABLE;
++
++	if (eheader-&gt;e_phentsize &lt; sizeof(struct Elf32_Phdr))
++		return B_NOT_AN_EXECUTABLE;
++
++	*_pheaderSize = eheader-&gt;e_phentsize * eheader-&gt;e_phnum;
++	*_sheaderSize = eheader-&gt;e_shentsize * eheader-&gt;e_shnum;
++
++	return *_pheaderSize &gt; 0 &amp;&amp; *_sheaderSize &gt; 0 ? B_OK : B_NOT_AN_EXECUTABLE;
++}
++
++
++static int32
++count_regions(char const *buff, int phnum, int phentsize)
++{
++	struct Elf32_Phdr *pheaders;
++	int32 count = 0;
++	int i;
++
++	for (i = 0; i &lt; phnum; i++) {
++		pheaders = (struct Elf32_Phdr *)(buff + i * phentsize);
++
++		switch (pheaders-&gt;p_type) {
++			case PT_NULL:
++				/* NOP header */
++				break;
++			case PT_LOAD:
++				count += 1;
++				if (pheaders-&gt;p_memsz != pheaders-&gt;p_filesz) {
++					addr_t A = TO_PAGE_SIZE(pheaders-&gt;p_vaddr + pheaders-&gt;p_memsz);
++					addr_t B = TO_PAGE_SIZE(pheaders-&gt;p_vaddr + pheaders-&gt;p_filesz);
++
++					if (A != B)
++						count += 1;
++				}
++				break;
++			case PT_DYNAMIC:
++				/* will be handled at some other place */
++				break;
++			case PT_INTERP:
++				/* should check here for appropiate interpreter */
++				break;
++			case PT_NOTE:
++				/* unsupported */
++				break;
++			case PT_SHLIB:
++				/* undefined semantics */
++				break;
++			case PT_PHDR:
++				/* we don't use it */
++				break;
++			default:
++				FATAL(&quot;unhandled pheader type 0x%lx\n&quot;, pheaders[i].p_type);
++				return B_BAD_DATA;
++		}
++	}
++
++	return count;
++}
++
++
++/*
++ * create_image() &amp; destroy_image()
++ *
++ * 	Create and destroy image_t structures. The destroyer makes sure that the
++ * 	memory buffers are full of garbage before freeing.
++ */
++
++static image_t *
++create_image(const char *name, const char *path, int num_regions)
++{
++	size_t allocSize = sizeof(image_t) + (num_regions - 1) * sizeof(elf_region_t);
++	const char *lastSlash;
++
++	image_t *image = (image_t*)malloc(allocSize);
++	if (image == NULL) {
++		FATAL(&quot;no memory for image %s\n&quot;, path);
++		return NULL;
++	}
++
++	memset(image, 0, allocSize);
++
++	strlcpy(image-&gt;path, path, sizeof(image-&gt;path));
++
++	// Make the last component of the supplied name the image name.
++	// If present, DT_SONAME will replace this name.
++	if ((lastSlash = strrchr(name, '/')))
++		strlcpy(image-&gt;name, lastSlash + 1, sizeof(image-&gt;name));
++	else
++		strlcpy(image-&gt;name, name, sizeof(image-&gt;name));
++
++	image-&gt;ref_count = 1;
++	image-&gt;num_regions = num_regions;
++
++	return image;
++}
++
++
++static void
++delete_image_struct(image_t *image)
++{
++#ifdef DEBUG
++	size_t size = sizeof(image_t) + (image-&gt;num_regions - 1) * sizeof(elf_region_t);
++	memset(image-&gt;needed, 0xa5, sizeof(image-&gt;needed[0]) * image-&gt;num_needed);
++#endif
++	free(image-&gt;needed);
++
++#ifdef DEBUG
++	memset(image, 0xa5, size);
++#endif
++	free(image);
++}
++
++
++static void
++delete_image(image_t *image)
++{
++	_kern_unregister_image(image-&gt;id);
++		// registered in load_container()
++
++	delete_image_struct(image);
++}
++
++
++static status_t
++parse_program_headers(image_t *image, char *buff, int phnum, int phentsize)
++{
++	struct Elf32_Phdr *pheader;
++	int regcount;
++	int i;
++
++	regcount = 0;
++	for (i = 0; i &lt; phnum; i++) {
++		pheader = (struct Elf32_Phdr *)(buff + i * phentsize);
++
++		switch (pheader-&gt;p_type) {
++			case PT_NULL:
++				/* NOP header */
++				break;
++			case PT_LOAD:
++				if (pheader-&gt;p_memsz == pheader-&gt;p_filesz) {
++					/*
++					 * everything in one area
++					 */
++					image-&gt;regions[regcount].start = pheader-&gt;p_vaddr;
++					image-&gt;regions[regcount].size = pheader-&gt;p_memsz;
++					image-&gt;regions[regcount].vmstart = PAGE_BASE(pheader-&gt;p_vaddr);
++					image-&gt;regions[regcount].vmsize = TO_PAGE_SIZE(pheader-&gt;p_memsz
++						+ PAGE_OFFSET(pheader-&gt;p_vaddr));
++					image-&gt;regions[regcount].fdstart = pheader-&gt;p_offset;
++					image-&gt;regions[regcount].fdsize = pheader-&gt;p_filesz;
++					image-&gt;regions[regcount].delta = 0;
++					image-&gt;regions[regcount].flags = 0;
++					if (pheader-&gt;p_flags &amp; PF_WRITE) {
++						// this is a writable segment
++						image-&gt;regions[regcount].flags |= RFLAG_RW;
++					}
++				} else {
++					/*
++					 * may require splitting
++					 */
++					addr_t A = TO_PAGE_SIZE(pheader-&gt;p_vaddr + pheader-&gt;p_memsz);
++					addr_t B = TO_PAGE_SIZE(pheader-&gt;p_vaddr + pheader-&gt;p_filesz);
++
++					image-&gt;regions[regcount].start = pheader-&gt;p_vaddr;
++					image-&gt;regions[regcount].size = pheader-&gt;p_filesz;
++					image-&gt;regions[regcount].vmstart = PAGE_BASE(pheader-&gt;p_vaddr);
++					image-&gt;regions[regcount].vmsize = TO_PAGE_SIZE(pheader-&gt;p_filesz
++						+ PAGE_OFFSET(pheader-&gt;p_vaddr));
++					image-&gt;regions[regcount].fdstart = pheader-&gt;p_offset;
++					image-&gt;regions[regcount].fdsize = pheader-&gt;p_filesz;
++					image-&gt;regions[regcount].delta = 0;
++					image-&gt;regions[regcount].flags = 0;
++					if (pheader-&gt;p_flags &amp; PF_WRITE) {
++						// this is a writable segment
++						image-&gt;regions[regcount].flags |= RFLAG_RW;
++					}
++
++					if (A != B) {
++						/*
++						 * yeah, it requires splitting
++						 */
++						regcount += 1;
++						image-&gt;regions[regcount].start = pheader-&gt;p_vaddr;
++						image-&gt;regions[regcount].size = pheader-&gt;p_memsz - pheader-&gt;p_filesz;
++						image-&gt;regions[regcount].vmstart = image-&gt;regions[regcount-1].vmstart + image-&gt;regions[regcount-1].vmsize;
++						image-&gt;regions[regcount].vmsize = TO_PAGE_SIZE(pheader-&gt;p_memsz + PAGE_OFFSET(pheader-&gt;p_vaddr))
++							- image-&gt;regions[regcount-1].vmsize;
++						image-&gt;regions[regcount].fdstart = 0;
++						image-&gt;regions[regcount].fdsize = 0;
++						image-&gt;regions[regcount].delta = 0;
++						image-&gt;regions[regcount].flags = RFLAG_ANON;
++						if (pheader-&gt;p_flags &amp; PF_WRITE) {
++							// this is a writable segment
++							image-&gt;regions[regcount].flags |= RFLAG_RW;
++						}
++					}
++				}
++				regcount += 1;
++				break;
++			case PT_DYNAMIC:
++				image-&gt;dynamic_ptr = pheader-&gt;p_vaddr;
++				break;
++			case PT_INTERP:
++				/* should check here for appropiate interpreter */
++				break;
++			case PT_NOTE:
++				/* unsupported */
++				break;
++			case PT_SHLIB:
++				/* undefined semantics */
++				break;
++			case PT_PHDR:
++				/* we don't use it */
++				break;
++			default:
++				FATAL(&quot;unhandled pheader type 0x%lx\n&quot;, pheader[i].p_type);
++				return B_BAD_DATA;
++		}
++	}
++
++	return B_OK;
++}
++
++
++static bool
++assert_dynamic_loadable(image_t *image)
++{
++	uint32 i;
++
++	if (!image-&gt;dynamic_ptr)
++		return true;
++
++	for (i = 0; i &lt; image-&gt;num_regions; i++) {
++		if (image-&gt;dynamic_ptr &gt;= image-&gt;regions[i].start
++			&amp;&amp; image-&gt;dynamic_ptr &lt; image-&gt;regions[i].start + image-&gt;regions[i].size)
++			return true;
++	}
++
++	return false;
++}
++
++
++/**	This function will change the protection of all read-only segments
++ *	to really be read-only.
++ *	The areas have to be read/write first, so that they can be relocated.
++ */
++
++static void
++remap_images(void)
++{
++	image_t *image;
++	uint32 i;
++
++	for (image = sLoadedImages.head; image != NULL; image = image-&gt;next) {
++		for (i = 0; i &lt; image-&gt;num_regions; i++) {
++			if ((image-&gt;regions[i].flags &amp; RFLAG_RW) == 0
++				&amp;&amp; (image-&gt;regions[i].flags &amp; RFLAG_REMAPPED) == 0) {
++				// we only need to do this once, so we remember those we've already mapped
++				if (_kern_set_area_protection(image-&gt;regions[i].id,
++						B_READ_AREA | B_EXECUTE_AREA) == B_OK)
++					image-&gt;regions[i].flags |= RFLAG_REMAPPED;
++			}
++		}
++	}
++}
++
++
++static status_t
++map_image(int fd, char const *path, image_t *image, bool fixed)
++{
++	status_t status = B_OK;
++	const char *baseName;
++	uint32 i;
++
++	(void)(fd);
++
++	// cut the file name from the path as base name for the created areas
++	baseName = strrchr(path, '/');
++	if (baseName != NULL)
++		baseName++;
++	else
++		baseName = path;
++
++	for (i = 0; i &lt; image-&gt;num_regions; i++) {
++		char regionName[B_OS_NAME_LENGTH];
++		addr_t loadAddress;
++		uint32 addressSpecifier;
++
++		// for BeOS compatibility: if we load an old BeOS executable, we
++		// have to relocate it, if possible - we recognize it because the
++		// vmstart is set to 0 (hopefully always)
++		if (fixed &amp;&amp; image-&gt;regions[i].vmstart == 0)
++			fixed = false;
++
++		snprintf(regionName, sizeof(regionName), &quot;%s_seg%lu%s&quot;,
++			baseName, i, (image-&gt;regions[i].flags &amp; RFLAG_RW) ? &quot;rw&quot; : &quot;ro&quot;);
++
++		if (image-&gt;dynamic_ptr &amp;&amp; !fixed) {
++			// relocatable image... we can afford to place wherever
++			if (i == 0) {
++				// but only the first segment gets a free ride
++				loadAddress = RLD_PROGRAM_BASE;
++				addressSpecifier = B_BASE_ADDRESS;
++			} else {
++				loadAddress = image-&gt;regions[i].vmstart + image-&gt;regions[i-1].delta;
++				addressSpecifier = B_EXACT_ADDRESS;
++			}
++		} else {
++			// not relocatable, put it where it asks or die trying
++			loadAddress = image-&gt;regions[i].vmstart;
++			addressSpecifier = B_EXACT_ADDRESS;
++		}
++
++		if (image-&gt;regions[i].flags &amp; RFLAG_ANON) {
++			image-&gt;regions[i].id = _kern_create_area(regionName, (void **)&amp;loadAddress,
++				addressSpecifier, image-&gt;regions[i].vmsize, B_NO_LOCK,
++				B_READ_AREA | B_WRITE_AREA);
++
++			if (image-&gt;regions[i].id &lt; 0) {
++				status = image-&gt;regions[i].id;
++				goto error;
++			}
++
++			image-&gt;regions[i].delta = loadAddress - image-&gt;regions[i].vmstart;
++			image-&gt;regions[i].vmstart = loadAddress;
++		} else {
++			image-&gt;regions[i].id = sys_vm_map_file(regionName, (void **)&amp;loadAddress,
++				addressSpecifier, image-&gt;regions[i].vmsize, B_READ_AREA | B_WRITE_AREA,
++				REGION_PRIVATE_MAP, path, PAGE_BASE(image-&gt;regions[i].fdstart));
++
++			if (image-&gt;regions[i].id &lt; 0) {
++				status = image-&gt;regions[i].id;
++				goto error;
++			}
++
++			TRACE((&quot;\&quot;%s\&quot; at %p, 0x%lx bytes (%s)\n&quot;, path,
++				(void *)loadAddress, image-&gt;regions[i].vmsize,
++				image-&gt;regions[i].flags &amp; RFLAG_RW ? &quot;rw&quot; : &quot;read-only&quot;));
++
++			image-&gt;regions[i].delta = loadAddress - image-&gt;regions[i].vmstart;
++			image-&gt;regions[i].vmstart = loadAddress;
++
++			// handle trailer bits in data segment
++			if (image-&gt;regions[i].flags &amp; RFLAG_RW) {
++				addr_t startClearing;
++				addr_t toClear;
++
++				startClearing = image-&gt;regions[i].vmstart
++					+ PAGE_OFFSET(image-&gt;regions[i].start)
++					+ image-&gt;regions[i].size;
++				toClear = image-&gt;regions[i].vmsize
++					- PAGE_OFFSET(image-&gt;regions[i].start)
++					- image-&gt;regions[i].size;
++
++				TRACE((&quot;cleared 0x%lx and the following 0x%lx bytes\n&quot;, startClearing, toClear));
++				memset((void *)startClearing, 0, toClear);
++			}
++		}
++	}
++
++	if (image-&gt;dynamic_ptr)
++		image-&gt;dynamic_ptr += image-&gt;regions[0].delta;
++
++	return B_OK;
++
++error:
++	return status;
++}
++
++
++static void
++unmap_image(image_t *image)
++{
++	uint32 i;
++
++	for (i = 0; i &lt; image-&gt;num_regions; i++) {
++		_kern_delete_area(image-&gt;regions[i].id);
++
++		image-&gt;regions[i].id = -1;
++	}
++}
++
++
++static bool
++parse_dynamic_segment(image_t *image)
++{
++	struct Elf32_Dyn *d;
++	int i;
++	int sonameOffset = -1;
++
++	image-&gt;symhash = 0;
++	image-&gt;syms = 0;
++	image-&gt;strtab = 0;
++
++	d = (struct Elf32_Dyn *)image-&gt;dynamic_ptr;
++	if (!d)
++		return true;
++
++	for (i = 0; d[i].d_tag != DT_NULL; i++) {
++		switch (d[i].d_tag) {
++			case DT_NEEDED:
++				image-&gt;num_needed += 1;
++				break;
++			case DT_HASH:
++				image-&gt;symhash = (uint32 *)(d[i].d_un.d_ptr + image-&gt;regions[0].delta);
++				break;
++			case DT_STRTAB:
++				image-&gt;strtab = (char *)(d[i].d_un.d_ptr + image-&gt;regions[0].delta);
++				break;
++			case DT_SYMTAB:
++				image-&gt;syms = (struct Elf32_Sym *)(d[i].d_un.d_ptr + image-&gt;regions[0].delta);
++				break;
++			case DT_REL:
++				image-&gt;rel = (struct Elf32_Rel *)(d[i].d_un.d_ptr + image-&gt;regions[0].delta);
++				break;
++			case DT_RELSZ:
++				image-&gt;rel_len = d[i].d_un.d_val;
++				break;
++			case DT_RELA:
++				image-&gt;rela = (struct Elf32_Rela *)(d[i].d_un.d_ptr + image-&gt;regions[0].delta);
++				break;
++			case DT_RELASZ:
++				image-&gt;rela_len = d[i].d_un.d_val;
++				break;
++			// TK: procedure linkage table
++			case DT_JMPREL:
++				image-&gt;pltrel = (struct Elf32_Rel *)(d[i].d_un.d_ptr + image-&gt;regions[0].delta);
++				break;
++			case DT_PLTRELSZ:
++				image-&gt;pltrel_len = d[i].d_un.d_val;
++				break;
++			case DT_INIT:
++				image-&gt;init_routine = (d[i].d_un.d_ptr + image-&gt;regions[0].delta);
++				break;
++			case DT_FINI:
++				image-&gt;term_routine = (d[i].d_un.d_ptr + image-&gt;regions[0].delta);
++				break;
++			case DT_SONAME:
++				sonameOffset = d[i].d_un.d_val;
++				break;
++			default:
++				continue;
++		}
++	}
++
++	// lets make sure we found all the required sections
++	if (!image-&gt;symhash || !image-&gt;syms || !image-&gt;strtab)
++		return false;
++
++	if (sonameOffset &gt;= 0)
++		strlcpy(image-&gt;name, STRING(image, sonameOffset), sizeof(image-&gt;name));
++
++	return true;
++}
++
++
++static struct Elf32_Sym *
++find_symbol(image_t *image, const char *name, int32 type)
++{
++	uint32 hash, i;
++
++	// ToDo: &quot;type&quot; is currently ignored!
++	(void)type;
++
++	if (image-&gt;dynamic_ptr == NULL)
++		return NULL;
++
++	hash = elf_hash((uint8 *)name) % HASHTABSIZE(image);
++
++	for (i = HASHBUCKETS(image)[hash]; i != STN_UNDEF; i = HASHCHAINS(image)[i]) {
++		struct Elf32_Sym *symbol = &amp;image-&gt;syms[i];
++
++		if (symbol-&gt;st_shndx != SHN_UNDEF
++			&amp;&amp; ((ELF32_ST_BIND(symbol-&gt;st_info)== STB_GLOBAL)
++				|| (ELF32_ST_BIND(symbol-&gt;st_info) == STB_WEAK))
++			&amp;&amp; !strcmp(SYMNAME(image, symbol), name)) {
++			// check if the type matches
++			if ((type == B_SYMBOL_TYPE_TEXT &amp;&amp; ELF32_ST_TYPE(symbol-&gt;st_info) != STT_FUNC)
++				|| (type == B_SYMBOL_TYPE_DATA &amp;&amp; ELF32_ST_TYPE(symbol-&gt;st_info) != STT_OBJECT))
++				continue;
++
++			return symbol;
++		}
++	}
++
++	return NULL;
++}
++
++
++static struct Elf32_Sym *
++find_symbol_in_loaded_images(image_t **_image, const char *name)
++{
++	image_t *image;
++
++	for (image = sLoadedImages.head; image; image = image-&gt;next) {
++		struct Elf32_Sym *symbol;
++
++		if (image-&gt;dynamic_ptr == NULL)
++			continue;
++
++		symbol = find_symbol(image, name, B_SYMBOL_TYPE_ANY);
++		if (symbol) {
++			*_image = image;
++			return symbol;
++		}
++	}
++
++	return NULL;
++}
++
++
++int
++resolve_symbol(image_t *image, struct Elf32_Sym *sym, addr_t *sym_addr)
++{
++	struct Elf32_Sym *sym2;
++	char *symname;
++	image_t *shimg;
++
++	switch (sym-&gt;st_shndx) {
++		case SHN_UNDEF:
++			// patch the symbol name
++			symname = SYMNAME(image, sym);
++
++			// it's undefined, must be outside this image, try the other image
++			sym2 = find_symbol_in_loaded_images(&amp;shimg, symname);
++			if (!sym2) {
++				printf(&quot;elf_resolve_symbol: could not resolve symbol '%s'\n&quot;, symname);
++				return B_MISSING_SYMBOL;
++			}
++
++			// make sure they're the same type
++			if (ELF32_ST_TYPE(sym-&gt;st_info) != STT_NOTYPE
++				&amp;&amp; ELF32_ST_TYPE(sym-&gt;st_info) != ELF32_ST_TYPE(sym2-&gt;st_info)) {
++				printf(&quot;elf_resolve_symbol: found symbol '%s' in shared image but wrong type\n&quot;, symname);
++				return B_MISSING_SYMBOL;
++			}
++
++			if (ELF32_ST_BIND(sym2-&gt;st_info) != STB_GLOBAL
++				&amp;&amp; ELF32_ST_BIND(sym2-&gt;st_info) != STB_WEAK) {
++				printf(&quot;elf_resolve_symbol: found symbol '%s' but not exported\n&quot;, symname);
++				return B_MISSING_SYMBOL;
++			}
++
++			*sym_addr = sym2-&gt;st_value + shimg-&gt;regions[0].delta;
++			return B_NO_ERROR;
++
++		case SHN_ABS:
++			*sym_addr = sym-&gt;st_value + image-&gt;regions[0].delta;
++			return B_NO_ERROR;
++
++		case SHN_COMMON:
++			// ToDo: finish this
++			printf(&quot;elf_resolve_symbol: COMMON symbol, finish me!\n&quot;);
++			return B_ERROR; //ERR_NOT_IMPLEMENTED_YET;
++
++		default:
++			// standard symbol
++			*sym_addr = sym-&gt;st_value + image-&gt;regions[0].delta;
++			return B_NO_ERROR;
++	}
++}
++
++
++static void
++register_image(image_t *image, int fd, const char *path)
++{
++	struct stat stat;
++	image_info info;
++
++	// ToDo: set these correctly
++	info.id = 0;
++	info.type = image-&gt;type;
++	info.sequence = 0;
++	info.init_order = 0;
++	info.init_routine = (void (*)())image-&gt;init_routine;
++	info.term_routine = (void (*)())image-&gt;term_routine;
++	
++	if (_kern_read_stat(fd, NULL, false, &amp;stat, sizeof(struct stat)) == B_OK) {
++		info.device = stat.st_dev;
++		info.node = stat.st_ino;
++	} else {
++		info.device = -1;
++		info.node = -1;
++	}
++
++	strlcpy(info.name, path, sizeof(info.name));
++	info.text = (void *)image-&gt;regions[0].vmstart;
++	info.text_size = image-&gt;regions[0].vmsize;
++	info.data = (void *)image-&gt;regions[1].vmstart;
++	info.data_size = image-&gt;regions[1].vmsize;
++	image-&gt;id = _kern_register_image(&amp;info, sizeof(image_info));
++}
++
++
++static status_t
++relocate_image(image_t *image)
++{
++	status_t status = arch_relocate_image(image);
++	if (status &lt; B_OK) {
++		FATAL(&quot;troubles relocating: 0x%lx\n&quot;, status);
++		return status;
++	}
++
++	_kern_image_relocated(image-&gt;id);
++	return B_OK;
++}
++
++
++static status_t
++load_container(char const *name, image_type type, const char *rpath, image_t **_image)
++{
++	int32 pheaderSize, sheaderSize;
++	char path[PATH_MAX];
++	ssize_t length;
++	char ph_buff[4096];
++	int32 numRegions;
++	image_t *found;
++	image_t *image;
++	status_t status;
++	int fd;
++
++	struct Elf32_Ehdr eheader;
++
++	// Have we already loaded that image? Don't check for add-ons -- we always
++	// reload them.
++	if (type != B_ADD_ON_IMAGE) {
++		found = find_image(name, APP_OR_LIBRARY_TYPE);
++		if (found) {
++			atomic_add(&amp;found-&gt;ref_count, 1);
++			*_image = found;
++			return B_OK;
++		}
++	}
++
++	strlcpy(path, name, sizeof(path));
++
++	// Try to load explicit image path first
++	fd = open_executable(path, type, rpath);
++	if (fd &lt; 0) {
++		FATAL(&quot;cannot open file %s\n&quot;, path);
++		return fd;
++	}
++
++	// If the path is not absolute, we prepend the CWD to make it one.
++	if (path[0] != '/') {
++		char relativePath[PATH_MAX];
++		if (!strncmp(path, &quot;./&quot;, 2))
++			strcpy(relativePath, path + 2);
++		else
++			strcpy(relativePath, path);
++
++		// get the CWD
++		status = _kern_getcwd(path, sizeof(path));
++		if (status &lt; B_OK) {
++			FATAL(&quot;_kern_getcwd() failed\n&quot;);
++			goto err1;
++		}
++
++		if (strlcat(path, &quot;/&quot;, sizeof(path)) &gt;= sizeof(path)
++			|| strlcat(path, relativePath, sizeof(path)) &gt;= sizeof(path)) {
++			status = B_NAME_TOO_LONG;
++			FATAL(&quot;Absolute path of image %s is too &quot;
++				&quot;long!\n&quot;, relativePath);
++			goto err1;
++		}
++	}
++
++	// Test again if this image has been registered already - this time,
++	// we can check the full path, not just its name as noted.
++	// You could end up loading an image twice with symbolic links, else.
++	if (type != B_ADD_ON_IMAGE) {
++		found = find_image(path, APP_OR_LIBRARY_TYPE);
++		if (found) {
++			atomic_add(&amp;found-&gt;ref_count, 1);
++			*_image = found;
++			return B_OK;
++		}
++	}
++
++	length = _kern_read(fd, 0, &amp;eheader, sizeof(eheader));
++	if (length != sizeof(eheader)) {
++		status = B_NOT_AN_EXECUTABLE;
++		FATAL(&quot;troubles reading ELF header\n&quot;);
++		goto err1;
++	}
++
++	status = parse_elf_header(&amp;eheader, &amp;pheaderSize, &amp;sheaderSize);
++	if (status &lt; B_OK) {
++		FATAL(&quot;incorrect ELF header\n&quot;);
++		goto err1;
++	}
++
++	// ToDo: what to do about this restriction??
++	if (pheaderSize &gt; (int)sizeof(ph_buff)) {
++		FATAL(&quot;Cannot handle program headers bigger than %lu\n&quot;, sizeof(ph_buff));
++		status = B_UNSUPPORTED;
++		goto err1;
++	}
++
++	length = _kern_read(fd, eheader.e_phoff, ph_buff, pheaderSize);
++	if (length != pheaderSize) {
++		FATAL(&quot;Could not read program headers: %s\n&quot;, strerror(length));
++		status = B_BAD_DATA;
++		goto err1;
++	}
++
++	numRegions = count_regions(ph_buff, eheader.e_phnum, eheader.e_phentsize);
++	if (numRegions &lt;= 0) {
++		FATAL(&quot;Troubles parsing Program headers, numRegions = %ld\n&quot;, numRegions);
++		status = B_BAD_DATA;
++		goto err1;
++	}
++
++	image = create_image(name, path, numRegions);
++	if (image == NULL) {
++		FATAL(&quot;Failed to allocate image_t object\n&quot;);
++		status = B_NO_MEMORY;
++		goto err1;
++	}
++
++	status = parse_program_headers(image, ph_buff, eheader.e_phnum, eheader.e_phentsize);
++	if (status &lt; B_OK)
++		goto err2;
++
++	if (!assert_dynamic_loadable(image)) {
++		FATAL(&quot;Dynamic segment must be loadable (implementation restriction)\n&quot;);
++		status = B_UNSUPPORTED;
++		goto err2;
++	}
++
++	status = map_image(fd, path, image, type == B_APP_IMAGE);
++	if (status &lt; B_OK) {
++		FATAL(&quot;Could not map image: %s\n&quot;, strerror(status));
++		status = B_ERROR;
++		goto err2;
++	}
++
+
+[... truncated: 580 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002505.html">[Haiku-commits] r21282 - haiku/trunk/src/servers/app/drawing
+</A></li>
+	<LI>Next message: <A HREF="002507.html">[Haiku-commits] r21284 - haiku/trunk/src/data/beos_mime/application
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2506">[ date ]</a>
+              <a href="thread.html#2506">[ thread ]</a>
+              <a href="subject.html#2506">[ subject ]</a>
+              <a href="author.html#2506">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

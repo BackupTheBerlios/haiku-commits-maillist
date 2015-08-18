@@ -1,0 +1,309 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27214 - in haiku/trunk/src: kits/app servers/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27214%20-%20in%20haiku/trunk/src%3A%20kits/app%20servers/app&In-Reply-To=%3C200808271339.m7RDdGCs003474%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011342.html">
+   <LINK REL="Next"  HREF="011344.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27214 - in haiku/trunk/src: kits/app servers/app</H1>
+    <B>julun at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27214%20-%20in%20haiku/trunk/src%3A%20kits/app%20servers/app&In-Reply-To=%3C200808271339.m7RDdGCs003474%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27214 - in haiku/trunk/src: kits/app servers/app">julun at mail.berlios.de
+       </A><BR>
+    <I>Wed Aug 27 15:39:16 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011342.html">[Haiku-commits] r27213 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+        <LI>Next message: <A HREF="011344.html">[Haiku-commits] r27215 -	haiku/trunk/src/add-ons/kernel/partitioning_systems/intel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11343">[ date ]</a>
+              <a href="thread.html#11343">[ thread ]</a>
+              <a href="subject.html#11343">[ subject ]</a>
+              <a href="author.html#11343">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: julun
+Date: 2008-08-27 15:39:16 +0200 (Wed, 27 Aug 2008)
+New Revision: 27214
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27214&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27214&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/kits/app/LinkReceiver.cpp
+   haiku/trunk/src/kits/app/LinkSender.cpp
+   haiku/trunk/src/servers/app/ServerPicture.cpp
+Log:
+* first implementation of passing data via area to app_server
+  this makes printing of large images work, fixes task #1067
+
+
+
+Modified: haiku/trunk/src/kits/app/LinkReceiver.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/LinkReceiver.cpp	2008-08-27 12:52:23 UTC (rev 27213)
++++ haiku/trunk/src/kits/app/LinkReceiver.cpp	2008-08-27 13:39:16 UTC (rev 27214)
+@@ -21,8 +21,8 @@
+ #include &lt;Region.h&gt;
+ 
+ #include &quot;link_message.h&quot;
++#include &quot;syscalls.h&quot;
+ 
+-
+ //#define DEBUG_BPORTLINK
+ #ifdef DEBUG_BPORTLINK
+ #	include &lt;stdio.h&gt;
+@@ -245,9 +245,11 @@
+ 
+ 
+ status_t
+-LinkReceiver::Read(void *data, ssize_t size)
++LinkReceiver::Read(void *data, ssize_t passedSize)
+ {
+ //	STRACE((&quot;info: LinkReceiver Read()ing %ld bytes...\n&quot;, size));
++	ssize_t size = passedSize;
++
+ 	if (fReadError &lt; B_OK)
+ 		return fReadError;
+ 
+@@ -259,13 +261,49 @@
+ 	if (fDataSize == 0 || fReplySize == 0)
+ 		return B_NO_INIT;	// need to call GetNextReply() first
+ 
++	bool useArea = false;
++	if ((size_t)size &gt;= kMaxBufferSize) {
++		useArea = true;
++		size = sizeof(area_id);
++	}
++
+ 	if (fRecvPosition + size &gt; fRecvStart + fReplySize) {
+ 		// reading past the end of current message
+ 		fReadError = B_BAD_VALUE;
+ 		return B_BAD_VALUE;
+ 	}
+ 
+-	memcpy(data, fRecvBuffer + fRecvPosition, size);
++	if (useArea) {
++		area_id sourceArea;
++		memcpy((void*)&amp;sourceArea, fRecvBuffer + fRecvPosition, size);
++
++		area_info areaInfo;
++		if (get_area_info(sourceArea, &amp;areaInfo) &lt; B_OK)
++			fReadError = B_BAD_VALUE;
++
++		if (fReadError &gt;= B_OK) {
++			thread_info threadInfo;
++			get_thread_info(find_thread(NULL), &amp;threadInfo);
++
++			void* areaAddress = NULL;
++			if (areaInfo.team != threadInfo.team) {
++				sourceArea = _kern_transfer_area(sourceArea, &amp;areaAddress,
++					B_ANY_ADDRESS, threadInfo.team);
++		
++				if (sourceArea &lt; B_OK)
++					fReadError = sourceArea;
++			} else {
++				areaAddress = areaInfo.address;
++			}
++			
++			if (areaAddress &amp;&amp; sourceArea &gt;= B_OK) {
++				memcpy(data, areaAddress, passedSize);
++				delete_area(sourceArea);
++			}
++		}
++	} else {
++		memcpy(data, fRecvBuffer + fRecvPosition, size);
++	}
+ 	fRecvPosition += size;
+ 	return fReadError;
+ }
+
+Modified: haiku/trunk/src/kits/app/LinkSender.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/LinkSender.cpp	2008-08-27 12:52:23 UTC (rev 27213)
++++ haiku/trunk/src/kits/app/LinkSender.cpp	2008-08-27 13:39:16 UTC (rev 27214)
+@@ -129,8 +129,11 @@
+ 
+ 
+ status_t
+-LinkSender::Attach(const void *data, size_t size)
++LinkSender::Attach(const void *passedData, size_t passedSize)
+ {
++	size_t size = passedSize;
++	const void* data = passedData;
++
+ 	if (fCurrentStatus &lt; B_OK)
+ 		return fCurrentStatus;
+ 
+@@ -140,6 +143,12 @@
+ 	if (fCurrentEnd == fCurrentStart)
+ 		return B_NO_INIT;	// need to call StartMessage() first
+ 
++	bool useArea = false;
++	if (size &gt;= kMaxBufferSize) {
++		useArea = true;
++		size = sizeof(area_id);
++	}
++
+ 	if (SpaceLeft() &lt; size) {
+ 		// we have to make space for the data
+ 
+@@ -148,6 +157,20 @@
+ 			return fCurrentStatus = status;
+ 	}
+ 
++	area_id senderArea = -1;
++	if (useArea) {
++		void* address = NULL;
++		off_t alignedSize = (passedSize + B_PAGE_SIZE) &amp; ~(B_PAGE_SIZE - 1);
++		senderArea = create_area(&quot;LinkSenderArea&quot;, &amp;address, B_ANY_ADDRESS,
++			alignedSize, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
++
++		if (senderArea &lt; B_OK)
++			return senderArea;
++
++		data = &senderArea;
++		memcpy(address, passedData, passedSize);
++	}
++
+ 	memcpy(fBuffer + fCurrentEnd, data, size);
+ 	fCurrentEnd += size;
+ 
+
+Modified: haiku/trunk/src/servers/app/ServerPicture.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ServerPicture.cpp	2008-08-27 12:52:23 UTC (rev 27213)
++++ haiku/trunk/src/servers/app/ServerPicture.cpp	2008-08-27 13:39:16 UTC (rev 27214)
+@@ -30,6 +30,7 @@
+ #include &lt;List.h&gt;
+ #include &lt;Shape.h&gt;
+ 
++#include &lt;new&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stack&gt;
+ 
+@@ -976,37 +977,27 @@
+ }
+ 
+ 
+-#define BUFFER_SIZE 4096
+-
+-
+ status_t
+ ServerPicture::ImportData(BPrivate::LinkReceiver &amp;link)
+ {	
+ 	int32 size = 0;
+ 	link.Read&lt;int32&gt;(&amp;size);
+ 
+-	if (size &gt;= 65536) {
+-		//TODO: Pass via an area.
+-		// Ideally the Link** api would allow to write partial messages,
+-		// so that a big picture could be written in chunks of 4096 bytes
+-		// or so
+-		return B_ERROR;
+-	}
+-
+ 	off_t oldPosition = fData-&gt;Position();
+ 	fData-&gt;Seek(0, SEEK_SET);
+ 
+-	// TODO: Oh yeah... 65kb on the stack...
+-	char buffer[size];
+-	status_t read = link.Read(buffer, size);
+-	if (read &lt; B_OK)
+-		return (status_t)read;		
+-	
+-	fData-&gt;Write(buffer, size);	
++	status_t status = B_NO_MEMORY;
++	char* buffer = new(std::nothrow) char[size];
++	if (buffer) {
++		status = B_OK;
++		ssize_t read = link.Read(buffer, size);
++		if (read &lt; B_OK || fData-&gt;Write(buffer, size) &lt; B_OK)
++			status = B_ERROR;
++		delete [] buffer;
++	}
+ 
+ 	fData-&gt;Seek(oldPosition, SEEK_SET);
+-	
+-	return B_OK;
++	return status;
+ }
+ 
+ 
+@@ -1032,27 +1023,24 @@
+ 	off_t size = 0;
+ 	fData-&gt;GetSize(&amp;size);
+ 	link.Attach&lt;int32&gt;((int32)size);
+-	if (size &gt;= 65536) {
+-		//TODO: Pass via an area
++
++	status_t status = B_NO_MEMORY;
++	char* buffer = new(std::nothrow) char[size];
++	if (buffer) {
++		status = B_OK;
++		ssize_t read = fData-&gt;Read(buffer, size);
++		if (read &lt; B_OK || link.Attach(buffer, read) &lt; B_OK)
++			status = B_ERROR;
++		delete [] buffer;
++	}
++
++	if (status &lt; B_OK) {
+ 		link.CancelMessage();
+ 		link.StartMessage(B_ERROR);
+-		return B_ERROR;
+ 	}
+-	// TODO: Oh yeah... 65kb on the stack...
+-	char buffer[size];
+-	ssize_t read = fData-&gt;Read(buffer, size);
+-	if (read &lt; B_OK)
+-		return (status_t)read;		
+-	if (link.Attach(buffer, read) &lt; B_OK) {
+-		//
+-		link.CancelMessage();
+-		link.StartMessage(B_ERROR);	
+-	};
+ 
+-	
+ 	fData-&gt;Seek(oldPosition, SEEK_SET);
+-
+-	return B_OK;
++	return status;
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011342.html">[Haiku-commits] r27213 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+	<LI>Next message: <A HREF="011344.html">[Haiku-commits] r27215 -	haiku/trunk/src/add-ons/kernel/partitioning_systems/intel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11343">[ date ]</a>
+              <a href="thread.html#11343">[ thread ]</a>
+              <a href="subject.html#11343">[ subject ]</a>
+              <a href="author.html#11343">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

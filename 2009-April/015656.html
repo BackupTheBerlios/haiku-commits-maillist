@@ -1,0 +1,441 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30069 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30069%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200904091524.n39FOgWu005640%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015652.html">
+   <LINK REL="Next"  HREF="015657.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30069 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30069%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200904091524.n39FOgWu005640%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30069 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr  9 17:24:42 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015652.html">[Haiku-commits] r30068 - haiku/trunk/src/servers/app
+</A></li>
+        <LI>Next message: <A HREF="015657.html">[Haiku-commits] r30070 - in haiku/trunk: headers/os/interface	src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15656">[ date ]</a>
+              <a href="thread.html#15656">[ thread ]</a>
+              <a href="subject.html#15656">[ subject ]</a>
+              <a href="author.html#15656">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-04-09 17:24:40 +0200 (Thu, 09 Apr 2009)
+New Revision: 30069
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30069&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30069&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h
+Log:
+Implement DMA transfers in the new ATA bus_manager.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp	2009-04-09 14:19:09 UTC (rev 30068)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp	2009-04-09 15:24:40 UTC (rev 30069)
+@@ -14,6 +14,7 @@
+ 		fChannelID(0),
+ 		fController(NULL),
+ 		fCookie(NULL),
++		fExpectsDMATransfer(false),
+ 		fStatus(B_NO_INIT),
+ 		fSCSIBus(NULL),
+ 		fDeviceCount(0),
+@@ -21,7 +22,9 @@
+ 		fUseDMA(true),
+ 		fRequest(NULL)
+ {
+-	mutex_init(&amp;fLock, &quot;ata channel&quot;);
++	mutex_init(&amp;fExecutionLock, &quot;ata io execution&quot;);
++	B_INITIALIZE_SPINLOCK(&amp;fDMATransferLock);
++	fDMATransferCondition.Init(this, &quot;ata dma transfer&quot;);
+ 
+ 	gDeviceManager-&gt;get_attr_uint32(node, ATA_CHANNEL_ID_ITEM, &amp;fChannelID,
+ 		true);
+@@ -80,12 +83,14 @@
+ 	fStatus = gDeviceManager-&gt;get_driver(parent,
+ 		(driver_module_info **)&amp;fController, &amp;fCookie);
+ 	gDeviceManager-&gt;put_node(parent);
++
++	fController-&gt;set_channel(fCookie, this);
+ }
+ 
+ 
+ ATAChannel::~ATAChannel()
+ {
+-	mutex_lock(&amp;fLock);
++	mutex_lock(&amp;fExecutionLock);
+ 
+ 	if (fDevices) {
+ 		for (uint8 i = 0; i &lt; fDeviceCount; i++)
+@@ -94,7 +99,7 @@
+ 	}
+ 
+ 	delete fRequest;
+-	mutex_destroy(&amp;fLock);
++	mutex_destroy(&amp;fExecutionLock);
+ }
+ 
+ 
+@@ -217,10 +222,10 @@
+ ATAChannel::ExecuteIO(scsi_ccb *ccb)
+ {
+ 	TRACE_FUNCTION(&quot;%p\n&quot;, ccb);
+-	if (mutex_trylock(&amp;fLock) != B_OK)
++	if (mutex_trylock(&amp;fExecutionLock) != B_OK)
+ 		return B_BUSY;
+ 
+-	MutexLocker _(&amp;fLock, true);
++	MutexLocker _(&amp;fExecutionLock, true);
+ 
+ 	fRequest-&gt;SetCCB(ccb);
+ 	if (ccb-&gt;cdb[0] == SCSI_OP_REQUEST_SENSE) {
+@@ -445,6 +450,10 @@
+ status_t
+ ATAChannel::SendRequest(ATARequest *request, uint32 flags)
+ {
++	// disable interrupts for PIO transfers, enable them for DMA
++	_WriteControl((flags &amp; ATA_DMA_TRANSFER) != 0 ? 0
++		: ATA_DEVICE_CONTROL_DISABLE_INTS);
++
+ 	ATADevice *device = request-&gt;Device();
+ 	if (device-&gt;Select() != B_OK || WaitForIdle() != B_OK) {
+ 		// resetting the device here will discard current configuration,
+@@ -479,7 +488,7 @@
+ 		// wait for the device to finish current command (device no longer busy)
+ 		status_t result = Wait(0, ATA_STATUS_BUSY, 0, request-&gt;Timeout());
+ 		if (result != B_OK) {
+-			TRACE_ERROR(&quot;timeout\n&quot;);
++			TRACE_ERROR(&quot;timeout waiting for request finish\n&quot;);
+ 			request-&gt;SetStatus(SCSI_CMD_TIMEOUT);
+ 			return result;
+ 		}
+@@ -565,11 +574,44 @@
+ 
+ 
+ status_t
++ATAChannel::PrepareDMA(ATARequest *request)
++{
++	scsi_ccb *ccb = request-&gt;CCB();
++	return fController-&gt;prepare_dma(fCookie, ccb-&gt;sg_list, ccb-&gt;sg_count,
++		request-&gt;IsWrite());
++}
++
++
++status_t
++ATAChannel::FinishDMA()
++{
++	return fController-&gt;finish_dma(fCookie);
++}
++
++
++status_t
+ ATAChannel::ExecuteDMATransfer(ATARequest *request)
+ {
+-	TRACE_ERROR(&quot;dma transfers unimplemented\n&quot;);
+-	request-&gt;SetStatus(SCSI_SEQUENCE_FAIL);
+-	return B_ERROR;
++	InterruptsSpinLocker locker(fDMATransferLock);
++	fExpectsDMATransfer = true;
++	ConditionVariableEntry entry;
++	fDMATransferCondition.Add(&amp;entry);
++	locker.Unlock();
++
++	fController-&gt;start_dma(fCookie);
++	bigtime_t timeout = system_time() + request-&gt;Timeout();
++	status_t waitResult = entry.Wait(B_ABSOLUTE_TIMEOUT, timeout);
++
++	locker.Lock();
++	fExpectsDMATransfer = false;
++	locker.Unlock();
++
++	if (waitResult != B_OK) {
++		TRACE_ERROR(&quot;timeout waiting for DMA transfer\n&quot;);
++		return B_TIMED_OUT;
++	}
++
++	return B_OK;
+ }
+ 
+ 
+@@ -612,14 +654,6 @@
+ 		result = B_ERROR;
+ 	}
+ 
+-	if (result == B_OK) {
+-		result = FinishRequest(request, ATA_WAIT_FINISH
+-			| ATA_DEVICE_READY_REQUIRED, ATA_ERROR_ABORTED);
+-	}
+-
+-	if (result != B_OK)
+-		request-&gt;SetStatus(SCSI_SEQUENCE_FAIL);
+-
+ 	return result;
+ }
+ 
+@@ -632,6 +666,24 @@
+ }
+ 
+ 
++void
++ATAChannel::Interrupt(uint8 status)
++{
++	SpinLocker locker(fDMATransferLock);
++	if (!fExpectsDMATransfer) {
++		TRACE_ERROR(&quot;interrupt when not expecting transfer\n&quot;);
++		return;
++	}
++
++	if ((status &amp; ATA_STATUS_BUSY) != 0) {
++		TRACE_ERROR((&quot;interrupt while device is busy\n&quot;));
++		return;
++	}
++
++	fDMATransferCondition.NotifyAll();
++}
++
++
+ status_t
+ ATAChannel::_ReadRegs(ata_task_file *taskFile, ata_reg_mask mask)
+ {
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp	2009-04-09 14:19:09 UTC (rev 30068)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp	2009-04-09 15:24:40 UTC (rev 30069)
+@@ -17,6 +17,7 @@
+ 		fUse48Bits(false),
+ 		fUseDMA(channel-&gt;UseDMA()),
+ 		fDMAMode(0),
++		fDMAFailures(0),
+ 		fTotalSectors(0),
+ 		fRegisterMask(0)
+ {
+@@ -513,18 +514,15 @@
+ ATADevice::ExecuteReadWrite(ATARequest *request, uint64 address,
+ 	uint32 sectorCount)
+ {
+-	request-&gt;SetUseDMA(fUseDMA &amp;&amp; _PrepareDMA(request) == B_OK);
+-	if (!request-&gt;UseDMA()) {
+-		status_t result = _PreparePIO(request);
+-		if (result != B_OK) {
+-			TRACE_ERROR(&quot;failed to prepare pio transfer\n&quot;);
+-			return result;
+-		}
+-	}
++	request-&gt;SetUseDMA(fUseDMA &amp;&amp; fChannel-&gt;PrepareDMA(request) == B_OK);
++	if (!request-&gt;UseDMA())
++		request-&gt;PrepareSGInfo();
+ 
+ 	request-&gt;SetBlocksLeft(sectorCount);
+ 	if (_FillTaskFile(request, address) != B_OK) {
+ 		TRACE_ERROR(&quot;failed to setup transfer request\n&quot;);
++		if (request-&gt;UseDMA())
++			fChannel-&gt;FinishDMA();
+ 		return B_ERROR;
+ 	}
+ 
+@@ -537,13 +535,39 @@
+ 	status_t result = fChannel-&gt;SendRequest(request, flags);
+ 	if (result != B_OK) {
+ 		TRACE_ERROR(&quot;failed to send transfer request\n&quot;);
++		if (request-&gt;UseDMA())
++			fChannel-&gt;FinishDMA();
+ 		return result;
+ 	}
+ 
+-	if (request-&gt;UseDMA())
+-		return fChannel-&gt;ExecuteDMATransfer(request);
++	if (request-&gt;UseDMA()) {
++		result = fChannel-&gt;ExecuteDMATransfer(request);
++		status_t dmaResult = fChannel-&gt;FinishDMA();
++		if (result == B_OK &amp;&amp; dmaResult == B_OK) {
++			fDMAFailures = 0;
++			request-&gt;CCB()-&gt;data_resid = 0;
++		} else {
++			if (dmaResult != B_OK) {
++				request-&gt;SetSense(SCSIS_KEY_HARDWARE_ERROR,
++					SCSIS_ASC_LUN_COM_FAILURE);
++				fDMAFailures++;
++				if (fDMAFailures &gt;= ATA_MAX_DMA_FAILURES) {
++					TRACE_ALWAYS(&quot;disabling DMA after %u failures\n&quot;,
++						fDMAFailures);
++					fUseDMA = false;
++				}
++			} else {
++				// timeout
++				request-&gt;SetStatus(SCSI_CMD_TIMEOUT);
++			}
++		}
++	} else {
++		if (fChannel-&gt;ExecutePIOTransfer(request) != B_OK)
++			request-&gt;SetStatus(SCSI_SEQUENCE_FAIL);
++	}
+ 
+-	return fChannel-&gt;ExecutePIOTransfer(request);
++	return fChannel-&gt;FinishRequest(request, ATA_WAIT_FINISH
++		| ATA_DEVICE_READY_REQUIRED, ATA_ERROR_ABORTED);
+ }
+ 
+ 
+@@ -621,18 +645,3 @@
+ 
+ 	return B_OK;
+ }
+-
+-
+-status_t
+-ATADevice::_PrepareDMA(ATARequest *request)
+-{
+-	return B_ERROR;
+-}
+-
+-
+-status_t
+-ATADevice::_PreparePIO(ATARequest *request)
+-{
+-	request-&gt;PrepareSGInfo();
+-	return B_OK;
+-}
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp	2009-04-09 14:19:09 UTC (rev 30068)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp	2009-04-09 15:24:40 UTC (rev 30069)
+@@ -205,7 +205,13 @@
+ status_t
+ ata_interrupt_handler(void *cookie, uint8 status)
+ {
+-	return B_UNHANDLED_INTERRUPT;
++	ATAChannel *channel = (ATAChannel *)cookie;
++	channel-&gt;Interrupt(status);
++
++	// the controller driver already checks if its interrupt status indicates
++	// that the interrupt was for this device, so we are only here if that's
++	// the case.
++	return B_HANDLED_INTERRUPT;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h	2009-04-09 14:19:09 UTC (rev 30068)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h	2009-04-09 15:24:40 UTC (rev 30069)
+@@ -25,6 +25,7 @@
+ #include &quot;ATATracing.h&quot;
+ #include &quot;ata_device_infoblock.h&quot;
+ 
++#define ATA_MAX_DMA_FAILURES		3
+ #define ATA_STANDARD_TIMEOUT		10 * 1000 * 1000
+ #define ATA_RELEASE_TIMEOUT			10 * 1000 * 1000
+ #define ATA_SIGNATURE_ATAPI			0xeb140101
+@@ -35,10 +36,10 @@
+ enum {
+ 	ATA_DEVICE_READY_REQUIRED	= 0x01,
+ 	ATA_IS_WRITE				= 0x02,
+-	ATA_DMA_TRANSFER			= 0x03,
+-	ATA_CHECK_ERROR_BIT			= 0x04,
+-	ATA_WAIT_FINISH				= 0x08,
+-	ATA_WAIT_ANY_BIT			= 0x10
++	ATA_DMA_TRANSFER			= 0x04,
++	ATA_CHECK_ERROR_BIT			= 0x08,
++	ATA_WAIT_FINISH				= 0x10,
++	ATA_WAIT_ANY_BIT			= 0x20
+ };
+ 
+ 
+@@ -91,11 +92,16 @@
+ 										uint32 flags, uint8 errorMask);
+ 
+ 		// data transfers
++		status_t					PrepareDMA(ATARequest *request);
++		status_t					FinishDMA();
++
+ 		status_t					ExecuteDMATransfer(ATARequest *request);
+ 		status_t					ExecutePIOTransfer(ATARequest *request);
+ 
+ 		status_t					ReadPIO(uint8 *buffer, size_t length);
+ 
++		void						Interrupt(uint8 status);
++
+ private:
+ 		status_t					_ReadRegs(ata_task_file *taskFile,
+ 										ata_reg_mask mask);
+@@ -125,7 +131,12 @@
+ 		uint32						fChannelID;
+ 		ata_controller_interface *	fController;
+ 		void *						fCookie;
+-		mutex						fLock;
++
++		mutex						fExecutionLock;
++		spinlock					fDMATransferLock;
++		ConditionVariable			fDMATransferCondition;
++		bool						fExpectsDMATransfer;
++
+ 		status_t					fStatus;
+ 		scsi_bus					fSCSIBus;
+ 		uint8						fDeviceCount;
+@@ -178,9 +189,6 @@
+ 		status_t					_FillTaskFile(ATARequest *request,
+ 										uint64 address);
+ 
+-		status_t					_PrepareDMA(ATARequest *request);
+-		status_t					_PreparePIO(ATARequest *request);
+-
+ 		const char *				_DebugContext() { return fDebugContext; };
+ 
+ 		ATAChannel *				fChannel;
+@@ -189,6 +197,7 @@
+ 		bool						fUse48Bits;
+ 		bool						fUseDMA;
+ 		uint8						fDMAMode;
++		uint8						fDMAFailures;
+ 		uint64						fTotalSectors;
+ 		ata_device_infoblock		fInfoBlock;
+ 		ata_task_file				fTaskFile;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015652.html">[Haiku-commits] r30068 - haiku/trunk/src/servers/app
+</A></li>
+	<LI>Next message: <A HREF="015657.html">[Haiku-commits] r30070 - in haiku/trunk: headers/os/interface	src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15656">[ date ]</a>
+              <a href="thread.html#15656">[ thread ]</a>
+              <a href="subject.html#15656">[ subject ]</a>
+              <a href="author.html#15656">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

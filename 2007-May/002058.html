@@ -1,0 +1,395 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20992 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20992%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd&In-Reply-To=%3C200705030606.l4366Bhe027529%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002057.html">
+   <LINK REL="Next"  HREF="002059.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20992 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd</H1>
+    <B>mmu_man at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20992%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd&In-Reply-To=%3C200705030606.l4366Bhe027529%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20992 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd">mmu_man at mail.berlios.de
+       </A><BR>
+    <I>Thu May  3 08:06:11 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002057.html">[Haiku-commits] r20991 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd
+</A></li>
+        <LI>Next message: <A HREF="002059.html">[Haiku-commits] r20993 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2058">[ date ]</a>
+              <a href="thread.html#2058">[ thread ]</a>
+              <a href="subject.html#2058">[ subject ]</a>
+              <a href="author.html#2058">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmu_man
+Date: 2007-05-03 08:06:10 +0200 (Thu, 03 May 2007)
+New Revision: 20992
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20992&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20992&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c
+Log:
+Implemented request funcs. Done read(). It's working \o/
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c	2007-05-03 03:37:04 UTC (rev 20991)
++++ haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c	2007-05-03 06:06:10 UTC (rev 20992)
+@@ -54,8 +54,14 @@
+ 
+ struct nbd_request_entry {
+ 	struct nbd_request_entry *next;
+-	struct nbd_request req;
+-	bool r; /* is read */
++	struct nbd_request req; /* net byte order */
++	struct nbd_reply reply; /* net byte order */
++	sem_id sem;
++	bool replied;
++	bool discard;
++	uint64 handle;
++	uint32 type;
++	uint64 from;
+ 	size_t len;
+ 	void *buffer; /* write: ptr to passed buffer; read: ptr to malloc()ed extra */
+ };
+@@ -78,10 +84,10 @@
+ } cookie_t;
+ 
+ /* data=NULL on read */
+-status_t nbd_alloc_request(struct nbd_device, struct nbd_request_entry **req, size_t len, const char *data);
+-status_t nbd_post_request(struct nbd_device, uint64 handle, struct nbd_request_entry **req);
+-status_t nbd_dequeue_request(struct nbd_device, uint64 handle, struct nbd_request_entry **req);
+-status_t nbd_free_request(struct nbd_device, struct nbd_request_entry *req);
++status_t nbd_alloc_request(struct nbd_device *dev, struct nbd_request_entry **req, uint32 type, off_t from, size_t len, const char *data);
++status_t nbd_queue_request(struct nbd_device *dev, struct nbd_request_entry *req);
++status_t nbd_dequeue_request(struct nbd_device *dev, uint64 handle, struct nbd_request_entry **req);
++status_t nbd_free_request(struct nbd_device *dev, struct nbd_request_entry *req);
+ 
+ struct nbd_device *nbd_find_device(const char* name);
+ 
+@@ -98,19 +104,191 @@
+ 
+ #pragma mark ==== request manager ====
+ 
++status_t nbd_alloc_request(struct nbd_device *dev, struct nbd_request_entry **req, uint32 type, off_t from, size_t len, const char *data)
++{
++	bool w = (type == NBD_CMD_WRITE);
++	struct nbd_request_entry *r;
++	status_t err = EINVAL;
++	uint64 handle;
++	PRINT((DP &quot;&gt;%s(%ld, %Ld, %ld)\n&quot;, __FUNCTION__, type, from, len));
++	
++	if (type != NBD_CMD_READ &amp;&amp; type != NBD_CMD_WRITE &amp;&amp; type != NBD_CMD_DISC)
++		return err;
++	if (!dev || !req || from &lt; 0)
++		return err;
++	
++	//LOCK
++	err = benaphore_lock(&amp;dev-&gt;ben);
++	if (err)
++		return err;
+ 
++	// atomic
++	handle = dev-&gt;req++;
++	
++	
++	//UNLOCK
++	benaphore_unlock(&amp;dev-&gt;ben);
++	
++	err = ENOMEM;
++	r = malloc(sizeof(struct nbd_request_entry) + (w ? 0 : len));
++	if (r == NULL)
++		goto err0;
++	r-&gt;next = NULL;
++	err = r-&gt;sem = create_sem(0, &quot;nbd request sem&quot;);
++	if (err &lt; 0)
++		goto err1;
++	
++	r-&gt;replied = false;
++	r-&gt;discard = false;
++	r-&gt;handle = handle;
++	r-&gt;type = type;
++	r-&gt;from = from;
++	r-&gt;len = len;
++	
++	r-&gt;req.magic = B_HOST_TO_BENDIAN_INT32(NBD_REQUEST_MAGIC);
++	r-&gt;req.type = B_HOST_TO_BENDIAN_INT32(type);
++	r-&gt;req.handle = B_HOST_TO_BENDIAN_INT64(r-&gt;handle);
++	r-&gt;req.from = B_HOST_TO_BENDIAN_INT64(r-&gt;from);
++	r-&gt;req.len = B_HOST_TO_BENDIAN_INT32(len);
++	
++	r-&gt;buffer = w ? data : (((char *)r) + sizeof(struct nbd_request_entry));
++	
++	*req = r;
++	return B_OK;
++
++err1:
++	free(r);
++err0:
++	dprintf(DP &quot; %s: error 0x%08lx\n&quot;, __FUNCTION__, err);
++	return err;
++}
++
++status_t nbd_queue_request(struct nbd_device *dev, struct nbd_request_entry *req)
++{
++	PRINT((DP &quot;&gt;%s(handle:%Ld)\n&quot;, __FUNCTION__, req-&gt;handle));
++	req-&gt;next = dev-&gt;reqs;
++	dev-&gt;reqs = req;
++	return B_OK;
++}
++
++status_t nbd_dequeue_request(struct nbd_device *dev, uint64 handle, struct nbd_request_entry **req)
++{
++	struct nbd_request_entry *r, *prev;
++	PRINT((DP &quot;&gt;%s(handle:%Ld)\n&quot;, __FUNCTION__, handle));
++	r = dev-&gt;reqs;
++	prev = NULL;
++	while (r &amp;&amp; r-&gt;handle != handle) {
++		prev = r;
++		r = r-&gt;next;
++	}
++	if (!r)
++		return ENOENT;
++	
++	if (prev)
++		prev-&gt;next = r-&gt;next;
++	else
++		dev-&gt;reqs = r-&gt;next;
++	
++	*req = r;
++	return B_OK;
++}
++
++status_t nbd_free_request(struct nbd_device *dev, struct nbd_request_entry *req)
++{
++	PRINT((DP &quot;&gt;%s(handle:%Ld)\n&quot;, __FUNCTION__, req-&gt;handle));
++	delete_sem(req-&gt;sem);
++	free(req);
++	return B_OK;
++}
++
++
++
+ #pragma mark ==== nbd handler ====
+ 
+ int32 nbd_postoffice(void *arg)
+ {
+ 	struct nbd_device *dev = (struct nbd_device *)arg;
++	struct nbd_request_entry *req = NULL;
++	struct nbd_reply reply;
+ 	int sock = dev-&gt;sock;
++	status_t err;
++	const char *reason;
+ 	PRINT((DP &quot;&gt;%s()\n&quot;, __FUNCTION__));
+ 	
++	for (;;) {
++		reason = &quot;recv&quot;;
++		err = krecv(dev-&gt;sock, &amp;reply, sizeof(reply), 0);
++		if (err == -1 &amp;&amp; errno &lt; 0)
++			err = errno;
++		if (err &lt; 0)
++			goto err;
++		reason = &quot;recv:size&quot;;
++		if (err &lt; sizeof(reply))
++			err = EINVAL;
++		if (err &lt; 0)
++			goto err;
++		reason = &quot;magic&quot;;
++		err = EINVAL;
++		if (B_BENDIAN_TO_HOST_INT32(reply.magic) != NBD_REPLY_MAGIC)
++			goto err;
++		
++		reason = &quot;lock&quot;;
++		//LOCK
++		err = benaphore_lock(&amp;dev-&gt;ben);
++		if (err)
++			goto err;
++		
++		reason = &quot;dequeue_request&quot;;
++		err = nbd_dequeue_request(dev, B_BENDIAN_TO_HOST_INT64(reply.handle), &amp;req);
++		
++		//UNLOCK
++		benaphore_unlock(&amp;dev-&gt;ben);
++		
++		if (!err &amp;&amp; !req) {
++			dprintf(DP &quot;nbd_dequeue_rquest found NULL!\n&quot;);
++			err = ENOENT;
++		}
++		
++		if (err == B_OK) {
++			memcpy(&amp;req-&gt;reply, &amp;reply, sizeof(reply));
++			if (req-&gt;type == NBD_CMD_READ) {
++				err = 0;
++				reason = &quot;recv(data)&quot;;
++				if (reply.error == 0)
++					err = krecv(dev-&gt;sock, req-&gt;buffer, req-&gt;len, 0);
++				if (err &lt; 0)
++					goto err;
++				/* tell back how much we've got (?) */
++				req-&gt;len = err;
++			} else {
++				if (reply.error)
++					req-&gt;len = 0;
++			}
++			
++			reason = &quot;lock&quot;;
++			//LOCK
++			err = benaphore_lock(&amp;dev-&gt;ben);
++			if (err)
++				goto err;
++			
++			// this also must be atomic!
++			release_sem(req-&gt;sem);
++			req-&gt;replied = true;
++			if (req-&gt;discard)
++				nbd_free_request(dev, req);
++			
++			//UNLOCK
++			benaphore_unlock(&amp;dev-&gt;ben);
++		}
++		
++	}
+ 	
+-	
+ 	PRINT((DP &quot;&lt;%s\n&quot;, __FUNCTION__));
+ 	return 0;
++
++err:
++	dprintf(DP &quot;%s: %s: error 0x%08lx\n&quot;, __FUNCTION__, reason, err);
++	return err;
+ }
+ 
+ status_t nbd_connect(struct nbd_device *dev)
+@@ -184,6 +362,20 @@
+ 	return B_OK;
+ }
+ 
++status_t nbd_post_request(struct nbd_device *dev, struct nbd_request_entry *req)
++{
++	status_t err;
++	PRINT((DP &quot;&gt;%s(handle:%Ld)\n&quot;, __FUNCTION__, req-&gt;handle));
++	
++	err = ksend(dev-&gt;sock, &amp;req-&gt;req, sizeof(req-&gt;req), 0);
++	if (err &lt; 0)
++		return err;
++	
++	err = nbd_queue_request(dev, req);
++	return err;
++}
++
++
+ #pragma mark ==== device hooks ====
+ 
+ static struct nbd_device nbd_devices[MAX_NBDS];
+@@ -312,9 +504,70 @@
+ }
+ 
+ status_t nbd_read(cookie_t *cookie, off_t position, void *data, size_t *numbytes) {
++	struct nbd_device *dev = cookie-&gt;dev;
++	struct nbd_request_entry *req;
++	status_t err, semerr;
+ 	PRINT((DP &quot;&gt;%s(%d, %Ld, , )\n&quot;, __FUNCTION__, WHICH(cookie-&gt;dev), position));
++	
++	if (position &lt; 0)
++		return EINVAL;
++	if (!data)
++		return EINVAL;
++	
++	err = nbd_alloc_request(dev, &amp;req, NBD_CMD_READ, position, *numbytes, NULL);
++	if (err)
++		goto err0;
++	
++	//LOCK
++	err = benaphore_lock(&amp;dev-&gt;ben);
++	if (err)
++		goto err1;
++	
++	err = nbd_post_request(dev, req);
++	
++	//UNLOCK
++	benaphore_unlock(&amp;dev-&gt;ben);
++
++	if (err)
++		goto err2;
++
++
++	semerr = acquire_sem(req-&gt;sem);
++	
++	//LOCK
++	err = benaphore_lock(&amp;dev-&gt;ben);
++	if(err)
++		goto err3;
++	
++	/* bad scenarii */
++	if (!req-&gt;replied)
++		req-&gt;discard = true;
++	else if (semerr)
++		nbd_free_request(dev, req);
++	
++	//UNLOCK
++	benaphore_unlock(&amp;dev-&gt;ben);
++
++	if (semerr == B_OK) {
++		*numbytes = req-&gt;len;
++		memcpy(data, req-&gt;buffer, req-&gt;len);
++		nbd_free_request(dev, req);
++		if (*numbytes == 0 &amp;&amp; req-&gt;reply.error)
++			return B_ERROR;
++		return B_OK;
++	}
++	
+ 	*numbytes = 0;
+-	return B_NOT_ALLOWED;
++	return semerr;
++			
++
++err3:
++err2:
++err1:
++	nbd_free_request(dev, req);
++err0:
++	*numbytes = 0;
++	return err;
+ }
+ 
+ status_t nbd_write(cookie_t *cookie, off_t position, const void *data, size_t *numbytes) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002057.html">[Haiku-commits] r20991 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd
+</A></li>
+	<LI>Next message: <A HREF="002059.html">[Haiku-commits] r20993 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2058">[ date ]</a>
+              <a href="thread.html#2058">[ thread ]</a>
+              <a href="subject.html#2058">[ subject ]</a>
+              <a href="author.html#2058">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

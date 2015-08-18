@@ -1,0 +1,472 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22545 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22545%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200710132322.l9DNMQDI005704%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004267.html">
+   <LINK REL="Next"  HREF="004269.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22545 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>sbenedetto at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22545%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200710132322.l9DNMQDI005704%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22545 - haiku/trunk/src/add-ons/kernel/busses/usb">sbenedetto at mail.berlios.de
+       </A><BR>
+    <I>Sun Oct 14 01:22:26 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004267.html">[Haiku-commits] r22544 - haiku/trunk/src/kits/storage
+</A></li>
+        <LI>Next message: <A HREF="004269.html">[Haiku-commits] r22546 - haiku/trunk/src/add-ons/disk_systems
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4268">[ date ]</a>
+              <a href="thread.html#4268">[ thread ]</a>
+              <a href="subject.html#4268">[ subject ]</a>
+              <a href="author.html#4268">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: sbenedetto
+Date: 2007-10-14 01:22:25 +0200 (Sun, 14 Oct 2007)
+New Revision: 22545
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22545&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22545&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci_rh.cpp
+Log:
+* Fix some bugs introduced by myself ;)
+* Removed IOC bit on last TD. To find out whether the TD removed is the
+last one of a transfer it simply iterate through every transfer submitted. Not the best
+solution, but should be ok for now. Improvements will be made when there will be some driver to test it with.
+* Clean up
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2007-10-13 23:17:44 UTC (rev 22544)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2007-10-13 23:22:25 UTC (rev 22545)
+@@ -15,10 +15,7 @@
+ #include &lt;stdlib.h&gt;
+ 
+ #include &quot;uhci.h&quot;
+-#include &quot;uhci_hardware.h&quot;
+-#include &quot;usb_p.h&quot;
+ 
+-
+ pci_module_info *UHCI::sPCIModule = NULL;
+ 
+ 
+@@ -800,6 +797,7 @@
+ 	data-&gt;last_to_process = transfer-&gt;IsochronousData()-&gt;packet_count - 1;
+ 	data-&gt;incoming = directionIn;
+ 	data-&gt;is_active = true;
++	data-&gt;link = NULL;
+ 
+ 	// Put in the isochronous transfer list
+ 	if (!LockIsochronous()) {
+@@ -829,6 +827,13 @@
+ 	packetSize /= isochronousData-&gt;packet_count;
+ 	uint16 currentFrame;
+ 
++	if (packetSize &gt; pipe-&gt;MaxPacketSize())
++	{
++		TRACE_ERROR((&quot;usb_uhci: isochronous packetSize is bigger&quot;
++			&quot; than pipe MaxPacketSize\n&quot;));
++		return B_BAD_VALUE;
++	}
++
+ 	// Ignore the fact that the last descriptor might need less bandwidth.
+ 	// The overhead is not worthy.
+ 	uint16 bandwidth = transfer-&gt;Bandwidth() / isochronousData-&gt;packet_count;
+@@ -842,11 +847,22 @@
+ 	// other in a queue like for every other transfer.
+ 	uhci_td **isoRequest
+ 		= new(std::nothrow) uhci_td *[isochronousData-&gt;packet_count];
++	if (isoRequest == NULL) {
++		TRACE((&quot;usb_uhci: failed to create isoRequest array!\n&quot;));
++		return B_NO_MEMORY;
++	}
+ 
+ 	// Create the list of transfer descriptors
+ 	for (uint32 i = 0; i &lt; (isochronousData-&gt;packet_count - 1); i++) {
+ 		isoRequest[i] = CreateDescriptor(pipe,
+ 			directionIn ? TD_TOKEN_IN : TD_TOKEN_OUT, packetSize);
++		// If we ran out of memory, clean up and return
++		if (isoRequest[i] == NULL) {
++			for (uint32 j = 0; j &lt; i; j++)
++				FreeDescriptor(isoRequest[j]);
++			delete [] isoRequest;
++			return B_NO_MEMORY;
++		}
+ 		// Make sure data toggle is set to zero
+ 		isoRequest[i]-&gt;token &amp;= ~TD_TOKEN_DATA1;
+ 	}
+@@ -854,9 +870,16 @@
+ 	// Create the last transfer descriptor which should be of smaller size
+ 	// and set the IOC bit
+ 	isoRequest[isochronousData-&gt;packet_count - 1] = CreateDescriptor(pipe,
+-		directionIn ? TD_TOKEN_IN : TD_TOKEN_OUT, restSize);
++		directionIn ? TD_TOKEN_IN : TD_TOKEN_OUT,
++		(restSize) ? restSize : packetSize);
++	// If we are that unlucky...
++	if (!isoRequest[isochronousData-&gt;packet_count - 1]) {
++		for (uint32 i = 0; i &lt; (isochronousData-&gt;packet_count - 2); i++)
++			FreeDescriptor(isoRequest[i]);
++		delete [] isoRequest;
++		return B_NO_MEMORY;
++	}
+ 	isoRequest[isochronousData-&gt;packet_count - 1]-&gt;token &amp;= ~TD_TOKEN_DATA1;
+-	isoRequest[isochronousData-&gt;packet_count - 1]-&gt;status |= TD_CONTROL_IOC;
+ 
+ 	// If direction is out set every descriptor data
+ 	if (!directionIn) {
+@@ -904,7 +927,10 @@
+ 		if (currentFrame == startSeekingFromFrame) {
+ 			TRACE_ERROR((&quot;usb_uhci: Not enough bandwidth to queue the&quot;
+ 				&quot; isochronous request. Try again later!\n&quot;));
+-			return B_ERROR;
++			for (uint32 i = 0; i &lt; isochronousData-&gt;packet_count; i++)
++				FreeDescriptor(isoRequest[i]);
++			delete [] isoRequest;
++		return B_ERROR;
+ 		}
+ 	}
+ 
+@@ -916,10 +942,9 @@
+ 		directionIn);
+ 	if (result &lt; B_OK) {
+ 		TRACE_ERROR((&quot;usb_uhci: failed to add pending isochronous transfer\n&quot;));
+-		for (uint32 i = 0; i &lt; isochronousData-&gt;packet_count; i++) {
++		for (uint32 i = 0; i &lt; isochronousData-&gt;packet_count; i++)
+ 			FreeDescriptor(isoRequest[i]);
+-			delete [] isoRequest;
+-		}
++		delete [] isoRequest;
+ 		return result;
+ 	}
+ 
+@@ -930,7 +955,15 @@
+ 	// the starting_frame_number entry
+ 	// TODO: We don't consider bInterval, and assume it's 1!
+ 	for (uint32 i = 0; i &lt; isochronousData-&gt;packet_count; i++) {
+-		LinkIsochronousDescriptor(isoRequest[i], currentFrame);
++		result = LinkIsochronousDescriptor(isoRequest[i], currentFrame);
++		if (result &lt; B_OK) {
++			TRACE_ERROR((&quot;usb_uhci: failed to add pending isochronous transfer\n&quot;));
++			for (uint32 i = 0; i &lt; isochronousData-&gt;packet_count; i++)
++				FreeDescriptor(isoRequest[i]);
++			delete [] isoRequest;
++			return result;
++		}
++
+ 		fFrameBandwidth[currentFrame] -= bandwidth;
+ 		currentFrame = (currentFrame + 1) % NUMBER_OF_FRAMES;
+ 	}
+@@ -946,54 +979,73 @@
+ UHCI::FindIsochronousTransfer(uhci_td *descriptor)
+ {
+ 	// Simply check every last descriptor of the isochronous transfer list
+-	LockIsochronous();
+-	isochronous_transfer_data *transfer = fFirstIsochronousTransfer;
+-	while (transfer-&gt;descriptors[transfer-&gt;last_to_process] != descriptor) {
+-		transfer = transfer-&gt;link;
+-		if (!transfer)
+-			break;
++	if (LockIsochronous()) {
++		isochronous_transfer_data *transfer = fFirstIsochronousTransfer;
++		if (transfer) {
++			while (transfer-&gt;descriptors[transfer-&gt;last_to_process]
++				!= descriptor) {
++				transfer = transfer-&gt;link;
++				if (!transfer)
++					break;
++			}
++		}
++		UnlockIsochronous();
++		return transfer;
+ 	}
+-
+-	UnlockIsochronous();
+-	return transfer;
++	return NULL;
+ }
+ 
+ 
+-void
++status_t
+ UHCI::LinkIsochronousDescriptor(uhci_td *descriptor, uint16 frame)
+ {
+ 	// The transfer descriptor is appended to the last
+ 	// existing isochronous transfer descriptor (if any)
+ 	// in that frame.
+-	if (fFrameList[frame] &amp; FRAMELIST_NEXT_IS_QH) {
+-		// Insert the transfer descriptor in the first position
+-		descriptor-&gt;link_phy = fFrameList[frame];
+-		// No need to set the link_log as it is already NULL
+-		fFrameList[frame] = descriptor-&gt;this_phy &amp; ~FRAMELIST_NEXT_IS_QH;
+-		fFirstIsochronousDescriptor[frame] = descriptor;
+-		fLastIsochronousDescriptor[frame] = descriptor;
+-	} else {
+-		// Append to the last transfer descriptor
+-		descriptor-&gt;link_phy = fLastIsochronousDescriptor[frame]-&gt;link_phy;
+-		fLastIsochronousDescriptor[frame]-&gt;link_log = descriptor;
+-		fLastIsochronousDescriptor[frame]-&gt;link_phy
+-			= descriptor-&gt;this_phy &amp; ~TD_NEXT_IS_QH;
+-		fLastIsochronousDescriptor[frame] = descriptor;
++	if (LockIsochronous()) {
++		if (!fFirstIsochronousDescriptor[frame]) {
++			// Insert the transfer descriptor in the first position
++			fFrameList[frame] = descriptor-&gt;this_phy &amp; ~FRAMELIST_NEXT_IS_QH;
++			fFirstIsochronousDescriptor[frame] = descriptor;
++			fLastIsochronousDescriptor[frame] = descriptor;
++		} else {
++			// Append to the last transfer descriptor
++			fLastIsochronousDescriptor[frame]-&gt;link_log = descriptor;
++			fLastIsochronousDescriptor[frame]-&gt;link_phy
++				= descriptor-&gt;this_phy &amp; ~TD_NEXT_IS_QH;
++			fLastIsochronousDescriptor[frame] = descriptor;
++		}
++
++		descriptor-&gt;link_phy
++			= fQueues[UHCI_INTERRUPT_QUEUE]-&gt;PhysicalAddress() | TD_NEXT_IS_QH;
++		UnlockIsochronous();
++		return B_OK;
+ 	}
++	return B_ERROR;
+ }
+ 
+ 
+-void
+-UHCI::UnlinkIsochronousDescriptor(uhci_td *descriptor, uint16 frame)
++uhci_td *
++UHCI::UnlinkIsochronousDescriptor(uint16 frame)
+ {
+-	// The pointer to the descriptor is in descriptors[frame] and it will be
+-	// freed later.
+-	fFrameList[frame] = descriptor-&gt;link_phy;
+-	if (fFrameList[frame] &amp; FRAMELIST_NEXT_IS_QH) {
+-		fFirstIsochronousDescriptor[frame] = NULL;
+-		fLastIsochronousDescriptor[frame] = NULL;
+-	} else
+-		fFirstIsochronousDescriptor[frame] = (uhci_td *)descriptor-&gt;link_log;
++	// We always unlink from the top
++	if (LockIsochronous()) {
++		uhci_td *descriptor = fFirstIsochronousDescriptor[frame];
++		if (descriptor) {
++			// The descriptor will be freed later.
++			fFrameList[frame] = descriptor-&gt;link_phy;
++			if (descriptor-&gt;link_log) {
++				fFirstIsochronousDescriptor[frame]
++					= (uhci_td *)descriptor-&gt;link_log;
++			} else {
++				fFirstIsochronousDescriptor[frame] = NULL;
++				fLastIsochronousDescriptor[frame] = NULL;
++			}
++		}
++		UnlockIsochronous();
++		return descriptor;
++	}
++	return NULL;
+ }
+ 
+ 
+@@ -1233,47 +1285,38 @@
+ 
+ 			// Process the frame till it has isochronous descriptors in it.
+ 			while (!(fFrameList[currentFrame] &amp; FRAMELIST_NEXT_IS_QH)) {
+-				uhci_td *current = fFirstIsochronousDescriptor[currentFrame];
+-				UnlinkIsochronousDescriptor(current, currentFrame);
++				uhci_td *current = UnlinkIsochronousDescriptor(currentFrame);
+ 
+ 				// Process the transfer if we found the last descriptor
+-				if (current-&gt;status &amp; TD_CONTROL_IOC) {
+-					isochronous_transfer_data *transfer
+-						= FindIsochronousTransfer(current);
+-
+-					// The following should NEVER happen
+-					if (!transfer) {
+-						TRACE_ERROR((&quot;usb_uhci: Isochronous transfer not found&quot;
+-							&quot; in the finisher thread!\n&quot;));
+-						return;
+-
++				isochronous_transfer_data *transfer
++					= FindIsochronousTransfer(current);
+ 					// Process the descriptors only if it is still active and
+ 					// belongs to an inbound transfer. If the transfer is not
+ 					// active, it means the request has been removed, so simply
+ 					// remove the descriptors.
+-					} else if (transfer-&gt;is_active
+-						&amp;&amp; (current-&gt;status &amp; TD_TOKEN_IN)) {
++				if (transfer &amp;&amp; transfer-&gt;is_active) {
++					if (current-&gt;token &amp; TD_TOKEN_IN) {
+ 						iovec *vector = transfer-&gt;transfer-&gt;Vector();
+ 						transfer-&gt;transfer-&gt;PrepareKernelAccess();
+ 						ReadIsochronousDescriptorChain(transfer, vector);
++					}
+ 
+-						// Remove the transfer
+-						if (LockIsochronous()) {
+-							if (transfer == fFirstIsochronousTransfer)
+-								fFirstIsochronousTransfer = transfer-&gt;link;
+-							else {
+-								isochronous_transfer_data *temp
+-									= fFirstIsochronousTransfer;
+-								while (transfer != temp-&gt;link)
+-									temp = temp-&gt;link;
++					// Remove the transfer
++					if (LockIsochronous()) {
++						if (transfer == fFirstIsochronousTransfer)
++							fFirstIsochronousTransfer = transfer-&gt;link;
++						else {
++							isochronous_transfer_data *temp
++								= fFirstIsochronousTransfer;
++							while (transfer != temp-&gt;link)
++								temp = temp-&gt;link;
+ 
+-								if (transfer == fLastIsochronousTransfer)
+-									fLastIsochronousTransfer = temp;
+-								temp-&gt;link = temp-&gt;link-&gt;link;
+-							}
+-
+-							UnlockIsochronous();
++							if (transfer == fLastIsochronousTransfer)
++								fLastIsochronousTransfer = temp;
++							temp-&gt;link = temp-&gt;link-&gt;link;
+ 						}
++						UnlockIsochronous();
++					}
+ 
+ 					transfer-&gt;transfer-&gt;Finished(B_OK, 0);
+ 
+@@ -1286,7 +1329,6 @@
+ 					delete transfer-&gt;transfer;
+ 					delete transfer;
+ 					transferDone = true;
+-					}
+ 				}
+ 			}
+ 
+@@ -1295,7 +1337,6 @@
+ 			currentFrame = (currentFrame + 1) % NUMBER_OF_FRAMES;
+ 		}
+ 	}
+-
+ }
+ 
+ 
+@@ -1574,7 +1615,8 @@
+ 				continue;
+ 			}
+ 
+-			TRACE((&quot;usb_uhci: AddTo(): found at IRQ %u\n&quot;, item-&gt;u.h0.interrupt_line));
++			TRACE((&quot;usb_uhci: AddTo(): found at IRQ %u\n&quot;,
++				item-&gt;u.h0.interrupt_line));
+ 			UHCI *bus = new(std::nothrow) UHCI(item, stack);
+ 			if (!bus) {
+ 				delete item;
+@@ -1584,7 +1626,8 @@
+ 			}
+ 
+ 			if (bus-&gt;InitCheck() &lt; B_OK) {
+-				TRACE_ERROR((&quot;usb_uhci: AddTo(): InitCheck() failed 0x%08lx\n&quot;, bus-&gt;InitCheck()));
++				TRACE_ERROR((&quot;usb_uhci: AddTo(): InitCheck() failed 0x%08lx\n&quot;,
++					bus-&gt;InitCheck()));
+ 				delete bus;
+ 				continue;
+ 			}
+@@ -1979,9 +2022,9 @@
+ 	for (uint32 i = 0; i &lt; isochronousData-&gt;packet_count; i++) {
+ 		uhci_td *current = transfer-&gt;descriptors[i];
+ 
+-		size_t bufferSize
+-			= isochronousData-&gt;packet_descriptors[i].request_length;
+-		int16 actualLength = (current-&gt;status &amp; TD_STATUS_ACTLEN_MASK) + 1;
++		size_t bufferSize = current-&gt;buffer_size;
++		size_t actualLength = (current-&gt;status &amp; TD_STATUS_ACTLEN_MASK) + 1;
++
+ 		if (actualLength == TD_STATUS_ACTLEN_NULL + 1)
+ 			actualLength = 0;
+ 
+@@ -1989,9 +2032,11 @@
+ 
+ 		if (actualLength &gt; 0)
+ 			isochronousData-&gt;packet_descriptors[i].status = B_OK;
+-		else
++		else {
+ 			isochronousData-&gt;packet_descriptors[i].status = B_ERROR;
+-
++			vectorOffset += bufferSize;
++			continue;
++		}
+ 		memcpy((uint8 *)vector-&gt;iov_base + vectorOffset,
+ 			(uint8 *)current-&gt;buffer_log, bufferSize);
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2007-10-13 23:17:44 UTC (rev 22544)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2007-10-13 23:22:25 UTC (rev 22545)
+@@ -138,12 +138,10 @@
+ 		void						FinishIsochronousTransfers();
+ 		isochronous_transfer_data	*FindIsochronousTransfer(uhci_td *descriptor);
+ 
+-		void						LinkIsochronousDescriptor(
++		status_t					LinkIsochronousDescriptor(
+ 										uhci_td *descriptor,
+ 										uint16 frame);
+-		void						UnlinkIsochronousDescriptor(
+-										uhci_td *descriptor,
+-										uint16 frame);
++		uhci_td						*UnlinkIsochronousDescriptor(uint16 frame);
+ 
+ 		// Transfer queue functions
+ 		uhci_qh						*CreateTransferQueue(uhci_td *descriptor);
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci_rh.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci_rh.cpp	2007-10-13 23:17:44 UTC (rev 22544)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci_rh.cpp	2007-10-13 23:22:25 UTC (rev 22545)
+@@ -138,7 +138,6 @@
+ 		return B_ERROR;
+ 
+ 	usb_request_data *request = transfer-&gt;RequestData();
+-	TRACE((&quot;usb_uhci_roothub: request: %d\n&quot;, request-&gt;Request));
+ 
+ 	status_t status = B_TIMED_OUT;
+ 	size_t actualLength = 0;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004267.html">[Haiku-commits] r22544 - haiku/trunk/src/kits/storage
+</A></li>
+	<LI>Next message: <A HREF="004269.html">[Haiku-commits] r22546 - haiku/trunk/src/add-ons/disk_systems
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4268">[ date ]</a>
+              <a href="thread.html#4268">[ thread ]</a>
+              <a href="subject.html#4268">[ subject ]</a>
+              <a href="author.html#4268">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

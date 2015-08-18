@@ -1,0 +1,1068 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21735 - haiku/trunk/src/add-ons/kernel/drivers/tty
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21735%20-%20haiku/trunk/src/add-ons/kernel/drivers/tty&In-Reply-To=%3C200707290109.l6T19fIw012641%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003234.html">
+   <LINK REL="Next"  HREF="003236.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21735 - haiku/trunk/src/add-ons/kernel/drivers/tty</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21735%20-%20haiku/trunk/src/add-ons/kernel/drivers/tty&In-Reply-To=%3C200707290109.l6T19fIw012641%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21735 - haiku/trunk/src/add-ons/kernel/drivers/tty">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Jul 29 03:09:41 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003234.html">[Haiku-commits] r21734 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="003236.html">[Haiku-commits] r21736 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3235">[ date ]</a>
+              <a href="thread.html#3235">[ thread ]</a>
+              <a href="subject.html#3235">[ subject ]</a>
+              <a href="author.html#3235">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-07-29 03:09:39 +0200 (Sun, 29 Jul 2007)
+New Revision: 21735
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21735&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21735&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/tty/driver.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/tty/line_buffer.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/tty/line_buffer.h
+   haiku/trunk/src/add-ons/kernel/drivers/tty/master.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/tty/slave.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h
+Log:
+* Moved members pgrp_id, termios, window_size from the tty structure to
+  the new structure tty_settings of which there's only one instance per
+  master/slave tty pair. Previously the existence of two instances of those
+  members caused several kinds of problems, e.g. the Terminal setting
+  the window size on the master and CLI programs readings the unchanged
+  values from the slave. E.g. less correctly adjusts the display when the
+  Terminal size changes, now.
+* Reorganized writing to a TTY. We do no longer handle writes to master
+  and slave the same way. Writes to the master are &quot;input&quot; and need to
+  be processed differently from writes to the slave (&quot;output&quot;). Before,
+  both were processed first as output then as input, which caused incorrect
+  behavior. E.g. CRs were not echoed correctly.
+* Added canonical ERASE (backspace) and KILL (clear line) processing.
+  Couldn't really see it work. glibc's fgets() seems to read single
+  chars, so that we never have anything in the line buffer.
+* Added handling for EOF. Works well with Be's Terminal, ours seems to
+  write an ESC sequence instead of the EOF char (Ctrl-D), though.
+* Extended output processing support (ECHOE, ECHOK, ECHONL, OCRNL,
+  ONLRET, OLCUC).
+* Writes use user_memcpy() now.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/driver.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/driver.cpp	2007-07-29 01:06:36 UTC (rev 21734)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/driver.cpp	2007-07-29 01:09:39 UTC (rev 21735)
+@@ -102,8 +102,9 @@
+ 		if (++digit &gt; 15)
+ 			digit = 0, letter++;
+ 
+-		reset_tty(&amp;gMasterTTYs[i], i);
+-		reset_tty(&amp;gSlaveTTYs[i], i);
++		reset_tty(&amp;gMasterTTYs[i], i, true);
++		reset_tty(&amp;gSlaveTTYs[i], i, false);
++		reset_tty_settings(&amp;gTTYSettings[i], i);
+ 
+ 		if (!sDeviceNames[i] || !sDeviceNames[i + kNumTTYs]) {
+ 			uninit_driver();
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/line_buffer.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/line_buffer.cpp	2007-07-29 01:06:36 UTC (rev 21734)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/line_buffer.cpp	2007-07-29 01:09:39 UTC (rev 21735)
+@@ -57,7 +57,8 @@
+ 
+ 
+ ssize_t
+-line_buffer_user_read(struct line_buffer &amp;buffer, char *data, size_t length)
++line_buffer_user_read(struct line_buffer &amp;buffer, char *data, size_t length,
++	char eof, bool* hitEOF)
+ {
+ 	size_t available = buffer.in;
+ 
+@@ -67,6 +68,19 @@
+ 	if (length == 0)
+ 		return 0;
+ 
++	// check for EOF, if the caller asked us to
++	if (hitEOF) {
++		*hitEOF = false;
++		for (size_t i = 0; i &lt; available; i++) {
++			char c = buffer.buffer[(buffer.first + i) % buffer.size];
++			if (c == eof) {
++				*hitEOF = true;
++				length = i;
++				break;
++			}
++		}
++	}
++
+ 	ssize_t bytesRead = length;
+ 
+ 	if (buffer.first + length &lt; buffer.size) {
+@@ -88,6 +102,12 @@
+ 		buffer.in -= bytesRead;
+ 	}
+ 
++	// dispose of EOF char
++	if (hitEOF &amp;&amp; *hitEOF) {
++		buffer.first = (buffer.first + 1) % buffer.size;
++		buffer.in--;
++	}
++
+ 	return bytesRead;
+ }
+ 
+@@ -116,3 +136,14 @@
+ }
+ 
+ #endif
++
++
++bool
++line_buffer_tail_getc(struct line_buffer &amp;buffer, char *c)
++{
++	if (buffer.in == 0)
++		return false;
++
++	*c = buffer.buffer[(buffer.first + --buffer.in) % buffer.size];
++	return true;	
++}
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/line_buffer.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/line_buffer.h	2007-07-29 01:06:36 UTC (rev 21734)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/line_buffer.h	2007-07-29 01:09:39 UTC (rev 21735)
+@@ -21,9 +21,11 @@
+ status_t clear_line_buffer(struct line_buffer &amp;buffer);
+ int32 line_buffer_readable(struct line_buffer &amp;buffer);
+ int32 line_buffer_writable(struct line_buffer &amp;buffer);
+-ssize_t line_buffer_user_read(struct line_buffer &amp;buffer, char *data, size_t length);
++ssize_t line_buffer_user_read(struct line_buffer &amp;buffer, char *data,
++			size_t length, char eof = 0, bool* hitEOF = NULL);
+ status_t line_buffer_getc(struct line_buffer &amp;buffer, char *_c);
+ status_t line_buffer_putc(struct line_buffer &amp;buffer, char c);
+ status_t line_buffer_ungetc(struct line_buffer &amp;buffer, char *c);
++bool line_buffer_tail_getc(struct line_buffer &amp;buffer, char *c);
+ 
+ #endif	/* LINE_BUFFER_H */
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/master.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/master.cpp	2007-07-29 01:06:36 UTC (rev 21734)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/master.cpp	2007-07-29 01:09:39 UTC (rev 21735)
+@@ -173,7 +173,7 @@
+ 	TRACE((&quot;master_write: cookie %p, offset %Ld, buffer %p, length %lu\n&quot;,
+ 		_cookie, offset, buffer, *_length));
+ 
+-	status_t result = tty_write_to_tty(cookie, buffer, _length, true);
++	status_t result = tty_write_to_tty_master(cookie, buffer, _length);
+ 
+ 	TRACE((&quot;master_write done: cookie %p, result: %lx, length %lu\n&quot;, _cookie,
+ 		result, *_length));
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/slave.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/slave.cpp	2007-07-29 01:06:36 UTC (rev 21734)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/slave.cpp	2007-07-29 01:09:39 UTC (rev 21735)
+@@ -146,7 +146,7 @@
+ 	TRACE((&quot;slave_write: cookie %p, offset %Ld, buffer %p, length %lu\n&quot;,
+ 		_cookie, offset, buffer, *_length));
+ 
+-	status_t result = tty_write_to_tty(cookie, buffer, _length, false);
++	status_t result = tty_write_to_tty_slave(cookie, buffer, _length);
+ 
+ 	TRACE((&quot;slave_write done: cookie %p, result %lx, length %lu\n&quot;,
+ 		_cookie, result, *_length));
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp	2007-07-29 01:06:36 UTC (rev 21734)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp	2007-07-29 01:09:39 UTC (rev 21735)
+@@ -1,4 +1,5 @@
+ /*
++ * Copyright 2007, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at cs.tu-berlin.de.</A> All rights reserved.
+  * Copyright 2004-2006, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
+  * Distributed under the terms of the MIT License.
+  */
+@@ -8,11 +9,13 @@
+ // tailored for pseudo-TTYs. Have a look at Be's TTY includes (drivers/tty/*)
+ 
+ 
+-#include &lt;util/AutoLock.h&gt;
+-#include &lt;util/kernel_cpp.h&gt;
++#include &lt;ctype.h&gt;
+ #include &lt;signal.h&gt;
+ #include &lt;string.h&gt;
+ 
++#include &lt;util/AutoLock.h&gt;
++#include &lt;util/kernel_cpp.h&gt;
++
+ #include &quot;SemaphorePool.h&quot;
+ #include &quot;tty_private.h&quot;
+ 
+@@ -45,13 +48,13 @@
+ 	operations are done at a certain point when closing a cookie
+ 	(cf. tty_close_cookie() and TTYReference).
+ 
+-	tty::lock: Guards the access to tty::{input_buffer,termios,window_size,
+-	pgrp_id}. Moreover when held guarantees that tty::open_count won't drop
+-	to zero (both gGlobalTTYLock and tty::lock must be held to decrement
+-	it). A tty and the tty connected to it (master and slave) share the same
+-	lock. tty::lock is only valid when tty::open_count is &gt; 0. So before
+-	accessing tty::lock, it must be made sure that it is still valid. Given
+-	a tty_cookie, TTYReference can be used to do that, or otherwise
++	tty::lock: Guards the access to tty::{input_buffer,settings::{termios,
++	window_size,pgrp_id}}. Moreover when held guarantees that tty::open_count
++	won't drop to zero (both gGlobalTTYLock and tty::lock must be held to
++	decrement it). A tty and the tty connected to it (master and slave) share
++	the same lock. tty::lock is only valid when tty::open_count is &gt; 0. So
++	before accessing tty::lock, it must be made sure that it is still valid.
++	Given a tty_cookie, TTYReference can be used to do that, or otherwise
+ 	gGlobalTTYLock can be acquired and tty::open_count be checked.
+ 
+ 	gTTYRequestLock: Guards access to tty::{reader,writer}_queue (most
+@@ -79,6 +82,9 @@
+ */
+ 
+ 
++tty_settings gTTYSettings[kNumTTYs];
++
++
+ static void tty_notify_select_event(struct tty *tty, uint8 event);
+ static void tty_notify_if_available(struct tty *tty, struct tty *otherTTY,
+ 				bool notifySelect);
+@@ -252,6 +258,7 @@
+ 		first-&gt;Notify(bytesAvailable);
+ }
+ 
++
+ void
+ RequestQueue::NotifyError(status_t error)
+ {
+@@ -263,6 +270,7 @@
+ 	}
+ }
+ 
++
+ void
+ RequestQueue::NotifyError(tty_cookie *cookie, status_t error)
+ {
+@@ -369,7 +377,7 @@
+ 
+ 	// check, if already done
+ 	if (fError == B_OK 
+-		&amp;&amp; (!fRequests[0].WasNotified() || !fRequests[0].WasNotified())) {
++		&amp;&amp; (!fRequests[0].WasNotified() || !fRequests[1].WasNotified())) {
+ 		// not yet done
+ 
+ 		// set the semaphore
+@@ -478,7 +486,8 @@
+ 		// tty_close_cookie() pseudo request).
+ 
+ 		// get the echo mode
+-		fEcho = (fTarget-&gt;termios.c_lflag &amp; ECHO) != 0;
++		fEcho = (fSource-&gt;is_master
++			&amp;&amp; fSource-&gt;settings-&gt;termios.c_lflag &amp; ECHO) != 0;
+ 
+ 		// enqueue ourselves in the respective request queues
+ 		RecursiveLocker locker(gTTYRequestLock);
+@@ -542,7 +551,7 @@
+ 			return B_OK;
+ 	}
+ 
+-	// We are not the first in queue or currently there's nothing to read:
++	// We are not the first in queue or currently there's no space to write:
+ 	// bail out, if we shall not block.
+ 	if (dontBlock)
+ 		return B_WOULD_BLOCK;
+@@ -665,7 +674,7 @@
+ }
+ 
+ 
+-void
++static void
+ reset_termios(struct termios &amp;termios)
+ {
+ 	memset(&amp;termios, 0, sizeof(struct termios));
+@@ -682,6 +691,8 @@
+ 	termios.c_cc[VERASE] = CTRL('H');
+ 	termios.c_cc[VKILL] = CTRL('U');
+ 	termios.c_cc[VEOF] = CTRL('D');
++	termios.c_cc[VEOL] = '\0';
++	termios.c_cc[VEOL2] = '\0';
+ 	termios.c_cc[VSTART] = CTRL('S');
+ 	termios.c_cc[VSTOP] = CTRL('Q');
+ 	termios.c_cc[VSUSP] = CTRL('Z');
+@@ -689,25 +700,33 @@
+ 
+ 
+ void
+-reset_tty(struct tty *tty, int32 index)
++reset_tty_settings(tty_settings *settings, int32 index)
+ {
+-	reset_termios(tty-&gt;termios);
++	reset_termios(settings-&gt;termios);
+ 
+-	tty-&gt;open_count = 0;
+-	tty-&gt;index = index;
+-	tty-&gt;lock = NULL;
+-
+-	tty-&gt;pgrp_id = 0;
++	settings-&gt;pgrp_id = 0;
+ 		// this value prevents any signal of being sent
+ 
+ 	// some initial window size - the TTY in question should set these values
+-	tty-&gt;window_size.ws_col = 80;
+-	tty-&gt;window_size.ws_row = 25;
+-	tty-&gt;window_size.ws_xpixel = tty-&gt;window_size.ws_col * 8;
+-	tty-&gt;window_size.ws_ypixel = tty-&gt;window_size.ws_row * 8;
++	settings-&gt;window_size.ws_col = 80;
++	settings-&gt;window_size.ws_row = 25;
++	settings-&gt;window_size.ws_xpixel = settings-&gt;window_size.ws_col * 8;
++	settings-&gt;window_size.ws_ypixel = settings-&gt;window_size.ws_row * 8;
+ }
+ 
+ 
++void
++reset_tty(struct tty *tty, int32 index, bool isMaster)
++{
++	tty-&gt;open_count = 0;
++	tty-&gt;index = index;
++	tty-&gt;lock = NULL;
++	tty-&gt;settings = &amp;gTTYSettings[index];
++	tty-&gt;is_master = isMaster;
++	tty-&gt;pending_eof = 0;
++}
++
++
+ status_t
+ tty_output_getc(struct tty *tty, int *_c)
+ {
+@@ -719,64 +738,76 @@
+  *	Depending on the termios flags set, signals may be sent, the input
+  *	character changed or removed, etc.
+  */
+-
+ static void
+ tty_input_putc_locked(struct tty *tty, int c)
+ {
+-	tcflag_t flags = tty-&gt;termios.c_iflag;
+-
+ 	// process signals if needed
+ 
+-	if ((tty-&gt;termios.c_lflag &amp; ISIG) != 0) {
++	if ((tty-&gt;settings-&gt;termios.c_lflag &amp; ISIG) != 0) {
+ 		// enable signals, process INTR, QUIT, and SUSP
+ 		int signal = -1;
+ 
+-		if (c == tty-&gt;termios.c_cc[VINTR])
++		if (c == tty-&gt;settings-&gt;termios.c_cc[VINTR])
+ 			signal = SIGINT;
+-		else if (c == tty-&gt;termios.c_cc[VQUIT])
++		else if (c == tty-&gt;settings-&gt;termios.c_cc[VQUIT])
+ 			signal = SIGQUIT;
+-		else if (c == tty-&gt;termios.c_cc[VSUSP])
++		else if (c == tty-&gt;settings-&gt;termios.c_cc[VSUSP])
+ 			// ToDo: what to do here?
+ 			signal = -1;
+ 
+ 		// do we need to deliver a signal?
+ 		if (signal != -1) {
+ 			// we may have to flush the input buffer
+-			if ((tty-&gt;termios.c_lflag &amp; NOFLSH) == 0)
++			if ((tty-&gt;settings-&gt;termios.c_lflag &amp; NOFLSH) == 0)
+ 				clear_line_buffer(tty-&gt;input_buffer);
+ 
+-			if (tty-&gt;pgrp_id != 0)
+-				send_signal(-tty-&gt;pgrp_id, signal);
++			if (tty-&gt;settings-&gt;pgrp_id != 0)
++				send_signal(-tty-&gt;settings-&gt;pgrp_id, signal);
+ 			return;
+ 		}
+ 	}
+ 
+ 	// process special canonical input characters
+ 
+-	if ((tty-&gt;termios.c_lflag &amp; ICANON) != 0) {
++	if ((tty-&gt;settings-&gt;termios.c_lflag &amp; ICANON) != 0) {
+ 		// canonical mode, process ERASE and KILL
+-		if (c == tty-&gt;termios.c_cc[VERASE]) {
+-			// ToDo: erase one character
++		cc_t* controlChars = tty-&gt;settings-&gt;termios.c_cc;
++
++		if (c == controlChars[VERASE]) {
++			// erase one character
++			char lastChar;
++			if (line_buffer_tail_getc(tty-&gt;input_buffer, &amp;lastChar)) {
++				if (lastChar == controlChars[VEOF]
++					|| lastChar == controlChars[VEOL]
++					|| lastChar == '\n' || lastChar == '\r') {
++					// EOF or end of line -- put it back
++					line_buffer_putc(tty-&gt;input_buffer, lastChar);
++				}
++			}
+ 			return;
+-		} else if (c == tty-&gt;termios.c_cc[VKILL]) {
+-			// ToDo: erase line
++		} else if (c == controlChars[VKILL]) {
++			// erase line
++			char lastChar;
++			while (line_buffer_tail_getc(tty-&gt;input_buffer, &amp;lastChar)) {
++				if (lastChar == controlChars[VEOF]
++					|| lastChar == controlChars[VEOL]
++					|| lastChar == '\n' || lastChar == '\r') {
++					// EOF or end of line -- put it back
++					line_buffer_putc(tty-&gt;input_buffer, lastChar);
++					break;
++				}
++			}
+ 			return;
++		} else if (c == controlChars[VEOF]) {
++			// we still write the EOF to the stream -- tty_input_read() needs
++			// to recognize it
++			tty-&gt;pending_eof++;
+ 		}
+ 	}
+ 
+-	// character conversions
++	// Input character conversions have already been done. What reaches this
++	// point can directly be written to the line buffer.
+ 
+-	if (c == '\n' &amp;&amp; (flags &amp; INLCR) != 0) {
+-		// map NL to CR
+-		c = '\r';
+-	} else if (c == '\r') {
+-		if (flags &amp; IGNCR)	// ignore CR
+-			return;
+-		if (flags &amp; ICRNL)	// map CR to NL
+-			c = '\n';
+-	} if (flags &amp; ISTRIP)	// strip the highest bit
+-		c &amp;= 0x7f;
+-
+ 	line_buffer_putc(tty-&gt;input_buffer, c);
+ }
+ 
+@@ -1033,6 +1064,130 @@
+ }
+ 
+ 
++/*!
++	\brief Performs input character conversion and writes the result to
++		\a buffer.
++	\param tty The master tty.
++	\param c The input character.
++	\param buffer The buffer to which to write the converted character.
++	\param _bytesNeeded The number of bytes needed in the target tty's
++		line buffer.
++	\return \c true, if the character shall be processed further, \c false, if
++		it shall be skipped.
++*/
++static bool
++process_input_char(struct tty* tty, char c, char* buffer,
++	size_t* _bytesNeeded)
++{
++	tcflag_t flags = tty-&gt;settings-&gt;termios.c_iflag;
++
++	// signals
++	if (tty-&gt;settings-&gt;termios.c_lflag &amp; ISIG) {
++		if (c == tty-&gt;settings-&gt;termios.c_cc[VINTR]
++			|| c == tty-&gt;settings-&gt;termios.c_cc[VQUIT]
++			|| c == tty-&gt;settings-&gt;termios.c_cc[VSUSP]) {
++			*buffer = c;
++			*_bytesNeeded = 0;
++			return true;
++		}
++	}
++
++	// canonical input characters
++	if (tty-&gt;settings-&gt;termios.c_lflag &amp; ICANON) {
++		if (c == tty-&gt;settings-&gt;termios.c_cc[VERASE]
++			|| c == tty-&gt;settings-&gt;termios.c_cc[VKILL]) {
++			*buffer = c;
++			*_bytesNeeded = 0;
++			return true;
++		}
++	}
++
++	// convert chars
++	if (c == '\r') {
++		if (flags &amp; IGNCR)		// ignore CR
++			return false;
++		if (flags &amp; ICRNL)		// CR -&gt; NL
++			c = '\n';
++	} else if (c == '\n') {
++		if (flags &amp; INLCR)		// NL -&gt; CR
++			c = '\r';
++	} else if (flags &amp; ISTRIP)	// strip of eighth bit
++		c &amp;= 0x7f;
++
++	*buffer = c;
++	*_bytesNeeded = 1;
++	return true;
++}
++
++/*!
++	\brief Performs output character conversion and writes the result to
++		\a buffer.
++	\param tty The master tty.
++	\param c The output character.
++	\param buffer The buffer to which to write the converted character(s).
++	\param _bytesWritten The number of bytes written to the output buffer
++		(max 3).
++	\param echoed \c true if the output char to be processed has been echoed
++		from the input.
++*/
++static void
++process_output_char(struct tty* tty, char c, char* buffer,
++	size_t *_bytesWritten, bool echoed)
++{
++	tcflag_t flags = tty-&gt;settings-&gt;termios.c_oflag;
++
++	if (flags &amp; OPOST) {
++		if (echoed &amp;&amp; c == tty-&gt;settings-&gt;termios.c_cc[VERASE]) {
++			if (tty-&gt;settings-&gt;termios.c_lflag &amp; ECHOE) {
++				// ERASE -&gt; ERASE SPACE ERASE
++				buffer[0] = tty-&gt;settings-&gt;termios.c_cc[VERASE];
++				buffer[1] = ' ';
++				buffer[2] = tty-&gt;settings-&gt;termios.c_cc[VERASE];
++				*_bytesWritten = 3;
++				return;
++			}
++		} else if (echoed &amp;&amp; c == tty-&gt;settings-&gt;termios.c_cc[VKILL]) {
++			if (!(tty-&gt;settings-&gt;termios.c_lflag &amp; ECHOK)) {
++				// don't echo KILL
++				*_bytesWritten = 0;
++				return;
++			}
++		} else if (echoed &amp;&amp; c == tty-&gt;settings-&gt;termios.c_cc[VEOF]) {
++			// don't echo EOF
++			*_bytesWritten = 0;
++			return;
++		} else if (c == '\n') {
++			if (echoed &amp;&amp; !(tty-&gt;settings-&gt;termios.c_lflag &amp; ECHONL)) {
++				// don't echo NL
++				*_bytesWritten = 0;
++				return;
++			}
++			if (flags &amp; ONLCR) {			// NL -&gt; CR-NL
++				buffer[0] = '\r';
++				buffer[1] = '\n';
++				*_bytesWritten = 2;
++				return;
++			}
++		} else if (c == '\r') {
++			if (flags &amp; OCRNL) {			// CR -&gt; NL
++				c = '\n';
++			} else if (flags &amp; ONLRET) {	// NL also does RET, ignore CR
++				*_bytesWritten = 0;
++				return;
++			} else if (flags &amp; ONOCR) {		// don't output CR at column 0
++				// TODO: We can't decide that here.
++			}
++		} else {
++			if (flags &amp; OLCUC)				// lower case -&gt; upper case
++				c = toupper(c);
++		}
++	}
++
++	*buffer = c;
++	*_bytesWritten = 1;
++}
++
++
+ //	#pragma mark -
+ //	device functions
+ 
+@@ -1096,44 +1251,54 @@
+ 
+ 		case TCGETA:
+ 			TRACE((&quot;tty: get attributes\n&quot;));
+-			return user_memcpy(buffer, &amp;tty-&gt;termios, sizeof(struct termios));
++			return user_memcpy(buffer, &amp;tty-&gt;settings-&gt;termios,
++				sizeof(struct termios));
+ 
+ 		case TCSETA:
+ 		case TCSETAW:
+ 		case TCSETAF:
+-			TRACE((&quot;tty: set attributes (iflag = %lx, oflag = %lx, cflag = %lx, lflag = %lx)\n&quot;,
+-				tty-&gt;termios.c_iflag, tty-&gt;termios.c_oflag, tty-&gt;termios.c_cflag, tty-&gt;termios.c_lflag));
++			TRACE((&quot;tty: set attributes (iflag = %lx, oflag = %lx, &quot;
++				&quot;cflag = %lx, lflag = %lx)\n&quot;, tty-&gt;settings-&gt;termios.c_iflag,
++				tty-&gt;settings-&gt;termios.c_oflag, tty-&gt;settings-&gt;termios.c_cflag,
++				tty-&gt;settings-&gt;termios.c_lflag));
+ 
+-			return user_memcpy(&amp;tty-&gt;termios, buffer, sizeof(struct termios));
++			return user_memcpy(&amp;tty-&gt;settings-&gt;termios, buffer,
++				sizeof(struct termios));
+ 
+ 		/* get and set process group ID */
+ 
+ 		case TIOCGPGRP:
+ 			TRACE((&quot;tty: get pgrp_id\n&quot;));
+-			return user_memcpy(buffer, &amp;tty-&gt;pgrp_id, sizeof(pid_t));
++			return user_memcpy(buffer, &amp;tty-&gt;settings-&gt;pgrp_id, sizeof(pid_t));
+ 		case TIOCSPGRP:
+ 		case 'pgid':
+ 			TRACE((&quot;tty: set pgrp_id\n&quot;));
+-			return user_memcpy(&amp;tty-&gt;pgrp_id, buffer, sizeof(pid_t));
++			return user_memcpy(&amp;tty-&gt;settings-&gt;pgrp_id, buffer, sizeof(pid_t));
+ 
+ 		/* get and set window size */
+ 
+ 		case TIOCGWINSZ:
+ 			TRACE((&quot;tty: set window size\n&quot;));
+-			return user_memcpy(buffer, &amp;tty-&gt;window_size, sizeof(struct winsize));
++			return user_memcpy(buffer, &amp;tty-&gt;settings-&gt;window_size,
++				sizeof(struct winsize));
+ 
+ 		case TIOCSWINSZ:
+ 		{
+-			uint16 oldColumns = tty-&gt;window_size.ws_col, oldRows = tty-&gt;window_size.ws_row;
++			uint16 oldColumns = tty-&gt;settings-&gt;window_size.ws_col;
++			uint16 oldRows = tty-&gt;settings-&gt;window_size.ws_row;
+ 
+ 			TRACE((&quot;tty: set window size\n&quot;));
+-			if (user_memcpy(&amp;tty-&gt;window_size, buffer, sizeof(struct winsize)) &lt; B_OK)
++			if (user_memcpy(&amp;tty-&gt;settings-&gt;window_size, buffer,
++					sizeof(struct winsize)) &lt; B_OK) {
+ 				return B_BAD_ADDRESS;
++			}
+ 
+ 			// send a signal only if the window size has changed
+-			if ((oldColumns != tty-&gt;window_size.ws_col || oldRows != tty-&gt;window_size.ws_row)
+-				&amp;&amp; tty-&gt;pgrp_id != 0)
+-				send_signal(-tty-&gt;pgrp_id, SIGWINCH);
++			if ((oldColumns != tty-&gt;settings-&gt;window_size.ws_col
++					|| oldRows != tty-&gt;settings-&gt;window_size.ws_row)
++				&amp;&amp; tty-&gt;settings-&gt;pgrp_id != 0) {
++				send_signal(-tty-&gt;settings-&gt;pgrp_id, SIGWINCH);
++			}
+ 
+ 			return B_OK;
+ 		}
+@@ -1172,14 +1337,21 @@
+ 			return status;
+ 		}
+ 
+-		// ToDo: add support for ICANON mode
++		bool _hitEOF = false;
++		bool* hitEOF = (tty-&gt;pending_eof &gt; 0 ? &amp;_hitEOF : NULL);
+ 
+ 		bytesRead = line_buffer_user_read(tty-&gt;input_buffer, (char *)buffer,
+-			length);
++			length, tty-&gt;settings-&gt;termios.c_cc[VEOF], hitEOF);
+ 		if (bytesRead &lt; B_OK) {
+ 			*_length = 0;
+ 			return bytesRead;
+ 		}
++
++		// we hit an EOF char -- bail out, whatever amount of data we have
++		if (hitEOF &amp;&amp; *hitEOF) {
++			tty-&gt;pending_eof--;
++			break;
++		}
+ 	}
+ 
+ 	*_length = bytesRead;
+@@ -1187,13 +1359,12 @@
+ }
+ 
+ 
+-status_t
+-tty_write_to_tty(tty_cookie *sourceCookie, const void *buffer, size_t *_length,
+-	bool sourceIsMaster)
++static status_t
++tty_write_to_tty_master_unsafe(tty_cookie *sourceCookie, const char *data,
++	size_t *_length)
+ {
+ 	struct tty *source = sourceCookie-&gt;tty;
+ 	struct tty *target = sourceCookie-&gt;other_tty;
+-	const char *data = (const char *)buffer;
+ 	size_t length = *_length;
+ 	size_t bytesWritten = 0;
+ 	uint32 mode = sourceCookie-&gt;open_mode;
+@@ -1213,72 +1384,172 @@
+ 	if (target-&gt;open_count &lt;= 0)
+ 		return B_FILE_ERROR;
+ 
+-	bool echo = (target-&gt;termios.c_lflag &amp; ECHO) != 0;
+-		// Confusingly enough, we need to echo when the target's ECHO flag is
+-		// set. That's because our target is supposed to echo back at us, not
+-		// to itself.
++	bool echo = (source-&gt;settings-&gt;termios.c_lflag &amp; ECHO) != 0;
+ 
+-	TRACE((&quot;tty_write_to_tty(source = %p, target = %p, length = %lu, %s%s)\n&quot;, source, target, length,
+-		sourceIsMaster ? &quot;master&quot; : &quot;slave&quot;, echo ? &quot;, echo mode&quot; : &quot;&quot;));
++	TRACE((&quot;tty_write_to_tty_master(source = %p, target = %p, &quot;
++		&quot;length = %lu%s)\n&quot;, source, target, length,
++		(echo ? &quot;, echo mode&quot; : &quot;&quot;)));
+ 
+-	// ToDo: &quot;buffer&quot; is not yet copied or accessed in a safe way!
++	status_t status = locker.AcquireWriter(dontBlock, 0);
++	if (status != B_OK) {
++		*_length = 0;
++		return status;
++	}
++	size_t writable = locker.AvailableBytes();
+ 
+-	size_t bytesNeeded = 1;
+-
+ 	while (bytesWritten &lt; length) {
+-		status_t status = locker.AcquireWriter(dontBlock, bytesNeeded);
+-		if (status != B_OK) {
+-			*_length = bytesWritten;
+-			return status;
++		// fetch next char and do input processing
++		char c;
++		size_t bytesNeeded;
++		if (!process_input_char(source, *data, &amp;c, &amp;bytesNeeded)) {
++			// input char shall be skipped
++			data++;
++			bytesWritten++;
++			continue;
+ 		}
+ 
+-		bytesNeeded = 1;	// reset
++		// If in echo mode, we do the output conversion and need to update
++		// the needed bytes count.
++		char echoBuffer[3];
++		size_t echoBytes;
++		if (echo) {
++			process_output_char(source, c, echoBuffer, &amp;echoBytes, true);
++			if (echoBytes &gt; bytesNeeded)
++				bytesNeeded = echoBytes;
++		}
+ 
+-		size_t writable = locker.AvailableBytes();
+-		if (writable == 0) {
+-			// should never happen
++		// If there's not enough space to write what we have, we need to wait
++		// until it is available.
++		if (writable &lt; bytesNeeded) {
++			status = locker.AcquireWriter(dontBlock, bytesNeeded);
++			if (status != B_OK) {
++				*_length = bytesWritten;
++				return status;
++			}
++
++			writable = locker.AvailableBytes();
++
++			// We need to restart the loop, since the termios flags might have
++			// changed in the meantime (while we've unlocked the tty). Note,
++			// that we don't re-get &quot;echo&quot; -- maybe we should.
+ 			continue;
+ 		}
+ 
+-		while (writable &gt; 0 &amp;&amp; bytesWritten &lt; length) {
+-			char c = data[0];
++		// write the bytes
++		tty_input_putc_locked(target, c);
+ 
+-			if (c == '\n' &amp;&amp; (source-&gt;termios.c_oflag &amp; (OPOST | ONLCR)) == OPOST | ONLCR) {
+-				// post-process output and transfrom '\n' to '\r\n'
++		if (echo) {
++			for (size_t i = 0; i &lt; echoBytes; i++)
++				line_buffer_putc(source-&gt;input_buffer, echoBuffer[i]);
++		}
+ 
+-				// If we can't write both '\r' and '\n', we won't write either,
+-				// or we would write the '\r' again.
+-				if (writable &lt; 2) {
+-					// try acquiring the writer again, when enough space is available
+-					bytesNeeded = 2;
+-					writable = 0;
+-						// make sure we're breaking out of this loop
+-					continue;
+-				}
++		writable -= bytesNeeded;
++		data++;
++		bytesWritten++;
++	}
+ 
+-#if 1
+-	// ToDo: this doesn't fix the bug that is responsible for the doubled shell prompt
+-	//		and it's all wrong, too - but it cures the symptoms, and that's good enough
+-	//		for now :)
+-	//		Apparently, the shell reads only single bytes and handles both, '\r' and '\n'
+-	//		as a newline.
+-				if (!sourceIsMaster)
+-#endif
+-				tty_input_putc_locked(target, '\r');
+-			 	if (echo)
+-					tty_input_putc_locked(source, '\r');
++	return B_OK;
++}
+ 
+-				if (--writable == 0)
+-					continue;
++
++status_t
++tty_write_to_tty_master(tty_cookie *sourceCookie, const void *_buffer,
++	size_t *_length)
++{
++	const char* buffer = (const char*)_buffer;
++	size_t bytesRemaining = *_length;
++	*_length = 0;
++
++	while (bytesRemaining &gt; 0) {
++		// copy data to stack
++		char safeBuffer[256];
++		size_t toWrite = min_c(sizeof(safeBuffer), bytesRemaining);
++		status_t error = user_memcpy(safeBuffer, buffer, toWrite);
++		if (error != B_OK)
++			return error;
++
++		// write them
++		size_t written = toWrite;
++		error = tty_write_to_tty_master_unsafe(sourceCookie, safeBuffer,
++			&amp;written);
++		if (error != B_OK)
++			return error;
++
++		buffer += written;
++		bytesRemaining -= written;
++		*_length += written;
++
++		if (written &lt; toWrite)
++			return B_OK;
++	}
++
++	return B_OK;
++}
++
++
++static status_t
++tty_write_to_tty_slave_unsafe(tty_cookie *sourceCookie, const char *data,
++	size_t *_length)
++{
++	struct tty *target = sourceCookie-&gt;other_tty;
++	size_t length = *_length;
++	size_t bytesWritten = 0;
++	uint32 mode = sourceCookie-&gt;open_mode;
++	bool dontBlock = (mode &amp; O_NONBLOCK) != 0;
++
++	// bail out, if source is already closed
++	TTYReference sourceTTYReference(sourceCookie);
++	if (!sourceTTYReference.IsLocked())
++		return B_FILE_ERROR;
++
++	if (length == 0)
++		return B_OK;
++
++	WriterLocker locker(sourceCookie);
++
++	// if the target is not open, fail now
++	if (target-&gt;open_count &lt;= 0)
++		return B_FILE_ERROR;
++
++	TRACE((&quot;tty_write_to_tty_slave(source = %p, target = %p, length = %lu)\n&quot;,
++		sourceCookie-&gt;tty, target, length));
++
++	status_t status = locker.AcquireWriter(dontBlock, 0);
++	if (status != B_OK) {
++		*_length = 0;
++		return status;
++	}
++	size_t writable = locker.AvailableBytes();
++
++	while (bytesWritten &lt; length) {
++		// fetch next char and do output processing
++		char buffer[3];
++		size_t bytesNeeded;
++		process_output_char(target, *data, buffer, &amp;bytesNeeded, false);
++
++		// If there's not enough space to write what we have, we need to wait
++		// until it is available.
++		if (writable &lt; bytesNeeded) {
++			status = locker.AcquireWriter(dontBlock, bytesNeeded);
++			if (status != B_OK) {
++				*_length = bytesWritten;
++				return status;
+ 			}
+ 
+-			tty_input_putc_locked(target, c);
+-			if (echo)
+-				tty_input_putc_locked(source, c);
++			writable = locker.AvailableBytes();
+ 
+-			data++;
+-			bytesWritten++;
++			// We need to restart the loop, since the termios flags might have
++			// changed in the meantime (while we've unlocked the tty).
++			continue;
+ 		}
++
++		// write the bytes
++		for (size_t i = 0; i &lt; bytesNeeded; i++)
++			tty_input_putc_locked(target, buffer[i]);
++
++		writable -= bytesNeeded;
++		data++;
++		bytesWritten++;
+ 	}
+ 
+ 	return B_OK;
+@@ -1286,6 +1557,41 @@
+ 
+ 
+ status_t
++tty_write_to_tty_slave(tty_cookie *sourceCookie, const void *_buffer,
++	size_t *_length)
++{
++	const char* buffer = (const char*)_buffer;
++	size_t bytesRemaining = *_length;
++	*_length = 0;
++
++	while (bytesRemaining &gt; 0) {
++		// copy data to stack
++		char safeBuffer[256];
++		size_t toWrite = min_c(sizeof(safeBuffer), bytesRemaining);
++		status_t error = user_memcpy(safeBuffer, buffer, toWrite);
++		if (error != B_OK)
++			return error;
++
++		// write them
++		size_t written = toWrite;
++		error = tty_write_to_tty_slave_unsafe(sourceCookie, safeBuffer,
++			&amp;written);
++		if (error != B_OK)
++			return error;
++
++		buffer += written;
++		bytesRemaining -= written;
++		*_length += written;
++
++		if (written &lt; toWrite)
++			return B_OK;
++	}
++
++	return B_OK;
++}
++
++
++status_t
+ tty_select(tty_cookie *cookie, uint8 event, uint32 ref, selectsync *sync)
+ {
+ 	struct tty *tty = cookie-&gt;tty;
+@@ -1346,9 +1652,10 @@
+ 				break;
+ 			}
+ 
+-			// In case the other TTY echos, we have to check, whether we can
++			// In case input is echoed, we have to check, whether we can
+ 			// currently can write to our TTY as well.
+-			bool echo = (otherTTY-&gt;termios.c_lflag &amp; ECHO);
++			bool echo = (tty-&gt;is_master
++				&amp;&amp; tty-&gt;settings-&gt;termios.c_lflag &amp; ECHO);
+ 
+ 			if (otherTTY-&gt;writer_queue.IsEmpty()
+ 				&amp;&amp; line_buffer_writable(otherTTY-&gt;input_buffer) &gt; 0) {
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h	2007-07-29 01:06:36 UTC (rev 21734)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h	2007-07-29 01:09:39 UTC (rev 21735)
+@@ -118,24 +118,31 @@
+ 
+ typedef DoublyLinkedList&lt;tty_cookie&gt; TTYCookieList;
+ 
++struct tty_settings {
++	pid_t				pgrp_id;
++	struct termios		termios;
++	struct winsize		window_size;
++};
++
+ struct tty {
+ 	int32				open_count;
+ 	int32				index;
+-	struct mutex		*lock;
++	struct mutex*		lock;
++	tty_settings*		settings;
+ 	RequestQueue		reader_queue;
+ 	RequestQueue		writer_queue;
+ 	TTYCookieList		cookies;
+-	pid_t				pgrp_id;
+ 	line_buffer			input_buffer;
+ 	tty_service_func	service_func;
+-	struct termios		termios;
+-	struct winsize		window_size;
++	uint32				pending_eof;
++	bool				is_master;
+ };
+ 
+ static const uint32 kNumTTYs = 64;
+ 
+ extern tty gMasterTTYs[kNumTTYs];
+ extern tty gSlaveTTYs[kNumTTYs];
++extern tty_settings gTTYSettings[kNumTTYs];
+ 
+ extern device_hooks gMasterTTYHooks;
+ extern device_hooks gSlaveTTYHooks;
+@@ -149,13 +156,16 @@
+ // functions available for master/slave TTYs
+ 
+ extern int32 get_tty_index(const char *name);
+-extern void reset_tty(struct tty *tty, int32 index);
++extern void reset_tty(struct tty *tty, int32 index, bool isMaster);
++extern void reset_tty_settings(tty_settings *settings, int32 index);
+ //extern status_t tty_input_putc(struct tty *tty, int c);
+ extern status_t tty_input_read(tty_cookie *cookie, void *buffer,
+ 					size_t *_length);
+ extern status_t tty_output_getc(struct tty *tty, int *_c);
+-extern status_t tty_write_to_tty(tty_cookie *sourceCookie, const void *buffer,
+-					size_t *_length, bool sourceIsMaster);
++extern status_t tty_write_to_tty_master(tty_cookie *sourceCookie,
++					const void *buffer, size_t *_length);
++extern status_t tty_write_to_tty_slave(tty_cookie *sourceCookie,
++					const void *buffer, size_t *_length);
+ 
+ extern status_t init_tty_cookie(tty_cookie *cookie, struct tty *tty,
+ 					struct tty *otherTTY, uint32 openMode);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003234.html">[Haiku-commits] r21734 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="003236.html">[Haiku-commits] r21736 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3235">[ date ]</a>
+              <a href="thread.html#3235">[ thread ]</a>
+              <a href="subject.html#3235">[ subject ]</a>
+              <a href="author.html#3235">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

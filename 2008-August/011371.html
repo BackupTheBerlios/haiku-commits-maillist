@@ -1,0 +1,241 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27232 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27232%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808291345.m7TDj9hh025047%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011370.html">
+   <LINK REL="Next"  HREF="011373.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27232 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27232%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808291345.m7TDj9hh025047%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27232 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Aug 29 15:45:09 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011370.html">[Haiku-commits] r27231 - haiku/branches/developer
+</A></li>
+        <LI>Next message: <A HREF="011373.html">[Haiku-commits] r27233 - haiku/trunk/headers/private/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11371">[ date ]</a>
+              <a href="thread.html#11371">[ thread ]</a>
+              <a href="subject.html#11371">[ subject ]</a>
+              <a href="author.html#11371">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-29 15:45:08 +0200 (Fri, 29 Aug 2008)
+New Revision: 27232
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27232&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27232&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+Log:
+Adding/removing swap files:
+* swap_file_add() open()s the swap file now with O_NOCACHE and
+  swap_file_delete() closes it. This squashes a TODO (the file cache
+  wasn't kept disabled for the swap file before).
+* swap_file_add() only adds swap files that can actually be used (i.e.
+  non 0-sized ones).
+
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-29 13:38:20 UTC (rev 27231)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-29 13:45:08 UTC (rev 27232)
+@@ -21,6 +21,7 @@
+ 
+ #include &lt;arch_config.h&gt;
+ #include &lt;driver_settings.h&gt;
++#include &lt;fs/fd.h&gt;
+ #include &lt;fs_interface.h&gt;
+ #include &lt;heap.h&gt;
+ #include &lt;kernel_daemon.h&gt;
+@@ -80,7 +81,9 @@
+ // anymore.
+ 
+ struct swap_file : DoublyLinkedListLinkImpl&lt;swap_file&gt; {
++	int				fd;
+ 	struct vnode	*vnode;
++	void			*cookie;
+ 	swap_addr_t		first_slot;
+ 	swap_addr_t		last_slot;
+ 	swap_addr_t		used;   // # of slots used
+@@ -569,8 +572,8 @@
+ 
+ 		off_t pos = (startSlotIndex - swapFile-&gt;first_slot) * B_PAGE_SIZE;
+ 
+-		status_t status = vfs_read_pages(swapFile-&gt;vnode, NULL, pos, vecs + i,
+-				j - i, 0, _numBytes);
++		status_t status = vfs_read_pages(swapFile-&gt;vnode, swapFile-&gt;cookie, pos,
++			vecs + i, j - i, 0, _numBytes);
+ 		if (status != B_OK)
+ 			return status;
+ 	}
+@@ -618,8 +621,8 @@
+ 
+ 		off_t pos = (slotIndex - swapFile-&gt;first_slot) * B_PAGE_SIZE;
+ 
+-		status_t status = vfs_write_pages(swapFile-&gt;vnode, NULL, pos, vecs + i,
+-				n, flags, _numBytes);
++		status_t status = vfs_write_pages(swapFile-&gt;vnode, swapFile-&gt;cookie,
++			pos, vecs + i, n, flags, _numBytes);
+ 		if (status != B_OK) {
+ 			locker.Lock();
+ 			fAllocatedSwapSize -= n * B_PAGE_SIZE;
+@@ -689,8 +692,8 @@
+ 	swap_file* swapFile = find_swap_file(slotIndex);
+ 	off_t pos = (slotIndex - swapFile-&gt;first_slot) * B_PAGE_SIZE;
+ 
+-	return vfs_asynchronous_write_pages(swapFile-&gt;vnode, NULL, pos, vecs, 1,
+-		numBytes, flags, callback);
++	return vfs_asynchronous_write_pages(swapFile-&gt;vnode, swapFile-&gt;cookie, pos,
++		vecs, 1, numBytes, flags, callback);
+ }
+ 
+ 
+@@ -1054,40 +1057,56 @@
+ status_t
+ swap_file_add(char *path)
+ {
+-	vnode *node = NULL;
+-	status_t status = vfs_get_vnode_from_path(path, true, &amp;node);
+-	if (status != B_OK)
+-		return status;
++	// open the file
++	int fd = open(path, O_RDWR | O_NOCACHE, S_IRUSR | S_IWUSR);
++	if (fd &lt; 0)
++		return errno;
+ 
++	// fstat() it and check whether we can use it
++	struct stat st;
++	if (fstat(fd, &amp;st) &lt; 0) {
++		close(fd);
++		return errno;
++	}
++
++	if (!(S_ISREG(st.st_mode) || S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))) {
++		close(fd);
++		return B_BAD_VALUE;
++	}
++
++	if (st.st_size &lt; B_PAGE_SIZE) {
++		close(fd);
++		return B_BAD_VALUE;
++	}
++
++	// get file descriptor, vnode, and cookie
++	file_descriptor* descriptor = get_fd(get_current_io_context(true), fd);
++	put_fd(descriptor);
++
++	vnode *node = fd_vnode(descriptor);
++	if (node == NULL) {
++		close(fd);
++		return B_BAD_VALUE;
++	}
++
++	// do the allocations and prepare the swap_file structure
+ 	swap_file *swap = (swap_file *)malloc(sizeof(swap_file));
+ 	if (swap == NULL) {
+-		vfs_put_vnode(node);
++		close(fd);
+ 		return B_NO_MEMORY;
+ 	}
+ 
++	swap-&gt;fd = fd;
+ 	swap-&gt;vnode = node;
++	swap-&gt;cookie = descriptor-&gt;cookie;
+ 
+-	struct stat st;
+-	status = vfs_stat_vnode(node, &amp;st);
+-	if (status != B_OK) {
+-		free(swap);
+-		vfs_put_vnode(node);
+-		return status;
+-    }
+-
+-	if (!(S_ISREG(st.st_mode) || S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode))) {
+-		free(swap);
+-		vfs_put_vnode(node);
+-		return B_ERROR;
+-	}
+-
+ 	int32 pageCount = st.st_size &gt;&gt; PAGE_SHIFT;
+ 	swap-&gt;used = 0;
+ 
+ 	swap-&gt;maps = (uint32 *)malloc((pageCount + 7) / 8);
+ 	if (swap-&gt;maps == NULL) {
+ 		free(swap);
+-		vfs_put_vnode(node);
++		close(fd);
+ 		return B_NO_MEMORY;
+ 	}
+ 	memset(swap-&gt;maps, 0, (pageCount + 7) / 8);
+@@ -1095,6 +1114,7 @@
+ 
+ 	// set slot index and add this file to swap file list
+ 	mutex_lock(&amp;sSwapFileListLock);
++	// TODO: Also check whether the swap file is already registered!
+ 	if (sSwapFileList.IsEmpty()) {
+ 		swap-&gt;first_slot = 0;
+ 		swap-&gt;last_slot = pageCount;
+@@ -1151,7 +1171,7 @@
+ 	sAvailSwapSpace -= (swapFile-&gt;last_slot - swapFile-&gt;first_slot) * PAGE_SIZE;
+ 	mutex_unlock(&amp;sAvailSwapSpaceLock);
+ 
+-	vfs_put_vnode(swapFile-&gt;vnode);
++	close(swapFile-&gt;fd);
+ 	free(swapFile-&gt;maps);
+ 	free(swapFile);
+ 
+@@ -1239,10 +1259,10 @@
+ 	}
+ 
+ 	close(fd);
+-		// TODO: if we don't keep the file open, O_NOCACHE is going to be
+-		// removed - we must not do this while we're using the swap file
+ 
+-	swap_file_add(&quot;/var/swap&quot;);
++	error = swap_file_add(&quot;/var/swap&quot;);
++	if (error != B_OK)
++		dprintf(&quot;Failed to add swap file /var/swap: %s\n&quot;, strerror(error));
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011370.html">[Haiku-commits] r27231 - haiku/branches/developer
+</A></li>
+	<LI>Next message: <A HREF="011373.html">[Haiku-commits] r27233 - haiku/trunk/headers/private/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11371">[ date ]</a>
+              <a href="thread.html#11371">[ thread ]</a>
+              <a href="subject.html#11371">[ subject ]</a>
+              <a href="author.html#11371">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

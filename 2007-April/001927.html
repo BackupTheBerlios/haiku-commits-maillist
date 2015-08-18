@@ -1,0 +1,176 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20902 - haiku/trunk/src/system/kernel/slab
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20902%20-%20haiku/trunk/src/system/kernel/slab&In-Reply-To=%3C200704291513.l3TFDLmq000223%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001925.html">
+   <LINK REL="Next"  HREF="001928.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20902 - haiku/trunk/src/system/kernel/slab</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20902%20-%20haiku/trunk/src/system/kernel/slab&In-Reply-To=%3C200704291513.l3TFDLmq000223%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20902 - haiku/trunk/src/system/kernel/slab">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Sun Apr 29 17:13:21 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001925.html">[Haiku-commits] r20901 - in haiku/trunk:	headers/private/kernel/slab src/system/kernel/slab
+</A></li>
+        <LI>Next message: <A HREF="001928.html">[Haiku-commits] r20903 - haiku/trunk/src/system/kernel/slab
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1927">[ date ]</a>
+              <a href="thread.html#1927">[ thread ]</a>
+              <a href="subject.html#1927">[ subject ]</a>
+              <a href="author.html#1927">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-29 17:13:09 +0200 (Sun, 29 Apr 2007)
+New Revision: 20902
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20902&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20902&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/slab/Slab.cpp
+   haiku/trunk/src/system/kernel/slab/allocator.cpp
+Log:
+cache allocator: for allocations &gt; 8k create areas, and delete them on free.
+
+
+Modified: haiku/trunk/src/system/kernel/slab/Slab.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/slab/Slab.cpp	2007-04-29 13:11:30 UTC (rev 20901)
++++ haiku/trunk/src/system/kernel/slab/Slab.cpp	2007-04-29 15:13:09 UTC (rev 20902)
+@@ -26,10 +26,6 @@
+ #include &lt;new&gt;
+ 
+ 
+-// TODO all of the small allocations we perform here will fallback
+-//      to the internal allocator which in the future will use this
+-//      same code. We'll have to resolve all of the dependencies
+-//      then, for now, it is still not required.
+ // TODO kMagazineCapacity should be dynamically tuned per cache.
+ 
+ 
+
+Modified: haiku/trunk/src/system/kernel/slab/allocator.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/slab/allocator.cpp	2007-04-29 13:11:30 UTC (rev 20901)
++++ haiku/trunk/src/system/kernel/slab/allocator.cpp	2007-04-29 15:13:09 UTC (rev 20902)
+@@ -10,6 +10,8 @@
+ 
+ #include &quot;slab_private.h&quot;
+ 
++#include &lt;kernel.h&gt; // for ROUNDUP
++
+ #include &lt;stdio.h&gt;
+ 
+ #define DEBUG_ALLOCATOR
+@@ -35,6 +37,12 @@
+ #endif
+ };
+ 
++struct area_boundary_tag {
++	area_id area;
++	boundary_tag tag;
++};
++
++
+ static const uint32 kBoundaryMagic = 0x6da78d13;
+ 
+ 
+@@ -68,24 +76,34 @@
+ 	object_cache *cache = size_to_cache(size + sizeof(boundary_tag));
+ 
+ 	void *block;
++	boundary_tag *tag;
+ 
+ 	if (cache) {
+-		block = object_cache_alloc(cache, 0);
++		tag = (boundary_tag *)object_cache_alloc(cache, 0);
++		if (tag == NULL)
++			return NULL;
++		block = tag + 1;
+ 	} else {
+-		// TODO create areas
+-		panic(&quot;allocator: unimplemented&quot;);
+-		return NULL;
++		void *pages;
++		area_id area = create_area(&quot;alloc'ed block&quot;, &amp;pages,
++			B_ANY_KERNEL_ADDRESS, ROUNDUP(size + sizeof(area_boundary_tag),
++				B_PAGE_SIZE), B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
++		if (area &lt; B_OK)
++			return NULL;
++
++		area_boundary_tag *areaTag = (area_boundary_tag *)pages;
++		areaTag-&gt;area = area;
++		tag = &amp;areaTag-&gt;tag;
++		block = areaTag + 1;
+ 	}
+ 
+-	boundary_tag *tag = (boundary_tag *)block;
+-
+ 	tag-&gt;size = size;
+ 
+ #ifdef DEBUG_ALLOCATOR
+ 	tag-&gt;magic = kBoundaryMagic;
+ #endif
+ 
+-	return ((uint8 *)block) + sizeof(boundary_tag);
++	return block;
+ }
+ 
+ 
+@@ -101,10 +119,13 @@
+ #endif
+ 
+ 	object_cache *cache = size_to_cache(tag-&gt;size);
+-	if (cache == NULL)
+-		panic(&quot;allocator: unimplemented&quot;);
+-
+-	object_cache_free(cache, tag);
++	if (cache == NULL) {
++		area_boundary_tag *areaTag = (area_boundary_tag *)(((uint8 *)block)
++			- sizeof(area_boundary_tag));
++		delete_area(areaTag-&gt;area);
++	} else {
++		object_cache_free(cache, tag);
++	}
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001925.html">[Haiku-commits] r20901 - in haiku/trunk:	headers/private/kernel/slab src/system/kernel/slab
+</A></li>
+	<LI>Next message: <A HREF="001928.html">[Haiku-commits] r20903 - haiku/trunk/src/system/kernel/slab
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1927">[ date ]</a>
+              <a href="thread.html#1927">[ thread ]</a>
+              <a href="subject.html#1927">[ subject ]</a>
+              <a href="author.html#1927">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

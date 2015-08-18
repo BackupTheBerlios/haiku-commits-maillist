@@ -1,0 +1,417 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25564 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25564%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200805191827.m4JIRB0M019112%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009002.html">
+   <LINK REL="Next"  HREF="008944.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25564 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25564%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200805191827.m4JIRB0M019112%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25564 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon May 19 20:27:11 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009002.html">[Haiku-commits] r25563 - in	haiku/trunk/src/add-ons/kernel/drivers/audio/ac97: auich ich
+</A></li>
+        <LI>Next message: <A HREF="008944.html">[Haiku-commits] r25565 - in haiku/trunk: build/jam	src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8943">[ date ]</a>
+              <a href="thread.html#8943">[ thread ]</a>
+              <a href="subject.html#8943">[ subject ]</a>
+              <a href="author.html#8943">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-05-19 20:27:10 +0200 (Mon, 19 May 2008)
+New Revision: 25564
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25564&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25564&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.h
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h
+Log:
+* Made the endpoint manager wait on bind() if the existing connection is
+  local, and is about to close.
+* This fixes several race conditions with the neon test suite that relied
+  on TCP sockets being gone after close, and their port being available again
+  (note, that is not what the TCP spec says, anyway, but it makes sense to
+  do so, since we already removed the time wait state for local connections).
+* The endpoint manager is now using a mutex instead of a semaphore.
+* TCPEndpoint::_Close() now notifies the senders/receivers instead of
+  _HandleReset().
+* Besides ssl_closure(), all tests of the neon test suite seem to pass now.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp	2008-05-19 18:07:51 UTC (rev 25563)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp	2008-05-19 18:27:10 UTC (rev 25564)
+@@ -221,29 +221,24 @@
+ 	fConnectionHash(this),
+ 	fLastPort(kFirstEphemeralPort)
+ {
+-	benaphore_init(&amp;fLock, &quot;endpoint manager&quot;);
++	mutex_init(&amp;fLock, &quot;endpoint manager&quot;);
+ }
+ 
+ 
+ EndpointManager::~EndpointManager()
+ {
+-	benaphore_destroy(&amp;fLock);
++	mutex_destroy(&amp;fLock);
+ }
+ 
+ 
+ status_t
+ EndpointManager::InitCheck() const
+ {
+-	if (fConnectionHash.InitCheck() &lt; B_OK)
+-		return fConnectionHash.InitCheck();
++	status_t status = fConnectionHash.InitCheck();
++	if (status == B_OK)
++		status = fEndpointHash.InitCheck();
+ 
+-	if (fEndpointHash.InitCheck() &lt; B_OK)
+-		return fEndpointHash.InitCheck();
+-
+-	if (fLock.sem &lt; B_OK)
+-		return fLock.sem;
+-
+-	return B_OK;
++	return status;
+ }
+ 
+ 
+@@ -266,7 +261,7 @@
+ {
+ 	TRACE((&quot;EndpointManager::SetConnection(%p)\n&quot;, endpoint));
+ 
+-	BenaphoreLocker _(fLock);
++	MutexLocker _(fLock);
+ 
+ 	SocketAddressStorage local(AddressModule());
+ 	local.SetTo(_local);
+@@ -292,7 +287,7 @@
+ status_t
+ EndpointManager::SetPassive(TCPEndpoint* endpoint)
+ {
+-	BenaphoreLocker _(fLock);
++	MutexLocker _(fLock);
+ 
+ 	if (!endpoint-&gt;IsBound()) {
+ 		// if the socket is unbound first bind it to ephemeral
+@@ -319,7 +314,7 @@
+ TCPEndpoint*
+ EndpointManager::FindConnection(sockaddr* local, sockaddr* peer)
+ {
+-	BenaphoreLocker _(fLock);
++	MutexLocker _(fLock);
+ 
+ 	TCPEndpoint *endpoint = _LookupConnection(local, peer);
+ 	if (endpoint != NULL) {
+@@ -366,7 +361,7 @@
+ 	// if (!AddressModule()-&gt;is_understandable(address))
+ 	//	return EAFNOSUPPORT;
+ 
+-	BenaphoreLocker _(fLock);
++	MutexLocker _(fLock);
+ 
+ 	if (AddressModule()-&gt;get_port(address) == 0)
+ 		return _BindToEphemeral(endpoint, address);
+@@ -378,11 +373,12 @@
+ status_t
+ EndpointManager::BindChild(TCPEndpoint* endpoint)
+ {
+-	BenaphoreLocker _(fLock);
++	MutexLocker _(fLock);
+ 	return _Bind(endpoint, *endpoint-&gt;LocalAddress());
+ }
+ 
+ 
++/*! You must hold fLock when calling this method. */
+ status_t
+ EndpointManager::_BindToAddress(TCPEndpoint* endpoint, const sockaddr* _address)
+ {
+@@ -397,25 +393,52 @@
+ 	if (ntohs(port) &lt;= kLastReservedPort &amp;&amp; geteuid() != 0)
+ 		return B_PERMISSION_DENIED;
+ 
+-	EndpointTable::ValueIterator portUsers = fEndpointHash.Lookup(port);
++	bool retrying = false;
++	int32 retry = 0;
++	do {
++		EndpointTable::ValueIterator portUsers = fEndpointHash.Lookup(port);
++		retry = false;
+ 
+-	while (portUsers.HasNext()) {
+-		TCPEndpoint *user = portUsers.Next();
++		while (portUsers.HasNext()) {
++			TCPEndpoint* user = portUsers.Next();
+ 
+-		if (user-&gt;LocalAddress().IsEmpty(false)
+-			|| address.EqualTo(*user-&gt;LocalAddress(), false)) {
+-			if ((endpoint-&gt;socket-&gt;options &amp; SO_REUSEADDR) == 0)
+-				return EADDRINUSE;
+-			// TODO lock endpoint before retriving state?
+-			if (user-&gt;State() != TIME_WAIT &amp;&amp; user-&gt;State() != CLOSED)
+-				return EADDRINUSE;
++			if (user-&gt;LocalAddress().IsEmpty(false)
++				|| address.EqualTo(*user-&gt;LocalAddress(), false)) {
++				// Check if this belongs to a local connection
++
++				// Note, while we hold our lock, the endpoint cannot go away,
++				// it can only change its state - IsLocal() is safe to be used
++				// without having the endpoint locked.
++				tcp_state userState = user-&gt;State();
++				if (user-&gt;IsLocal()
++					&amp;&amp; (userState &gt; ESTABLISHED || userState == CLOSED)) {
++					// This is a closing local connection - wait until it's
++					// gone away for real
++					mutex_unlock(&amp;fLock);
++					snooze(10000);
++					mutex_lock(&amp;fLock);
++						// TODO: make this better
++					if (!retrying) {
++						retrying = true;
++						retry = 5;
++					}
++					break;
++				}
++
++				if ((endpoint-&gt;socket-&gt;options &amp; SO_REUSEADDR) == 0)
++					return EADDRINUSE;
++
++				if (userState != TIME_WAIT &amp;&amp; userState != CLOSED)
++					return EADDRINUSE;
++			}
+ 		}
+-	}
++	} while (retry-- &gt; 0);
+ 
+ 	return _Bind(endpoint, *address);
+ }
+ 
+ 
++/*! You must hold fLock when calling this method. */
+ status_t
+ EndpointManager::_BindToEphemeral(TCPEndpoint* endpoint,
+ 	const sockaddr* address)
+@@ -486,7 +509,7 @@
+ 		return B_BAD_VALUE;
+ 	}
+ 
+-	BenaphoreLocker _(fLock);
++	MutexLocker _(fLock);
+ 
+ 	if (!fEndpointHash.Remove(endpoint))
+ 		panic(&quot;bound endpoint %p not in hash!&quot;, endpoint);
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.h	2008-05-19 18:07:51 UTC (rev 25563)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.h	2008-05-19 18:27:10 UTC (rev 25564)
+@@ -106,7 +106,7 @@
+ 	typedef OpenHashTable&lt;ConnectionHashDefinition&gt; ConnectionTable;
+ 	typedef MultiHashTable&lt;EndpointHashDefinition&gt; EndpointTable;
+ 
+-	benaphore				fLock;
++	mutex					fLock;
+ 	net_domain*				fDomain;
+ 	ConnectionTable			fConnectionHash;
+ 	EndpointTable			fEndpointHash;
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2008-05-19 18:07:51 UTC (rev 25563)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2008-05-19 18:27:10 UTC (rev 25564)
+@@ -220,6 +220,7 @@
+ 	FLAG_NO_RECEIVE				= 0x04,
+ 	FLAG_CLOSED					= 0x08,
+ 	FLAG_DELETE_ON_CLOSE		= 0x10,
++	FLAG_LOCAL					= 0x20
+ };
+ 
+ 
+@@ -497,21 +498,6 @@
+ 
+ 		TRACE(&quot;Close(): after waiting, the SendQ was left with %lu bytes.&quot;,
+ 			fSendQueue.Used());
+-#if 0
+-// TODO: For the following to work we also need to be notified when TIME_WAIT
+-// is entered.
+-	} else if (fRoute != NULL &amp;&amp; (fRoute-&gt;flags &amp; RTF_LOCAL) != 0) {
+-		// This is a local connection - just wait until we're done so that
+-		// the port is available again
+-		while (fState != CLOSED &amp;&amp; fState != TIME_WAIT) {
+-			if (socket-&gt;error != B_OK)
+-				return socket-&gt;error;
+-
+-			status_t status = fSendList.Wait(locker);
+-			if (status &lt; B_OK)
+-				return status;
+-		}
+-#endif	// 0
+ 	}
+ 	return B_OK;
+ }
+@@ -1022,6 +1008,13 @@
+ }
+ 
+ 
++bool
++TCPEndpoint::IsLocal() const
++{
++	return (fFlags &amp; FLAG_LOCAL) != 0;
++}
++
++
+ status_t
+ TCPEndpoint::DelayedAcknowledge()
+ {
+@@ -1058,8 +1051,7 @@
+ 
+ 	_CancelConnectionTimers();
+ 
+-	if (fState == TIME_WAIT &amp;&amp; fRoute != NULL
+-		&amp;&amp; (fRoute-&gt;flags &amp; RTF_LOCAL) != 0) {
++	if (fState == TIME_WAIT &amp;&amp; IsLocal()) {
+ 		// we do not use TIME_WAIT state for local connections
+ 		fFlags |= FLAG_DELETE_ON_CLOSE;
+ 		return;
+@@ -1131,13 +1123,9 @@
+ status_t
+ TCPEndpoint::_WaitForEstablished(MutexLocker &amp;locker, bigtime_t timeout)
+ {
+-#if 0
+ // TODO: Checking for CLOSED seems correct, but breaks several neon tests.
+ // When investigating this, also have a look at _Close() and _HandleReset().
+-	while (fState &lt; ESTABLISHED &amp;&amp; fState != CLOSED) {
+-#else
+-	while (fState &lt; ESTABLISHED) {
+-#endif
++	while (fState &lt; ESTABLISHED/* &amp;&amp; fState != CLOSED*/) {
+ 		if (socket-&gt;error != B_OK)
+ 			return socket-&gt;error;
+ 
+@@ -1162,12 +1150,8 @@
+ 
+ 	fFlags |= FLAG_DELETE_ON_CLOSE;
+ 
+-#if 0
+-// TODO: Should probably be moved here (from _HandleReset()), but cf. the
+-// comment in _WaitForEstablished().
+ 	fSendList.Signal();
+ 	_NotifyReader();
+-#endif
+ }
+ 
+ 
+@@ -1177,12 +1161,6 @@
+ 	socket-&gt;error = error;
+ 	_Close();
+ 
+-#if 1
+-// TODO: Should be moved to _Close(), but cf. comment in _WaitForEstablished().
+-	fSendList.Signal();
+-	_NotifyReader();
+-#endif
+-
+ 	gSocketModule-&gt;notify(socket, B_SELECT_WRITE, error);
+ 	gSocketModule-&gt;notify(socket, B_SELECT_ERROR, error);
+ }
+@@ -2041,6 +2019,9 @@
+ 		fRoute = gDatalinkModule-&gt;get_route(Domain(), peer);
+ 		if (fRoute == NULL)
+ 			return ENETUNREACH;
++
++		if ((fRoute-&gt;flags &amp; RTF_LOCAL) != 0)
++			fFlags |= FLAG_LOCAL;
+ 	}
+ 
+ 	// make sure connection does not already exist
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2008-05-19 18:07:51 UTC (rev 25563)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2008-05-19 18:27:10 UTC (rev 25564)
+@@ -73,6 +73,7 @@
+ 
+ 			tcp_state	State() const { return fState; }
+ 			bool		IsBound() const;
++			bool		IsLocal() const;
+ 
+ 			status_t	DelayedAcknowledge();
+ 			status_t	SendAcknowledge(bool force);
+@@ -162,6 +163,7 @@
+ 
+ 	net_route 		*fRoute;
+ 		// TODO: don't use a net_route, but a net_route_info!!!
++		// (the latter will automatically adapt to routing changes)
+ 
+ 	tcp_sequence	fReceiveNext;
+ 	tcp_sequence	fReceiveMaxAdvertised;
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h	2008-05-19 18:07:51 UTC (rev 25563)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h	2008-05-19 18:27:10 UTC (rev 25564)
+@@ -25,7 +25,7 @@
+ 
+ class EndpointManager;
+ 
+-typedef enum {
++enum tcp_state {
+ 	// establishing a connection
+ 	CLOSED,
+ 	LISTEN,
+@@ -42,7 +42,7 @@
+ 	FINISH_ACKNOWLEDGED,
+ 	CLOSING,
+ 	TIME_WAIT
+-} tcp_state;
++};
+ 
+ struct tcp_header {
+ 	uint16 source_port;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009002.html">[Haiku-commits] r25563 - in	haiku/trunk/src/add-ons/kernel/drivers/audio/ac97: auich ich
+</A></li>
+	<LI>Next message: <A HREF="008944.html">[Haiku-commits] r25565 - in haiku/trunk: build/jam	src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8943">[ date ]</a>
+              <a href="thread.html#8943">[ thread ]</a>
+              <a href="subject.html#8943">[ subject ]</a>
+              <a href="author.html#8943">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

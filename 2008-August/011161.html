@@ -1,0 +1,149 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27101 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27101%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808210328.m7L3Sbcv004283%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011160.html">
+   <LINK REL="Next"  HREF="011169.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27101 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27101%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808210328.m7L3Sbcv004283%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27101 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug 21 05:28:37 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011160.html">[Haiku-commits] r27100 - in haiku/trunk: headers/private/kernel	headers/private/kernel/slab src/system/kernel/slab	src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="011169.html">[Haiku-commits] r27102 -	haiku/trunk/src/add-ons/kernel/file_systems/udf
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11161">[ date ]</a>
+              <a href="thread.html#11161">[ thread ]</a>
+              <a href="subject.html#11161">[ subject ]</a>
+              <a href="author.html#11161">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-21 05:28:35 +0200 (Thu, 21 Aug 2008)
+New Revision: 27101
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27101&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27101&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+Log:
+* The callback object created in WriteAsync() was never deleted. Thus
+  eventually the VIP heap would be exhausted.
+* WriteAsync() didn't call the provided callback when an error occurred
+  before invoking vfs_asynchronous_write_pages(). The page writer would
+  get stuck in those cases.
+* The object cache used for the swap blocks does now use the
+  asynchronous resizing feature to avoid deadlocks.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-21 03:21:37 UTC (rev 27100)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-21 03:28:35 UTC (rev 27101)
+@@ -45,6 +45,10 @@
+ #	define TRACE(x) ;
+ #endif
+ 
++
++// number of free swap blocks the object cache shall minimally have
++#define MIN_SWAP_BLOCK_RESERVE	4096
++
+ #define SWAP_BLOCK_PAGES 32
+ #define SWAP_BLOCK_SHIFT 5		/* 1 &lt;&lt; SWAP_BLOCK_SHIFT == SWAP_BLOCK_PAGES */
+ #define SWAP_BLOCK_MASK  (SWAP_BLOCK_PAGES - 1)
+@@ -349,8 +353,15 @@
+ 		}
+ 
+ 		fNextCallback-&gt;IOFinished(status, partialTransfer, bytesTransferred);
++
++		delete this;
+ 	}
+ 
++	void operator delete(void* address, size_t size)
++	{
++		io_request_free(address);
++	}
++
+ private:
+ 	VMAnonymousCache*	fCache;
+ 	page_num_t			fPageIndex;
+@@ -531,8 +542,10 @@
+ 	// If the page doesn't have any swap space yet, allocate it.
+ 	if (newSlot) {
+ 		AutoLocker&lt;VMCache&gt; locker(this);
+-		if (fAllocatedSwapSize + B_PAGE_SIZE &gt; fCommittedSwapSize)
++		if (fAllocatedSwapSize + B_PAGE_SIZE &gt; fCommittedSwapSize) {
++			_callback-&gt;IOFinished(B_ERROR, true, 0);
+ 			return B_ERROR;
++		}
+ 
+ 		fAllocatedSwapSize += B_PAGE_SIZE;
+ 
+@@ -551,6 +564,7 @@
+ 
+ 			swap_slot_dealloc(slotIndex, 1);
+ 		}
++		_callback-&gt;IOFinished(B_NO_MEMORY, true, 0);
+ 		return B_NO_MEMORY;
+ 	}
+ // TODO: If the page already had swap space assigned, we don't need an own
+@@ -917,9 +931,18 @@
+ 	if (sSwapBlockCache == NULL)
+ 		panic(&quot;swap_init(): can't create object cache for swap blocks\n&quot;);
+ 
++	status_t error = object_cache_set_minimum_reserve(sSwapBlockCache,
++		MIN_SWAP_BLOCK_RESERVE);
++	if (error != B_OK) {
++		panic(&quot;swap_init(): object_cache_set_minimum_reserve() failed: %s&quot;,
++			strerror(error));
++	}
++
+ 	// init swap hash table
+ 	sSwapHashTable.Init();
+ 	mutex_init(&amp;sSwapHashLock, &quot;swaphash&quot;);
++// TODO: The hash table needs a special resizing strategy. Otherwise we could
++// deadlock while trying swap pages out.
+ 
+ 	// init swap file list
+ 	mutex_init(&amp;sSwapFileListLock, &quot;swaplist&quot;);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011160.html">[Haiku-commits] r27100 - in haiku/trunk: headers/private/kernel	headers/private/kernel/slab src/system/kernel/slab	src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="011169.html">[Haiku-commits] r27102 -	haiku/trunk/src/add-ons/kernel/file_systems/udf
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11161">[ date ]</a>
+              <a href="thread.html#11161">[ thread ]</a>
+              <a href="subject.html#11161">[ subject ]</a>
+              <a href="author.html#11161">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

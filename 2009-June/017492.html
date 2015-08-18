@@ -1,0 +1,158 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31253 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31253%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200906261449.n5QEnmGr011156%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017491.html">
+   <LINK REL="Next"  HREF="017493.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31253 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31253%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200906261449.n5QEnmGr011156%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31253 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Jun 26 16:49:48 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017491.html">[Haiku-commits] r31252 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+        <LI>Next message: <A HREF="017493.html">[Haiku-commits] r31254 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17492">[ date ]</a>
+              <a href="thread.html#17492">[ thread ]</a>
+              <a href="subject.html#17492">[ subject ]</a>
+              <a href="author.html#17492">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-06-26 16:49:48 +0200 (Fri, 26 Jun 2009)
+New Revision: 31253
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31253&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31253&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+Log:
+* Directories now only preallocate 4 KB.
+* Reworked how preallocations are chosen, and also take the grow rate into
+  account.
+* Also, the preallocation is now rounded to the next multiple of the
+  preallocation size (previously, a 64K write would only allocate 64K).
+* This should also close bug #2573.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2009-06-26 13:47:13 UTC (rev 31252)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2009-06-26 14:49:48 UTC (rev 31253)
+@@ -1585,6 +1585,10 @@
+ }
+ 
+ 
++/*!	Grows the stream to \a size, and fills the direct/indirect/double indirect
++	ranges with the runs.
++	This method will also determine the size of the preallocation, if any.
++*/
+ status_t
+ Inode::_GrowStream(Transaction&amp; transaction, off_t size)
+ {
+@@ -1615,12 +1619,12 @@
+ 		bytes = size - data-&gt;Size();
+ 
+ 	// do we have enough free blocks on the disk?
+-	off_t blocksRequested = (bytes + fVolume-&gt;BlockSize() - 1)
++	off_t blocksNeeded = (bytes + fVolume-&gt;BlockSize() - 1)
+ 		&gt;&gt; fVolume-&gt;BlockShift();
+-	if (blocksRequested &gt; fVolume-&gt;FreeBlocks())
++	if (blocksNeeded &gt; fVolume-&gt;FreeBlocks())
+ 		return B_DEVICE_FULL;
+ 
+-	off_t blocksNeeded = blocksRequested;
++	off_t blocksRequested = blocksNeeded;
+ 		// because of preallocations and partial allocations, the number of
+ 		// blocks we need to allocate may be different from the one we request
+ 		// from the block allocator
+@@ -1629,27 +1633,33 @@
+ 	// Attributes, attribute directories, and long symlinks usually won't get
+ 	// that big, and should stay close to the inode - preallocating could be
+ 	// counterproductive.
+-	// Also, if free disk space is tight, we probably don't want to do this as
+-	// well.
++	// Also, if free disk space is tight, don't preallocate.
+ 	if (!IsAttribute() &amp;&amp; !IsAttributeDirectory() &amp;&amp; !IsSymLink()
+-		&amp;&amp; blocksRequested &lt; (65536 &gt;&gt; fVolume-&gt;BlockShift())
+ 		&amp;&amp; fVolume-&gt;FreeBlocks() &gt; 128) {
+-		// preallocate 64 KB at minimum
++		off_t roundTo = 0;
+ 		if (IsFile()) {
+-			// request preallocated blocks depending on the file size
+-			if (size &lt; 1 * 1024 * 1024) {
+-				// preallocate 64 KB for file sizes &lt; 1 MB
+-				blocksRequested = 65536 &gt;&gt; fVolume-&gt;BlockShift();
+-			} else if (size &lt; 32 * 1024 * 1024) {
+-				// preallocate 512 KB for file sizes between 1 MB and 32 MB
+-				blocksRequested = (512 * 1024) &gt;&gt; fVolume-&gt;BlockShift();
++			// Request preallocated blocks depending on the file size and growth
++			if (size &lt; 1 * 1024 * 1024 &amp;&amp; bytes &lt; 512 * 1024) {
++				// Preallocate 64 KB for file sizes &lt;1 MB and grow rates &lt;512 KB
++				roundTo = 65536 &gt;&gt; fVolume-&gt;BlockShift();
++			} else if (size &lt; 32 * 1024 * 1024 &amp;&amp; bytes &lt;= 1 * 1024 * 1024) {
++				// Preallocate 512 KB for file sizes between 1 MB and 32 MB, and
++				// grow rates smaller than 1 MB
++				roundTo = (512 * 1024) &gt;&gt; fVolume-&gt;BlockShift();
+ 			} else {
+-				// preallocate 1/16 of the file size (ie. 4 MB for 64 MB,
++				// Preallocate 1/16 of the file size (ie. 4 MB for 64 MB,
+ 				// 64 MB for 1 GB)
+-				blocksRequested = size &gt;&gt; (fVolume-&gt;BlockShift() + 4);
++				roundTo = size &gt;&gt; (fVolume-&gt;BlockShift() + 4);
+ 			}
+-		} else
+-			blocksRequested = 65536 &gt;&gt; fVolume-&gt;BlockShift();
++		} else {
++			// Preallocate only 4 KB - directories only get trimmed when their
++			// vnode is flushed, which might not happen very often.
++			roundTo = 4096 &gt;&gt; fVolume-&gt;BlockShift();
++		}
++		if (roundTo &gt; 1) {
++			// Round to next &quot;roundTo&quot; block count
++			blocksRequested = ((blocksNeeded + roundTo) / roundTo) * roundTo;
++		}
+ 	}
+ 
+ 	while (blocksNeeded &gt; 0) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017491.html">[Haiku-commits] r31252 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+	<LI>Next message: <A HREF="017493.html">[Haiku-commits] r31254 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17492">[ date ]</a>
+              <a href="thread.html#17492">[ thread ]</a>
+              <a href="subject.html#17492">[ subject ]</a>
+              <a href="author.html#17492">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

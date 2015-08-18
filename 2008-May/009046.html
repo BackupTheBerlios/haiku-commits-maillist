@@ -1,0 +1,320 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25625 - in haiku/trunk: headers/posix	src/system/libroot/posix/unistd
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25625%20-%20in%20haiku/trunk%3A%20headers/posix%0A%09src/system/libroot/posix/unistd&In-Reply-To=%3C200805230033.m4N0XAw2031509%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009045.html">
+   <LINK REL="Next"  HREF="009047.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25625 - in haiku/trunk: headers/posix	src/system/libroot/posix/unistd</H1>
+    <B>mmu_man at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25625%20-%20in%20haiku/trunk%3A%20headers/posix%0A%09src/system/libroot/posix/unistd&In-Reply-To=%3C200805230033.m4N0XAw2031509%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25625 - in haiku/trunk: headers/posix	src/system/libroot/posix/unistd">mmu_man at mail.berlios.de
+       </A><BR>
+    <I>Fri May 23 02:33:10 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009045.html">[Haiku-commits] r25624 - haiku/trunk/src/system/kernel/lib
+</A></li>
+        <LI>Next message: <A HREF="009047.html">[Haiku-commits] r25626 - haiku/trunk/headers/posix
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9046">[ date ]</a>
+              <a href="thread.html#9046">[ thread ]</a>
+              <a href="subject.html#9046">[ subject ]</a>
+              <a href="author.html#9046">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmu_man
+Date: 2008-05-23 02:33:08 +0200 (Fri, 23 May 2008)
+New Revision: 25625
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25625&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25625&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/posix/unistd.h
+   haiku/trunk/src/system/libroot/posix/unistd/conf.c
+Log:
+- factored out [f]pathconf().
+- *pathconf() now uses statvfs and fs_info data when appropriate. It should also check for file type though, some only apply to directory or others.
+- added confstr(_CS_PATH) with a sensible default.
+
+
+Modified: haiku/trunk/headers/posix/unistd.h
+===================================================================
+--- haiku/trunk/headers/posix/unistd.h	2008-05-23 00:11:07 UTC (rev 25624)
++++ haiku/trunk/headers/posix/unistd.h	2008-05-23 00:33:08 UTC (rev 25625)
+@@ -87,6 +87,9 @@
+ #define _SC_SEMAPHORES			30
+ #define _SC_THREADS				31
+ 
++/* confstr() constants */
++#define _CS_PATH				1
++
+ /* lseek() constants */
+ #ifndef SEEK_SET
+ #	define SEEK_SET 0
+
+Modified: haiku/trunk/src/system/libroot/posix/unistd/conf.c
+===================================================================
+--- haiku/trunk/src/system/libroot/posix/unistd/conf.c	2008-05-23 00:11:07 UTC (rev 25624)
++++ haiku/trunk/src/system/libroot/posix/unistd/conf.c	2008-05-23 00:33:08 UTC (rev 25625)
+@@ -11,9 +11,11 @@
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+ #include &lt;sys/resource.h&gt;
++#include &lt;sys/statvfs.h&gt;
+ 
+ #include &lt;SupportDefs.h&gt;
+ 
++#include &lt;fs_info.h&gt;
+ #include &lt;libroot_private.h&gt;
+ #include &lt;posix/realtime_sem_defs.h&gt;
+ #include &lt;user_group.h&gt;
+@@ -77,17 +79,45 @@
+ }
+ 
+ 
+-long
+-fpathconf(int fd, int name)
++enum {
++	FS_BFS,
++	FS_FAT,
++	FS_EXT,
++	FS_UNKNOWN
++};
++
++
++static int
++fstype(const char *fsh_name)
+ {
+-	if (fd &lt; 0) {
+-		errno = EBADF;
++	if (!strncmp(fsh_name, &quot;bfs&quot;, B_OS_NAME_LENGTH))
++		return FS_BFS;
++	if (!strncmp(fsh_name, &quot;dos&quot;, B_OS_NAME_LENGTH))
++		return FS_FAT;
++	if (!strncmp(fsh_name, &quot;fat&quot;, B_OS_NAME_LENGTH))
++		return FS_FAT;
++	if (!strncmp(fsh_name, &quot;ext2&quot;, B_OS_NAME_LENGTH))
++		return FS_EXT;
++	if (!strncmp(fsh_name, &quot;ext3&quot;, B_OS_NAME_LENGTH))
++		return FS_EXT;
++	return FS_UNKNOWN;
++}
++
++
++
++static long
++__pathconf_common(struct statvfs *fs, struct stat *st,
++	int name)
++{
++	fs_info info;
++	int ret;
++	ret = fs_stat_dev(fs-&gt;f_fsid, &amp;info);
++	if (ret &lt; 0) {
++		errno = ret;
+ 		return -1;
+ 	}
+ 
+-	// TODO: should query the underlying filesystem
+-	// for correct value, as most are fs-dependant
+-	// (which is why it's a different call than sysconf() btw).
++	// TODO: many cases should check for file type from st.
+ 	switch (name) {
+ 		case _PC_CHOWN_RESTRICTED:
+ 			return _POSIX_CHOWN_RESTRICTED;
+@@ -99,7 +129,8 @@
+ 			return MAX_INPUT;
+ 
+ 		case _PC_NAME_MAX:
+-			return NAME_MAX;
++			return fs-&gt;f_namemax;
++			//return NAME_MAX;
+ 
+ 		case _PC_NO_TRUNC:
+ 			return _POSIX_NO_TRUNC;
+@@ -117,15 +148,53 @@
+ 			return _POSIX_VDISABLE;
+ 
+ 		case _PC_FILESIZEBITS:
++		{
++			int type = fstype(info.fsh_name);
++			switch (type) {
++				case FS_BFS:
++				case FS_EXT:
++					return 64;
++				case FS_FAT:
++					return 32;
++			}
++			// XXX: add fs ? add to statvfs/fs_info ?
+ 			return 64;
++		}
+ 
++		case _PC_SYMLINK_MAX:
++			return SYMLINK_MAX;
++
++		case _PC_2_SYMLINKS:
++		{
++			int type = fstype(info.fsh_name);
++			switch (type) {
++				case FS_BFS:
++				case FS_EXT:
++					return 1;
++				case FS_FAT:
++					return 0;
++			}
++			// XXX: there should be an HAS_SYMLINKS flag
++			// to fs_info...
++			return 1;
++		}
++
+ 		case _PC_XATTR_EXISTS:
+ 		case _PC_XATTR_ENABLED:
++		{
++#if 0
+ 			/* those seem to be Solaris specific,
+ 			 * else we should return 1 I suppose.
++			 * we don't yet map POSIX xattrs
++			 * to BFS ones anyway.
+ 			 */
++			if (info.flags &amp; B_FS_HAS_ATTR)
++				return 1;
++			return -1;
++#endif
+ 			errno = EINVAL;
+ 			return -1;
++		}
+ 
+ 		case _PC_SYNC_IO:
+ 		case _PC_ASYNC_IO:
+@@ -136,8 +205,6 @@
+ 		case _PC_REC_MIN_XFER_SIZE:
+ 		case _PC_REC_XFER_ALIGN:
+ 		case _PC_ALLOC_SIZE_MIN:
+-		case _PC_SYMLINK_MAX:
+-		case _PC_2_SYMLINKS:
+ 			/* not yet supported */
+ 			errno = EINVAL;
+ 			return -1;
+@@ -150,38 +217,71 @@
+ 
+ 
+ long
++fpathconf(int fd, int name)
++{
++	struct statvfs fs;
++	struct stat st;
++	int ret;
++	if (fd &lt; 0) {
++		errno = EBADF;
++		return -1;
++	}
++	ret = fstat(fd, &amp;st);
++	if (ret &lt; 0)
++		return ret;
++	ret = fstatvfs(fd, &amp;fs);
++	if (ret &lt; 0)
++		return ret;
++	return __pathconf_common(&amp;fs, &amp;st, name);
++}
++
++
++long
+ pathconf(const char *path, int name)
+ {
+-	int fd;
+-	long value;
+-	//XXX: some names shouldn't require openning,
+-	// just statfs
+-	fd = open(path, O_RDONLY | O_NOCTTY | O_NOTRAVERSE);
+-	if (fd &lt; 0)
+-		return fd;
+-	
+-	value = fpathconf(fd, name);
+-	close(fd);
+-	return value;
++	struct statvfs fs;
++	struct stat st;
++	int ret;
++	if (path == NULL) {
++		errno = EFAULT;
++		return -1;
++	}
++	ret = lstat(path, &amp;st);
++	if (ret &lt; 0)
++		return ret;
++	ret = statvfs(path, &amp;fs);
++	if (ret &lt; 0)
++		return ret;
++	return __pathconf_common(&amp;fs, &amp;st, name);
+ }
+ 
+ 
+ size_t
+ confstr(int name, char *buffer, size_t length)
+ {
+-	size_t stringLength = 1;
++	size_t stringLength = 0;
+ 	char *string = &quot;&quot;;
+ 
++	if (!length || !buffer) {
++		errno = EINVAL;
++		return 0;
++	}
++
+ 	switch (name) {
+-		case 0:
++		case _CS_PATH:
++			string = &quot;/bin:/boot/beos/apps:&quot; \
++				&quot;/boot/common/bin:/boot/develop/bin&quot;;
+ 			break;
+ 		default:
+ 			errno = EINVAL;
+ 			return 0;
+ 	}
+ 
+-	if (buffer != NULL)
+-		strlcpy(buffer, string, min_c(length, stringLength));
++	if (buffer != NULL) {
++		stringLength = strlen(string) + 1;
++		strlcpy(buffer, string,
++			min_c(length - 1, stringLength));
++	}
+ 
+ 	return stringLength;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009045.html">[Haiku-commits] r25624 - haiku/trunk/src/system/kernel/lib
+</A></li>
+	<LI>Next message: <A HREF="009047.html">[Haiku-commits] r25626 - haiku/trunk/headers/posix
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9046">[ date ]</a>
+              <a href="thread.html#9046">[ thread ]</a>
+              <a href="subject.html#9046">[ subject ]</a>
+              <a href="author.html#9046">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

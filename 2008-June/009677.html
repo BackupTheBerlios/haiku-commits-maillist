@@ -1,0 +1,562 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26003 - haiku/trunk/src/apps/terminal
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26003%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200806172249.m5HMn8pH027870%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009675.html">
+   <LINK REL="Next"  HREF="009679.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26003 - haiku/trunk/src/apps/terminal</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26003%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200806172249.m5HMn8pH027870%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26003 - haiku/trunk/src/apps/terminal">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Jun 18 00:49:08 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009675.html">[Haiku-commits] r26002 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="009679.html">[Haiku-commits] r26004 - haiku/trunk/src/apps/terminal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9677">[ date ]</a>
+              <a href="thread.html#9677">[ thread ]</a>
+              <a href="subject.html#9677">[ subject ]</a>
+              <a href="author.html#9677">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-06-18 00:49:06 +0200 (Wed, 18 Jun 2008)
+New Revision: 26003
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26003&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26003&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/terminal/BasicTerminalBuffer.cpp
+   haiku/trunk/src/apps/terminal/BasicTerminalBuffer.h
+   haiku/trunk/src/apps/terminal/TermParse.cpp
+   haiku/trunk/src/apps/terminal/TermParse.h
+   haiku/trunk/src/apps/terminal/TermView.cpp
+   haiku/trunk/src/apps/terminal/TerminalBuffer.cpp
+   haiku/trunk/src/apps/terminal/TerminalBuffer.h
+Log:
+* Some preparations for DEC private mode settings support.
+* Implemented alternate screen buffer support. Not used by any program
+  yet, since we still use the beterm termcap entry.
+
+
+Modified: haiku/trunk/src/apps/terminal/BasicTerminalBuffer.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/BasicTerminalBuffer.cpp	2008-06-17 20:00:51 UTC (rev 26002)
++++ haiku/trunk/src/apps/terminal/BasicTerminalBuffer.cpp	2008-06-17 22:49:06 UTC (rev 26003)
+@@ -120,6 +120,7 @@
+ 	fScreenOffset = 0;
+ 
+ 	fOverwriteMode = true;
++	fAlternateScreenActive = false;
+ 
+ 	fScreen = _AllocateLines(width, height);
+ 	if (fScreen == NULL)
+@@ -162,12 +163,10 @@
+ 	if (width == fWidth &amp;&amp; height == fHeight)
+ 		return SetHistoryCapacity(historyCapacity);
+ 
+-	// TODO: When alternate screen support is implemented, do that only when
+-	// not using the alternate screen.
+-	if (true)
+-		return _ResizeRewrap(width, height, historyCapacity);
++	if (fAlternateScreenActive)
++		return _ResizeSimple(width, height, historyCapacity);
+ 
+-	return _ResizeSimple(width, height, historyCapacity);
++	return _ResizeRewrap(width, height, historyCapacity);
+ }
+ 
+ 
+@@ -179,12 +178,14 @@
+ 
+ 
+ void
+-BasicTerminalBuffer::Clear()
++BasicTerminalBuffer::Clear(bool resetCursor)
+ {
+ 	fScreenOffset = 0;
+ 	_ClearLines(0, fHeight - 1);
+-	fCursor.SetTo(0, 0);
+ 
++	if (resetCursor)
++		fCursor.SetTo(0, 0);
++
+ 	if (fHistory != NULL)
+ 		fHistory-&gt;Clear();
+ 
+@@ -585,7 +586,8 @@
+ 	if (fCursor.y == fScrollBottom) {
+ 		_Scroll(fScrollTop, fScrollBottom, 1);
+ 	} else {
+-		fCursor.y++;
++		if (fCursor.y &lt; fHeight - 1)
++			fCursor.y++;
+ 		_CursorChanged();
+ 	}
+ }
+@@ -731,7 +733,7 @@
+ {
+ //debug_printf(&quot;BasicTerminalBuffer::SetCursor(%d, %d)\n&quot;, x, y);
+ 	x = restrict_value(x, 0, fWidth - 1);
+-	y = restrict_value(y, fScrollTop, fScrollBottom);
++	y = restrict_value(y, 0, fHeight - 1);
+ 	if (x != fCursor.x || y != fCursor.y) {
+ 		fCursor.x = x;
+ 		fCursor.y = y;
+@@ -775,6 +777,18 @@
+ // #pragma mark - private methods
+ 
+ 
++void
++BasicTerminalBuffer::_InvalidateAll()
++{
++	fDirtyInfo.invalidateAll = true;
++
++	if (!fDirtyInfo.messageSent) {
++		NotifyListener();
++		fDirtyInfo.messageSent = true;
++	}
++}
++
++
+ /* static */ TerminalLine**
+ BasicTerminalBuffer::_AllocateLines(int32 width, int32 count)
+ {
+
+Modified: haiku/trunk/src/apps/terminal/BasicTerminalBuffer.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/BasicTerminalBuffer.h	2008-06-17 20:00:51 UTC (rev 26002)
++++ haiku/trunk/src/apps/terminal/BasicTerminalBuffer.h	2008-06-17 22:49:06 UTC (rev 26003)
+@@ -21,6 +21,7 @@
+ 	int32	linesScrolled;			// number of lines added to the history
+ 	int32	dirtyTop;				// dirty line range
+ 	int32	dirtyBottom;			//
++	bool	invalidateAll;
+ 	bool	messageSent;			// listener has been notified
+ 
+ 	bool IsDirtyRegionValid() const
+@@ -41,6 +42,7 @@
+ 		linesScrolled = 0;
+ 		dirtyTop = INT_MAX;
+ 		dirtyBottom = INT_MIN;
++		invalidateAll = false;
+ 		messageSent = false;
+ 	}
+ };
+@@ -61,11 +63,11 @@
+ 
+ 			TerminalBufferDirtyInfo&amp; DirtyInfo()	{ return fDirtyInfo; }
+ 
+-			status_t			ResizeTo(int32 width, int32 height);
+-			status_t			ResizeTo(int32 width, int32 height,
++	virtual	status_t			ResizeTo(int32 width, int32 height);
++	virtual	status_t			ResizeTo(int32 width, int32 height,
+ 									int32 historyCapacity);
+ 			status_t			SetHistoryCapacity(int32 historyCapacity);
+-			void				Clear();
++			void				Clear(bool resetCursor);
+ 
+ 			void				SynchronizeWith(
+ 									const BasicTerminalBuffer* other,
+@@ -139,6 +141,7 @@
+ 
+ 	inline	void				_Invalidate(int32 top, int32 bottom);
+ 	inline	void				_CursorChanged();
++			void				_InvalidateAll();
+ 
+ 	static	TerminalLine**		_AllocateLines(int32 width, int32 count);
+ 	static	void				_FreeLines(TerminalLine** lines, int32 count);
+@@ -182,6 +185,7 @@
+ 			TermPos				fSavedCursor;
+ 
+ 			bool				fOverwriteMode;	// false for insert
++			bool				fAlternateScreenActive;
+ 
+ 			int					fEncoding;
+ 
+
+Modified: haiku/trunk/src/apps/terminal/TermParse.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermParse.cpp	2008-06-17 20:00:51 UTC (rev 26002)
++++ haiku/trunk/src/apps/terminal/TermParse.cpp	2008-06-17 22:49:06 UTC (rev 26003)
+@@ -790,13 +790,15 @@
+ 
+ 				case CASE_DECSET:
+ 					/* DECSET */
+-					//      dpmodes(term, bitset);
++					for (int i = 0; i &lt; nparam; i++)
++						_DecPrivateModeSet(param[i]);
+ 					parsestate = groundtable;
+ 					break;
+ 
+ 				case CASE_DECRST:
+ 					/* DECRST */
+-					//      dpmodes(term, bitclr);
++					for (int i = 0; i &lt; nparam; i++)
++						_DecPrivateModeReset(param[i]);
+ 					parsestate = groundtable;
+ 					break;
+ 
+@@ -1070,3 +1072,80 @@
+ 			return;
+ 	}
+ }
++
++
++void
++TermParse::_DecPrivateModeSet(int value)
++{
++	switch (value) {
++		case 1:
++			// Application Cursor Keys (whatever that means).
++			// Not supported yet.
++			break;
++		case 5:
++			// Reverse Video (inverses colors for the complete screen
++			// -- when followed by normal video, that's shortly flashes the
++			// screen).
++			// Not supported yet.
++			break;
++		case 12:
++			// Start Blinking Cursor.
++			// Not supported yet.
++			break;
++		case 25:
++			// Show Cursor
++			// Not supported yet.
++			break;
++		case 1034:
++			// Interpret &quot;meta&quot; key, sets eighth bit.
++			// Not supported yet.
++			break;
++		case 1049:
++			// Save cursor as in DECSC and use Alternate Screen Buffer, clearing
++			// it first.
++			fBuffer-&gt;SaveCursor();
++			fBuffer-&gt;UseAlternateScreenBuffer();
++			break;
++	}
++}
++
++
++void
++TermParse::_DecPrivateModeReset(int value)
++{
++	switch (value) {
++		case 1:
++			// Normal Cursor Keys (whatever that means).
++			// Not supported yet.
++			break;
++		case 3:
++			// 80 Column Mode.
++			// Not supported yet.
++			break;
++		case 4:
++			// Jump (Fast) Scroll.
++			// Not supported yet.
++			break;
++		case 5:
++			// Normal Video (Leaves Reverse Video, cf. there).
++			// Not supported yet.
++			break;
++		case 12:
++			// Stop Blinking Cursor.
++			// Not supported yet.
++			break;
++		case 25:
++			// Hide Cursor
++			// Not supported yet.
++			break;
++		case 1034:
++			// Don&#8217;t interpret &quot;meta&quot; key.
++			// Not supported yet.
++			break;
++		case 1049:
++			// Use Normal Screen Buffer and restore cursor as in DECRC.
++			fBuffer-&gt;RestoreCursor();
++			fBuffer-&gt;UseNormalScreenBuffer();
++			break;
++	}
++}
+
+Modified: haiku/trunk/src/apps/terminal/TermParse.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermParse.h	2008-06-17 20:00:51 UTC (rev 26002)
++++ haiku/trunk/src/apps/terminal/TermParse.h	2008-06-17 22:49:06 UTC (rev 26003)
+@@ -76,6 +76,8 @@
+ 	status_t _ReadParserBuffer();
+ 
+ 	void _DeviceStatusReport(int n);
++	void _DecPrivateModeSet(int value);
++	void _DecPrivateModeReset(int value);
+ 
+ 	int fFd;
+ 
+
+Modified: haiku/trunk/src/apps/terminal/TermView.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermView.cpp	2008-06-17 20:00:51 UTC (rev 26002)
++++ haiku/trunk/src/apps/terminal/TermView.cpp	2008-06-17 22:49:06 UTC (rev 26003)
+@@ -710,9 +710,9 @@
+ 
+ 	{
+ 		BAutolock _(fTextBuffer);
+-		fTextBuffer-&gt;Clear();
++		fTextBuffer-&gt;Clear(true);
+ 	}
+-	fVisibleTextBuffer-&gt;Clear();
++	fVisibleTextBuffer-&gt;Clear(true);
+ 
+ //debug_printf(&quot;Invalidate()\n&quot;);
+ 	Invalidate();
+@@ -1563,10 +1563,6 @@
+ {
+ 	TerminalBufferDirtyInfo&amp; info = fTextBuffer-&gt;DirtyInfo();
+ 	int32 linesScrolled = info.linesScrolled;
+-	BRect bounds = Bounds();
+-	int32 firstVisible = _LineAt(0);
+-	int32 lastVisible = _LineAt(bounds.bottom);
+-	int32 historySize = fTextBuffer-&gt;HistorySize();
+ 
+ //debug_printf(&quot;TermView::_SynchronizeWithTextBuffer(): dirty: %ld - %ld, &quot;
+ //&quot;scrolled: %ld, visible dirty: %ld - %ld\n&quot;, info.dirtyTop, info.dirtyBottom,
+@@ -1630,6 +1626,22 @@
+ 		fScrolledSinceLastSync = 0;
+ 	}
+ 
++	// Simple case first -- complete invalidation.
++	if (info.invalidateAll) {
++		Invalidate();
++		_UpdateScrollBarRange();
++		int32 offset = _LineAt(0);
++		fVisibleTextBuffer-&gt;SynchronizeWith(fTextBuffer, offset, offset,
++			offset + fTextBuffer-&gt;Height() + 2);
++		info.Reset();
++		return;
++	}
++
++	BRect bounds = Bounds();
++	int32 firstVisible = _LineAt(0);
++	int32 lastVisible = _LineAt(bounds.bottom);
++	int32 historySize = fTextBuffer-&gt;HistorySize();
++
+ 	bool doScroll = false;
+ 	if (linesScrolled &gt; 0) {
+ 		_UpdateScrollBarRange();
+
+Modified: haiku/trunk/src/apps/terminal/TerminalBuffer.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/TerminalBuffer.cpp	2008-06-17 20:00:51 UTC (rev 26002)
++++ haiku/trunk/src/apps/terminal/TerminalBuffer.cpp	2008-06-17 22:49:06 UTC (rev 26003)
+@@ -5,6 +5,8 @@
+ 
+ #include &quot;TerminalBuffer.h&quot;
+ 
++#include &lt;algorithm&gt;
++
+ #include &lt;Message.h&gt;
+ 
+ #include &quot;Coding.h&quot;
+@@ -18,6 +20,9 @@
+ 	:
+ 	BLocker(&quot;terminal buffer&quot;),
+ 	fEncoding(M_UTF8),
++	fAlternateScreen(NULL),
++	fAlternateHistory(NULL),
++	fAlternateScreenOffset(0),
+ 	fListenerValid(false)
+ {
+ }
+@@ -25,6 +30,8 @@
+ 
+ TerminalBuffer::~TerminalBuffer()
+ {
++	delete fAlternateScreen;
++	delete fAlternateHistory;
+ }
+ 
+ 
+@@ -34,6 +41,10 @@
+ 	if (Sem() &lt; 0)
+ 		return Sem();
+ 
++	fAlternateScreen = _AllocateLines(width, height);
++	if (fAlternateScreen == NULL)
++		return B_NO_MEMORY;
++
+ 	return BasicTerminalBuffer::Init(width, height, historySize);
+ }
+ 
+@@ -95,3 +106,100 @@
+ 	if (fListenerValid)
+ 		fListener.SendMessage(MSG_TERMINAL_BUFFER_CHANGED);
+ }
++
++
++status_t
++TerminalBuffer::ResizeTo(int32 width, int32 height)
++{
++	int32 historyCapacity = 0;
++	if (!fAlternateScreenActive)
++		historyCapacity = HistoryCapacity();
++	else if (fAlternateHistory != NULL)
++		historyCapacity = fAlternateHistory-&gt;Capacity();
++
++	return ResizeTo(width, height, historyCapacity);
++}
++
++
++status_t
++TerminalBuffer::ResizeTo(int32 width, int32 height, int32 historyCapacity)
++{
++	// switch to the normal screen buffer first
++	bool alternateScreenActive = fAlternateScreenActive;
++	if (alternateScreenActive)
++		_SwitchScreenBuffer();
++
++	int32 oldWidth = fWidth;
++	int32 oldHeight = fHeight;
++
++	// Resize the normal screen buffer/history.
++	status_t error = BasicTerminalBuffer::ResizeTo(width, height,
++		historyCapacity);
++	if (error != B_OK) {
++		if (alternateScreenActive)
++			_SwitchScreenBuffer();
++		return error;
++	}
++
++	TermPos cursor = fCursor;
++
++	// Switch to the alternate screen buffer and resize it.
++	if (fAlternateScreen != NULL) {
++		_SwitchScreenBuffer();
++
++		fWidth = oldWidth;
++		fHeight = oldHeight;
++		fCursor.SetTo(0, 0);
++
++		error = BasicTerminalBuffer::ResizeTo(width, height, 0);
++		if (error != B_OK) {
++			// This sucks -- we can't do anything about it. Delete the
++			// alternate screen buffer.
++			_FreeLines(fAlternateScreen, oldHeight);
++			fAlternateScreen = NULL;
++		}
++
++		// Switch back.
++		if (!alternateScreenActive)
++			_SwitchScreenBuffer();
++
++		fWidth = width;
++		fHeight = height;
++		fCursor = cursor;
++	}
++
++	return error;
++}
++
++
++void
++TerminalBuffer::UseAlternateScreenBuffer()
++{
++	if (fAlternateScreenActive || fAlternateScreen == NULL)
++		return;
++
++	_SwitchScreenBuffer();
++	Clear(false);
++	_InvalidateAll();
++}
++
++
++void
++TerminalBuffer::UseNormalScreenBuffer()
++{
++	if (!fAlternateScreenActive)
++		return;
++
++	_SwitchScreenBuffer();
++	_InvalidateAll();
++}
++
++
++void
++TerminalBuffer::_SwitchScreenBuffer()
++{
++	std::swap(fScreen, fAlternateScreen);
++	std::swap(fHistory, fAlternateHistory);
++	std::swap(fScreenOffset, fAlternateScreenOffset);
++	fAlternateScreenActive = !fAlternateScreenActive;
++}
+
+Modified: haiku/trunk/src/apps/terminal/TerminalBuffer.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/TerminalBuffer.h	2008-06-17 20:00:51 UTC (rev 26002)
++++ haiku/trunk/src/apps/terminal/TerminalBuffer.h	2008-06-17 22:49:06 UTC (rev 26003)
+@@ -28,12 +28,26 @@
+ 			void				SetTitle(const char* title);
+ 			void				NotifyQuit(int32 reason);
+ 
++	virtual	status_t			ResizeTo(int32 width, int32 height);
++	virtual	status_t			ResizeTo(int32 width, int32 height,
++									int32 historyCapacity);
++
++			void				UseAlternateScreenBuffer();
++			void				UseNormalScreenBuffer();
++
+ protected:
+ 	virtual	void				NotifyListener();
+ 
+ private:
++			void				_SwitchScreenBuffer();
++
++private:
+ 			int					fEncoding;
+ 
++			TerminalLine**		fAlternateScreen;
++			HistoryBuffer*		fAlternateHistory;
++			int32				fAlternateScreenOffset;
++
+ 			// listener/dirty region management
+ 			BMessenger			fListener;
+ 			bool				fListenerValid;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009675.html">[Haiku-commits] r26002 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="009679.html">[Haiku-commits] r26004 - haiku/trunk/src/apps/terminal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9677">[ date ]</a>
+              <a href="thread.html#9677">[ thread ]</a>
+              <a href="subject.html#9677">[ subject ]</a>
+              <a href="author.html#9677">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

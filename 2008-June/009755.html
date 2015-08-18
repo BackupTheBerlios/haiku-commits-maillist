@@ -1,0 +1,1087 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26059 -	haiku/trunk/src/add-ons/media/media-add-ons/opensound
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26059%20-%0A%09haiku/trunk/src/add-ons/media/media-add-ons/opensound&In-Reply-To=%3C200806211214.m5LCEXRr032085%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009754.html">
+   <LINK REL="Next"  HREF="009756.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26059 -	haiku/trunk/src/add-ons/media/media-add-ons/opensound</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26059%20-%0A%09haiku/trunk/src/add-ons/media/media-add-ons/opensound&In-Reply-To=%3C200806211214.m5LCEXRr032085%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26059 -	haiku/trunk/src/add-ons/media/media-add-ons/opensound">stippi at mail.berlios.de
+       </A><BR>
+    <I>Sat Jun 21 14:14:33 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009754.html">[Haiku-commits] r26058 - in	haiku/trunk/src/add-ons/input_server/methods: . pen
+</A></li>
+        <LI>Next message: <A HREF="009756.html">[Haiku-commits] r26060 -	haiku/trunk/src/add-ons/media/media-add-ons/opensound
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9755">[ date ]</a>
+              <a href="thread.html#9755">[ thread ]</a>
+              <a href="subject.html#9755">[ subject ]</a>
+              <a href="author.html#9755">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2008-06-21 14:14:26 +0200 (Sat, 21 Jun 2008)
+New Revision: 26059
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26059&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26059&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/add-ons/media/media-add-ons/opensound/SupportFunctions.h
+Modified:
+   haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundDeviceEngine.cpp
+   haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundDeviceEngine.h
+   haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundNode.cpp
+   haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundNode.h
+Log:
+Victory! With these changes, playback is nearly perfect under BeOS (tested with
+C-Media based sound card). In Haiku, I could test with HD Audio, and playback
+has clicks. It doesn't seem to have to do with the &quot;drift&quot;, which is now
+correctly published, I am not sure what exactly is causing it, I would like to
+test on different hardware yet.
+* I have modified the buffering policy (4 will give about 2048 bytes internal
+  OSS buffer), which decreases the latency of the node to an acceptable value.
+* I completely replaced the timesource publishing algo to be more reliable.
+* Removed now unnecessary methods from OpenSoundDeviceEngine.
+
+
+Modified: haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundDeviceEngine.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundDeviceEngine.cpp	2008-06-21 12:12:17 UTC (rev 26058)
++++ haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundDeviceEngine.cpp	2008-06-21 12:14:26 UTC (rev 26059)
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include &quot;OpenSoundDeviceEngine.h&quot;
++
+ #include &quot;debug.h&quot;
+ #include &quot;driver_io.h&quot;
+ #include &lt;MediaDefs.h&gt;
+@@ -13,6 +14,8 @@
+ #include &lt;errno.h&gt;
+ #include &lt;string.h&gt;
+ 
++#include &quot;SupportFunctions.h&quot;
++
+ OpenSoundDeviceEngine::~OpenSoundDeviceEngine()
+ {
+ 	CALLED();
+@@ -27,8 +30,7 @@
+ 	, fOpenMode(0)
+ 	, fFD(-1)
+ 	, fMediaFormat()
+-	, fPlayedFramesCount(0LL)
+-	, fPlayedRealTime(0LL)
++	, fDriverBufferSize(0)
+ {
+ 	CALLED();
+ 	fInitCheckStatus = B_NO_INIT;
+@@ -93,29 +95,31 @@
+ 		Close();
+ 		return EIO;
+ 	}
+-#if 1
+-	// set fragments
+-	v = 0x7fff0000 | 0x000b; // unlimited * 2048
+-	if (ioctl(fFD, SNDCTL_DSP_SETFRAGMENT, &amp;v, sizeof(int)) &lt; 0) {
+-		fInitCheckStatus = errno;
+-		Close();
+-		return EIO;
+-	}
+-#endif
+ 
+-#if 0
+-	// set latency policy = fragment size
++	// set latency policy = fragment size (4 means 2048 bytes driver buffer
++	// in my tests)
+ 	// XXX: BParameter?
+-	v = 0;
++	v = 4;
+ 	if (ioctl(fFD, SNDCTL_DSP_POLICY, &amp;v, sizeof(int)) &lt; 0) {
+-		fInitCheckStatus = errno;
+-		Close();
+-		return EIO;
+-	}
++		if (errno != EIO &amp;&amp; errno != EINVAL) {
++			fInitCheckStatus = errno;
++			Close();
++			return EIO;
++		}
++		// TODO: use this older API as fallback:
++#if 0
++		// set fragments
++		v = 0x7fff0000 | 0x000b; // unlimited * 2048
++		if (ioctl(fFD, SNDCTL_DSP_SETFRAGMENT, &amp;v, sizeof(int)) &lt; 0) {
++			fInitCheckStatus = errno;
++			Close();
++			return EIO;
++		}
+ #endif
++	}
+ 
+-	fPlayedFramesCount = 0LL;
+-	fPlayedRealTime = system_time();
++	fDriverBufferSize = 2048;
++		// preliminary, adjusted in AcceptFormat()
+ 	return B_OK;
+ }
+ 
+@@ -128,8 +132,6 @@
+ 	fFD = -1;
+ 	fOpenMode = 0;
+ 	fMediaFormat = media_format();
+-	fPlayedFramesCount = 0LL;
+-	fPlayedRealTime = 0LL;
+ 	return B_OK;
+ }
+ 
+@@ -145,50 +147,32 @@
+ }
+ 
+ 
+-ssize_t OpenSoundDeviceEngine::Write(const void *buffer, size_t size)
++ssize_t
++OpenSoundDeviceEngine::Write(const void *buffer, size_t size)
+ {
+-	ssize_t done;
+-	int v;
+ 	CALLED();
++
+ 	ASSERT(size &gt; 0);
+-	done = write(fFD, buffer, size);
++
++	ssize_t done = write(fFD, buffer, size);
+ 	if (done &lt; 0)
+ 		return errno;
+-	switch (fMediaFormat.type) {
+-	case B_MEDIA_RAW_AUDIO:
+-		fPlayedFramesCount += done / (fMediaFormat.u.raw_audio.channel_count
+-							 		* (fMediaFormat.AudioFormat() &amp; media_raw_audio_format::B_AUDIO_SIZE_MASK));
+-/*		fPlayedRealTime = system_time();
+-		v = 0;
+-		if (ioctl(fFD, SNDCTL_DSP_GETODELAY, &amp;v, sizeof(int)) &gt; -1) {
+-			bigtime_t delay = (bigtime_t)v * 1000000LL
+-								/ (fMediaFormat.u.raw_audio.channel_count * fMediaFormat.u.raw_audio.frame_rate
+-							 		* (fMediaFormat.AudioFormat() &amp; media_raw_audio_format::B_AUDIO_SIZE_MASK));
+-			fPlayedRealTime += delay;
+-			PRINT((&quot;********************************* v = %d, delay %Ld\n&quot;, v, delay));
+-		}*/
+-//		PRINT((&quot;OpenSoundDeviceEngine::%s: wrote %d, played %Ld frames&quot;/*&quot;, realtime %Ld&quot;*/&quot;\n&quot;, __FUNCTION__, done, fPlayedFramesCount/*, fPlayedRealTime*/));
+-		break;
+-	case B_MEDIA_ENCODED_AUDIO:
+-		//XXX: WRITEME! -- bitrate ?
+-		break;
+-	default:
+-		return EINVAL;
+-	}
++
+ 	return done;
+ }
+ 
+ 
+-status_t OpenSoundDeviceEngine::UpdateInfo(void)
++status_t
++OpenSoundDeviceEngine::UpdateInfo()
+ {
+-	status_t err;
+ 	CALLED();
++
+ 	if (fFD &lt; 0)
+ 		return ENODEV;
+ 	
+-	if (ioctl(fFD, SNDCTL_ENGINEINFO, &amp;fAudioInfo, sizeof(oss_audioinfo)) &lt; 0) {
++	if (ioctl(fFD, SNDCTL_ENGINEINFO, &amp;fAudioInfo, sizeof(oss_audioinfo)) &lt; 0)
+ 		return errno;
+-	}
++
+ 	return B_OK;
+ }
+ 
+@@ -196,18 +180,15 @@
+ bigtime_t
+ OpenSoundDeviceEngine::PlaybackLatency()
+ {
+-	bigtime_t latency;
+-	int delay;
+-	delay = GetODelay();
+-delay = 0; //XXX 
+-	latency = (bigtime_t)((double)delay * 1000000LL 
+-		/ (fMediaFormat.u.raw_audio.channel_count
+-		* fMediaFormat.u.raw_audio.frame_rate
+-		* (fMediaFormat.AudioFormat()
+-			&amp; media_raw_audio_format::B_AUDIO_SIZE_MASK)));
+-	PRINT((&quot;PlaybackLatency: odelay %d latency %Ld card %Ld\n&quot;, delay, latency,
+-		CardLatency()));
+-	latency += CardLatency();
++	bigtime_t latency = time_for_buffer(fDriverBufferSize, fMediaFormat);
++	bigtime_t cardLatency = CardLatency();
++	if (cardLatency == 0) {
++		// that's unrealistic, take matters into own hands
++		cardLatency = latency / 3;
++	}
++	latency += cardLatency;
++//	PRINT((&quot;PlaybackLatency: odelay %d latency %Ld card %Ld\n&quot;,
++//		fDriverBufferSize, latency, CardLatency()));
+ 	return latency;
+ }
+ 
+@@ -365,35 +346,42 @@
+ 
+ 
+ int64
+-OpenSoundDeviceEngine::GetCurrentOPtr(int32 *fifoed, oss_count_t *info)
++OpenSoundDeviceEngine::GetCurrentOPtr(int32* fifoed, size_t* fragmentPos)
+ {
+-	oss_count_t ocount;
+-	count_info cinfo;
+ 	CALLED();
+-	if (!info)
+-		info = &ocount;
+-	memset(info, 0, sizeof(oss_count_t));
+-	if (!(fOpenMode &amp; OPEN_WRITE))
++
++	if (!(fOpenMode &amp; OPEN_WRITE)) {
++		if (fifoed != NULL)
++			*fifoed = 0;
+ 		return 0;
+-	if (ioctl(fFD, SNDCTL_DSP_CURRENT_OPTR, info, sizeof(oss_count_t)) &lt; 0) {
++	}
++
++	oss_count_t info;
++	memset(&amp;info, 0, sizeof(oss_count_t));
++
++	if (ioctl(fFD, SNDCTL_DSP_CURRENT_OPTR, &amp;info, sizeof(oss_count_t)) &lt; 0) {
+ 		PRINT((&quot;OpenSoundDeviceEngine::%s: %s: %s\n&quot;, 
+ 				__FUNCTION__, &quot;SNDCTL_DSP_CURRENT_OPTR&quot;, strerror(errno)));
+-		//return EIO;
+-		// fallback: try GET*PTR
++
++		return 0;
++	}
++
++	if (fragmentPos != NULL) {
++		count_info cinfo;
+ 		if (ioctl(fFD, SNDCTL_DSP_GETOPTR, &amp;cinfo, sizeof(count_info)) &lt; 0) {
+ 			PRINT((&quot;OpenSoundDeviceEngine::%s: %s: %s\n&quot;, 
+ 					__FUNCTION__, &quot;SNDCTL_DSP_GETOPTR&quot;, strerror(errno)));
+ 			return 0;
+ 		}
+-		// it's probably wrong...
+-		info-&gt;samples = cinfo.bytes / (fMediaFormat.u.raw_audio.channel_count
+-						 		* (fMediaFormat.AudioFormat() &amp; media_raw_audio_format::B_AUDIO_SIZE_MASK));
+-		info-&gt;fifo_samples = 0;
++		*fragmentPos = cinfo.ptr;
+ 	}
+-	//PRINT((&quot;OpenSoundDeviceEngine::%s: OPTR: { samples=%Ld, fifo_samples=%d }\n&quot;, __FUNCTION__, info-&gt;samples, info-&gt;fifo_samples));
+-	if (fifoed)
+-		*fifoed = info-&gt;fifo_samples;
+-	return info-&gt;samples;
++
++//	PRINT((&quot;OpenSoundDeviceEngine::%s: OPTR: { samples=%Ld, &quot;
++//		&quot;fifo_samples=%d }\n&quot;, __FUNCTION__, info-&gt;samples,
++//		info-&gt;fifo_samples));
++	if (fifoed != NULL)
++		*fifoed = info.fifo_samples;
++	return info.samples;
+ }
+ 
+ 
+@@ -433,14 +421,10 @@
+ }
+ 
+ 
+-int OpenSoundDeviceEngine::GetODelay(void)
++size_t
++OpenSoundDeviceEngine::DriverBufferSize() const
+ {
+-	//CALLED();
+-	int v = 1;
+-	if (ioctl(fFD, SNDCTL_DSP_GETODELAY, &amp;v, sizeof(int)) &lt; 0) {
+-		return 0;
+-	}
+-	return v;
++	return fDriverBufferSize;
+ }
+ 
+ 
+@@ -464,44 +448,10 @@
+ }
+ 
+ 
+-int64 OpenSoundDeviceEngine::PlayedFramesCount(void)
++status_t
++OpenSoundDeviceEngine::WildcardFormatFor(int fmt, media_format &amp;format,
++	bool rec)
+ {
+-	int64 played;
+-	int32 fifoed;
+-	played = GetCurrentOPtr(&amp;fifoed);
+-	//played += fifoed;
+-	//return played;
+-	fPlayedFramesCount = played - fifoed;
+-	return fPlayedFramesCount;//XXX
+-	return fPlayedFramesCount - (GetODelay() / (fMediaFormat.u.raw_audio.channel_count
+-						 		* (fMediaFormat.AudioFormat() &amp; media_raw_audio_format::B_AUDIO_SIZE_MASK)));
+-	return fPlayedFramesCount - (GetODelay() / (/*fMediaFormat.u.raw_audio.channel_count
+-						 		* */(fMediaFormat.AudioFormat() &amp; media_raw_audio_format::B_AUDIO_SIZE_MASK)));
+-	//return fPlayedFramesCount;
+-}
+-
+-
+-bigtime_t OpenSoundDeviceEngine::PlayedRealTime(void)
+-{
+-	//CALLED();
+-	bigtime_t playedRealTime = system_time();
+-	return playedRealTime;//XXX
+-	int v = 1;
+-	if (ioctl(fFD, SNDCTL_DSP_GETODELAY, &amp;v, sizeof(int)) &lt; 0) {
+-		return playedRealTime;
+-	}
+-	bigtime_t delay = (bigtime_t)(v * 1000000LL
+-						/ (fMediaFormat.u.raw_audio.channel_count * fMediaFormat.u.raw_audio.frame_rate
+-					 		* (fMediaFormat.AudioFormat() &amp; media_raw_audio_format::B_AUDIO_SIZE_MASK)));
+-	playedRealTime += delay;
+-	//PRINT((&quot;********************************* v = %d, delay %Ld\n&quot;, v, delay));
+-//	playedRealTime-=41000;
+-	return playedRealTime;
+-}
+-
+-
+-status_t OpenSoundDeviceEngine::WildcardFormatFor(int fmt, media_format &amp;format, bool rec)
+-{
+ 	status_t err;
+ 	CALLED();
+ 	fmt &amp;= rec ? Info()-&gt;iformats : Info()-&gt;oformats;
+@@ -637,33 +587,21 @@
+ 			Close();
+ 			return err;
+ 		}
+-		
+-		
+-		
+-#if 0
+-		raw.buffer_size = DEFAULT_BUFFER_SIZE
+-						* (raw.format &amp; media_raw_audio_format::B_AUDIO_SIZE_MASK)
+-						* raw.channel_count;
+-#endif
++
++		// retrieve the driver buffer size (it's important to do this
++		// after all the other setup, since OSS may have adjusted it, and
++		// also weird things happen if this ioctl() is done before other
++		// setup itctl()s)
+ 		audio_buf_info abinfo;
+-		if (ioctl(fFD, rec?SNDCTL_DSP_GETISPACE:SNDCTL_DSP_GETOSPACE, &amp;abinfo, sizeof(abinfo)) &lt; 0) {
+-			PRINT((&quot;OpenSoundDeviceEngine::%s: %s: %s\n&quot;, 
+-				__FUNCTION__, &quot;SNDCTL_DSP_GET?SPACE&quot;, strerror(errno)));
+-			return -1;
++		memset(&amp;abinfo, 0, sizeof(audio_buf_info));
++		if (ioctl(fFD, SNDCTL_DSP_GETOSPACE, &amp;abinfo, sizeof(audio_buf_info)) &lt; 0) {
++			fprintf(stderr, &quot;failed to retrieve driver buffer size!\n&quot;);
++			abinfo.bytes = 0;
+ 		}
+-		PRINT((&quot;OSS: %cSPACE: { bytes=%d, fragments=%d, fragsize=%d, fragstotal=%d }\n&quot;, rec?'I':'O', abinfo.bytes, abinfo.fragments, abinfo.fragsize, abinfo.fragstotal));
+-		// cache the first one in the Device
+-		// so StartThread() knows the number of frags
+-		//if (!fFragments.fragstotal)
+-		//	memcpy(&amp;fFragments, &amp;abinfo, sizeof(abinfo));
++		fDriverBufferSize = abinfo.bytes;
+ 
+-		// make sure buffer size is less than the driver's own buffer ( /2 to keep some margin )
+-//		if (/*rec &amp;&amp; raw.buffer_size &amp;&amp;*/ raw.buffer_size &gt;= abinfo.fragsize * abinfo.fragstotal / 2)
+-//			return B_MEDIA_BAD_FORMAT;
+-//		if (!raw.buffer_size)
+-		raw.buffer_size = abinfo.fragsize;// * abinfo.fragstotal / 4;//XXX
+-/*						* (raw.format &amp; media_raw_audio_format::B_AUDIO_SIZE_MASK)
+-						* raw.channel_count;*/
++		raw.buffer_size = fDriverBufferSize;
++
+ 	} else if (format.type == B_MEDIA_ENCODED_AUDIO) {
+ 		media_raw_audio_format &amp;raw = format.u.encoded_audio.output;
+ 		// XXX: do we really have to do this ?
+@@ -680,6 +618,7 @@
+ 	}
+ 	// cache it
+ 	fMediaFormat = format;
++
+ 	string_for_format(format, buf, 1024);
+ 	PRINT((&quot;%s: %s\n&quot;, __FUNCTION__, buf));
+ 	return B_OK;
+@@ -740,15 +679,16 @@
+ 		// endianness
+ 		if (!raw.byte_order)
+ 			raw.byte_order = OpenSoundDevice::convert_oss_format_to_endian(afmt);
+-		if (raw.byte_order != OpenSoundDevice::convert_oss_format_to_endian(afmt)) {
++		if ((int)raw.byte_order != OpenSoundDevice::convert_oss_format_to_endian(afmt)) {
+ 			Close();
+ 			return B_MEDIA_BAD_FORMAT;
+ 		}
+ 		
+ 		// channel count
+-		if (!raw.channel_count)
++		if (raw.channel_count == 0)
+ 			raw.channel_count = (unsigned)Info()-&gt;min_channels;
+-		if (raw.channel_count &lt; Info()-&gt;min_channels || raw.channel_count &gt; Info()-&gt;max_channels)
++		if ((int)raw.channel_count &lt; Info()-&gt;min_channels
++			|| (int)raw.channel_count &gt; Info()-&gt;max_channels)
+ 			return B_MEDIA_BAD_FORMAT;
+ 		err = SetChannels(raw.channel_count);
+ 		if (err &lt; B_OK) {
+@@ -784,7 +724,7 @@
+ 		//	memcpy(&amp;fFragments, &amp;abinfo, sizeof(abinfo));
+ 
+ 		// make sure buffer size is less than the driver's own buffer ( /2 to keep some margin )
+-		if (/*rec &amp;&amp; raw.buffer_size &amp;&amp;*/ raw.buffer_size &gt; abinfo.fragsize * abinfo.fragstotal / 4)
++		if (/*rec &amp;&amp; raw.buffer_size &amp;&amp;*/ (int)raw.buffer_size &gt; abinfo.fragsize * abinfo.fragstotal / 4)
+ 			return B_MEDIA_BAD_FORMAT;
+ 		if (!raw.buffer_size)
+ 			raw.buffer_size = abinfo.fragsize;//XXX
+
+Modified: haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundDeviceEngine.h
+===================================================================
+--- haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundDeviceEngine.h	2008-06-21 12:12:17 UTC (rev 26058)
++++ haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundDeviceEngine.h	2008-06-21 12:14:26 UTC (rev 26059)
+@@ -38,7 +38,7 @@
+ 		status_t	UpdateInfo();
+ 		// shortcuts
+ 		int			Caps() const { return fAudioInfo.caps; };
+-		bigtime_t	CardLatency(void) const { return (fAudioInfo.latency&lt;0) ? 0 : fAudioInfo.latency; };
++		bigtime_t	CardLatency(void) const { return (fAudioInfo.latency &lt; 0) ? 0 : fAudioInfo.latency; };
+ 		bigtime_t	PlaybackLatency(void);
+ 		bigtime_t	RecordingLatency(void);
+ 		
+@@ -57,19 +57,18 @@
+ 		size_t		GetISpace(audio_buf_info *info=NULL);
+ 		size_t		GetOSpace(audio_buf_info *info=NULL);
+ 
+-		int64		GetCurrentIPtr(int32 *fifoed=NULL, oss_count_t *info=NULL);
+-		int64		GetCurrentOPtr(int32 *fifoed=NULL, oss_count_t *info=NULL);
++		int64		GetCurrentIPtr(int32* fifoed = NULL,
++						oss_count_t* info = NULL);
++		int64		GetCurrentOPtr(int32* fifoed = NULL,
++						size_t* fragmentPos = NULL);
+ 
+ 		int32		GetIOverruns();
+ 		int32		GetOUnderruns();
+ 
+-		int			GetODelay(void);
++		size_t		DriverBufferSize() const;
+ 
+ 		status_t	StartRecording(void);
+ 
+-		int64		PlayedFramesCount(void);
+-		bigtime_t	PlayedRealTime(void);
+-		
+ 		// suggest possibles
+ 		status_t	WildcardFormatFor(int fmt, media_format &amp;format, bool rec=false);
+ 		// suggest best
+@@ -90,6 +89,7 @@
+ 		media_format			fMediaFormat;
+ 		int64					fPlayedFramesCount;
+ 		bigtime_t				fPlayedRealTime;
++		size_t					fDriverBufferSize;
+ };
+ 
+ #endif
+
+Modified: haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundNode.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundNode.cpp	2008-06-21 12:12:17 UTC (rev 26058)
++++ haiku/trunk/src/add-ons/media/media-add-ons/opensound/OpenSoundNode.cpp	2008-06-21 12:14:26 UTC (rev 26059)
+@@ -13,6 +13,7 @@
+ #include &lt;Debug.h&gt;
+ #include &lt;MediaAddOn.h&gt;
+ #include &lt;MediaRoster.h&gt;
++#include &lt;scheduler.h&gt;
+ #include &lt;String.h&gt;
+ 
+ #include &lt;new&gt;
+@@ -29,10 +30,44 @@
+ #include &quot;OpenSoundDevice.h&quot;
+ #include &quot;OpenSoundDeviceEngine.h&quot;
+ #include &quot;OpenSoundDeviceMixer.h&quot;
++#include &quot;SupportFunctions.h&quot;
+ 
+ using std::nothrow;
+ 
+ 
++class FunctionTracer {
++public:
++	FunctionTracer(const char* functionName)
++		: fFunctionName(functionName)
++	{
++		printf(&quot;OpenSoundNode::%s()\n&quot;, fFunctionName.String());
++	}
++	 ~FunctionTracer()
++	{
++		printf(&quot;OpenSoundNode::%s() - leave\n&quot;, fFunctionName.String());
++	}
++	BString	fFunctionName;
++};
++
++
++// debugging
++#ifdef TRACE
++#	undef TRACE
++#endif
++#ifdef CALLED
++#	undef CALLED
++#endif
++//#define TRACE_OSS_NODE
++#ifdef TRACE_OSS_NODE
++#	define TRACE(x...)		printf(x)
++#	define CALLED(x...)		FunctionTracer _ft(__FUNCTION__)
++#	define PRINTING
++#else
++#	define TRACE(x...)
++#	define CALLED(x...)
++#endif
++
++
+ class OpenSoundNode::NodeInput {
+ public:
+ 	NodeInput(const media_input&amp; input, int engineIndex, int ossFormatFlags,
+@@ -48,7 +83,9 @@
+ 		  	// in case we are re-connected and need to start &quot;clean&quot;
+ 
+ 		  fThread(-1),
+-		  fBuffers(4)
++		  fBuffers(4),
++
++		  fTestTonePhase(0)
+ 	{
+ 		CALLED();
+ 
+@@ -59,6 +96,8 @@
+ 	~NodeInput()
+ 	{
+ 		CALLED();
++
++		RecycleAllBuffers();
+ 	}
+ 
+ 	status_t FillBuffer(BBuffer* buffer)
+@@ -70,8 +109,9 @@
+ 
+ 		if (written &lt; 0)
+ 			return (status_t)written;
+-		if (written &lt; buffer-&gt;SizeUsed())
++		if (written &lt; (ssize_t)buffer-&gt;SizeUsed())
+ 			return B_IO_ERROR;
++
+ 		return B_OK;
+ 	}
+ 
+@@ -99,6 +139,52 @@
+ 		}
+ 	}
+ 
++	void WriteTestTone(size_t bytes)
++	{
++		// phase of the sine wave
++		uint8 buffer[bytes];
++		float sampleRate = fInput.format.u.raw_audio.frame_rate;
++
++		const static int kSineBuffer[48] = {
++			0, 4276, 8480, 12539, 16383, 19947, 23169, 25995,
++			28377, 30272, 31650, 32486, 32767, 32486, 31650, 30272,
++			28377, 25995, 23169, 19947, 16383, 12539, 8480, 4276,
++			0, -4276, -8480, -12539, -16383, -19947, -23169, -25995,
++			-28377, -30272, -31650, -32486, -32767, -32486, -31650, -30272,
++			-28377, -25995, -23169, -19947, -16383, -12539, -8480, -4276
++		};
++
++		short* b = (short*)buffer;
++			// TODO: assumes 16 bit samples!
++		int32 channels = fInput.format.u.raw_audio.channel_count;
++		int32 frames = bytes / bytes_per_frame(fInput.format);
++		for (int32 i = 0; i &lt; frames; i ++) {
++			// convert sample rate from 48000 to connected format
++			uint32 p = (uint32)((fTestTonePhase * sampleRate) / 48000);
++	
++			// prevent phase from integer overflow
++			fTestTonePhase = (fTestTonePhase + 1) % 4800;
++			for (int32 k = 0; k &lt; channels; k++)
++				b[k] = kSineBuffer[p % 48];
++			b += channels;
++		}
++
++		ssize_t written = fRealEngine-&gt;Write(buffer, bytes);
++		if (written != (ssize_t)bytes) {
++			// error
++		}
++	}
++
++	void RecycleAllBuffers()
++	{
++		CALLED();
++
++		// make sure all buffers are recycled, or we might hang
++		// when told to quit
++		while (BBuffer* buffer = (BBuffer*)fBuffers.RemoveItem(0L))
++			buffer-&gt;Recycle();
++	}
++
+ 	OpenSoundNode*			fNode;
+ 	int32					fEngineIndex;
+ 	OpenSoundDeviceEngine*	fRealEngine;
+@@ -111,6 +197,8 @@
+ 	thread_id				fThread;
+ 	BList					fBuffers;
+ 		// contains BBuffer* pointers that have not yet played
++
++	uint32					fTestTonePhase;
+ };
+ 
+ 
+@@ -127,6 +215,7 @@
+ 
+ 		  fThread(-1),
+ 		  fBufferGroup(NULL),
++		  fUsingOwnBufferGroup(true),
+ 		  fOutputEnabled(true),
+ 
+ 		  fSamplesSent(0)
+@@ -137,8 +226,56 @@
+ 	~NodeOutput()
+ 	{
+ 		CALLED();
++
++		FreeBuffers();
+ 	}
+ 
++	status_t AllocateBuffers(bigtime_t bufferDuration, bigtime_t latency)
++	{
++		TRACE(&quot;NodeOutput::AllocateBuffers(bufferDuration = %lld, &quot;
++			&quot;latency = %lld)\n&quot;, bufferDuration, latency);
++
++		FreeBuffers();
++
++		// allocate enough buffers to span our downstream latency, plus one
++		size_t size = fOutput.format.u.raw_audio.buffer_size;
++		int32 count = int32(latency / bufferDuration + 1 + 1);
++
++		fBufferGroup = new (nothrow) BBufferGroup(size, count);
++		fUsingOwnBufferGroup = true;
++		return fBufferGroup != NULL ? fBufferGroup-&gt;InitCheck() : B_NO_MEMORY;
++	}
++
++	status_t SetExternalBuffers(BBufferGroup* bufferGroup)
++	{
++		TRACE(&quot;NodeOutput::SetExternalBuffers(%p)\n&quot;, bufferGroup);
++
++		fBufferGroup = bufferGroup;
++		fUsingOwnBufferGroup = false;
++		return fBufferGroup-&gt;InitCheck();
++	}
++
++	void FreeBuffers()
++	{
++		TRACE(&quot;NodeOutput::FreeBuffers(): %p (own %d)\n&quot;, fBufferGroup,
++			fUsingOwnBufferGroup);
++// TODO: it is not clear to me how buffer group responsibility is supposed
++// to work properly. Appearantly, a consumer can use SetOutputBuffers(),
++// which is a deprecated call in the BeOS API, with &quot;willReclaim == true&quot;.
++// In that case, we would not be responsible for deleting these buffers,
++// but I don't understand what mechanism makes sure that we know about this.
++// The documentation for SetBufferGroup() says you are supposed to delete
++// the given buffer group. In any case, the fUsingOwnBufferGroup is correclty
++// maintained as far as we are concerned, but I delete the buffers anyways,
++// which is what the code was doing from the beginning and that worked. I
++// have not tested yet, whether an external buffer group is passed to the node
++// from the system mixer.
++
++//		if (fUsingOwnBufferGroup)
++			delete fBufferGroup;
++		fBufferGroup = NULL;
++	}
++
+ 	BBuffer* FillNextBuffer(bigtime_t bufferDuration)
+ 	{
+ 		if (fBufferGroup == NULL)
+@@ -157,14 +294,14 @@
+ 		ssize_t sizeUsed = fRealEngine-&gt;Read(buffer-&gt;Data(),
+ 			fOutput.format.u.raw_audio.buffer_size);
+ 		if (sizeUsed &lt; 0) {
+-			PRINT((&quot;NodeOutput::%s: %s\n&quot;, __FUNCTION__,
+-				strerror(sizeUsed)));
++			TRACE(&quot;NodeOutput::%s: %s\n&quot;, __FUNCTION__,
++				strerror(sizeUsed));
+ 			buffer-&gt;Recycle();
+ 			return NULL;
+ 		}
+-		if (sizeUsed &lt; fOutput.format.u.raw_audio.buffer_size) {
+-			PRINT((&quot;NodeOutput::%s: requested %d, got %d\n&quot;, __FUNCTION__,
+-				fOutput.format.u.raw_audio.buffer_size, sizeUsed));
++		if (sizeUsed &lt; (ssize_t)fOutput.format.u.raw_audio.buffer_size) {
++			TRACE(&quot;NodeOutput::%s: requested %d, got %d\n&quot;, __FUNCTION__,
++				fOutput.format.u.raw_audio.buffer_size, sizeUsed);
+ 		}
+ 
+ 		media_header* hdr = buffer-&gt;Header();
+@@ -187,6 +324,7 @@
+ 	
+ 	thread_id				fThread;
+ 	BBufferGroup*			fBufferGroup;
++	bool					fUsingOwnBufferGroup;
+ 	bool 					fOutputEnabled;
+ 	uint64 					fSamplesSent;
+ };
+@@ -195,24 +333,6 @@
+ // #pragma mark - OpenSoundNode
+ 
+ 
+-OpenSoundNode::~OpenSoundNode()
+-{
+-	CALLED();
+-	fAddOn-&gt;GetConfigurationFor(this, NULL);
+-
+-	int32 count = fInputs.CountItems();
+-	for (int32 i = 0; i &lt; count; i++)
+-		delete (NodeInput*)fInputs.ItemAtFast(i);
+-	count = fOutputs.CountItems();
+-	for (int32 i = 0; i &lt; count; i++)
+-		delete (NodeOutput*)fOutputs.ItemAtFast(i);
+-
+-	BMediaEventLooper::Quit();
+-		
+-	fWeb = NULL;	
+-}
+-
+-
+ OpenSoundNode::OpenSoundNode(BMediaAddOn* addon, const char* name,
+ 		OpenSoundDevice* device, int32 internal_id, BMessage* config)
+ 	: BMediaNode(name),
+@@ -223,9 +343,10 @@
+ 
+ 	  fInitCheckStatus(B_NO_INIT),
+ 	  fDevice(device),
++
+ 	  fTimeSourceStarted(false),
+-	  fOldPlayedFramesCount(0LL),
+-	  fOldPlayedRealTime(0LL),
++	  fTimeSourceStartTime(0),
++
+ 	  fWeb(NULL),
+ 	  fConfig(*config)
+ {
+@@ -276,6 +397,25 @@
+ }
+ 
+ 
++OpenSoundNode::~OpenSoundNode()
++{
++	CALLED();
++
++	fAddOn-&gt;GetConfigurationFor(this, NULL);
++
++	int32 count = fInputs.CountItems();
++	for (int32 i = 0; i &lt; count; i++)
++		delete (NodeInput*)fInputs.ItemAtFast(i);
++	count = fOutputs.CountItems();
++	for (int32 i = 0; i &lt; count; i++)
++		delete (NodeOutput*)fOutputs.ItemAtFast(i);
++
++	BMediaEventLooper::Quit();
++		
++	fWeb = NULL;	
++}
++
++
+ status_t
+ OpenSoundNode::InitCheck() const
+ {
+@@ -333,7 +473,7 @@
+ 	
+ 	Run();
+ 	
+-	PRINT((&quot;NodeRegistered: %d engines\n&quot;, fDevice-&gt;CountEngines()));
++	TRACE(&quot;NodeRegistered: %d engines\n&quot;, fDevice-&gt;CountEngines());
+ 	for (int32 i = 0; i &lt; fDevice-&gt;CountEngines(); i++) {
+ 		OpenSoundDeviceEngine* engine = fDevice-&gt;EngineAt(i);
+ 		if (engine == NULL)
+@@ -345,8 +485,8 @@
+ 		if ((engine-&gt;Caps() &amp; PCM_CAP_OUTPUT) == 0)
+ 			continue;
+ 
+-		PRINT((&quot;NodeRegistered: engine[%d]: .caps=0x%08x, .oformats=0x%08x\n&quot;,
+-			i, engine-&gt;Caps(), engine-&gt;Info()-&gt;oformats));
++		TRACE(&quot;NodeRegistered: engine[%d]: .caps=0x%08x, .oformats=0x%08x\n&quot;,
++			i, engine-&gt;Caps(), engine-&gt;Info()-&gt;oformats);
+ 
+ 		// iterate over all possible OSS formats/encodings and
+ 		// create a NodeInput for each
+@@ -355,8 +495,8 @@
+ 			int fmt = gSupportedFormats[f] &amp; engine-&gt;Info()-&gt;oformats;
+ 			if (fmt == 0)
+ 				continue;
+-			PRINT((&quot;NodeRegistered() : creating an input for engine %i, &quot;
+-				&quot;format[%i]\n&quot;, i, f));
++			TRACE(&quot;NodeRegistered() : creating an input for engine %i, &quot;
++				&quot;format[%i]\n&quot;, i, f);
+ 
+ 			media_input mediaInput;
+ 			status_t err = engine-&gt;PreferredFormatFor(fmt, mediaInput.format);
+@@ -392,15 +532,15 @@
+ 		if ((engine-&gt;Caps() &amp; PCM_CAP_INPUT) == 0)
+ 			continue;
+ 
+-		PRINT((&quot;NodeRegistered: engine[%d]: .caps=0x%08x, .iformats=0x%08x\n&quot;,
+-			i, engine-&gt;Caps(), engine-&gt;Info()-&gt;iformats));
++		TRACE(&quot;NodeRegistered: engine[%d]: .caps=0x%08x, .iformats=0x%08x\n&quot;,
++			i, engine-&gt;Caps(), engine-&gt;Info()-&gt;iformats);
+ 
+ 		for (int32 f = 0; gSupportedFormats[f]; f++) {
+ 			int fmt = gSupportedFormats[f] &amp; engine-&gt;Info()-&gt;iformats;
+ 			if (fmt == 0)
+ 				continue;
+-			PRINT((&quot;NodeRegistered() : creating an output for engine %i, &quot;
+-				&quot;format[%i]\n&quot;, i, f));
++			TRACE(&quot;NodeRegistered() : creating an output for engine %i, &quot;
++				&quot;format[%i]\n&quot;, i, f);
+ 			
+ 			media_format preferredFormat;
+ 			status_t err = engine-&gt;PreferredFormatFor(fmt, preferredFormat);
+@@ -456,7 +596,7 @@
+ 		index++;
+ 	}
+ 	
+-	PRINT((&quot;apply configuration in : %lld&#181;s\n&quot;, system_time() - start));
++	TRACE(&quot;apply configuration in : %lld&#181;s\n&quot;, system_time() - start);
+ }
+ 
+ 
+@@ -593,7 +733,7 @@
+ 	*out_input = channel-&gt;fInput;
+ 	*cookie += 1;
+ 
+-	PRINT((&quot;input.format : %u\n&quot;, channel-&gt;fInput.format.u.raw_audio.format));
++	TRACE(&quot;input.format : %u\n&quot;, channel-&gt;fInput.format.u.raw_audio.format);
+ 
+ 	return B_OK;
+ }
+@@ -629,7 +769,7 @@
+ 			if (buffer-&gt;Flags() &amp; BBuffer::B_SMALL_BUFFER) {
+ 				fprintf(stderr, &quot;OpenSoundNode::BufferReceived() - &quot;
+ 					&quot;B_SMALL_BUFFER not implemented\n&quot;);
+-				// XXX: implement this part
++				// TODO: implement this part
+ 				buffer-&gt;Recycle();			
+ 			} else {
+ 				media_timed_event event(buffer-&gt;Header()-&gt;start_time,
+@@ -667,8 +807,8 @@
+ 		return;
+ 	}
+ 	
+-//	PRINT((&quot;************ ProducerDataStatus: queuing event ************\n&quot;));
+-//	PRINT((&quot;************ status=%d ************\n&quot;, status));
++//	TRACE(&quot;************ ProducerDataStatus: queuing event ************\n&quot;);
++//	TRACE(&quot;************ status=%d ************\n&quot;, status);
+ 	
+ 	media_timed_event event(at_performance_time,
+ 		BTimedEventQueue::B_DATA_STATUS, &amp;channel-&gt;fInput,
+@@ -700,10 +840,11 @@
+ 	*out_latency = EventLatency();
+ 
+ 	// add the OSS driver buffer's latency as well
+-	*out_latency += channel-&gt;fRealEngine-&gt;PlaybackLatency();
++	bigtime_t bufferLatency = channel-&gt;fRealEngine-&gt;PlaybackLatency();
++	*out_latency += bufferLatency;
+ 
+-	PRINT((&quot;OpenSoundNode::GetLatencyFor() - EventLatency %lld, OSS %lld\n&quot;,
+-		EventLatency(), channel-&gt;fRealEngine-&gt;PlaybackLatency()));
++	TRACE(&quot;OpenSoundNode::GetLatencyFor() - EventLatency %lld, OSS %lld\n&quot;,
++		EventLatency(), bufferLatency);
+ 
+ 	*out_timesource = TimeSource()-&gt;ID();
+ 
+@@ -723,7 +864,7 @@
+ 		return B_BAD_VALUE;
+ 	}
+ 
+-	NodeInput *channel = _FindInput(where);
++	NodeInput* channel = _FindInput(where);
+ 
+ 	if (channel == NULL) {
+ 		fprintf(stderr,&quot;OpenSoundNode::Connected() - &quot;
+@@ -733,19 +874,11 @@
+ 
+ 	BAutolock L(fDevice-&gt;Locker());
+ 
+-	// use one buffer length latency
+-	size_t bufferSize = with_format.u.raw_audio.buffer_size;
+-	int32 channelCount = with_format.u.raw_audio.channel_count;
+-	size_t sampleSize = with_format.u.raw_audio.format
+-			&amp; media_raw_audio_format::B_AUDIO_SIZE_MASK;
+-	size_t frameSize = sampleSize * channelCount;
+-	float frameRate = with_format.u.raw_audio.frame_rate;
++	// use one half buffer length latency
++	size_t bufferSize = channel-&gt;fRealEngine-&gt;DriverBufferSize() / 2;
++	fInternalLatency = time_for_buffer(bufferSize, with_format);
++	TRACE(&quot;  internal latency = %lld\n&quot;, fInternalLatency);
+ 
+-	fInternalLatency = bufferSize * 10000 / 2
+-		/ frameSize / (int32)(frameRate / 100);
+-			
+-	PRINT((&quot;  internal latency = %lld\n&quot;, fInternalLatency));
+-
+ 	// TODO: A global node value is assigned a channel specific value!
+ 	// That can't be correct. For as long as there is only one output
+ 	// in use at a time, this will not matter of course.
+@@ -783,12 +916,14 @@
+ 	}
+ 
+ 	_StopPlayThread(channel);
++
++	channel-&gt;RecycleAllBuffers();
++
+ 	channel-&gt;fInput.source = media_source::null;
+ 	channel-&gt;fInput.format = channel-&gt;fPreferredFormat;
+ 	if (channel-&gt;fRealEngine)
+ 		channel-&gt;fRealEngine-&gt;Close();
+ 	channel-&gt;fRealEngine = NULL;
+-	//GetFormat(&amp;channel-&gt;fInput.format);
+ }
+ 
+ 
+@@ -801,16 +936,21 @@
+ 	const media_format&amp; format)
+ {
+ 	CALLED();
+-	NodeInput *channel = _FindInput(consumer);
++	NodeInput* channel = _FindInput(consumer);
+ 	
+-	if(channel==NULL) {
+-		fprintf(stderr,&quot;&lt;- B_MEDIA_BAD_DESTINATION\n&quot;);
++	if (channel == NULL) {
++		fprintf(stderr,&quot;OpenSoundNode::FormatChanged() - &quot;
++			&quot;B_MEDIA_BAD_DESTINATION\n&quot;);
+ 		return B_MEDIA_BAD_DESTINATION;
+ 	}
++
+ 	if (channel-&gt;fInput.source != producer) {
++		fprintf(stderr,&quot;OpenSoundNode::FormatChanged() - &quot;
++			&quot;B_MEDIA_BAD_SOURCE\n&quot;);
+ 		return B_MEDIA_BAD_SOURCE;
+ 	}
+-		
++
++	// currently not supported, TODO: implement?	
+ 	return B_ERROR;
+ }
+ 
+@@ -843,7 +983,7 @@
+ {
+ 	CALLED();
+ 
+-	if (!format) {
++	if (format == NULL) {
+ 		fprintf(stderr, &quot;\tERROR - NULL format pointer passed in!\n&quot;);
+ 		return B_BAD_VALUE;
+ 	}
+@@ -918,7 +1058,8 @@
+ {
+ 	CALLED();
+ 
+-	// we don't support any other formats, so we just reject any format changes.
++	// we don't support any other formats, so we just reject any format
++	// changes. TODO: implement?
+ 	return B_ERROR;
+ }
+ 
+@@ -963,7 +1104,8 @@
+ 	}
+ 
+ 	// Are we being passed the buffer group we're already using?
+-	if (newGroup == channel-&gt;fBufferGroup) return B_OK;
++	if (newGroup == channel-&gt;fBufferGroup)
++		return B_OK;
+ 
+ 	// Ahh, someone wants us to use a different buffer group.  At this point
+ 	// we delete the one we are using and use the specified one instead.  If
+@@ -971,20 +1113,16 @@
+ 	// use *that*.  Note that if we're caching a BBuffer that we requested
+ 	// earlier, we have to Recycle() that buffer *before* deleting the buffer
+ 	// group, otherwise we'll deadlock waiting for that buffer to be recycled!
+-	delete channel-&gt;fBufferGroup;
++	channel-&gt;FreeBuffers();
+ 		// waits for all buffers to recycle
+ 	if (newGroup != NULL) {
+ 		// we were given a valid group; just use that one from now on
+-		channel-&gt;fBufferGroup = newGroup;
++		return channel-&gt;SetExternalBuffers(newGroup);
+ 	} else {
+ 		// we were passed a NULL group pointer; that means we construct
+ 		// our own buffer group to use from now on
+-		size_t size = channel-&gt;fOutput.format.u.raw_audio.buffer_size;
+-		int32 count = int32(fLatency / BufferDuration() + 1 + 1);
+-		channel-&gt;fBufferGroup = new BBufferGroup(size, count);
++		return channel-&gt;AllocateBuffers(BufferDuration(), fLatency);
+ 	}
+-
+-	return B_OK;
+ }
+ 
+ 
+@@ -1112,20 +1250,20 @@
+ 	// Do so, then make sure we get our events early enough.
+ 	media_node_id id;
+ 	FindLatencyFor(channel-&gt;fOutput.destination, &amp;fLatency, &amp;id);
+-	PRINT((&quot;\tdownstream latency = %Ld\n&quot;, fLatency));
++	TRACE(&quot;\tdownstream latency = %Ld\n&quot;, fLatency);
+ 
+ 	fInternalLatency = BufferDuration();
+-	PRINT((&quot;\tbuffer-filling took %Ld usec on this machine\n&quot;,
+-		fInternalLatency));
++	TRACE(&quot;\tbuffer-filling took %Ld usec on this machine\n&quot;,
++		fInternalLatency);
+ 	//SetEventLatency(fLatency + fInternalLatency);
+ 
+ 	// Set up the buffer group for our connection, as long as nobody handed us 
+ 	// a buffer group (via SetBufferGroup()) prior to this.  That can happen,
+ 	// for example, if the consumer calls SetOutputBuffersFor() on us from
+ 	// within its Connected() method.
+-	if (!channel-&gt;fBufferGroup) 
+-		_AllocateBuffers(*channel);
+-	
++	if (channel-&gt;fBufferGroup == NULL)
++		channel-&gt;AllocateBuffers(BufferDuration(), fLatency);
+
+[... truncated: 1083 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009754.html">[Haiku-commits] r26058 - in	haiku/trunk/src/add-ons/input_server/methods: . pen
+</A></li>
+	<LI>Next message: <A HREF="009756.html">[Haiku-commits] r26060 -	haiku/trunk/src/add-ons/media/media-add-ons/opensound
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9755">[ date ]</a>
+              <a href="thread.html#9755">[ thread ]</a>
+              <a href="subject.html#9755">[ subject ]</a>
+              <a href="author.html#9755">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

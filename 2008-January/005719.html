@@ -1,0 +1,359 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23698 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23698%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200801220816.m0M8G4KS023878%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005714.html">
+   <LINK REL="Next"  HREF="005720.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23698 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23698%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200801220816.m0M8G4KS023878%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23698 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Jan 22 09:16:04 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005714.html">[Haiku-commits] r23697 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="005720.html">[Haiku-commits] r23699 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5719">[ date ]</a>
+              <a href="thread.html#5719">[ thread ]</a>
+              <a href="subject.html#5719">[ subject ]</a>
+              <a href="author.html#5719">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-01-22 09:16:04 +0100 (Tue, 22 Jan 2008)
+New Revision: 23698
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23698&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23698&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/block_cache.cpp
+   haiku/trunk/src/system/kernel/cache/block_cache_private.h
+Log:
+* Fixed compare_blocks() function; it actually gets cached_block**.
+* Added block_writer thread that continuously writes back blocks for all current
+  block caches.
+* A block cache now maintains the number of dirty blocks if it doesn't use
+  transactions. That knowledge could also be used in block_cache_sync()...
+
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-01-21 23:25:34 UTC (rev 23697)
++++ haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-01-22 08:16:04 UTC (rev 23698)
+@@ -6,6 +6,12 @@
+ 
+ #include &quot;block_cache_private.h&quot;
+ 
++#include &lt;unistd.h&gt;
++#include &lt;signal.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;errno.h&gt;
++
+ #include &lt;KernelExport.h&gt;
+ #include &lt;fs_cache.h&gt;
+ 
+@@ -18,12 +24,7 @@
+ #include &lt;util/AutoLock.h&gt;
+ #include &lt;util/khash.h&gt;
+ 
+-#include &lt;unistd.h&gt;
+-#include &lt;stdlib.h&gt;
+-#include &lt;string.h&gt;
+-#include &lt;errno.h&gt;
+ 
+-
+ // TODO: this is a naive but growing implementation to test the API:
+ //	1) block reading/writing is not at all optimized for speed, it will
+ //	   just read and write single blocks.
+@@ -192,10 +193,10 @@
+ 	bool deleteTransaction = true);
+ 
+ 
+-#ifdef DEBUG_BLOCK_CACHE
+ static DoublyLinkedList&lt;block_cache&gt; sCaches;
+ static mutex sCachesLock;
+-#endif
++static DoublyLinkedListLink&lt;block_cache&gt; sMarkCache;
++	// TODO: this only works if the link is the first entry of block_cache
+ static object_cache *sBlockCache;
+ 
+ 
+@@ -278,8 +279,8 @@
+ int
+ compare_blocks(const void *_blockA, const void *_blockB)
+ {
+-	cached_block *blockA = (cached_block *)_blockA;
+-	cached_block *blockB = (cached_block *)_blockB;
++	cached_block *blockA = *(cached_block **)_blockA;
++	cached_block *blockB = *(cached_block **)_blockB;
+ 
+ 	off_t diff = blockA-&gt;block_number - blockB-&gt;block_number;
+ 	if (diff &gt; 0)
+@@ -289,8 +290,7 @@
+ }
+ 
+ 
+-/* static */
+-int
++/*static*/ int
+ cached_block::Compare(void *_cacheEntry, const void *_block)
+ {
+ 	cached_block *cacheEntry = (cached_block *)_cacheEntry;
+@@ -301,8 +301,7 @@
+ 
+ 
+ 
+-/* static */
+-uint32
++/*static*/ uint32
+ cached_block::Hash(void *_cacheEntry, const void *_block, uint32 range)
+ {
+ 	cached_block *cacheEntry = (cached_block *)_cacheEntry;
+@@ -328,25 +327,25 @@
+ 	next_transaction_id(1),
+ 	last_transaction(NULL),
+ 	transaction_hash(NULL),
++	num_dirty_blocks(0),
+ 	read_only(readOnly)
+ {
+-#ifdef DEBUG_BLOCK_CACHE
+ 	mutex_lock(&amp;sCachesLock);
+ 	sCaches.Add(this);
+ 	mutex_unlock(&amp;sCachesLock);
+-#endif
+ 
+ 	buffer_cache = create_object_cache_etc(&quot;block cache buffers&quot;, blockSize,
+ 		8, 0, CACHE_LARGE_SLAB, NULL, NULL, NULL, NULL);
+ 	if (buffer_cache == NULL)
+ 		return;
+ 
+-	hash = hash_init(1024, 0, &amp;cached_block::Compare, &amp;cached_block::Hash);
++	hash = hash_init(1024, offsetof(cached_block, next), &amp;cached_block::Compare,
++		&amp;cached_block::Hash);
+ 	if (hash == NULL)
+ 		return;
+ 
+-	transaction_hash = hash_init(16, 0, &amp;transaction_compare,
+-		&amp;::transaction_hash);
++	transaction_hash = hash_init(16, offsetof(cache_transaction, next),
++		&amp;transaction_compare, &amp;::transaction_hash);
+ 	if (transaction_hash == NULL)
+ 		return;
+ 
+@@ -359,11 +358,9 @@
+ 
+ block_cache::~block_cache()
+ {
+-#ifdef DEBUG_BLOCK_CACHE
+ 	mutex_lock(&amp;sCachesLock);
+ 	sCaches.Remove(this);
+ 	mutex_unlock(&amp;sCachesLock);
+-#endif
+ 
+ 	unregister_low_memory_handler(&amp;block_cache::LowMemoryHandler, this);
+ 
+@@ -726,6 +723,9 @@
+ 		if (cleared)
+ 			memset(block-&gt;current_data, 0, cache-&gt;block_size);
+ 
++		if (!block-&gt;is_dirty)
++			cache-&gt;num_dirty_blocks++;
++
+ 		block-&gt;is_dirty = true;
+ 			// mark the block as dirty
+ 
+@@ -825,6 +825,9 @@
+ 		return B_IO_ERROR;
+ 	}
+ 
++	if (cache-&gt;num_dirty_blocks &gt; 0)
++		cache-&gt;num_dirty_blocks--;
++
+ 	if (data == block-&gt;current_data)
+ 		block-&gt;is_dirty = false;
+ 
+@@ -1070,7 +1073,11 @@
+ 	kprintf(&quot;Block caches:\n&quot;);
+ 	DoublyLinkedList&lt;block_cache&gt;::Iterator i = sCaches.GetIterator();
+ 	while (i.HasNext()) {
+-		kprintf(&quot;  %p\n&quot;, i.Next());
++		block_cache *cache = i.Next();
++		if (cache == (block_cache *)&amp;sMarkCache)
++			continue;
++
++		kprintf(&quot;  %p\n&quot;, cache);
+ 	}
+ 
+ 	return 0;
+@@ -1078,6 +1085,89 @@
+ #endif	// DEBUG_BLOCK_CACHE
+ 
+ 
++static block_cache *
++get_next_block_cache(block_cache *last)
++{
++	MutexLocker _(sCachesLock);
++	block_cache *cache;
++	if (last != NULL) {
++		cache = sCaches.GetNext((block_cache *)&amp;sMarkCache);
++		sCaches.Remove((block_cache *)&amp;sMarkCache);
++	} else
++		cache = sCaches.Head();
++
++	if (cache != NULL)
++		sCaches.Insert(sCaches.GetNext(cache), (block_cache *)&amp;sMarkCache);
++
++	return cache;
++}
++
++
++static status_t
++block_writer(void *)
++{
++	while (true) {
++		// write 64 blocks of each block_cache every two seconds
++		// TODO: change this once we have an I/O scheduler
++		snooze(2000000LL);
++
++		block_cache *cache = NULL;
++		while ((cache = get_next_block_cache(cache)) != NULL) {
++			BenaphoreLocker locker(&amp;cache-&gt;lock);
++			const uint32 kMaxCount = 64;
++			cached_block *blocks[kMaxCount];
++			uint32 count = 0;
++
++			if (cache-&gt;num_dirty_blocks) {
++				// This cache is not using transactions, we'll scan the blocks
++				// directly
++				hash_iterator iterator;
++				hash_open(cache-&gt;hash, &amp;iterator);
++
++				cached_block *block;
++				while (count &lt; kMaxCount
++					&amp;&amp; (block = (cached_block *)hash_next(cache-&gt;hash,
++							&amp;iterator)) != NULL) {
++					if (block-&gt;is_dirty)
++						blocks[count++] = block;
++				}
++
++				hash_close(cache-&gt;hash, &amp;iterator, false);			
++			} else {
++				hash_iterator iterator;
++				hash_open(cache-&gt;transaction_hash, &amp;iterator);
++
++				cache_transaction *transaction;
++				while ((transaction = (cache_transaction *)hash_next(
++						cache-&gt;transaction_hash, &amp;iterator)) != NULL
++					&amp;&amp; count &lt; kMaxCount) {
++					if (transaction-&gt;open)
++						continue;
++
++					// sort blocks to speed up writing them back
++					// TODO: ideally, this should be handled by the I/O scheduler
++					block_list::Iterator iterator
++						= transaction-&gt;blocks.GetIterator();
++
++					for (; count &lt; kMaxCount &amp;&amp; iterator.HasNext(); count++) {
++						blocks[count] = iterator.Next();
++					}
++				}
++
++				hash_close(cache-&gt;transaction_hash, &amp;iterator, false);			
++			}
++
++			qsort(blocks, count, sizeof(void *), &amp;compare_blocks);
++
++			for (uint32 i = 0; i &lt; count; i++) {
++				if (write_cached_block(cache, blocks[i], true) != B_OK)
++					break;
++			}
++		}
++	}
++}
++
++
+ extern &quot;C&quot; status_t
+ block_cache_init(void)
+ {
+@@ -1086,11 +1176,16 @@
+ 	if (sBlockCache == NULL)
+ 		return B_ERROR;
+ 
+-#ifdef DEBUG_BLOCK_CACHE
+ 	mutex_init(&amp;sCachesLock, &quot;block caches&quot;);
+ 	new (&amp;sCaches) DoublyLinkedList&lt;block_cache&gt;;
+ 		// manually call constructor
+ 
++	thread_id thread = spawn_kernel_thread(&amp;block_writer, &quot;block writer&quot;,
++		B_LOW_PRIORITY, NULL);
++	if (thread &gt;= B_OK)
++		send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
++
++#ifdef DEBUG_BLOCK_CACHE
+ 	add_debugger_command_etc(&quot;block_caches&quot;, &amp;dump_caches,
+ 		&quot;dumps all block caches&quot;, &quot;\n&quot;, 0);
+ 	add_debugger_command_etc(&quot;block_cache&quot;, &amp;dump_cache,
+@@ -1726,6 +1821,9 @@
+ 			&amp;blockNumber);
+ 		if (block == NULL)
+ 			continue;
++
++		// TODO: sort blocks!
++
+ 		if (block-&gt;previous_transaction != NULL
+ 			|| (block-&gt;transaction == NULL &amp;&amp; block-&gt;is_dirty)) {
+ 			status_t status = write_cached_block(cache, block);
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache_private.h
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache_private.h	2008-01-21 23:25:34 UTC (rev 23697)
++++ haiku/trunk/src/system/kernel/cache/block_cache_private.h	2008-01-22 08:16:04 UTC (rev 23698)
+@@ -64,6 +64,7 @@
+ 	object_cache *buffer_cache;
+ 	block_list	unused_blocks;
+ 
++	uint32		num_dirty_blocks;
+ 	bool		read_only;
+ 
+ 	block_cache(int fd, off_t numBlocks, size_t blockSize, bool readOnly);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005714.html">[Haiku-commits] r23697 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="005720.html">[Haiku-commits] r23699 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5719">[ date ]</a>
+              <a href="thread.html#5719">[ thread ]</a>
+              <a href="subject.html#5719">[ subject ]</a>
+              <a href="author.html#5719">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

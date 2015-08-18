@@ -1,0 +1,796 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32564 - haiku/trunk/src/servers/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32564%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200908211257.n7LCvPCB007220%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019695.html">
+   <LINK REL="Next"  HREF="019701.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32564 - haiku/trunk/src/servers/app</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32564%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200908211257.n7LCvPCB007220%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32564 - haiku/trunk/src/servers/app">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Aug 21 14:57:25 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019695.html">[Haiku-commits] r32563 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="019701.html">[Haiku-commits] r32565 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19700">[ date ]</a>
+              <a href="thread.html#19700">[ thread ]</a>
+              <a href="subject.html#19700">[ subject ]</a>
+              <a href="author.html#19700">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-08-21 14:57:24 +0200 (Fri, 21 Aug 2009)
+New Revision: 32564
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32564&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32564&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/Desktop.cpp
+   haiku/trunk/src/servers/app/Desktop.h
+   haiku/trunk/src/servers/app/ScreenConfigurations.cpp
+   haiku/trunk/src/servers/app/ScreenConfigurations.h
+   haiku/trunk/src/servers/app/ServerApp.cpp
+   haiku/trunk/src/servers/app/ServerApp.h
+Log:
+* ServerApp now maintains a mask of workspaces with temporary mode settings,
+  and reverts the modes if the app goes away (ie. if it crashes).
+* Desktop::SetScreenMode() also set the mode on the current screen, even if
+  it should have been set on another screen.
+* Cleaned up the Desktop.h header.
+
+
+Modified: haiku/trunk/src/servers/app/Desktop.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/Desktop.cpp	2009-08-21 11:50:21 UTC (rev 32563)
++++ haiku/trunk/src/servers/app/Desktop.cpp	2009-08-21 12:57:24 UTC (rev 32564)
+@@ -931,6 +931,23 @@
+ }
+ 
+ 
++void
++Desktop::_SetCurrentWorkspaceConfiguration()
++{
++	ASSERT_MULTI_WRITE_LOCKED(fWindowLock);
++
++	uint32 changedScreens;
++	fVirtualScreen.SetConfiguration(*this,
++		fWorkspaces[fCurrentWorkspace].CurrentScreenConfiguration(),
++		&amp;changedScreens);
++
++	for (int32 i = 0; changedScreens != 0; i++, changedScreens /= 2) {
++		if ((changedScreens &amp; (1 &lt;&lt; i)) != 0)
++			ScreenChanged(fVirtualScreen.ScreenAt(i));
++	}
++}
++
++
+ /*!	Changes the current workspace to the one specified by \a index.
+ 	You must hold the all window lock when calling this method.
+ */
+@@ -998,16 +1015,8 @@
+ 	fCurrentWorkspace = index;
+ 
+ 	// Change the display modes, if needed
++	_SetCurrentWorkspaceConfiguration();
+ 
+-	uint32 changedScreens;
+-	fVirtualScreen.SetConfiguration(*this,
+-		fWorkspaces[index].CurrentScreenConfiguration(), &amp;changedScreens);
+-
+-	for (int32 i = 0; changedScreens != 0; i++, changedScreens /= 2) {
+-		if ((changedScreens &amp; (1 &lt;&lt; i)) != 0)
+-			ScreenChanged(fVirtualScreen.ScreenAt(i));
+-	}
+-
+ 	// Show windows, and include them in the changed region - but only
+ 	// those that were not visible before (or whose position changed)
+ 
+@@ -1143,6 +1152,12 @@
+ 
+ 		if (!memcmp(&amp;oldMode, &amp;mode, sizeof(display_mode)))
+ 			return B_OK;
++
++		// Set the new one
++
++		status_t status = screen-&gt;SetMode(mode);
++		if (status != B_OK)
++			return status;
+ 	} else {
+ 		// retrieve from settings
+ 		screen_configuration* configuration
+@@ -1153,12 +1168,6 @@
+ 			return B_OK;
+ 	}
+ 
+-	// Set the new one
+-
+-	status_t status = screen-&gt;SetMode(mode);
+-	if (status != B_OK)
+-		return status;
+-
+ 	// Update our configurations
+ 
+ 	monitor_info info;
+@@ -1242,9 +1251,54 @@
+ 
+ 
+ void
++Desktop::RevertScreenModes(uint32 workspaces)
++{
++	if (workspaces == 0)
++		return;
++
++	AutoWriteLocker _(fWindowLock);
++
++	for (int32 workspace = 0; workspace &lt; kMaxWorkspaces; workspace++) {
++		if ((workspaces &amp; (1U &lt;&lt; workspace)) == 0)
++			continue;
++
++		// Revert all screens on this workspace
++
++		// TODO: ideally, we would know which screens to revert - this way, too
++		// many of them could be reverted
++
++		for (int32 index = 0; index &lt; fVirtualScreen.CountScreens(); index++) {
++			Screen* screen = fVirtualScreen.ScreenAt(index);
++
++			// retrieve configurations
++			screen_configuration* stored = fWorkspaces[workspace]
++				.StoredScreenConfiguration().CurrentByID(screen-&gt;ID());
++			screen_configuration* current = fWorkspaces[workspace]
++				.CurrentScreenConfiguration().CurrentByID(screen-&gt;ID());
++
++			if ((stored != NULL &amp;&amp; current != NULL
++					&amp;&amp; !memcmp(&amp;stored-&gt;mode, &amp;current-&gt;mode,
++							sizeof(display_mode)))
++				|| (stored == NULL &amp;&amp; current == NULL))
++				continue;
++
++			if (stored == NULL) {
++				fWorkspaces[workspace].CurrentScreenConfiguration()
++					.Remove(current);
++
++				if (workspace == fCurrentWorkspace)
++					_SetCurrentWorkspaceConfiguration();
++			} else
++				SetScreenMode(workspace, screen-&gt;ID(), stored-&gt;mode, false);
++		}
++	}
++}
++
++
++void
+ Desktop::ScreenChanged(Screen* screen)
+ {
+-	ASSERT(fWindowLock.IsWriteLocked());
++	ASSERT_MULTI_WRITE_LOCKED(fWindowLock);
+ 
+ 	// the entire screen is dirty, because we're actually
+ 	// operating on an all new buffer in memory
+
+Modified: haiku/trunk/src/servers/app/Desktop.h
+===================================================================
+--- haiku/trunk/src/servers/app/Desktop.h	2009-08-21 11:50:21 UTC (rev 32563)
++++ haiku/trunk/src/servers/app/Desktop.h	2009-08-21 12:57:24 UTC (rev 32564)
+@@ -58,282 +58,285 @@
+ 
+ 
+ class Desktop : public MessageLooper, public ScreenOwner {
+-	public:
++public:
+ 								Desktop(uid_t userID);
+-		virtual					~Desktop();
++	virtual						~Desktop();
+ 
+-		status_t				Init();
++			status_t			Init();
+ 
+-		uid_t					UserID() const { return fUserID; }
+-		virtual port_id			MessagePort() const { return fMessagePort; }
+-		area_id					SharedReadOnlyArea() const
++			uid_t				UserID() const { return fUserID; }
++	virtual port_id				MessagePort() const { return fMessagePort; }
++			area_id				SharedReadOnlyArea() const
+ 									{ return fSharedReadOnlyArea; }
+ 
+-		::EventDispatcher&amp;		EventDispatcher() { return fEventDispatcher; }
++			::EventDispatcher&amp;	EventDispatcher() { return fEventDispatcher; }
+ 
+-		void					BroadcastToAllApps(int32 code);
+-		void					BroadcastToAllWindows(int32 code);
++			void				BroadcastToAllApps(int32 code);
++			void				BroadcastToAllWindows(int32 code);
+ 
+-		// Mouse and cursor methods
++	// Mouse and cursor methods
+ 
+-		void					SetCursor(ServerCursor* cursor);
+-		ServerCursorReference	Cursor() const;
+-		void					SetLastMouseState(const BPoint&amp; position,
++			void				SetCursor(ServerCursor* cursor);
++			ServerCursorReference Cursor() const;
++			void				SetLastMouseState(const BPoint&amp; position,
+ 									int32 buttons, Window* windowUnderMouse);
+ 									// for use by the mouse filter only
+ 									// both mouse position calls require
+ 									// the Desktop object to be locked
+ 									// already
+-		void					GetLastMouseState(BPoint* position,
++			void				GetLastMouseState(BPoint* position,
+ 									int32* buttons) const;
+ 									// for use by ServerWindow
+ 
+-		// Screen and drawing related methods
++	// Screen and drawing related methods
+ 
+-		Screen*					ScreenAt(int32 index) const
++			Screen*				ScreenAt(int32 index) const
+ 									{ return fActiveScreen; }
+-		Screen*					ActiveScreen() const
++			Screen*				ActiveScreen() const
+ 									{ return fActiveScreen; }
+ 
+-		CursorManager&amp;			GetCursorManager() { return fCursorManager; }
++			CursorManager&amp;		GetCursorManager() { return fCursorManager; }
+ 
+-		status_t				SetScreenMode(int32 workspace, int32 id,
++			status_t			SetScreenMode(int32 workspace, int32 id,
+ 									const display_mode&amp; mode, bool makeDefault);
+-		status_t				GetScreenMode(int32 workspace, int32 id,
++			status_t			GetScreenMode(int32 workspace, int32 id,
+ 									display_mode&amp; mode);
+-		status_t				GetScreenFrame(int32 workspace, int32 id,
++			status_t			GetScreenFrame(int32 workspace, int32 id,
+ 									BRect&amp; frame);
++			void				RevertScreenModes(uint32 workspaces);
+ 
+-		void					ScreenChanged(Screen* screen);
++			void				ScreenChanged(Screen* screen);
+ 
+-		const ::VirtualScreen&amp;	VirtualScreen() const { return fVirtualScreen; }
+-		DrawingEngine*			GetDrawingEngine() const
++			const ::VirtualScreen&amp; VirtualScreen() const
++									{ return fVirtualScreen; }
++			DrawingEngine*		GetDrawingEngine() const
+ 									{ return fVirtualScreen.DrawingEngine(); }
+-		::HWInterface*			HWInterface() const
++			::HWInterface*		HWInterface() const
+ 									{ return fVirtualScreen.HWInterface(); }
+ 
+-		// ScreenOwner implementation
+-		void					ScreenRemoved(Screen* screen) {}
+-		void					ScreenAdded(Screen* screen) {}
+-		bool					ReleaseScreen(Screen* screen) { return false; }
++	// ScreenOwner implementation
++	virtual	void				ScreenRemoved(Screen* screen) {}
++	virtual	void				ScreenAdded(Screen* screen) {}
++	virtual	bool				ReleaseScreen(Screen* screen) { return false; }
+ 
+-		// Workspace methods
++	// Workspace methods
+ 
+-		void					SetWorkspaceAsync(int32 index);
+-		void					SetWorkspace(int32 index);
+-		int32					CurrentWorkspace()
++			void				SetWorkspaceAsync(int32 index);
++			void				SetWorkspace(int32 index);
++			int32				CurrentWorkspace()
+ 									{ return fCurrentWorkspace; }
+-		Workspace::Private&amp;		WorkspaceAt(int32 index)
++			Workspace::Private&amp;	WorkspaceAt(int32 index)
+ 									{ return fWorkspaces[index]; }
+-		status_t				SetWorkspacesLayout(int32 columns, int32 rows);
+-		BRect					WorkspaceFrame(int32 index) const;
++			status_t			SetWorkspacesLayout(int32 columns, int32 rows);
++			BRect				WorkspaceFrame(int32 index) const;
+ 
+-		// Window methods
++	// Window methods
+ 
+-		void					ActivateWindow(Window* window);
+-		void					SendWindowBehind(Window* window,
++			void				ActivateWindow(Window* window);
++			void				SendWindowBehind(Window* window,
+ 									Window* behindOf = NULL);
+ 
+-		void					ShowWindow(Window* window);
+-		void					HideWindow(Window* window);
++			void				ShowWindow(Window* window);
++			void				HideWindow(Window* window);
+ 
+-		void					MoveWindowBy(Window* window, float x, float y,
++			void				MoveWindowBy(Window* window, float x, float y,
+ 									int32 workspace = -1);
+-		void					ResizeWindowBy(Window* window, float x,
++			void				ResizeWindowBy(Window* window, float x,
+ 									float y);
+-		bool					SetWindowTabLocation(Window* window,
++			bool				SetWindowTabLocation(Window* window,
+ 									float location);
+-		bool					SetWindowDecoratorSettings(Window* window,
++			bool				SetWindowDecoratorSettings(Window* window,
+ 									const BMessage&amp; settings);
+ 
+-		void					SetWindowWorkspaces(Window* window,
++			void				SetWindowWorkspaces(Window* window,
+ 									uint32 workspaces);
+ 
+-		void					AddWindow(Window* window);
+-		void					RemoveWindow(Window* window);
++			void				AddWindow(Window* window);
++			void				RemoveWindow(Window* window);
+ 
+-		bool					AddWindowToSubset(Window* subset,
++			bool				AddWindowToSubset(Window* subset,
+ 									Window* window);
+-		void					RemoveWindowFromSubset(Window* subset,
++			void				RemoveWindowFromSubset(Window* subset,
+ 									Window* window);
+ 
+-		void					FontsChanged(Window* window);
++			void				FontsChanged(Window* window);
+ 
+-		void					SetWindowLook(Window* window, window_look look);
+-		void					SetWindowFeel(Window* window, window_feel feel);
+-		void					SetWindowFlags(Window* window, uint32 flags);
+-		void					SetWindowTitle(Window* window,
++			void				SetWindowLook(Window* window, window_look look);
++			void				SetWindowFeel(Window* window, window_feel feel);
++			void				SetWindowFlags(Window* window, uint32 flags);
++			void				SetWindowTitle(Window* window,
+ 									const char* title);
+ 
+-		Window*					FocusWindow() const { return fFocus; }
+-		Window*					FrontWindow() const { return fFront; }
+-		Window*					BackWindow() const { return fBack; }
++			Window*				FocusWindow() const { return fFocus; }
++			Window*				FrontWindow() const { return fFront; }
++			Window*				BackWindow() const { return fBack; }
+ 
+-		Window*					WindowAt(BPoint where);
++			Window*				WindowAt(BPoint where);
+ 
+-		Window*					MouseEventWindow() const
++			Window*				MouseEventWindow() const
+ 									{ return fMouseEventWindow; }
+-		void					SetMouseEventWindow(Window* window);
++			void				SetMouseEventWindow(Window* window);
+ 
+-		void					SetViewUnderMouse(const Window* window,
++			void				SetViewUnderMouse(const Window* window,
+ 									int32 viewToken);
+-		int32					ViewUnderMouse(const Window* window);
++			int32				ViewUnderMouse(const Window* window);
+ 
+-		void					SetFocusWindow(Window* window = NULL);
+-		EventTarget*			KeyboardEventTarget();
+-		void					SetFocusLocked(const Window* window);
++			void				SetFocusWindow(Window* window = NULL);
++			EventTarget*		KeyboardEventTarget();
++			void				SetFocusLocked(const Window* window);
+ 
+-		Window*					FindWindowByClientToken(int32 token,
++			Window*				FindWindowByClientToken(int32 token,
+ 									team_id teamID);
+-		EventTarget*			FindTarget(BMessenger&amp; messenger);
++			EventTarget*		FindTarget(BMessenger&amp; messenger);
+ 
+ #if USE_MULTI_LOCKER
+-		bool					LockSingleWindow()
++			bool				LockSingleWindow()
+ 									{ return fWindowLock.ReadLock(); }
+-		void					UnlockSingleWindow()
++			void				UnlockSingleWindow()
+ 									{ fWindowLock.ReadUnlock(); }
+ 
+-		bool					LockAllWindows()
++			bool				LockAllWindows()
+ 									{ return fWindowLock.WriteLock(); }
+-		void					UnlockAllWindows()
++			void				UnlockAllWindows()
+ 									{ fWindowLock.WriteUnlock(); }
+ 
+-		MultiLocker				WindowLocker() { return fWindowLock; }
++			MultiLocker			WindowLocker() { return fWindowLock; }
+ #else // USE_MULTI_LOCKER
+-		bool					LockSingleWindow()
++			bool				LockSingleWindow()
+ 									{ return fWindowLock.Lock(); }
+-		void					UnlockSingleWindow()
++			void				UnlockSingleWindow()
+ 									{ fWindowLock.Unlock(); }
+ 
+-		bool					LockAllWindows()
++			bool				LockAllWindows()
+ 									{ return fWindowLock.Lock(); }
+-		void					UnlockAllWindows()
++			void				UnlockAllWindows()
+ 									{ fWindowLock.Unlock(); }
+ #endif // USE_MULTI_LOCKER
+ 
+-		void					MarkDirty(BRegion&amp; region);
+-		void					Redraw();
++			void				MarkDirty(BRegion&amp; region);
++			void				Redraw();
+ 
+-		BRegion&amp;				BackgroundRegion()
++			BRegion&amp;			BackgroundRegion()
+ 									{ return fBackgroundRegion; }
+ 
+-		void					RedrawBackground();
+-		void					StoreWorkspaceConfiguration(int32 index);
++			void				RedrawBackground();
++			void				StoreWorkspaceConfiguration(int32 index);
+ 
+-		void					AddWorkspacesView(WorkspacesView* view);
+-		void					RemoveWorkspacesView(WorkspacesView* view);
++			void				AddWorkspacesView(WorkspacesView* view);
++			void				RemoveWorkspacesView(WorkspacesView* view);
+ 
+-		void					MinimizeApplication(team_id team);
+-		void					BringApplicationToFront(team_id team);
+-		void					WindowAction(int32 windowToken, int32 action);
++			void				MinimizeApplication(team_id team);
++			void				BringApplicationToFront(team_id team);
++			void				WindowAction(int32 windowToken, int32 action);
+ 
+-		void					WriteWindowList(team_id team,
++			void				WriteWindowList(team_id team,
+ 									BPrivate::LinkSender&amp; sender);
+-		void					WriteWindowInfo(int32 serverToken,
++			void				WriteWindowInfo(int32 serverToken,
+ 									BPrivate::LinkSender&amp; sender);
+-		void					WriteApplicationOrder(int32 workspace,
++			void				WriteApplicationOrder(int32 workspace,
+ 									BPrivate::LinkSender&amp; sender);
+-		void					WriteWindowOrder(int32 workspace,
++			void				WriteWindowOrder(int32 workspace,
+ 									BPrivate::LinkSender&amp; sender);
+ 
+-	private:
+-		void					_LaunchInputServer();
+-		void					_SetWorkspace(int32 index);
+-		void					_ShowWindow(Window* window,
++private:
++			void				_LaunchInputServer();
++			void				_SetCurrentWorkspaceConfiguration();
++			void				_SetWorkspace(int32 index);
++			void				_ShowWindow(Window* window,
+ 									bool affectsOtherWindows = true);
+-		void					_HideWindow(Window* window);
++			void				_HideWindow(Window* window);
+ 
+-		void					_UpdateSubsetWorkspaces(Window* window,
++			void				_UpdateSubsetWorkspaces(Window* window,
+ 									int32 previousIndex = -1,
+ 									int32 newIndex = -1);
+-		void					_ChangeWindowWorkspaces(Window* window,
++			void				_ChangeWindowWorkspaces(Window* window,
+ 									uint32 oldWorkspaces, uint32 newWorkspaces);
+-		void					_BringWindowsToFront(WindowList&amp; windows,
++			void				_BringWindowsToFront(WindowList&amp; windows,
+ 									int32 list, bool wereVisible);
+-		Window*					_LastFocusSubsetWindow(Window* window);
+- 		status_t				_ActivateApp(team_id team);
+- 		void					_SendFakeMouseMoved(Window* window = NULL);
++			Window*				_LastFocusSubsetWindow(Window* window);
++			status_t			_ActivateApp(team_id team);
++			void				_SendFakeMouseMoved(Window* window = NULL);
+ 
+-		void					_RebuildClippingForAllWindows(
++			void				_RebuildClippingForAllWindows(
+ 									BRegion&amp; stillAvailableOnScreen);
+-		void					_TriggerWindowRedrawing(
++			void				_TriggerWindowRedrawing(
+ 									BRegion&amp; newDirtyRegion);
+-		void					_SetBackground(BRegion&amp; background);
+-		void					_RebuildAndRedrawAfterWindowChange(
++			void				_SetBackground(BRegion&amp; background);
++			void				_RebuildAndRedrawAfterWindowChange(
+ 									Window* window, BRegion&amp; dirty);
+ 
+-		void					_UpdateFloating(int32 previousWorkspace = -1,
++			void				_UpdateFloating(int32 previousWorkspace = -1,
+ 									int32 nextWorkspace = -1,
+ 									Window* mouseEventWindow = NULL);
+-		void					_UpdateBack();
+-		void					_UpdateFront(bool updateFloating = true);
+-		void					_UpdateFronts(bool updateFloating = true);
+-		bool					_WindowHasModal(Window* window);
++			void				_UpdateBack();
++			void				_UpdateFront(bool updateFloating = true);
++			void				_UpdateFronts(bool updateFloating = true);
++			bool				_WindowHasModal(Window* window);
+ 
+-		void					_WindowChanged(Window* window);
+-		void					_WindowRemoved(Window* window);
++			void				_WindowChanged(Window* window);
++			void				_WindowRemoved(Window* window);
+ 
+-		void					_GetLooperName(char* name, size_t size);
+-		void					_PrepareQuit();
+-		void					_DispatchMessage(int32 code,
++			void				_GetLooperName(char* name, size_t size);
++			void				_PrepareQuit();
++			void				_DispatchMessage(int32 code,
+ 									BPrivate::LinkReceiver &amp;link);
+ 
+-		WindowList&amp;				_CurrentWindows();
+-		WindowList&amp;				_Windows(int32 index);
++			WindowList&amp;			_CurrentWindows();
++			WindowList&amp;			_Windows(int32 index);
+ 
+-	private:
+-		friend class DesktopSettings;
+-		friend class LockedDesktopSettings;
++private:
++	friend class DesktopSettings;
++	friend class LockedDesktopSettings;
+ 
+-		uid_t					fUserID;
+-		::VirtualScreen			fVirtualScreen;
+-		DesktopSettingsPrivate*	fSettings;
+-		port_id					fMessagePort;
+-		::EventDispatcher		fEventDispatcher;
+-		port_id					fInputPort;
+-		area_id					fSharedReadOnlyArea;
+-		server_read_only_memory* fServerReadOnlyMemory;
++			uid_t				fUserID;
++			::VirtualScreen		fVirtualScreen;
++			DesktopSettingsPrivate*	fSettings;
++			port_id				fMessagePort;
++			::EventDispatcher	fEventDispatcher;
++			port_id				fInputPort;
++			area_id				fSharedReadOnlyArea;
++			server_read_only_memory* fServerReadOnlyMemory;
+ 
+-		BLocker					fApplicationsLock;
+-		BObjectList&lt;ServerApp&gt;	fApplications;
++			BLocker				fApplicationsLock;
++			BObjectList&lt;ServerApp&gt; fApplications;
+ 
+-		sem_id					fShutdownSemaphore;
+-		int32					fShutdownCount;
++			sem_id				fShutdownSemaphore;
++			int32				fShutdownCount;
+ 
+-		::Workspace::Private	fWorkspaces[kMaxWorkspaces];
+-		int32					fCurrentWorkspace;
+-		int32					fPreviousWorkspace;
++			::Workspace::Private fWorkspaces[kMaxWorkspaces];
++			int32				fCurrentWorkspace;
++			int32				fPreviousWorkspace;
+ 
+-		WindowList				fAllWindows;
+-		WindowList				fSubsetWindows;
+-		WindowList				fFocusList;
++			WindowList			fAllWindows;
++			WindowList			fSubsetWindows;
++			WindowList			fFocusList;
+ 
+-		BObjectList&lt;WorkspacesView&gt; fWorkspacesViews;
+-		BLocker					fWorkspacesLock;
++			BObjectList&lt;WorkspacesView&gt; fWorkspacesViews;
++			BLocker				fWorkspacesLock;
+ 
+-		Screen*					fActiveScreen;
++			Screen*				fActiveScreen;
+ 
+-		CursorManager			fCursorManager;
++			CursorManager		fCursorManager;
+ 
+ #if USE_MULTI_LOCKER
+-		MultiLocker				fWindowLock;
++			MultiLocker			fWindowLock;
+ #else
+-		BLocker					fWindowLock;
++			BLocker				fWindowLock;
+ #endif
+ 
+-		BRegion					fBackgroundRegion;
+-		BRegion					fScreenRegion;
++			BRegion				fBackgroundRegion;
++			BRegion				fScreenRegion;
+ 
+-		Window*					fMouseEventWindow;
+-		const Window*			fWindowUnderMouse;
+-		const Window*			fLockedFocusWindow;
+-		int32					fViewUnderMouse;
+-		BPoint					fLastMousePosition;
+-		int32					fLastMouseButtons;
++			Window*				fMouseEventWindow;
++			const Window*		fWindowUnderMouse;
++			const Window*		fLockedFocusWindow;
++			int32				fViewUnderMouse;
++			BPoint				fLastMousePosition;
++			int32				fLastMouseButtons;
+ 
+-		Window*					fFocus;
+-		Window*					fFront;
+-		Window*					fBack;
++			Window*				fFocus;
++			Window*				fFront;
++			Window*				fBack;
+ };
+ 
+ #endif	// DESKTOP_H
+
+Modified: haiku/trunk/src/servers/app/ScreenConfigurations.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ScreenConfigurations.cpp	2009-08-21 11:50:21 UTC (rev 32563)
++++ haiku/trunk/src/servers/app/ScreenConfigurations.cpp	2009-08-21 12:57:24 UTC (rev 32564)
+@@ -143,18 +143,14 @@
+ }
+ 
+ 
+-status_t
+-ScreenConfigurations::Update(int32 id, const display_mode&amp; mode)
++void
++ScreenConfigurations::Remove(screen_configuration* configuration)
+ {
+-	screen_configuration* configuration = CurrentByID(id);
+ 	if (configuration == NULL)
+-		return B_BAD_VALUE;
++		return;
+ 
+-	configuration-&gt;is_current = true;
+-
+-	memcpy(&amp;configuration-&gt;mode, &amp;mode, sizeof(display_mode));
+-
+-	return B_OK;
++	fConfigurations.RemoveItem(configuration);
++		// this also deletes the configuration
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/servers/app/ScreenConfigurations.h
+===================================================================
+--- haiku/trunk/src/servers/app/ScreenConfigurations.h	2009-08-21 11:50:21 UTC (rev 32563)
++++ haiku/trunk/src/servers/app/ScreenConfigurations.h	2009-08-21 12:57:24 UTC (rev 32564)
+@@ -37,7 +37,7 @@
+ 			status_t			Set(int32 id, const monitor_info* info,
+ 									const BRect&amp; frame,
+ 									const display_mode&amp; mode);
+-			status_t			Update(int32 id, const display_mode&amp; mode);
++			void				Remove(screen_configuration* configuration);
+ 
+ 			status_t			Store(BMessage&amp; settings) const;
+ 			status_t			Restore(const BMessage&amp; settings);
+
+Modified: haiku/trunk/src/servers/app/ServerApp.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ServerApp.cpp	2009-08-21 11:50:21 UTC (rev 32563)
++++ haiku/trunk/src/servers/app/ServerApp.cpp	2009-08-21 12:57:24 UTC (rev 32564)
+@@ -36,6 +36,7 @@
+ 
+ #include &lt;FontPrivate.h&gt;
+ #include &lt;MessengerPrivate.h&gt;
++#include &lt;PrivateScreen.h&gt;
+ #include &lt;RosterPrivate.h&gt;
+ #include &lt;ServerProtocol.h&gt;
+ #include &lt;WindowPrivate.h&gt;
+@@ -95,6 +96,7 @@
+ 	fSignature(signature),
+ 	fClientTeam(clientTeam),
+ 	fWindowListLock(&quot;window list&quot;),
++	fTemporaryDisplayModeChange(0),
+ 	fAppCursor(NULL),
+ 	fViewCursor(NULL),
+ 	fCursorHideLevel(0),
+@@ -185,6 +187,8 @@
+ 		fWindowListLock.Lock();
+ 	}
+ 
++	fDesktop-&gt;RevertScreenModes(fTemporaryDisplayModeChange);
++
+ 	for (int32 i = fBitmapList.CountItems(); i-- &gt; 0;) {
+ 		gBitmapManager-&gt;DeleteBitmap((ServerBitmap*)fBitmapList.ItemAt(i));
+ 	}
+@@ -2319,7 +2323,21 @@
+ 				status = fDesktop-&gt;SetScreenMode(workspace, id, mode,
+ 					makeDefault);
+ 			}
++			if (status == B_OK) {
++				if (workspace == (uint32)B_CURRENT_WORKSPACE_INDEX
++					&amp;&amp; fDesktop-&gt;LockSingleWindow()) {
++					workspace = fDesktop-&gt;CurrentWorkspace();
++					fDesktop-&gt;UnlockSingleWindow();
++				}
+ 
++				if (!makeDefault) {
++					// Memorize the screen change, so that it can be reverted
++					// later
++					fTemporaryDisplayModeChange |= 1 &lt;&lt; workspace;
++				} else
++					fTemporaryDisplayModeChange &amp;= ~(1 &lt;&lt; workspace);
++			}
++
+ 			fLink.StartMessage(status);
+ 			fLink.Flush();
+ 			break;
+
+Modified: haiku/trunk/src/servers/app/ServerApp.h
+===================================================================
+--- haiku/trunk/src/servers/app/ServerApp.h	2009-08-21 11:50:21 UTC (rev 32563)
++++ haiku/trunk/src/servers/app/ServerApp.h	2009-08-21 12:57:24 UTC (rev 32564)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2006, Haiku.
++ * Copyright 2001-2009, Haiku.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -41,11 +41,10 @@
+ class ServerApp : public MessageLooper {
+ public:
+ 								ServerApp(Desktop* desktop,
+-										  port_id clientAppPort,
+-										  port_id clientLooperPort,
+-										  team_id clientTeamID,
+-										  int32 handlerID,
+-										  const char* signature);
++									port_id clientAppPort,
++									port_id clientLooperPort,
++									team_id clientTeamID, int32 handlerID,
++									const char* signature);
+ 	virtual						~ServerApp();
+ 
+ 			status_t			InitCheck();
+@@ -105,6 +104,7 @@
+ 
+ 			bool				_HasWindowUnderMouse();
+ 
++private:
+ 			port_id				fMessagePort;
+ 			port_id				fClientReplyPort;
+ 									// our BApplication's event port
+@@ -128,6 +128,7 @@
+ 			BPrivate::BTokenSpace fViewTokens;
+ 
+ 			int32				fInitialWorkspace;
++			uint32				fTemporaryDisplayModeChange;
+ 
+ 			// NOTE: Bitmaps and Pictures are stored globally, but ServerApps
+ 			// remember which ones they own so that they can destroy them when
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019695.html">[Haiku-commits] r32563 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="019701.html">[Haiku-commits] r32565 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19700">[ date ]</a>
+              <a href="thread.html#19700">[ thread ]</a>
+              <a href="subject.html#19700">[ subject ]</a>
+              <a href="author.html#19700">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,162 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27380 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27380%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200809081345.m88DjSsb012768%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011630.html">
+   <LINK REL="Next"  HREF="011632.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27380 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27380%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200809081345.m88DjSsb012768%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27380 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Sep  8 15:45:28 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011630.html">[Haiku-commits] r27379 - haiku/trunk/src/apps/diskusage
+</A></li>
+        <LI>Next message: <A HREF="011632.html">[Haiku-commits] r27381 - haiku/trunk/src/apps/diskusage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11631">[ date ]</a>
+              <a href="thread.html#11631">[ thread ]</a>
+              <a href="subject.html#11631">[ subject ]</a>
+              <a href="author.html#11631">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-08 15:45:27 +0200 (Mon, 08 Sep 2008)
+New Revision: 27380
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27380&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27380&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+When mapping a file into memory we do now immediately map all active
+pages into the team's address space. Doing that is relatively cheap and
+saves later page faults.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2008-09-08 13:27:31 UTC (rev 27379)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2008-09-08 13:45:27 UTC (rev 27380)
+@@ -2087,6 +2087,33 @@
+ }
+ 
+ 
++/*!	\a cache must be locked. The area's address space must be read-locked.
++*/
++static void
++pre_map_area_pages(vm_area* area, VMCache* cache)
++{
++	addr_t baseAddress = area-&gt;base;
++	addr_t cacheOffset = area-&gt;cache_offset;
++	page_num_t firstPage = cacheOffset / B_PAGE_SIZE;
++	page_num_t endPage = firstPage + area-&gt;size / B_PAGE_SIZE;
++
++	for (VMCachePagesTree::Iterator it
++				= cache-&gt;pages.GetIterator(firstPage, true, true);
++			vm_page *page = it.Next();) {
++		if (page-&gt;cache_offset &gt;= endPage)
++			break;
++
++		// skip inactive pages
++		if (page-&gt;state == PAGE_STATE_BUSY || page-&gt;usage_count &lt;= 0)
++			continue;
++
++		vm_map_page(area, page,
++			baseAddress + (page-&gt;cache_offset * B_PAGE_SIZE - cacheOffset),
++			B_READ_AREA | B_KERNEL_READ_AREA);
++	}
++}
++
++
+ /*!	Will map the file specified by \a fd to an area in memory.
+ 	The file will be mirrored beginning at the specified \a offset. The
+ 	\a offset and \a size arguments have to be page aligned.
+@@ -2139,6 +2166,38 @@
+ 		return status;
+ 	CObjectDeleter&lt;struct vnode&gt; vnodePutter(vnode, vfs_put_vnode);
+ 
++	// If we're going to pre-map pages, we need to reserve the pages needed by
++	// the mapping backend upfront.
++	page_num_t reservedPreMapPages = 0;
++	if ((protection &amp; B_READ_AREA) != 0) {
++		AddressSpaceWriteLocker locker;
++		status = locker.SetTo(team);
++		if (status != B_OK)
++			return status;
++
++		vm_translation_map *map = &amp;locker.AddressSpace()-&gt;translation_map;
++		reservedPreMapPages = map-&gt;ops-&gt;map_max_pages_need(map, 0, size - 1);
++
++		locker.Unlock();
++
++		vm_page_reserve_pages(reservedPreMapPages);
++	}
++
++	struct PageUnreserver {
++		PageUnreserver(page_num_t count)
++			: fCount(count)
++		{
++		}
++
++		~PageUnreserver()
++		{
++			if (fCount &gt; 0)
++				vm_page_unreserve_pages(fCount);
++		}
++
++		page_num_t	fCount;
++	} pageUnreserver(reservedPreMapPages);
++
+ 	AddressSpaceWriteLocker locker(team);
+ 	if (!locker.IsLocked())
+ 		return B_BAD_TEAM_ID;
+@@ -2161,6 +2220,9 @@
+ 		cache-&gt;ReleaseRefLocked();
+ 	}
+ 
++	if (status == B_OK &amp;&amp; (protection &amp; B_READ_AREA) != 0)
++		pre_map_area_pages(area, cache);
++
+ 	cache-&gt;Unlock();
+ 
+ 	if (status &lt; B_OK)
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011630.html">[Haiku-commits] r27379 - haiku/trunk/src/apps/diskusage
+</A></li>
+	<LI>Next message: <A HREF="011632.html">[Haiku-commits] r27381 - haiku/trunk/src/apps/diskusage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11631">[ date ]</a>
+              <a href="thread.html#11631">[ thread ]</a>
+              <a href="subject.html#11631">[ subject ]</a>
+              <a href="author.html#11631">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

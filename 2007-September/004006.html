@@ -1,0 +1,437 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22323 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22323%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200709262019.l8QKJq1d015762%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004005.html">
+   <LINK REL="Next"  HREF="004007.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22323 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22323%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200709262019.l8QKJq1d015762%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22323 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Sep 26 22:19:52 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004005.html">[Haiku-commits] r22322 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+        <LI>Next message: <A HREF="004007.html">[Haiku-commits] r22324 - haiku/trunk/headers/os/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4006">[ date ]</a>
+              <a href="thread.html#4006">[ thread ]</a>
+              <a href="subject.html#4006">[ subject ]</a>
+              <a href="author.html#4006">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-09-26 22:19:51 +0200 (Wed, 26 Sep 2007)
+New Revision: 22323
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22323&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22323&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_page.h
+   haiku/trunk/headers/private/kernel/vm_priv.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* Renamed vm_page_write_modified() to vm_page_write_modifed_pages() and
+  introduced a new vm_page_write_modified_page().
+* Resolved a TODO: vm_page_write_modified_pages() did not mark a to be
+  written page busy but unlocked its cache which could let someone else
+  steal that page in the mean time.
+* Moved the logic when to move a page to the active or inactive queue to
+  a new function move_page_to_active_or_inactive_queue().
+* Moved page_state_to_string() to vm_page(); it's now also used by the
+  &quot;page&quot; and &quot;page_queue&quot; KDL commands.
+* Made the output of the &quot;page_queue list&quot; command more useful.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_page.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_page.h	2007-09-26 18:55:29 UTC (rev 22322)
++++ haiku/trunk/headers/private/kernel/vm_page.h	2007-09-26 20:19:51 UTC (rev 22323)
+@@ -32,7 +32,9 @@
+ size_t vm_page_num_pages(void);
+ size_t vm_page_num_free_pages(void);
+ 
+-status_t vm_page_write_modified(vm_cache *cache, bool fsReenter);
++status_t vm_page_write_modified_page(vm_cache *cache, struct vm_page *page,
++	bool fsReenter);
++status_t vm_page_write_modified_pages(vm_cache *cache, bool fsReenter);
+ 
+ void vm_page_unreserve_pages(uint32 count);
+ void vm_page_reserve_pages(uint32 count);
+
+Modified: haiku/trunk/headers/private/kernel/vm_priv.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_priv.h	2007-09-26 18:55:29 UTC (rev 22322)
++++ haiku/trunk/headers/private/kernel/vm_priv.h	2007-09-26 20:19:51 UTC (rev 22323)
+@@ -50,6 +50,9 @@
+ status_t vm_try_reserve_memory(size_t bytes);
+ status_t vm_daemon_init(void);
+ 
++const char *page_state_to_string(int state);
++	// for debugging purposes only
++
+ #ifdef __cplusplus
+ }
+ #endif
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-09-26 18:55:29 UTC (rev 22322)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-09-26 20:19:51 UTC (rev 22323)
+@@ -2690,32 +2690,6 @@
+ }
+ 
+ 
+-static const char *
+-page_state_to_string(int state)
+-{
+-	switch(state) {
+-		case PAGE_STATE_ACTIVE:
+-			return &quot;active&quot;;
+-		case PAGE_STATE_INACTIVE:
+-			return &quot;inactive&quot;;
+-		case PAGE_STATE_BUSY:
+-			return &quot;busy&quot;;
+-		case PAGE_STATE_MODIFIED:
+-			return &quot;modified&quot;;
+-		case PAGE_STATE_FREE:
+-			return &quot;free&quot;;
+-		case PAGE_STATE_CLEAR:
+-			return &quot;clear&quot;;
+-		case PAGE_STATE_WIRED:
+-			return &quot;wired&quot;;
+-		case PAGE_STATE_UNUSED:
+-			return &quot;unused&quot;;
+-		default:
+-			return &quot;unknown&quot;;
+-	}
+-}
+-
+-
+ static void
+ dump_cache_tree_recursively(vm_cache* cache, int level,
+ 	vm_cache* highlightCache)
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-09-26 18:55:29 UTC (rev 22322)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-09-26 20:19:51 UTC (rev 22323)
+@@ -443,7 +443,7 @@
+ 		return B_OK;
+ 
+ 	mutex_lock(&amp;cache-&gt;lock);
+-	status = vm_page_write_modified(cache, fsReenter);
++	status = vm_page_write_modified_pages(cache, fsReenter);
+ 	mutex_unlock(&amp;cache-&gt;lock);
+ 
+ 	return status;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-09-26 18:55:29 UTC (rev 22322)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-09-26 20:19:51 UTC (rev 22323)
+@@ -217,6 +217,32 @@
+ }
+ 
+ 
++const char *
++page_state_to_string(int state)
++{
++	switch(state) {
++		case PAGE_STATE_ACTIVE:
++			return &quot;active&quot;;
++		case PAGE_STATE_INACTIVE:
++			return &quot;inactive&quot;;
++		case PAGE_STATE_BUSY:
++			return &quot;busy&quot;;
++		case PAGE_STATE_MODIFIED:
++			return &quot;modified&quot;;
++		case PAGE_STATE_FREE:
++			return &quot;free&quot;;
++		case PAGE_STATE_CLEAR:
++			return &quot;clear&quot;;
++		case PAGE_STATE_WIRED:
++			return &quot;wired&quot;;
++		case PAGE_STATE_UNUSED:
++			return &quot;unused&quot;;
++		default:
++			return &quot;unknown&quot;;
++	}
++}
++
++
+ static int
+ dump_page(int argc, char **argv)
+ {
+@@ -269,9 +295,9 @@
+ 	kprintf(&quot;cache_offset:    %ld\n&quot;, page-&gt;cache_offset);
+ 	kprintf(&quot;cache_next,prev: %p, %p\n&quot;, page-&gt;cache_next, page-&gt;cache_prev);
+ 	kprintf(&quot;type:            %d\n&quot;, page-&gt;type);
+-	kprintf(&quot;state:           %d\n&quot;, page-&gt;state);
+-	kprintf(&quot;wired_count:     %u\n&quot;, page-&gt;wired_count);
+-	kprintf(&quot;usage_count:     %u\n&quot;, page-&gt;usage_count);
++	kprintf(&quot;state:           %s\n&quot;, page_state_to_string(page-&gt;state));
++	kprintf(&quot;wired_count:     %d\n&quot;, page-&gt;wired_count);
++	kprintf(&quot;usage_count:     %d\n&quot;, page-&gt;usage_count);
+ 	#ifdef DEBUG_PAGE_QUEUE
+ 		kprintf(&quot;queue:           %p\n&quot;, page-&gt;queue);
+ 	#endif
+@@ -323,11 +349,12 @@
+ 	if (argc == 3) {
+ 		struct vm_page *page = queue-&gt;head;
+ 		int i;
+-		
++
++		kprintf(&quot;page        cache          state  wired  usage\n&quot;);
+ 		for (i = 0; page; i++, page = page-&gt;queue_next) {
+-			kprintf(&quot;%5d. queue_next = %p, queue_prev = %p, type = %d, &quot;
+-				&quot;state = %d\n&quot;, i, page-&gt;queue_next, page-&gt;queue_prev,
+-				page-&gt;type, page-&gt;state);
++			kprintf(&quot;%p  %p  %8s  %5d  %5d\n&quot;, page, page-&gt;cache,
++				page_state_to_string(page-&gt;state),
++				page-&gt;wired_count, page-&gt;usage_count);
+ 		}
+ 	}
+ 	return 0;
+@@ -352,14 +379,20 @@
+ 
+ 	kprintf(&quot;page stats:\n&quot;);
+ 	kprintf(&quot;active: %lu\ninactive: %lu\nbusy: %lu\nunused: %lu\n&quot;,
+-		counter[PAGE_STATE_ACTIVE], counter[PAGE_STATE_INACTIVE], counter[PAGE_STATE_BUSY], counter[PAGE_STATE_UNUSED]);
++		counter[PAGE_STATE_ACTIVE], counter[PAGE_STATE_INACTIVE],
++		counter[PAGE_STATE_BUSY], counter[PAGE_STATE_UNUSED]);
+ 	kprintf(&quot;wired: %lu\nmodified: %lu\nfree: %lu\nclear: %lu\n&quot;,
+-		counter[PAGE_STATE_WIRED], counter[PAGE_STATE_MODIFIED], counter[PAGE_STATE_FREE], counter[PAGE_STATE_CLEAR]);
++		counter[PAGE_STATE_WIRED], counter[PAGE_STATE_MODIFIED],
++		counter[PAGE_STATE_FREE], counter[PAGE_STATE_CLEAR]);
+ 
+-	kprintf(&quot;\nfree_queue: %p, count = %ld\n&quot;, &amp;sFreePageQueue, sFreePageQueue.count);
+-	kprintf(&quot;clear_queue: %p, count = %ld\n&quot;, &amp;sClearPageQueue, sClearPageQueue.count);
+-	kprintf(&quot;modified_queue: %p, count = %ld\n&quot;, &amp;sModifiedPageQueue, sModifiedPageQueue.count);
+-	kprintf(&quot;active_queue: %p, count = %ld\n&quot;, &amp;sActivePageQueue, sActivePageQueue.count);
++	kprintf(&quot;\nfree_queue: %p, count = %ld\n&quot;, &amp;sFreePageQueue,
++		sFreePageQueue.count);
++	kprintf(&quot;clear_queue: %p, count = %ld\n&quot;, &amp;sClearPageQueue,
++		sClearPageQueue.count);
++	kprintf(&quot;modified_queue: %p, count = %ld\n&quot;, &amp;sModifiedPageQueue,
++		sModifiedPageQueue.count);
++	kprintf(&quot;active_queue: %p, count = %ld\n&quot;, &amp;sActivePageQueue,
++		sActivePageQueue.count);
+ 
+ 	return 0;
+ }
+@@ -439,7 +472,9 @@
+ 			fromQueue = &sClearPageQueue;
+ 			break;
+ 		default:
+-			panic(&quot;vm_page_set_state: vm_page %p in invalid state %d\n&quot;, page, page-&gt;state);
++			panic(&quot;vm_page_set_state: vm_page %p in invalid state %d\n&quot;,
++				page, page-&gt;state);
++			break;
+ 	}
+ 
+ 	if (page-&gt;state == PAGE_STATE_CLEAR || page-&gt;state == PAGE_STATE_FREE) {
+@@ -484,6 +519,25 @@
+ 
+ 
+ static void
++move_page_to_active_or_inactive_queue(vm_page *page, bool dequeued)
++{
++	// Note, this logic must be in sync with what the page daemon does
++	int32 state;
++	if (!page-&gt;mappings.IsEmpty() || page-&gt;usage_count &gt;= 0
++		|| page-&gt;wired_count)
++		state = PAGE_STATE_ACTIVE;
++	else
++		state = PAGE_STATE_INACTIVE;
++
++	if (dequeued) {
++		page-&gt;state = state;
++		enqueue_page(&amp;sActivePageQueue, page);
++	} else
++		set_page_state_nolock(page, state);
++}
++
++
++static void
+ clear_page(addr_t pa)
+ {
+ 	addr_t va;
+@@ -751,10 +805,70 @@
+ 
+ /*!
+ 	You need to hold the vm_cache lock when calling this function.
++	And \a page must obviously be in that cache.
++	Note that the cache lock is released in this function.
+ */
+ status_t
+-vm_page_write_modified(vm_cache *cache, bool fsReenter)
++vm_page_write_modified_page(vm_cache *cache, vm_page *page, bool fsReenter)
+ {
++	ASSERT(page-&gt;state == PAGE_STATE_MODIFIED);
++	ASSERT(page-&gt;cache == cache);
++
++	ConditionVariable&lt;vm_page&gt; busyCondition;
++	InterruptsSpinLocker locker(&amp;sPageLock);
++
++	remove_page_from_queue(&amp;sModifiedPageQueue, page);
++	page-&gt;state = PAGE_STATE_BUSY;
++
++	busyCondition.Publish(page, &quot;page&quot;);
++
++	locker.Unlock();
++
++	off_t pageOffset = (off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT;
++
++	for (vm_area *area = cache-&gt;areas; area; area = area-&gt;cache_next) {
++		if (pageOffset &gt;= area-&gt;cache_offset
++			&amp;&amp; pageOffset &lt; area-&gt;cache_offset + area-&gt;size) {
++			vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
++			// clear the modified flag
++			map-&gt;ops-&gt;lock(map);
++			map-&gt;ops-&gt;clear_flags(map, pageOffset - area-&gt;cache_offset
++				+ area-&gt;base, PAGE_MODIFIED);
++			map-&gt;ops-&gt;unlock(map);
++		}
++	}
++
++	mutex_unlock(&amp;cache-&gt;lock);
++
++	status_t status = write_page(page, fsReenter);
++
++	mutex_lock(&amp;cache-&gt;lock);
++
++	locker.Lock();
++
++	if (status == B_OK) {
++		// put it into the active queue
++		move_page_to_active_or_inactive_queue(page, true);
++	} else {
++		// We don't have to put the PAGE_MODIFIED bit back, as it's still
++		// in the modified pages list.
++		page-&gt;state = PAGE_STATE_MODIFIED;
++		enqueue_page(&amp;sModifiedPageQueue, page);
++	}
++
++	busyCondition.Unpublish();
++
++	return status;
++}
++
++
++/*!
++	You need to hold the vm_cache lock when calling this function.
++	Note that the cache lock is released in this function.
++*/
++status_t
++vm_page_write_modified_pages(vm_cache *cache, bool fsReenter)
++{
+ 	vm_page *page = cache-&gt;page_list;
+ 
+ 	// ToDo: join adjacent pages into one vec list
+@@ -805,7 +919,8 @@
+ 					map-&gt;ops-&gt;query(map, pageOffset - area-&gt;cache_offset + area-&gt;base,
+ 						&amp;physicalAddress, &amp;flags);
+ 					if (flags &amp; PAGE_MODIFIED) {
+-// TODO: Mark busy?
++						page-&gt;state = PAGE_STATE_BUSY;
++						busyCondition.Publish(page, &quot;page&quot;);
+ 						gotPage = true;
+ 						dequeuedPage = false;
+ 					}
+@@ -829,39 +944,32 @@
+ 		mutex_lock(&amp;cache-&gt;lock);
+ 
+ 		if (status == B_OK) {
+-			if (dequeuedPage) {
+-				// put it into the active queue
++			// put it into the active/inactive queue
+ 
+-				state = disable_interrupts();
+-				acquire_spinlock(&amp;sPageLock);
++			state = disable_interrupts();
++			acquire_spinlock(&amp;sPageLock);
+ 
+-				if (!page-&gt;mappings.IsEmpty() || page-&gt;wired_count)
+-					page-&gt;state = PAGE_STATE_ACTIVE;
+-				else
+-					page-&gt;state = PAGE_STATE_INACTIVE;
++			move_page_to_active_or_inactive_queue(page, dequeuedPage);
++			busyCondition.Unpublish();
+ 
+-				busyCondition.Unpublish();
+-
+-				enqueue_page(&amp;sActivePageQueue, page);
+-
+-				release_spinlock(&amp;sPageLock);
+-				restore_interrupts(state);
+-			}
++			release_spinlock(&amp;sPageLock);
++			restore_interrupts(state);
+ 		} else {
+ 			// We don't have to put the PAGE_MODIFIED bit back, as it's still
+ 			// in the modified pages list.
++			state = disable_interrupts();
++			acquire_spinlock(&amp;sPageLock);
++
+ 			if (dequeuedPage) {
+-				state = disable_interrupts();
+-				acquire_spinlock(&amp;sPageLock);
+-
+ 				page-&gt;state = PAGE_STATE_MODIFIED;
+ 				enqueue_page(&amp;sModifiedPageQueue, page);
++			} else
++				set_page_state_nolock(page, PAGE_STATE_MODIFIED);
+ 
+-				busyCondition.Unpublish();
++			busyCondition.Unpublish();
+ 
+-				release_spinlock(&amp;sPageLock);
+-				restore_interrupts(state);
+-			}
++			release_spinlock(&amp;sPageLock);
++			restore_interrupts(state);
+ 		}
+ 	}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004005.html">[Haiku-commits] r22322 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+	<LI>Next message: <A HREF="004007.html">[Haiku-commits] r22324 - haiku/trunk/headers/os/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4006">[ date ]</a>
+              <a href="thread.html#4006">[ thread ]</a>
+              <a href="subject.html#4006">[ subject ]</a>
+              <a href="author.html#4006">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

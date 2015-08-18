@@ -1,0 +1,241 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32384 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32384%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200908141831.n7EIVbNx019043%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019278.html">
+   <LINK REL="Next"  HREF="019284.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32384 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32384%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200908141831.n7EIVbNx019043%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32384 - haiku/trunk/src/system/kernel/fs">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Aug 14 20:31:37 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019278.html">[Haiku-commits] r32383 - in haiku/trunk:	headers/private/kernel/boot/platform/generic	src/system/boot/platform/bios_ia32 src/system/boot/platform/generic
+</A></li>
+        <LI>Next message: <A HREF="019284.html">[Haiku-commits] r32385 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19282">[ date ]</a>
+              <a href="thread.html#19282">[ thread ]</a>
+              <a href="subject.html#19282">[ subject ]</a>
+              <a href="author.html#19282">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-08-14 20:31:35 +0200 (Fri, 14 Aug 2009)
+New Revision: 32384
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32384&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32384&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/fd.cpp
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+Log:
+* _user_read_dir(): Allocate a temporary heap buffer passed into the kernel
+  instead of using the user buffer. This frees the VFS and FS implementations
+  from handling user buffers.
+* Adjusted fix_dirent() accordingly.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/fd.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/fd.cpp	2009-08-14 18:15:44 UTC (rev 32383)
++++ haiku/trunk/src/system/kernel/fs/fd.cpp	2009-08-14 18:31:35 UTC (rev 32384)
+@@ -31,6 +31,9 @@
+ #endif
+ 
+ 
++static const size_t kMaxReadDirBufferSize = 64 * 1024;
++
++
+ static struct file_descriptor* get_fd_locked(struct io_context* context,
+ 	int fd);
+ static struct file_descriptor* remove_fd(struct io_context* context, int fd);
+@@ -908,34 +911,56 @@
+ 
+ 
+ ssize_t
+-_user_read_dir(int fd, struct dirent* buffer, size_t bufferSize,
++_user_read_dir(int fd, struct dirent* userBuffer, size_t bufferSize,
+ 	uint32 maxCount)
+ {
+-	struct file_descriptor* descriptor;
+-	ssize_t retval;
++	TRACE((&quot;user_read_dir(fd = %d, userBuffer = %p, bufferSize = %ld, count = &quot;
++		&quot;%lu)\n&quot;, fd, userBuffer, bufferSize, maxCount));
+ 
+-	if (!IS_USER_ADDRESS(buffer))
++	if (maxCount == 0)
++		return 0;
++
++	if (userBuffer == NULL || !IS_USER_ADDRESS(userBuffer))
+ 		return B_BAD_ADDRESS;
+ 
+-	TRACE((&quot;user_read_dir(fd = %d, buffer = %p, bufferSize = %ld, count = &quot;
+-		&quot;%lu)\n&quot;, fd, buffer, bufferSize, maxCount));
+-
+-	struct io_context* ioContext = get_current_io_context(false);
+-	descriptor = get_fd(ioContext, fd);
++	// get I/O context and FD
++	io_context* ioContext = get_current_io_context(false);
++	FDGetter fdGetter;
++	struct file_descriptor* descriptor = fdGetter.SetTo(ioContext, fd, false);
+ 	if (descriptor == NULL)
+ 		return B_FILE_ERROR;
+ 
+-	if (descriptor-&gt;ops-&gt;fd_read_dir) {
+-		uint32 count = maxCount;
+-		retval = descriptor-&gt;ops-&gt;fd_read_dir(ioContext, descriptor, buffer,
+-			bufferSize, &amp;count);
+-		if (retval &gt;= 0)
+-			retval = count;
+-	} else
+-		retval = EOPNOTSUPP;
++	if (descriptor-&gt;ops-&gt;fd_read_dir == NULL)
++		return B_UNSUPPORTED;
+ 
+-	put_fd(descriptor);
+-	return retval;
++	// restrict buffer size and allocate a heap buffer
++	if (bufferSize &gt; kMaxReadDirBufferSize)
++		bufferSize = kMaxReadDirBufferSize;
++	struct dirent* buffer = (struct dirent*)malloc(bufferSize);
++	if (buffer == NULL)
++		return B_NO_MEMORY;
++	MemoryDeleter bufferDeleter(buffer);
++
++	// read the directory
++	uint32 count = maxCount;
++	status_t status = descriptor-&gt;ops-&gt;fd_read_dir(ioContext, descriptor,
++		buffer, bufferSize, &amp;count);
++	if (status != B_OK)
++		return status;
++
++	// copy the buffer back -- determine the total buffer size first
++	size_t sizeToCopy = 0;
++	struct dirent* entry = buffer;
++	for (uint32 i = 0; i &lt; count; i++) {
++		size_t length = entry-&gt;d_reclen;
++		sizeToCopy += length;
++		entry = (struct dirent*)((uint8*)entry + length);
++	}
++
++	if (user_memcpy(userBuffer, buffer, sizeToCopy) != B_OK)
++		return B_BAD_ADDRESS;
++
++	return count;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2009-08-14 18:15:44 UTC (rev 32383)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2009-08-14 18:31:35 UTC (rev 32384)
+@@ -5550,34 +5550,9 @@
+ 
+ 
+ static status_t
+-fix_dirent(struct vnode* parent, struct dirent* userEntry,
+-	struct io_context* ioContext, uint32* _length)
++fix_dirent(struct vnode* parent, struct dirent* entry,
++	struct io_context* ioContext)
+ {
+-	char buffer[sizeof(struct dirent) + B_FILE_NAME_LENGTH];
+-	struct dirent* entry;
+-
+-	if (IS_USER_ADDRESS(userEntry)) {
+-		entry = (struct dirent*)buffer;
+-		if (user_memcpy(entry, userEntry, sizeof(struct dirent) - 1) != B_OK)
+-			return B_BAD_ADDRESS;
+-
+-		ASSERT(entry-&gt;d_reclen &gt;= sizeof(struct dirent)
+-			&amp;&amp; entry-&gt;d_reclen &lt;= sizeof(buffer));
+-
+-		// This hints to a problem in the file system implementation, but
+-		// could also be caused by a malicious user application
+-		if (entry-&gt;d_reclen &lt; sizeof(struct dirent)
+-			|| entry-&gt;d_reclen &gt; sizeof(buffer))
+-			return B_BAD_DATA;
+-
+-		if (user_memcpy(entry-&gt;d_name, userEntry-&gt;d_name,
+-				entry-&gt;d_reclen + 1 - sizeof(struct dirent)) != B_OK)
+-			return B_BAD_ADDRESS;
+-	} else
+-		entry = userEntry;
+-
+-	*_length = entry-&gt;d_reclen;
+-
+ 	// set d_pdev and d_pino
+ 	entry-&gt;d_pdev = parent-&gt;device;
+ 	entry-&gt;d_pino = parent-&gt;id;
+@@ -5619,10 +5594,6 @@
+ 		}
+ 	}
+ 
+-	// copy back from userland buffer if needed
+-	if (entry != userEntry)
+-		return user_memcpy(userEntry, entry, sizeof(struct dirent) - 1);
+-
+ 	return B_OK;
+ }
+ 
+@@ -5641,15 +5612,12 @@
+ 
+ 	// we need to adjust the read dirents
+ 	uint32 count = *_count;
+-	if (count &gt; 0) {
+-		for (uint32 i = 0; i &lt; count; i++) {
+-			uint32 length;
+-			error = fix_dirent(vnode, buffer, ioContext, &amp;length);
+-			if (error != B_OK)
+-				return error;
++	for (uint32 i = 0; i &lt; count; i++) {
++		error = fix_dirent(vnode, buffer, ioContext);
++		if (error != B_OK)
++			return error;
+ 
+-			buffer = (struct dirent*)((uint8*)buffer + length);
+-		}
++		buffer = (struct dirent*)((uint8*)buffer + buffer-&gt;d_reclen);
+ 	}
+ 
+ 	return error;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019278.html">[Haiku-commits] r32383 - in haiku/trunk:	headers/private/kernel/boot/platform/generic	src/system/boot/platform/bios_ia32 src/system/boot/platform/generic
+</A></li>
+	<LI>Next message: <A HREF="019284.html">[Haiku-commits] r32385 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19282">[ date ]</a>
+              <a href="thread.html#19282">[ thread ]</a>
+              <a href="subject.html#19282">[ subject ]</a>
+              <a href="author.html#19282">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

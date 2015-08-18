@@ -1,0 +1,189 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26523 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26523%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200807201629.m6KGTDDg031613%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010398.html">
+   <LINK REL="Next"  HREF="010403.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26523 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26523%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200807201629.m6KGTDDg031613%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26523 - haiku/trunk/src/system/kernel/cache">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Jul 20 18:29:13 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010398.html">[Haiku-commits] r26522 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="010403.html">[Haiku-commits] r26523 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10399">[ date ]</a>
+              <a href="thread.html#10399">[ thread ]</a>
+              <a href="subject.html#10399">[ subject ]</a>
+              <a href="author.html#10399">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-07-20 18:29:12 +0200 (Sun, 20 Jul 2008)
+New Revision: 26523
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26523&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26523&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_map.cpp
+Log:
+axeld + bonefish + mmlr:
+* FileMap::_InvalidateAfter():
+  - Off-by-one error. The last extend (which normally should be kept)
+    was thrown away, too, but still accessed afterwards. Worst case
+    could be a write to free()d memory.
+  - Drop the last extend when it would be truncated to zero size.
+* FileMap::Translate():
+  - Incorrect handling of B_BUFFER_OVERFLOW case in the
+    vfs_get_file_map() loop. After the loop the function would return
+    incorrectly, making the caller think all vectors in the provided
+    array had been initialized correctly. This could cause a file system
+    implementation using the file map to read from or write to random
+    disk locations, in the latter case possibly corrupting the file
+    system.
+  - Some readability improvements in the final loop. Removed incorrect
+    check.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_map.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_map.cpp	2008-07-20 13:52:15 UTC (rev 26522)
++++ haiku/trunk/src/system/kernel/cache/file_map.cpp	2008-07-20 16:29:12 UTC (rev 26523)
+@@ -171,7 +171,7 @@
+ {
+ 	if (count &lt;= CACHED_FILE_EXTENTS) {
+ 		// just use the reserved area in the file_cache_ref structure
+-		if (count &lt;= CACHED_FILE_EXTENTS &amp;&amp; fCount &gt; CACHED_FILE_EXTENTS) {
++		if (fCount &gt; CACHED_FILE_EXTENTS) {
+ 			// the new size is smaller than the minimal array size
+ 			file_extent *array = fIndirect.array;
+ 			memcpy(fDirect, array, sizeof(file_extent) * count);
+@@ -270,10 +270,13 @@
+ 	uint32 index;
+ 	file_extent* extent = _FindExtent(offset, &amp;index);
+ 	if (extent != NULL) {
+-		_MakeSpace(index);
++		_MakeSpace(index + 1);
+ 
+-		if (extent-&gt;offset + extent-&gt;disk.length &gt; offset)
++		if (extent-&gt;offset + extent-&gt;disk.length &gt; offset) {
+ 			extent-&gt;disk.length = offset - extent-&gt;offset;
++			if (extent-&gt;disk.length == 0)
++				_MakeSpace(index);
++		}
+ 	}
+ }
+ 
+@@ -345,21 +348,12 @@
+ 
+ 	off_t end = offset + size;
+ 
+-	while (mapOffset &lt; end) {
++	while (status == B_OK &amp;&amp; mapOffset &lt; end) {
+ 		// We don't have the requested extents yet, retrieve them
+ 		size_t vecCount = maxVecs;
+ 		status = vfs_get_file_map(Vnode(), mapOffset, ~0UL, vecs, &amp;vecCount);
+-		if (status &lt; B_OK &amp;&amp; status != B_BUFFER_OVERFLOW)
+-			return status;
+-
+-		status_t addStatus = _Add(vecs, vecCount, mapOffset);
+-		if (addStatus != B_OK) {
+-			// only clobber the status in case of failure
+-			status = addStatus;
+-		}
+-
+-		if (status != B_BUFFER_OVERFLOW)
+-			break;
++		if (status == B_OK || status == B_BUFFER_OVERFLOW)
++			status = _Add(vecs, vecCount, mapOffset);
+ 	}
+ 
+ 	if (status != B_OK)
+@@ -375,7 +369,9 @@
+ 	vecs[0].offset = fileExtent-&gt;disk.offset + offset;
+ 	vecs[0].length = fileExtent-&gt;disk.length - offset;
+ 
+-	if (vecs[0].length &gt;= size || index &gt;= fCount - 1) {
++	if (vecs[0].length &gt;= size) {
++		if (vecs[0].length &gt; size)
++			vecs[0].length = size;
+ 		*_count = 1;
+ 		return B_OK;
+ 	}
+@@ -383,25 +379,28 @@
+ 	// copy the rest of the vecs
+ 
+ 	size -= vecs[0].length;
++	uint32 vecIndex = 1;
+ 
+-	for (index = 1; index &lt; fCount;) {
++	while (true) {
+ 		fileExtent++;
+ 
+-		vecs[index] = fileExtent-&gt;disk;
+-		index++;
++		vecs[vecIndex++] = fileExtent-&gt;disk;
+ 
+-		if (size &lt;= fileExtent-&gt;disk.length)
++		if (size &lt;= fileExtent-&gt;disk.length) {
++			if (size &lt; fileExtent-&gt;disk.length)
++				vecs[vecIndex - 1].length = size;
+ 			break;
++		}
+ 
+-		if (index &gt;= maxVecs) {
+-			*_count = index;
++		if (vecIndex &gt;= maxVecs) {
++			*_count = vecIndex;
+ 			return B_BUFFER_OVERFLOW;
+ 		}
+ 
+ 		size -= fileExtent-&gt;disk.length;
+ 	}
+ 
+-	*_count = index;
++	*_count = vecIndex;
+ 	return B_OK;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010398.html">[Haiku-commits] r26522 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="010403.html">[Haiku-commits] r26523 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10399">[ date ]</a>
+              <a href="thread.html#10399">[ thread ]</a>
+              <a href="subject.html#10399">[ subject ]</a>
+              <a href="author.html#10399">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

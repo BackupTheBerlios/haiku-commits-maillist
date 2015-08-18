@@ -1,0 +1,365 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32905 - haiku/trunk/src/apps/installer
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32905%20-%20haiku/trunk/src/apps/installer&In-Reply-To=%3C200909021455.n82Et4fj007760%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020288.html">
+   <LINK REL="Next"  HREF="020292.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32905 - haiku/trunk/src/apps/installer</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32905%20-%20haiku/trunk/src/apps/installer&In-Reply-To=%3C200909021455.n82Et4fj007760%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32905 - haiku/trunk/src/apps/installer">stippi at mail.berlios.de
+       </A><BR>
+    <I>Wed Sep  2 16:55:04 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020288.html">[Haiku-commits] r32904 - haiku/trunk/src/apps/installer
+</A></li>
+        <LI>Next message: <A HREF="020292.html">[Haiku-commits] r32905 - haiku/trunk/src/apps/installer
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20289">[ date ]</a>
+              <a href="thread.html#20289">[ thread ]</a>
+              <a href="subject.html#20289">[ subject ]</a>
+              <a href="author.html#20289">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-09-02 16:55:03 +0200 (Wed, 02 Sep 2009)
+New Revision: 32905
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32905&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32905&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/apps/installer/UnzipEngine.cpp
+   haiku/trunk/src/apps/installer/UnzipEngine.h
+Log:
+Added UnzipEngine, work in progress. This actually unzips, but the progress
+reporting is incomplete and it is not yet used for anything, it's not even
+part of the build. I am testing it in a selfcontained little test.
+
+
+Added: haiku/trunk/src/apps/installer/UnzipEngine.cpp
+===================================================================
+--- haiku/trunk/src/apps/installer/UnzipEngine.cpp	2009-09-02 14:53:06 UTC (rev 32904)
++++ haiku/trunk/src/apps/installer/UnzipEngine.cpp	2009-09-02 14:55:03 UTC (rev 32905)
+@@ -0,0 +1,224 @@
++/*
++ * Copyright 2008-2009, Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;
++ *  All rights reserved. Distributed under the terms of the MIT License.
++ */
++
++#include &quot;UnzipEngine.h&quot;
++
++#include &lt;new&gt;
++
++#include &lt;math.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/resource.h&gt;
++
++#include &lt;Directory.h&gt;
++#include &lt;fs_attr.h&gt;
++#include &lt;NodeInfo.h&gt;
++#include &lt;Path.h&gt;
++#include &lt;String.h&gt;
++#include &lt;SymLink.h&gt;
++
++#include &quot;CommandPipe.h&quot;
++#include &quot;SemaphoreLocker.h&quot;
++
++
++using std::nothrow;
++
++
++UnzipEngine::UnzipEngine(const BMessenger&amp; messenger, BMessage* message)
++	:
++	fPackage(&quot;&quot;),
++
++	fBytesToUncompress(0),
++	fBytesUncompressed(0),
++	fItemsToUncompress(0),
++	fItemsUncompressed(0),
++
++	fCurrentTargetFolder(NULL),
++	fCurrentItem(NULL),
++
++	fMessenger(messenger),
++	fMessage(message)
++{
++}
++
++
++UnzipEngine::~UnzipEngine()
++{
++	delete fMessage;
++}
++
++
++status_t
++UnzipEngine::SetTo(const char* pathToPackage)
++{
++	fPackage = pathToPackage;
++
++	BPrivate::BCommandPipe commandPipe;
++	status_t ret = commandPipe.AddArg(&quot;unzip&quot;);
++	if (ret == B_OK)
++		ret = commandPipe.AddArg(&quot;-Z&quot;);
++	if (ret == B_OK)
++		ret = commandPipe.AddArg(&quot;-t&quot;);
++	if (ret == B_OK)
++		ret = commandPipe.AddArg(fPackage.String());
++	if (ret != B_OK)
++		return ret;
++
++	// Launch the unzip thread and start reading the stdout and stderr output.
++	FILE* stdOutAndErrPipe = NULL;
++	thread_id unzipThread = commandPipe.PipeInto(&amp;stdOutAndErrPipe);
++	if (unzipThread &lt; 0)
++		return (status_t)unzipThread;
++
++	BString result = commandPipe.ReadLines(stdOutAndErrPipe);
++	static const char* kListingFormat = &quot;%llu files, %llu bytes uncompressed, &quot;
++		&quot;%llu bytes compressed: %f%%&quot;;
++
++	uint64 bytesCompressed;
++	float compresssionRatio;
++	if (sscanf(result.String(), kListingFormat, &amp;fItemsToUncompress,
++		&amp;fBytesToUncompress, &amp;bytesCompressed, &amp;compresssionRatio) != 4) {
++		fBytesToUncompress = 0;
++		fItemsToUncompress = 0;
++		fprintf(stderr, &quot;error reading command output: %s\n&quot;, result.String());
++		return B_ERROR;
++	}
++
++	printf(&quot;%s: %llu items in %llu bytes\n&quot;, pathToPackage, fItemsToUncompress,
++		fBytesToUncompress);
++
++	return B_OK;
++}
++
++
++status_t
++UnzipEngine::UnzipPackage(const char* destinationFolder,
++	sem_id cancelSemaphore)
++{
++	if (fItemsToUncompress == 0)
++		return B_NO_INIT;
++
++	if (fMessage) {
++		BMessage message(*fMessage);
++		message.AddString(&quot;status&quot;, &quot;Extracting package.&quot;);
++		fMessenger.SendMessage(&amp;message);
++	}
++
++	BPrivate::BCommandPipe commandPipe;
++	status_t ret = commandPipe.AddArg(&quot;unzip&quot;);
++	if (ret == B_OK)
++		ret = commandPipe.AddArg(&quot;-o&quot;);
++	if (ret == B_OK)
++		ret = commandPipe.AddArg(fPackage.String());
++	if (ret == B_OK)
++		ret = commandPipe.AddArg(&quot;-d&quot;);
++	if (ret == B_OK)
++		ret = commandPipe.AddArg(destinationFolder);
++	if (ret == B_OK)
++		ret = commandPipe.AddArg(&quot;-x&quot;);
++	if (ret == B_OK)
++		ret = commandPipe.AddArg(&quot;.OptionalPackageDescription&quot;);
++	if (ret != B_OK)
++		return ret;
++
++	// Launch the unzip thread and start reading the stdout and stderr output.
++	FILE* stdOutAndErrPipe = NULL;
++	thread_id unzipThread = commandPipe.PipeInto(&amp;stdOutAndErrPipe);
++	if (unzipThread &lt; 0)
++		return (status_t)unzipThread;
++
++	return _ReadFromPipe(stdOutAndErrPipe, commandPipe, cancelSemaphore);
++}
++
++
++// #pragma mark -
++
++
++status_t
++UnzipEngine::_ReadFromPipe(FILE* stdOutAndErrPipe,
++	BPrivate::BCommandPipe&amp; commandPipe, sem_id cancelSemaphore)
++{
++	class LineReader : public BPrivate::BCommandPipe::LineReader {
++	public:
++		LineReader(sem_id cancelSemaphore, off_t bytesToUncompress,
++				uint64 itemsToUncompress, BMessenger&amp; messenger,
++				const BMessage* message)
++			:
++			fCancelSemaphore(cancelSemaphore),
++
++			fBytesToUncompress(itemsToUncompress),
++			fBytesUncompressed(0),
++			fItemsToUncompress(itemsToUncompress),
++			fItemsUncompressed(0),
++
++			fMessenger(messenger),
++			fMessage(message)
++		{
++		}
++
++		virtual bool IsCanceled()
++		{
++			if (fCancelSemaphore &lt; 0)
++				return false;
++
++			SemaphoreLocker locker(fCancelSemaphore);
++			return !locker.IsLocked();
++		}
++
++		virtual status_t ReadLine(const BString&amp; line)
++		{
++			char item[1024];
++			char linkTarget[256];
++			const char* kInflatingFormat = &quot;   inflating: %s\n&quot;;
++			const char* kLinkingFormat = &quot;     linking: %s -&gt; %s\n&quot;;
++			if (sscanf(line.String(), kInflatingFormat, &amp;item) == 1
++				|| sscanf(line.String(), kLinkingFormat, &amp;item,
++					&amp;linkTarget) == 2) {
++				BString itemPath(item);
++				int pos = itemPath.FindLast('/');
++				BString itemName = itemPath.String() + pos + 1;
++				itemPath.Truncate(pos);
++				printf(&quot;extracted %s to %s\n&quot;, itemName.String(),
++					itemPath.String());
++			} else {
++				printf(&quot;ignored: %s&quot;, line.String());
++			}
++
++			return B_OK;
++		}
++
++	private:
++		sem_id			fCancelSemaphore;
++
++		off_t			fBytesToUncompress;
++		off_t			fBytesUncompressed;
++		uint64			fItemsToUncompress;
++		uint64			fItemsUncompressed;
++
++		BMessenger&amp;		fMessenger;
++		const BMessage*	fMessage;
++	};
++
++	LineReader lineReader(cancelSemaphore, fBytesToUncompress,
++		fItemsToUncompress, fMessenger, fMessage);
++
++	return commandPipe.ReadLines(stdOutAndErrPipe, &amp;lineReader);
++}
++
++
++void
++UnzipEngine::_UpdateProgress()
++{
++	if (fMessage != NULL) {
++		BMessage message(*fMessage);
++		float progress = 100.0 * fBytesUncompressed / fBytesToUncompress;
++		message.AddFloat(&quot;progress&quot;, progress);
++		message.AddInt32(&quot;current&quot;, fItemsUncompressed);
++		message.AddInt32(&quot;maximum&quot;, fItemsToUncompress);
++		message.AddString(&quot;item&quot;, fCurrentItem);
++		message.AddString(&quot;folder&quot;, fCurrentTargetFolder);
++		fMessenger.SendMessage(&amp;message);
++	}
++}
+
+Added: haiku/trunk/src/apps/installer/UnzipEngine.h
+===================================================================
+--- haiku/trunk/src/apps/installer/UnzipEngine.h	2009-09-02 14:53:06 UTC (rev 32904)
++++ haiku/trunk/src/apps/installer/UnzipEngine.h	2009-09-02 14:55:03 UTC (rev 32905)
+@@ -0,0 +1,54 @@
++/*
++ * Copyright 2009, Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;
++ *  All rights reserved. Distributed under the terms of the MIT License.
++ */
++#ifndef UNZIP_ENGINE_H
++#define UNZIP_ENGINE_H
++
++
++#include &lt;stdio.h&gt;
++
++#include &lt;Messenger.h&gt;
++#include &lt;String.h&gt;
++
++namespace BPrivate {
++	class BCommandPipe;
++}
++class BMessage;
++class BMessenger;
++
++
++class UnzipEngine {
++public:
++								UnzipEngine(const BMessenger&amp; messenger,
++									BMessage* message);
++	virtual						~UnzipEngine();
++
++			status_t			SetTo(const char* pathToPackage);
++
++			status_t			UnzipPackage(const char* destinationFolder,
++									sem_id cancelSemaphore = -1);
++
++private:
++			status_t			_ReadFromPipe(FILE* stdOutAndErrPipe,
++									BPrivate::BCommandPipe&amp; commandPipe,
++									sem_id cancelSemaphore);
++			void				_UpdateProgress();
++
++private:
++			BString				fPackage;
++
++			off_t				fBytesToUncompress;
++			off_t				fBytesUncompressed;
++			uint64				fItemsToUncompress;
++			uint64				fItemsUncompressed;
++
++			const char*			fCurrentTargetFolder;
++			const char*			fCurrentItem;
++
++			BMessenger			fMessenger;
++			BMessage*			fMessage;
++};
++
++
++#endif // UNZIP_ENGINE_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020288.html">[Haiku-commits] r32904 - haiku/trunk/src/apps/installer
+</A></li>
+	<LI>Next message: <A HREF="020292.html">[Haiku-commits] r32905 - haiku/trunk/src/apps/installer
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20289">[ date ]</a>
+              <a href="thread.html#20289">[ thread ]</a>
+              <a href="subject.html#20289">[ subject ]</a>
+              <a href="author.html#20289">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

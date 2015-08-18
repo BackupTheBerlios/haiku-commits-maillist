@@ -1,0 +1,725 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27780 - haiku/trunk/src/bin/debug/profile
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27780%20-%20haiku/trunk/src/bin/debug/profile&In-Reply-To=%3C200809291514.m8TFEV24019403%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012233.html">
+   <LINK REL="Next"  HREF="012237.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27780 - haiku/trunk/src/bin/debug/profile</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27780%20-%20haiku/trunk/src/bin/debug/profile&In-Reply-To=%3C200809291514.m8TFEV24019403%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27780 - haiku/trunk/src/bin/debug/profile">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Sep 29 17:14:31 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012233.html">[Haiku-commits] r27779 - in haiku/trunk/src/bin/debug: . profile
+</A></li>
+        <LI>Next message: <A HREF="012237.html">[Haiku-commits] r27781 - haiku/trunk/3rdparty/mmu_man/themes
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12236">[ date ]</a>
+              <a href="thread.html#12236">[ thread ]</a>
+              <a href="subject.html#12236">[ subject ]</a>
+              <a href="author.html#12236">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-29 17:14:31 +0200 (Mon, 29 Sep 2008)
+New Revision: 27780
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27780&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27780&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/bin/debug/profile/Thread.cpp
+   haiku/trunk/src/bin/debug/profile/Thread.h
+   haiku/trunk/src/bin/debug/profile/profile.cpp
+Log:
+Some refactoring: Separated the profile result collection from the
+thread management. There's now a ThreadProfileResult (abstract base
+class) object associated with a Thread object. Currently there's only
+one (currently misnamed) derived class AbstractThreadProfileResult, but
+some more refactoring will make the purpose clearer.
+
+
+Modified: haiku/trunk/src/bin/debug/profile/Thread.cpp
+===================================================================
+--- haiku/trunk/src/bin/debug/profile/Thread.cpp	2008-09-29 13:50:11 UTC (rev 27779)
++++ haiku/trunk/src/bin/debug/profile/Thread.cpp	2008-09-29 15:14:31 UTC (rev 27780)
+@@ -124,30 +124,29 @@
+ 	fTeam(team),
+ 	fSampleArea(-1),
+ 	fSamples(NULL),
+-	fImages(),
+-	fOldImages(),
+-	fTotalTicks(0),
+-	fUnkownTicks(0),
+-	fDroppedTicks(0),
+-	fInterval(1),
+-	fTotalSampleCount(0)
++	fProfileResult(NULL)
+ {
+ }
+ 
+ 
+ Thread::~Thread()
+ {
+-	while (ThreadImage* image = fImages.RemoveHead())
+-		delete image;
+-	while (ThreadImage* image = fOldImages.RemoveHead())
+-		delete image;
+-
+ 	if (fSampleArea &gt;= 0)
+ 		delete_area(fSampleArea);
++
++	delete fProfileResult;
+ }
+ 
+ 
+ void
++Thread::SetProfileResult(ThreadProfileResult* result)
++{
++	delete fProfileResult;
++	fProfileResult = result;
++}
++
++
++void
+ Thread::UpdateInfo()
+ {
+ 	thread_info info;
+@@ -167,13 +166,132 @@
+ void
+ Thread::SetInterval(bigtime_t interval)
+ {
+-	fInterval = interval;
++	fProfileResult-&gt;SetInterval(interval);
+ }
+ 
+ 
+ status_t
+ Thread::AddImage(Image* image)
+ {
++	return fProfileResult-&gt;AddImage(image);
++}
++
++
++void
++Thread::AddSamples(int32 count, int32 dropped, int32 stackDepth,
++	bool variableStackDepth, int32 event)
++{
++	fProfileResult-&gt;SynchronizeImages(event);
++
++	if (variableStackDepth) {
++		addr_t* samples = fSamples;
++
++		while (count &gt; 0) {
++			addr_t sampleCount = *(samples++);
++
++			if (sampleCount &gt;= B_DEBUG_PROFILE_EVENT_BASE) {
++				int32 eventParameterCount
++					= sampleCount &amp; B_DEBUG_PROFILE_EVENT_PARAMETER_MASK;
++				if (sampleCount == B_DEBUG_PROFILE_IMAGE_EVENT) {
++					fProfileResult-&gt;SynchronizeImages((int32)samples[0]);
++				} else {
++					fprintf(stderr, &quot;unknown profile event: %#lx\n&quot;,
++						sampleCount);
++				}
++
++				samples += eventParameterCount;
++				count -= eventParameterCount + 1;
++				continue;
++			}
++
++			fProfileResult-&gt;AddSamples(samples, sampleCount);
++
++			samples += sampleCount;
++			count -= sampleCount + 1;
++		}
++	} else {
++		count = count / stackDepth * stackDepth;
++
++		for (int32 i = 0; i &lt; count; i += stackDepth)
++			fProfileResult-&gt;AddSamples(fSamples + i, stackDepth);
++	}
++
++	fProfileResult-&gt;AddDroppedTicks(dropped);
++}
++
++
++void
++Thread::PrintResults() const
++{
++	fProfileResult-&gt;PrintResults();
++}
++
++
++// #pragma mark - ThreadProfileResult
++
++
++ThreadProfileResult::ThreadProfileResult()
++	:
++	fThread(NULL),
++	fInterval(1)
++{
++}
++
++
++ThreadProfileResult::~ThreadProfileResult()
++{
++}
++
++
++status_t
++ThreadProfileResult::Init(Thread* thread)
++{
++	fThread = thread;
++	return B_OK;
++}
++
++
++void
++ThreadProfileResult::SetInterval(bigtime_t interval)
++{
++	fInterval = interval;
++}
++
++
++// #pragma mark - AbstractThreadProfileResult
++
++AbstractThreadProfileResult::AbstractThreadProfileResult()
++	:
++	fImages(),
++	fNewImages(),
++	fOldImages(),
++	fTotalTicks(0),
++	fUnkownTicks(0),
++	fDroppedTicks(0),
++	fTotalSampleCount(0)
++{
++}
++
++
++AbstractThreadProfileResult::~AbstractThreadProfileResult()
++{
++	while (ThreadImage* image = fImages.RemoveHead())
++		delete image;
++	while (ThreadImage* image = fOldImages.RemoveHead())
++		delete image;
++}
++
++
++status_t
++AbstractThreadProfileResult::Init(Thread* thread)
++{
++	return ThreadProfileResult::Init(thread);
++}
++
++
++status_t
++AbstractThreadProfileResult::AddImage(Image* image)
++{
+ 	ThreadImage* threadImage = new(std::nothrow) ThreadImage(image);
+ 	if (threadImage == NULL)
+ 		return B_NO_MEMORY;
+@@ -184,31 +302,41 @@
+ 		return error;
+ 	}
+ 
+-	fImages.Add(threadImage);
++	fNewImages.Add(threadImage);
+ 
+ 	return B_OK;
+ }
+ 
+ 
+ void
+-Thread::ImageRemoved(Image* image)
++AbstractThreadProfileResult::SynchronizeImages(int32 event)
+ {
++	// remove obsolete images
+ 	ImageList::Iterator it = fImages.GetIterator();
+-	while (ThreadImage* threadImage = it.Next()) {
+-		if (threadImage-&gt;GetImage() == image) {
+-			fImages.Remove(threadImage);
+-			if (threadImage-&gt;TotalHits() &gt; 0)
+-				fOldImages.Add(threadImage);
++	while (ThreadImage* image = it.Next()) {
++		int32 deleted = image-&gt;GetImage()-&gt;DeletionEvent();
++		if (deleted &gt;= 0 &amp;&amp; event &gt;= deleted) {
++			it.Remove();
++			if (image-&gt;TotalHits() &gt; 0)
++				fOldImages.Add(image);
+ 			else
+-				delete threadImage;
+-			return;
++				delete image;
+ 		}
+ 	}
++
++	// add new images
++	it = fNewImages.GetIterator();
++	while (ThreadImage* image = it.Next()) {
++		if (image-&gt;GetImage()-&gt;CreationEvent() &gt;= event) {
++			it.Remove();
++			fImages.Add(image);
++		}
++	}
+ }
+ 
+ 
+ ThreadImage*
+-Thread::FindImage(addr_t address) const
++AbstractThreadProfileResult::FindImage(addr_t address) const
+ {
+ 	ImageList::ConstIterator it = fImages.GetIterator();
+ 	while (ThreadImage* image = it.Next()) {
+@@ -220,127 +348,75 @@
+ 
+ 
+ void
+-Thread::AddSamples(int32 count, int32 dropped, int32 stackDepth,
+-	bool variableStackDepth, int32 event)
++AbstractThreadProfileResult::AddSamples(addr_t* samples, int32 sampleCount)
+ {
+-	_RemoveObsoleteImages(event);
++	if (gOptions.analyze_full_stack) {
++		// Sort the samples. This way hits of the same symbol are
++		// successive and we can avoid incrementing the hit count of the
++		// same symbol twice. Same for images.
++		std::sort(samples, samples + sampleCount);
+ 
+-	// Temporarily remove images that have been created after the given
+-	// event.
+-	ImageList newImages;
+-	ImageList::Iterator it = fImages.GetIterator();
+-	while (ThreadImage* image = it.Next()) {
+-		if (image-&gt;GetImage()-&gt;CreationEvent() &gt; event) {
+-			it.Remove();
+-			newImages.Add(image);
+-		}
+-	}
++		int32 unknownSamples = 0;
++		ThreadImage* previousImage = NULL;
++		int32 previousSymbol = -1;
+ 
+-	if (variableStackDepth) {
+-		// Variable stack depth means we have full caller stack analyzes
+-		// enabled.
+-		int32 totalSampleCount = 0;
+-		int32 tickCount = 0;
+-		addr_t* samples = fSamples;
++		for (int32 i = 0; i &lt; sampleCount; i++) {
++			addr_t address = samples[i];
++			ThreadImage* image = FindImage(address);
++			int32 symbol = -1;
++			if (image != NULL) {
++				symbol = image-&gt;GetImage()-&gt;FindSymbol(address);
++				if (symbol &lt; 0) {
++					// TODO: Count unknown image hits?
++				} else if (symbol != previousSymbol)
++					image-&gt;AddSymbolHit(symbol);
+ 
+-		while (count &gt; 0) {
+-			addr_t sampleCount = *(samples++);
++				if (image != previousImage)
++					image-&gt;AddImageHit();
++			} else
++				unknownSamples++;
+ 
+-			if (sampleCount &gt;= B_DEBUG_PROFILE_EVENT_BASE) {
+-				int32 eventParameterCount
+-					= sampleCount &amp; B_DEBUG_PROFILE_EVENT_PARAMETER_MASK;
+-				if (sampleCount == B_DEBUG_PROFILE_IMAGE_EVENT) {
+-					int32 imageEvent = (int32)samples[0];
+-					_RemoveObsoleteImages(imageEvent);
+-					_AddNewImages(newImages, imageEvent);
+-				} else {
+-					fprintf(stderr, &quot;unknown profile event: %#lx\n&quot;,
+-						sampleCount);
+-				}
+-
+-				samples += eventParameterCount;
+-				count -= eventParameterCount + 1;
+-				continue;
+-			}
+-
+-			// Sort the samples. This way hits of the same symbol are
+-			// successive and we can avoid incrementing the hit count of the
+-			// same symbol twice. Same for images.
+-			std::sort(samples, samples + sampleCount);
+-
+-			int32 unknownSamples = 0;
+-			ThreadImage* previousImage = NULL;
+-			int32 previousSymbol = -1;
+-
+-			for (uint32 i = 0; i &lt; sampleCount; i++) {
+-				addr_t address = samples[i];
+-				ThreadImage* image = FindImage(address);
+-				int32 symbol = -1;
+-				if (image != NULL) {
+-					symbol = image-&gt;GetImage()-&gt;FindSymbol(address);
+-					if (symbol &lt; 0) {
+-						// TODO: Count unknown image hits?
+-					} else if (symbol != previousSymbol)
+-						image-&gt;AddSymbolHit(symbol);
+-
+-					if (image != previousImage)
+-						image-&gt;AddImageHit();
+-				} else
+-					unknownSamples++;
+-
+-				previousImage = image;
+-				previousSymbol = symbol;
+-			}
+-
+-			if (unknownSamples == (int32)sampleCount)
+-				fUnkownTicks++;
+-
+-			samples += sampleCount;
+-			count -= sampleCount + 1;
+-			tickCount++;
+-			totalSampleCount += sampleCount;
++			previousImage = image;
++			previousSymbol = symbol;
+ 		}
+ 
+-		fTotalTicks += tickCount;
+-		fTotalSampleCount += totalSampleCount;
++		if (unknownSamples == sampleCount)
++			fUnkownTicks++;
+ 	} else {
+-		count = count / stackDepth * stackDepth;
+-
+-		for (int32 i = 0; i &lt; count; i += stackDepth) {
+-			ThreadImage* image = NULL;
+-			for (int32 k = 0; k &lt; stackDepth; k++) {
+-				addr_t address = fSamples[i + k];
+-				image = FindImage(address);
+-				if (image != NULL) {
+-					image-&gt;AddHit(address);
+-					break;
+-				}
++		ThreadImage* image = NULL;
++		for (int32 k = 0; k &lt; sampleCount; k++) {
++			addr_t address = samples[k];
++			image = FindImage(address);
++			if (image != NULL) {
++				image-&gt;AddHit(address);
++				break;
+ 			}
+-
+-			if (image == NULL)
+-				fUnkownTicks++;
+ 		}
+ 
+-		fTotalTicks += count / stackDepth;
++		if (image == NULL)
++			fUnkownTicks++;
+ 	}
+ 
+-	fDroppedTicks += dropped;
++	fTotalTicks++;
++	fTotalSampleCount += sampleCount;
++}
+ 
+-	// re-add the new images
+-	fImages.MoveFrom(&amp;newImages);
+ 
+-	_SynchronizeImages();
++void
++AbstractThreadProfileResult::AddDroppedTicks(int32 dropped)
++{
++	fDroppedTicks += dropped;
+ }
+ 
+ 
+ void
+-Thread::PrintResults() const
++AbstractThreadProfileResult::PrintResults()
+ {
+ 	// count images and symbols
+ 	int32 imageCount = 0;
+ 	int32 symbolCount = 0;
+ 
+-	ImageList::ConstIterator it = fOldImages.GetIterator();
++	ImageList::Iterator it = fOldImages.GetIterator();
+ 	while (ThreadImage* image = it.Next()) {
+ 		if (image-&gt;TotalHits() &gt; 0) {
+ 			imageCount++;
+@@ -398,7 +474,7 @@
+ 
+ 	int64 totalTicks = fTotalTicks;
+ 	fprintf(gOptions.output, &quot;\nprofiling results for thread \&quot;%s\&quot; &quot;
+-		&quot;(%ld):\n&quot;, Name(), ID());
++		&quot;(%ld):\n&quot;, fThread-&gt;Name(), fThread-&gt;ID());
+ 	fprintf(gOptions.output, &quot;  tick interval:  %lld us\n&quot;, fInterval);
+ 	fprintf(gOptions.output, &quot;  total ticks:    %lld (%lld us)\n&quot;,
+ 		totalTicks, totalTicks * fInterval);
+@@ -447,71 +523,3 @@
+ 		fprintf(gOptions.output, &quot;  no functions were hit\n&quot;);
+ }
+ 
+-
+-void
+-Thread::_SynchronizeImages()
+-{
+-	const BObjectList&lt;Image&gt;&amp; teamImages = fTeam-&gt;Images();
+-
+-	// remove obsolete images
+-	ImageList::Iterator it = fImages.GetIterator();
+-	while (ThreadImage* image = it.Next()) {
+-		if (fTeam-&gt;FindImage(image-&gt;ID()) == NULL) {
+-			it.Remove();
+-			if (image-&gt;TotalHits() &gt; 0)
+-				fOldImages.Add(image);
+-			else
+-				delete image;
+-		}
+-	}
+-
+-	// add new images
+-	for (int32 i = 0; Image* image = teamImages.ItemAt(i); i++) {
+-		if (_FindImageByID(image-&gt;ID()) == NULL)
+-			AddImage(image);
+-	}
+-}
+-
+-
+-void
+-Thread::_AddNewImages(ImageList&amp; newImages, int32 event)
+-{
+-	ImageList::Iterator it = newImages.GetIterator();
+-	while (ThreadImage* image = it.Next()) {
+-		if (image-&gt;GetImage()-&gt;CreationEvent() &gt;= event) {
+-			it.Remove();
+-			fImages.Add(image);
+-		}
+-	}
+-}
+-
+-
+-void
+-Thread::_RemoveObsoleteImages(int32 event)
+-{
+-	// remove obsolete images
+-	ImageList::Iterator it = fImages.GetIterator();
+-	while (ThreadImage* image = it.Next()) {
+-		int32 deleted = image-&gt;GetImage()-&gt;DeletionEvent();
+-		if (deleted &gt;= 0 &amp;&amp; event &gt;= deleted) {
+-			it.Remove();
+-			if (image-&gt;TotalHits() &gt; 0)
+-				fOldImages.Add(image);
+-			else
+-				delete image;
+-		}
+-	}
+-}
+-
+-
+-ThreadImage*
+-Thread::_FindImageByID(image_id id) const
+-{
+-	ImageList::ConstIterator it = fImages.GetIterator();
+-	while (ThreadImage* image = it.Next()) {
+-		if (image-&gt;ID() == id)
+-			return image;
+-	}
+-
+-	return NULL;
+-}
+
+Modified: haiku/trunk/src/bin/debug/profile/Thread.h
+===================================================================
+--- haiku/trunk/src/bin/debug/profile/Thread.h	2008-09-29 13:50:11 UTC (rev 27779)
++++ haiku/trunk/src/bin/debug/profile/Thread.h	2008-09-29 15:14:31 UTC (rev 27780)
+@@ -12,6 +12,7 @@
+ 
+ class Team;
+ class ThreadImage;
++class ThreadProfileResult;
+ 
+ 
+ class Thread : public DoublyLinkedListLinkImpl&lt;Thread&gt; {
+@@ -24,14 +25,15 @@
+ 	inline	addr_t*				Samples() const;
+ 	inline	Team*				GetTeam() const;
+ 
++	inline	ThreadProfileResult* ProfileResult() const;
++			void				SetProfileResult(ThreadProfileResult* result);
++
+ 			void				UpdateInfo();
+ 
+ 			void				SetSampleArea(area_id area, addr_t* samples);
+ 			void				SetInterval(bigtime_t interval);
+ 
+ 			status_t			AddImage(Image* image);
+-			void				ImageRemoved(Image* image);
+-			ThreadImage*		FindImage(addr_t address) const;
+ 
+ 			void				AddSamples(int32 count, int32 dropped,
+ 									int32 stackDepth, bool variableStackDepth,
+@@ -41,25 +43,64 @@
+ private:
+ 	typedef DoublyLinkedList&lt;ThreadImage&gt;	ImageList;
+ 
+-			void				_SynchronizeImages();
+-
+-			void				_AddNewImages(ImageList&amp; newImages,
+-									int32 event);
+-			void				_RemoveObsoleteImages(int32 event);
+-
+-			ThreadImage*		_FindImageByID(image_id id) const;
+-
+ private:
+ 			thread_info			fInfo;
+ 			::Team*				fTeam;
+ 			area_id				fSampleArea;
+ 			addr_t*				fSamples;
++			ThreadProfileResult* fProfileResult;
++};
++
++
++class ThreadProfileResult {
++public:
++								ThreadProfileResult();
++	virtual						~ThreadProfileResult();
++
++	virtual	status_t			Init(Thread* thread);
++
++			void				SetInterval(bigtime_t interval);
++
++	virtual	status_t			AddImage(Image* image) = 0;
++	virtual	void				SynchronizeImages(int32 event) = 0;
++
++	virtual	void				AddSamples(addr_t* samples,
++									int32 sampleCount) = 0;
++	virtual	void				AddDroppedTicks(int32 dropped) = 0;
++	virtual	void				PrintResults() = 0;
++
++protected:
++			Thread*				fThread;
++			bigtime_t			fInterval;
++};
++
++
++class AbstractThreadProfileResult : public ThreadProfileResult {
++public:
++								AbstractThreadProfileResult();
++	virtual						~AbstractThreadProfileResult();
++
++	virtual	status_t			Init(Thread* thread);
++
++	virtual	status_t			AddImage(Image* image);
++	virtual	void				SynchronizeImages(int32 event);
++
++			ThreadImage*		FindImage(addr_t address) const;
++
++	virtual	void				AddSamples(addr_t* samples,
++									int32 sampleCount);
++	virtual	void				AddDroppedTicks(int32 dropped);
++	virtual	void				PrintResults();
++
++protected:
++	typedef DoublyLinkedList&lt;ThreadImage&gt;	ImageList;
++
+ 			ImageList			fImages;
++			ImageList			fNewImages;
+ 			ImageList			fOldImages;
+ 			int64				fTotalTicks;
+ 			int64				fUnkownTicks;
+ 			int64				fDroppedTicks;
+-			bigtime_t			fInterval;
+ 			int64				fTotalSampleCount;
+ };
+ 
+@@ -95,4 +136,11 @@
+ }
+ 
+ 
++ThreadProfileResult*
++Thread::ProfileResult() const
++{
++	return fProfileResult;
++}
++
++
+ #endif	// THREAD_H
+
+Modified: haiku/trunk/src/bin/debug/profile/profile.cpp
+===================================================================
+--- haiku/trunk/src/bin/debug/profile/profile.cpp	2008-09-29 13:50:11 UTC (rev 27779)
++++ haiku/trunk/src/bin/debug/profile/profile.cpp	2008-09-29 15:14:31 UTC (rev 27780)
+@@ -123,6 +123,12 @@
+ 		if (thread == NULL)
+ 			return B_NO_MEMORY;
+ 
++		error = _CreateThreadProfileResult(thread);
++		if (error != B_OK) {
++			delete thread;
++			return error;
++		}
++
+ 		error = team-&gt;InitThread(thread);
+ 		if (error != B_OK) {
+ 			delete thread;
+@@ -166,6 +172,24 @@
+ 	}
+ 
+ private:
++	status_t _CreateThreadProfileResult(Thread* thread)
++	{
++		ThreadProfileResult* profileResult
++			= new(std::nothrow) AbstractThreadProfileResult;
++		if (profileResult == NULL)
++			return B_NO_MEMORY;
++
++		status_t error = profileResult-&gt;Init(thread);
++		if (error != B_OK) {
++			delete profileResult;
++			return error;
++		}
++
++		thread-&gt;SetProfileResult(profileResult);
++		return B_OK;
++	}
++
++private:
+ 	BObjectList&lt;Team&gt;				fTeams;
+ 	BObjectList&lt;Thread&gt;				fThreads;
+ 	port_id							fDebuggerPort;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012233.html">[Haiku-commits] r27779 - in haiku/trunk/src/bin/debug: . profile
+</A></li>
+	<LI>Next message: <A HREF="012237.html">[Haiku-commits] r27781 - haiku/trunk/3rdparty/mmu_man/themes
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12236">[ date ]</a>
+              <a href="thread.html#12236">[ thread ]</a>
+              <a href="subject.html#12236">[ subject ]</a>
+              <a href="author.html#12236">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

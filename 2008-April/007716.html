@@ -1,0 +1,587 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24943 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24943%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/unix&In-Reply-To=%3C200804120937.m3C9bEOq032211%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007715.html">
+   <LINK REL="Next"  HREF="007720.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24943 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24943%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/unix&In-Reply-To=%3C200804120937.m3C9bEOq032211%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24943 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Apr 12 11:37:14 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007715.html">[Haiku-commits] r24942 - haiku/trunk/src/bin/bzip2
+</A></li>
+        <LI>Next message: <A HREF="007720.html">[Haiku-commits] r24944 - haiku/trunk/src/apps/bootman
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7716">[ date ]</a>
+              <a href="thread.html#7716">[ thread ]</a>
+              <a href="subject.html#7716">[ subject ]</a>
+              <a href="author.html#7716">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-04-12 11:37:13 +0200 (Sat, 12 Apr 2008)
+New Revision: 24943
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24943&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24943&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixEndpoint.h
+   haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/unix/unix.cpp
+Log:
+* Added support for SCM_RIGHTS (sending file descriptors).
+* Fixed shutdown(). It was computing the wrong fifo flags and set the
+  wrong ones from the wrong variable on the peer fifo.
+* Generally made the Unix sockets behave more like they should. E.g.
+  after closing one end, it must still be possible to read from the
+  other (as long as there are buffered data). Also fine-tuned when to
+  return what errors from recv()/send().
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixEndpoint.cpp	2008-04-12 09:30:47 UTC (rev 24942)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixEndpoint.cpp	2008-04-12 09:37:13 UTC (rev 24943)
+@@ -144,6 +144,10 @@
+ {
+ 	TRACE(&quot;[%ld] %p-&gt;UnixEndpoint::Free()\n&quot;, find_thread(NULL), this);
+ 
++	UnixEndpointLocker locker(this);
++
++	_UnsetReceiveFifo();
++
+ 	RETURN_ERROR(B_OK);
+ }
+ 
+@@ -248,6 +252,8 @@
+ 	if (fAcceptSemaphore &lt; 0)
+ 		RETURN_ERROR(ENOBUFS);
+ 
++	_UnsetReceiveFifo();
++
+ 	fState = UNIX_ENDPOINT_LISTENING;
+ 
+ 	RETURN_ERROR(B_OK);
+@@ -348,6 +354,9 @@
+ 
+ 	connectedEndpoint-&gt;_Spawn(this, peerFifo);
+ 
++	// update our attributes
++	_UnsetReceiveFifo();
++
+ 	fPeerEndpoint = connectedEndpoint;
+ 	PeerAddress().SetTo(&amp;connectedEndpoint-&gt;socket-&gt;address);
+ 	fPeerEndpoint-&gt;AddReference();
+@@ -459,23 +468,30 @@
+ 	if (notifyWrite)
+ 		gSocketModule-&gt;notify(socket, B_SELECT_WRITE, writable);
+ 
+-	if (error == UNIX_FIFO_SHUTDOWN) {
+-		// This might either mean, that someone called shutdown() or close(),
+-		// or our peer closed the connection.
+-		if (fPeerEndpoint == peerEndpoint) {
+-			// Orderly shutdown.
+-			error = EPIPE;
+-		} else if (fState == UNIX_ENDPOINT_CLOSED) {
+-			// The FD has been closed.
+-			error = EBADF;
+-		} else {
+-			// Peer closed the connection.
+-			error = EPIPE;
+-			send_signal(find_thread(NULL), SIGPIPE);
+-		}
+-	} else if (error == B_TIMED_OUT &amp;&amp; timeout == 0) {
+-		// translate non-blocking timeouts to the correct error code
+-		error = B_WOULD_BLOCK;
++	switch (error) {
++		case UNIX_FIFO_SHUTDOWN:
++			if (fPeerEndpoint == peerEndpoint
++					&amp;&amp; fState == UNIX_ENDPOINT_CONNECTED) {
++				// Orderly write shutdown on our side.
++				// Note: Linux and Solaris also send a SIGPIPE, but according
++				// the send() specification that shouldn't be done.
++				error = EPIPE;
++			} else {
++				// The FD has been closed.
++				error = EBADF;
++			}
++			break;
++		case EPIPE:
++			// The peer closed connection or shutdown its read side. Reward
++			// the caller with a SIGPIPE.
++			if (gStackModule-&gt;is_syscall())
++				send_signal(find_thread(NULL), SIGPIPE);
++			break;
++		case B_TIMED_OUT:
++			// Translate non-blocking timeouts to the correct error code.
++			if (timeout == 0)
++				error = B_WOULD_BLOCK;
++			break;
+ 	}
+ 
+ 	RETURN_ERROR(error);
+@@ -496,12 +512,11 @@
+ 
+ 	UnixEndpointLocker locker(this);
+ 
+-	if (fState != UNIX_ENDPOINT_CONNECTED)
++	// We can read as long as we have a FIFO. I.e. we are still connected, or
++	// disconnected and not yet reconnected/listening/closed.
++	if (fReceiveFifo == NULL)
+ 		RETURN_ERROR(ENOTCONN);
+ 
+-	UnixEndpoint* peerEndpoint = fPeerEndpoint;
+-	Reference&lt;UnixEndpoint&gt; peerReference(peerEndpoint);
+-
+ 	// lock our FIFO
+ 	UnixFifo* fifo = fReceiveFifo;
+ 	Reference&lt;UnixFifo&gt; _(fifo);
+@@ -533,23 +548,28 @@
+ 	if (notifyWrite)
+ 		gSocketModule-&gt;notify(socket, B_SELECT_WRITE, writable);
+ 
+-	if (error == UNIX_FIFO_SHUTDOWN) {
+-		// This might either mean, that someone called shutdown() or close(),
+-		// or our peer closed the connection.
+-		if (fPeerEndpoint == peerEndpoint) {
+-			// Orderly shutdown. Return B_OK, but a size of 0.
+-			error = B_OK;
+-			*_buffer = NULL;
+-		} else if (fState == UNIX_ENDPOINT_CLOSED) {
+-			// The FD has been closed.
+-			error = EBADF;
+-		} else {
+-			// The connection has been closed by our peer.
+-			error = ECONNRESET;
+-		}
+-	} else if (error == B_TIMED_OUT &amp;&amp; timeout == 0) {
+-		// translate non-blocking timeouts to the correct error code
+-		error = B_WOULD_BLOCK;
++	switch (error) {
++		case UNIX_FIFO_SHUTDOWN:
++			// Either our socket was closed or read shutdown.
++			if (fState == UNIX_ENDPOINT_CLOSED) {
++				// The FD has been closed.
++				error = EBADF;
++			} else {
++				// if (fReceiveFifo == fifo) {
++				// 		Orderly shutdown or the peer closed the connection.
++				// } else {
++				//		Weird case: Peer closed connection and we are already
++				// 		reconnected (or listening).
++				// }
++				error = B_OK;
++				*_buffer = NULL;
++			}
++			break;
++		case B_TIMED_OUT:
++			// translate non-blocking timeouts to the correct error code
++			if (timeout == 0)
++				error = B_WOULD_BLOCK;
++			break;
+ 	}
+ 
+ 	RETURN_ERROR(error);
+@@ -616,19 +636,19 @@
+ 	uint32 shutdown;
+ 	uint32 peerShutdown;
+ 
+-	// translate the direction into shutdown flags
++	// translate the direction into shutdown flags for our and the peer fifo
+ 	switch (direction) {
+ 		case SHUT_RD:
+ 			shutdown = UNIX_FIFO_SHUTDOWN_READ;
+-			peerShutdown = UNIX_FIFO_SHUTDOWN_WRITE;
++			peerShutdown = 0;
+ 			break;
+ 		case SHUT_WR:
+-			shutdown = UNIX_FIFO_SHUTDOWN_WRITE;
+-			peerShutdown = UNIX_FIFO_SHUTDOWN_READ;
++			shutdown = 0;
++			peerShutdown = UNIX_FIFO_SHUTDOWN_WRITE;
+ 			break;
+ 		case SHUT_RDWR:
+-			shutdown = peerShutdown = UNIX_FIFO_SHUTDOWN_READ
+-				| UNIX_FIFO_SHUTDOWN_WRITE;
++			shutdown = UNIX_FIFO_SHUTDOWN_READ;
++			peerShutdown = UNIX_FIFO_SHUTDOWN_WRITE;
+ 			break;
+ 		default:
+ 			RETURN_ERROR(B_BAD_VALUE);
+@@ -649,7 +669,7 @@
+ 
+ 	// shutdown peer FIFO
+ 	fPeerEndpoint-&gt;fReceiveFifo-&gt;Lock();
+-	fPeerEndpoint-&gt;fReceiveFifo-&gt;Shutdown(shutdown);
++	fPeerEndpoint-&gt;fReceiveFifo-&gt;Shutdown(peerShutdown);
+ 	fPeerEndpoint-&gt;fReceiveFifo-&gt;Unlock();
+ 
+ 	RETURN_ERROR(B_OK);
+@@ -678,12 +698,10 @@
+ {
+ 	// Both endpoints must be locked.
+ 
+-	// Shutdown and unset the receive FIFO.
++	// Write shutdown the receive FIFO.
+ 	fReceiveFifo-&gt;Lock();
+-	fReceiveFifo-&gt;Shutdown(UNIX_FIFO_SHUTDOWN_READ | UNIX_FIFO_SHUTDOWN_WRITE);
++	fReceiveFifo-&gt;Shutdown(UNIX_FIFO_SHUTDOWN_WRITE);
+ 	fReceiveFifo-&gt;Unlock();
+-	fReceiveFifo-&gt;RemoveReference();
+-	fReceiveFifo = NULL;
+ 
+ 	// select() notification.
+ 	gSocketModule-&gt;notify(socket, B_SELECT_WRITE, ECONNRESET);
+@@ -770,6 +788,16 @@
+ 
+ 
+ void
++UnixEndpoint::_UnsetReceiveFifo()
++{
++	if (fReceiveFifo) {
++		fReceiveFifo-&gt;RemoveReference();
++		fReceiveFifo = NULL;
++	}
++}
++
++
++void
+ UnixEndpoint::_StopListening()
+ {
+ 	if (fState == UNIX_ENDPOINT_LISTENING) {
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixEndpoint.h	2008-04-12 09:30:47 UTC (rev 24942)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixEndpoint.h	2008-04-12 09:37:13 UTC (rev 24943)
+@@ -101,6 +101,7 @@
+ 	status_t _Bind(int32 internalID);
+ 	status_t _Unbind();
+ 
++	void _UnsetReceiveFifo();
+ 	void _StopListening();
+ 
+ private:
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp	2008-04-12 09:30:47 UTC (rev 24942)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/unix/UnixFifo.cpp	2008-04-12 09:37:13 UTC (rev 24943)
+@@ -8,7 +8,7 @@
+ #include &quot;unix.h&quot;
+ 
+ 
+-#define UNIX_FIFO_DEBUG_LEVEL	1
++#define UNIX_FIFO_DEBUG_LEVEL	2
+ #define UNIX_DEBUG_LEVEL		UNIX_FIFO_DEBUG_LEVEL
+ #include &quot;UnixDebug.h&quot;
+ 
+@@ -64,6 +64,9 @@
+ 				return B_OK;
+ 			}
+ 
++			// transfer the ancillary data
++			gBufferModule-&gt;transfer_ancillary_data(nextBuffer, buffer);
++
+ 			if (nextBuffer-&gt;size &gt; toCopy) {
+ 				// remove the part we've copied
+ 				gBufferModule-&gt;remove_header(nextBuffer, toCopy);
+@@ -92,6 +95,9 @@
+ 		return error;
+ 	}
+ 
++	// transfer the ancillary data
++	gBufferModule-&gt;transfer_ancillary_data(buffer, newBuffer);
++
+ 	// remove the part we've copied
+ 	gBufferModule-&gt;remove_header(buffer, size);
+ 
+@@ -174,11 +180,11 @@
+ {
+ 	fShutdown |= shutdown;
+ 
+-	if ((shutdown &amp; UNIX_FIFO_SHUTDOWN_READ) != 0)
++	if (shutdown != 0) {
++		// Shutting down either end also effects the other, so notify both.
++		release_sem_etc(fWriterSem, 1, B_RELEASE_ALL);
+ 		release_sem_etc(fReaderSem, 1, B_RELEASE_ALL);
+-
+-	if ((shutdown &amp; UNIX_FIFO_SHUTDOWN_WRITE) != 0)
+-		release_sem_etc(fWriterSem, 1, B_RELEASE_ALL);
++	}
+ }
+ 
+ 
+@@ -312,11 +318,20 @@
+ 	if (IsReadShutdown())
+ 		return UNIX_FIFO_SHUTDOWN;
+ 
++	if (fBuffer.Readable() == 0) {
++		if (IsWriteShutdown()) {
++			*_buffer = NULL;
++			RETURN_ERROR(B_OK);
++		}
++
++		if (timeout == 0)
++			RETURN_ERROR(B_WOULD_BLOCK);
++	}
++
+ 	// wait for any data to become available
+-	if (fBuffer.Readable() == 0 &amp;&amp; timeout == 0)
+-		RETURN_ERROR(B_WOULD_BLOCK);
+-
+-	while (fBuffer.Readable() == 0 &amp;&amp; !IsReadShutdown()) {
++// TODO: Support low water marks!
++	while (fBuffer.Readable() == 0
++			&amp;&amp; !IsReadShutdown() &amp;&amp; !IsWriteShutdown()) {
+ 		benaphore_unlock(&amp;fLock);
+ 
+ 		status_t error = acquire_sem_etc(fReaderSem, 1,
+@@ -331,6 +346,11 @@
+ 	if (IsReadShutdown())
+ 		return UNIX_FIFO_SHUTDOWN;
+ 
++	if (fBuffer.Readable() == 0 &amp;&amp; IsWriteShutdown()) {
++		*_buffer = NULL;
++		RETURN_ERROR(B_OK);
++	}
++
+ 	RETURN_ERROR(fBuffer.Read(numBytes, _buffer));
+ }
+ 
+@@ -357,11 +377,15 @@
+ 	if (IsWriteShutdown())
+ 		return UNIX_FIFO_SHUTDOWN;
+ 
++	if (IsReadShutdown())
++		return EPIPE;
++
+ 	// wait for any space to become available
+ 	if (fBuffer.Writable() &lt; request.size &amp;&amp; timeout == 0)
+ 		RETURN_ERROR(B_WOULD_BLOCK);
+ 
+-	while (fBuffer.Writable() &lt; request.size &amp;&amp; !IsWriteShutdown()) {
++	while (fBuffer.Writable() &lt; request.size &amp;&amp; !IsWriteShutdown()
++			&amp;&amp; !IsReadShutdown()) {
+ 		benaphore_unlock(&amp;fLock);
+ 
+ 		status_t error = acquire_sem_etc(fWriterSem, 1,
+@@ -376,5 +400,8 @@
+ 	if (IsWriteShutdown())
+ 		return UNIX_FIFO_SHUTDOWN;
+ 
++	if (IsReadShutdown())
++		return EPIPE;
++
+ 	RETURN_ERROR(fBuffer.Write(buffer));
+ }
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/unix/unix.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/unix/unix.cpp	2008-04-12 09:30:47 UTC (rev 24942)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/unix/unix.cpp	2008-04-12 09:37:13 UTC (rev 24943)
+@@ -8,6 +8,9 @@
+ 
+ #include &lt;new&gt;
+ 
++#include &lt;AutoDeleter.h&gt;
++
++#include &lt;fs/fd.h&gt;
+ #include &lt;lock.h&gt;
+ #include &lt;util/AutoLock.h&gt;
+ #include &lt;vfs.h&gt;
+@@ -37,6 +40,23 @@
+ static struct net_domain *sDomain;
+ 
+ 
++void
++destroy_scm_rights_descriptors(const ancillary_data_header* header,
++	void* data)
++{
++	int count = header-&gt;len / sizeof(file_descriptor*);
++	file_descriptor** descriptors = (file_descriptor**)data;
++
++	for (int i = 0; i &lt; count; i++) {
++		if (descriptors[i] != NULL)
++			put_fd(descriptors[i]);
++	}
++}
++
++
++// #pragma mark -
++
++
+ net_protocol *
+ unix_init_protocol(net_socket *socket)
+ {
+@@ -247,6 +267,119 @@
+ }
+ 
+ 
++status_t
++unix_attach_ancillary_data(net_protocol *self, net_buffer *buffer,
++	const cmsghdr *header)
++{
++	TRACE(&quot;[%ld] unix_attach_ancillary_data(%p, %p, %p (level: %d, type: %d, &quot;
++		&quot;len: %d))\n&quot;, find_thread(NULL), self, buffer, header,
++		header-&gt;cmsg_level, header-&gt;cmsg_type, (int)header-&gt;cmsg_len);
++
++	// we support only SCM_RIGHTS
++	if (header-&gt;cmsg_level != SOL_SOCKET || header-&gt;cmsg_type != SCM_RIGHTS)
++		return B_BAD_VALUE;
++
++	int* fds = (int*)CMSG_DATA(header);
++	int count = (header-&gt;cmsg_len - CMSG_ALIGN(sizeof(cmsghdr))) / sizeof(int);
++	if (count == 0)
++		return B_BAD_VALUE;
++
++	file_descriptor** descriptors = new(std::nothrow) file_descriptor*[count];
++	if (descriptors == NULL)
++		return ENOBUFS;
++	ArrayDeleter&lt;file_descriptor*&gt; _(descriptors);
++	memset(descriptors, 0, sizeof(file_descriptor*) * count);
++
++	// get the file descriptors
++	io_context* ioContext = get_current_io_context(!gStackModule-&gt;is_syscall());
++
++	status_t error = B_OK;
++	for (int i = 0; i &lt; count; i++) {
++		descriptors[i] = get_fd(ioContext, fds[i]);
++		if (descriptors[i] == NULL) {
++			error = EBADF;
++			break;
++		}
++	}
++
++	// attach the ancillary data to the buffer
++	if (error == B_OK) {
++		ancillary_data_header header;
++		header.level = SOL_SOCKET;
++		header.type = SCM_RIGHTS;
++		header.len = count * sizeof(file_descriptor*);
++
++		TRACE(&quot;[%ld] unix_attach_ancillary_data(): attaching %d FDs to &quot;
++			&quot;buffer\n&quot;, find_thread(NULL), count);
++
++		error = gBufferModule-&gt;attach_ancillary_data(buffer, &amp;header,
++			descriptors, destroy_scm_rights_descriptors, NULL);
++	}
++
++	// cleanup on error
++	if (error != B_OK) {
++		for (int i = 0; i &lt; count; i++) {
++			if (descriptors[i] != NULL)
++				put_fd(descriptors[i]);
++		}
++	}
++
++	return error;
++}
++
++
++ssize_t
++unix_process_ancillary_data(net_protocol *self,
++	const ancillary_data_header *header, const void *data, void *buffer,
++	size_t bufferSize)
++{
++	TRACE(&quot;[%ld] unix_process_ancillary_data(%p, %p (level: %d, type: %d, &quot;
++		&quot;len: %lu), %p, %p, %lu)\n&quot;, find_thread(NULL), self, header,
++		header-&gt;level, header-&gt;type, header-&gt;len, data, buffer, bufferSize);
++
++	// we support only SCM_RIGHTS
++	if (header-&gt;level != SOL_SOCKET || header-&gt;type != SCM_RIGHTS)
++		return B_BAD_VALUE;
++
++	int count = header-&gt;len / sizeof(file_descriptor*);
++	file_descriptor** descriptors = (file_descriptor**)data;
++
++	// check if there's enough space in the buffer
++	size_t neededBufferSpace = CMSG_SPACE(sizeof(int) * count);
++	if (bufferSize &lt; neededBufferSpace)
++		return B_BAD_VALUE;
++
++	// init header
++	cmsghdr* messageHeader = (cmsghdr*)buffer;
++	messageHeader-&gt;cmsg_level = header-&gt;level;
++	messageHeader-&gt;cmsg_type = header-&gt;type;
++	messageHeader-&gt;cmsg_len = CMSG_LEN(sizeof(int) * count);
++
++	// create FDs for the current process
++	int* fds = (int*)CMSG_DATA(messageHeader);
++	io_context* ioContext = get_current_io_context(!gStackModule-&gt;is_syscall());
++
++	status_t error = B_OK;
++	for (int i = 0; i &lt; count; i++) {
++		// get an additional reference which will go to the FD table index
++		inc_fd_ref_count(descriptors[i]);
++		fds[i] = new_fd(ioContext, descriptors[i]);
++
++		if (fds[i] &lt; 0) {
++			error = fds[i];
++			put_fd(descriptors[i]);
++
++			// close FD indices
++			for (int k = i - 1; k &gt;= 0; k--)
++				close_fd_index(ioContext, fds[k]);
++			break;
++		}
++	}
++
++	return error == B_OK ? neededBufferSpace : error;
++}
++
++
+ // #pragma mark -
+ 
+ 
+@@ -335,6 +468,8 @@
+ 	unix_deliver_data,
+ 	unix_error,
+ 	unix_error_reply,
++	unix_attach_ancillary_data,
++	unix_process_ancillary_data
+ };
+ 
+ module_dependency module_dependencies[] = {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007715.html">[Haiku-commits] r24942 - haiku/trunk/src/bin/bzip2
+</A></li>
+	<LI>Next message: <A HREF="007720.html">[Haiku-commits] r24944 - haiku/trunk/src/apps/bootman
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7716">[ date ]</a>
+              <a href="thread.html#7716">[ thread ]</a>
+              <a href="subject.html#7716">[ subject ]</a>
+              <a href="author.html#7716">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

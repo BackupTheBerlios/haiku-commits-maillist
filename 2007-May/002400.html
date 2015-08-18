@@ -1,0 +1,421 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21214 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/protocols/udp	src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21214%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/protocols/udp%0A%09src/add-ons/kernel/network/stack&In-Reply-To=%3C200705230756.l4N7uF2O014920%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002399.html">
+   <LINK REL="Next"  HREF="002450.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21214 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/protocols/udp	src/add-ons/kernel/network/stack</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21214%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/protocols/udp%0A%09src/add-ons/kernel/network/stack&In-Reply-To=%3C200705230756.l4N7uF2O014920%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21214 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/protocols/udp	src/add-ons/kernel/network/stack">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Wed May 23 09:56:15 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002399.html">[Haiku-commits] r21213 -	haiku/trunk/src/add-ons/kernel/file_systems/dos
+</A></li>
+        <LI>Next message: <A HREF="002450.html">[Haiku-commits] r21214 - in haiku/trunk: headers/private/net src/add-ons/kernel/network/protocols/udp src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2400">[ date ]</a>
+              <a href="thread.html#2400">[ thread ]</a>
+              <a href="subject.html#2400">[ subject ]</a>
+              <a href="author.html#2400">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-05-23 09:55:54 +0200 (Wed, 23 May 2007)
+New Revision: 21214
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21214&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21214&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/net/net_buffer.h
+   haiku/trunk/src/add-ons/kernel/network/protocols/udp/udp.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h
+   haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp
+Log:
+net_interface_private: added receive queue and splited device reading from packet processing. Delivering to self no longer is executed in the sender's context, which had some problems with TCP's locking.
+
+
+Modified: haiku/trunk/headers/private/net/net_buffer.h
+===================================================================
+--- haiku/trunk/headers/private/net/net_buffer.h	2007-05-23 07:54:57 UTC (rev 21213)
++++ haiku/trunk/headers/private/net/net_buffer.h	2007-05-23 07:55:54 UTC (rev 21214)
+@@ -23,6 +23,7 @@
+ 	struct sockaddr *source;
+ 	struct sockaddr *destination;
+ 	struct net_interface *interface;
++	int32 type;
+ 	union {
+ 		struct {
+ 			uint16	start;
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/udp/udp.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/udp/udp.cpp	2007-05-23 07:54:57 UTC (rev 21213)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/udp/udp.cpp	2007-05-23 07:55:54 UTC (rev 21214)
+@@ -654,7 +654,8 @@
+ 		return B_ERROR;
+ 	}
+ 
+-	return B_ERROR;
++	gBufferModule-&gt;free(buffer);
++	return B_OK;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp	2007-05-23 07:54:57 UTC (rev 21213)
++++ haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp	2007-05-23 07:55:54 UTC (rev 21214)
+@@ -13,6 +13,7 @@
+ #include &quot;interfaces.h&quot;
+ #include &quot;routes.h&quot;
+ #include &quot;stack_private.h&quot;
++#include &quot;utility.h&quot;
+ 
+ #include &lt;net_device.h&gt;
+ #include &lt;KernelExport.h&gt;
+@@ -54,41 +55,22 @@
+ 		status = device-&gt;module-&gt;receive_data(device, &amp;buffer);
+ 		rx_lock.Lock();
+ 		if (status == B_OK) {
+-			//dprintf(&quot;received buffer of %ld bytes length\n&quot;, buffer-&gt;size);
+-
+ 			// feed device monitors
+-			DeviceMonitorList::Iterator iterator
+-				= interface-&gt;monitor_funcs.GetIterator();
++			DeviceMonitorList::Iterator iterator =
++				interface-&gt;monitor_funcs.GetIterator();
+ 			while (iterator.HasNext()) {
+ 				net_device_monitor *monitor = iterator.Next();
+ 				monitor-&gt;receive(monitor, buffer);
+ 			}
+ 
+-			int32 type = interface-&gt;deframe_func(device, buffer);
+-			if (type &gt;= 0) {
+-				// find handler for this packet
+-				DeviceHandlerList::Iterator iterator
+-					= interface-&gt;receive_funcs.GetIterator();
+-				status = B_ERROR;
+-
+-				while (iterator.HasNext()) {
+-					net_device_handler *handler = iterator.Next();
+-
+-					if (handler-&gt;type == type) {
+-						status = handler-&gt;func(handler-&gt;cookie, device, buffer);
+-						if (status == B_OK)
+-							break;
+-					}
+-				}
+-			} else
+-				status = type;
+-
+-			if (status == B_OK) {
+-				// the buffer no longer belongs to us
++			buffer-&gt;interface = NULL;
++			buffer-&gt;type = interface-&gt;deframe_func(interface-&gt;device, buffer);
++			if (buffer-&gt;type &lt; 0) {
++				gNetBufferModule.free(buffer);
+ 				continue;
+ 			}
+ 
+-			gNetBufferModule.free(buffer);
++			fifo_enqueue_buffer(&amp;interface-&gt;receive_queue, buffer);
+ 		} else {
+ 			// In case of error, give the other threads some
+ 			// time to run since this is a near real time thread.
+@@ -336,8 +318,8 @@
+ status_t
+ datalink_send_data(struct net_route *route, net_buffer *buffer)
+ {
+-	net_interface *interface = route-&gt;interface;
+-	net_domain *domain = interface-&gt;domain;
++	net_interface_private *interface =
++		(net_interface_private *)route-&gt;interface;
+ 
+ 	//dprintf(&quot;send buffer (%ld bytes) to interface %s (route flags %lx)\n&quot;,
+ 	//	buffer-&gt;size, interface-&gt;name, route-&gt;flags);
+@@ -346,8 +328,12 @@
+ 		return ENETUNREACH;
+ 
+ 	if (route-&gt;flags &amp; RTF_LOCAL) {
++		// we set the interface here so the buffer is delivered directly
++		// to the domain in interfaces.cpp:device_consumer_thread()
++		buffer-&gt;interface = interface;
+ 		// this one goes back to the domain directly
+-		return domain-&gt;module-&gt;receive_data(buffer);
++		return fifo_enqueue_buffer(
++			&amp;interface-&gt;device_interface-&gt;receive_queue, buffer);
+ 	}
+ 
+ 	if (route-&gt;flags &amp; RTF_GATEWAY) {
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp	2007-05-23 07:54:57 UTC (rev 21213)
++++ haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp	2007-05-23 07:55:54 UTC (rev 21214)
+@@ -21,6 +21,7 @@
+ 
+ #include &lt;net/if_dl.h&gt;
+ #include &lt;new&gt;
++#include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+ 
+@@ -39,6 +40,51 @@
+ static uint32 sDeviceIndex;
+ 
+ 
++static status_t
++device_consumer_thread(void *_interface)
++{
++	net_device_interface *interface = (net_device_interface *)_interface;
++	net_device *device = interface-&gt;device;
++	net_buffer *buffer;
++
++	while (true) {
++		ssize_t status = fifo_dequeue_buffer(&amp;interface-&gt;receive_queue, 0,
++			B_INFINITE_TIMEOUT, &amp;buffer);
++		if (status == B_INTERRUPTED)
++			continue;
++		else if (status &lt; B_OK)
++			break;
++
++		if (buffer-&gt;interface != NULL) {
++			// if the interface is already specified this buffer was
++			// delivered locally.
++
++			net_domain *domain = buffer-&gt;interface-&gt;domain;
++
++			if (domain-&gt;module-&gt;receive_data(buffer) == B_OK)
++				buffer = NULL;
++		} else {
++			// find handler for this packet
++			DeviceHandlerList::Iterator it2 =
++				interface-&gt;receive_funcs.GetIterator();
++			while (buffer &amp;&amp; it2.HasNext()) {
++				net_device_handler *handler = it2.Next();
++
++				// if the handler returns B_OK, it consumed the buffer
++				if (handler-&gt;type == buffer-&gt;type
++					&amp;&amp; handler-&gt;func(handler-&gt;cookie, device, buffer) == B_OK)
++					buffer = NULL;
++			}
++		}
++
++		if (buffer)
++			gNetBufferModule.free(buffer);
++	}
++
++	return B_OK;
++}
++
++
+ static net_device_interface *
+ find_device_interface(const char *name)
+ {
+@@ -65,6 +111,60 @@
+ }
+ 
+ 
++static net_device_interface *
++allocate_device_interface(net_device *device, net_device_module_info *module)
++{
++	net_device_interface *interface = new (std::nothrow) net_device_interface;
++	if (interface == NULL)
++		goto error_0;
++
++	if (recursive_lock_init(&amp;interface-&gt;rx_lock, &quot;rx lock&quot;) &lt; B_OK)
++		goto error_1;
++
++	char name[128];
++	snprintf(name, sizeof(name), &quot;%s receive queue&quot;, device-&gt;name);
++
++	if (init_fifo(&amp;interface-&gt;receive_queue, name, 16 * 1024 * 1024) &lt; B_OK)
++		goto error_2;
++
++	interface-&gt;name = device-&gt;name;
++	interface-&gt;module = module;
++	interface-&gt;device = device;
++	interface-&gt;up_count = 0;
++	interface-&gt;ref_count = 1;
++	interface-&gt;deframe_func = NULL;
++	interface-&gt;deframe_ref_count = 0;
++
++	snprintf(name, sizeof(name), &quot;%s consumer&quot;, device-&gt;name);
++
++	interface-&gt;reader_thread   = -1;
++	interface-&gt;consumer_thread = spawn_kernel_thread(device_consumer_thread,
++		name, B_REAL_TIME_DISPLAY_PRIORITY - 10, interface);
++	if (interface-&gt;consumer_thread &lt; B_OK)
++		goto error_3;
++	resume_thread(interface-&gt;consumer_thread);
++
++	// TODO: proper interface index allocation
++	device-&gt;index = ++sDeviceIndex;
++	device-&gt;module = module;
++
++	sInterfaces.Add(interface);
++	return interface;
++
++error_3:
++	uninit_fifo(&amp;interface-&gt;receive_queue);
++
++error_2:
++	recursive_lock_destroy(&amp;interface-&gt;rx_lock);
++
++error_1:
++	delete interface;
++
++error_0:
++	return NULL;
++}
++
++
+ net_device_interface *
+ grab_device_interface(net_device_interface *interface)
+ {
+@@ -337,13 +437,15 @@
+ 	if (atomic_add(&amp;interface-&gt;ref_count, -1) != 1)
+ 		return;
+ 
+-	// we need to remove this interface!
+-
+ 	{
+ 		BenaphoreLocker locker(sInterfaceLock);
+ 		sInterfaces.Remove(interface);
+ 	}
+ 
++	uninit_fifo(&amp;interface-&gt;receive_queue);
++	status_t status;
++	wait_for_thread(interface-&gt;consumer_thread, &amp;status);
++
+ 	interface-&gt;module-&gt;uninit_device(interface-&gt;device);
+ 	put_module(interface-&gt;module-&gt;info.name);
+ 
+@@ -411,27 +513,9 @@
+ 			net_device *device;
+ 			status_t status = module-&gt;init_device(name, &amp;device);
+ 			if (status == B_OK) {
+-				// create new module interface for this
+-				interface = new (std::nothrow) net_device_interface;
+-				if (interface != NULL) {
+-					if (recursive_lock_init(&amp;interface-&gt;rx_lock,
+-							&quot;rx lock&quot;) &gt;= B_OK) {
+-						interface-&gt;name = device-&gt;name;
+-						interface-&gt;module = module;
+-						interface-&gt;device = device;
+-						interface-&gt;up_count = 0;
+-						interface-&gt;ref_count = 1;
+-						interface-&gt;deframe_func = NULL;
+-						interface-&gt;deframe_ref_count = 0;
+-
+-						device-&gt;index = ++sDeviceIndex;
+-						device-&gt;module = module;
+-
+-						sInterfaces.Add(interface);
+-						return interface;
+-					}
+-					delete interface;
+-				}
++				interface = allocate_device_interface(device, module);
++				if (interface)
++					return interface;
+ 				module-&gt;uninit_device(device);
+ 			}
+ 			put_module(moduleName);
+@@ -469,6 +553,8 @@
+ 
+ 	thread_id reader_thread = interface-&gt;reader_thread;
+ 
++	// TODO when setting the interface down, should we clear the receive queue?
++
+ 	// one of the callers must hold a reference to the net_device_interface
+ 	// usually it is one of the net_interfaces.
+ 	recursive_lock_unlock(&amp;interface-&gt;rx_lock);
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h	2007-05-23 07:54:57 UTC (rev 21213)
++++ haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h	2007-05-23 07:55:54 UTC (rev 21214)
+@@ -27,7 +27,6 @@
+ 	DoublyLinkedListCLink&lt;net_device_monitor&gt; &gt; DeviceMonitorList;
+ 
+ struct net_device_interface : DoublyLinkedListLinkImpl&lt;net_device_interface&gt; {
+-	//struct list_link	link;
+ 	const char			*name;
+ 	struct net_device_module_info *module;
+ 	struct net_device	*device;
+@@ -43,6 +42,9 @@
+ 	DeviceHandlerList	receive_funcs;
+ 
+ 	recursive_lock		rx_lock;
++
++	thread_id			consumer_thread;
++	net_fifo			receive_queue;
+ };
+ 
+ typedef DoublyLinkedList&lt;net_device_interface&gt; DeviceInterfaceList;
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp	2007-05-23 07:54:57 UTC (rev 21213)
++++ haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp	2007-05-23 07:55:54 UTC (rev 21214)
+@@ -345,6 +345,8 @@
+ 	buffer-&gt;flags = 0;
+ 	buffer-&gt;size = 0;
+ 
++	buffer-&gt;type = -1;
++
+ 	return buffer;
+ }
+ 
+@@ -378,6 +380,7 @@
+ 	destination-&gt;offset = source-&gt;offset;
+ 	destination-&gt;size = source-&gt;size;
+ 	destination-&gt;protocol = source-&gt;protocol;
++	destination-&gt;type = source-&gt;type;
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002399.html">[Haiku-commits] r21213 -	haiku/trunk/src/add-ons/kernel/file_systems/dos
+</A></li>
+	<LI>Next message: <A HREF="002450.html">[Haiku-commits] r21214 - in haiku/trunk: headers/private/net src/add-ons/kernel/network/protocols/udp src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2400">[ date ]</a>
+              <a href="thread.html#2400">[ thread ]</a>
+              <a href="subject.html#2400">[ subject ]</a>
+              <a href="author.html#2400">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

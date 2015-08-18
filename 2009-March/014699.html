@@ -1,0 +1,159 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29414 - haiku/trunk/src/kits/tracker
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29414%20-%20haiku/trunk/src/kits/tracker&In-Reply-To=%3C200903061342.n26DgYNR004321%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014706.html">
+   <LINK REL="Next"  HREF="014707.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29414 - haiku/trunk/src/kits/tracker</H1>
+    <B>anevilyak at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29414%20-%20haiku/trunk/src/kits/tracker&In-Reply-To=%3C200903061342.n26DgYNR004321%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29414 - haiku/trunk/src/kits/tracker">anevilyak at mail.berlios.de
+       </A><BR>
+    <I>Fri Mar  6 14:42:34 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014706.html">[Haiku-commits] r29413 - haiku/trunk/src/add-ons/input_server/devices/mouse
+</A></li>
+        <LI>Next message: <A HREF="014707.html">[Haiku-commits] r29415 - haiku/trunk/src/data/etc/timezones
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14699">[ date ]</a>
+              <a href="thread.html#14699">[ thread ]</a>
+              <a href="subject.html#14699">[ subject ]</a>
+              <a href="author.html#14699">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: anevilyak
+Date: 2009-03-06 14:42:33 +0100 (Fri, 06 Mar 2009)
+New Revision: 29414
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29414&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29414&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/kits/tracker/PoseView.cpp
+   haiku/trunk/src/kits/tracker/PoseView.h
+Log:
+Rework this again due to flaws in the previous optimization - due to its use for things like sorting the visible pose list, it would rely on whatever pose column was being used for sorting, and as such would generate false positives when the view was being ordered by certain attributes. We now use an std::hash_set to track all the nodes that have been added to the current view and use that for a duplicate check instead. Also slightly boost the max number of models per chunk that we read.
+
+
+Modified: haiku/trunk/src/kits/tracker/PoseView.cpp
+===================================================================
+--- haiku/trunk/src/kits/tracker/PoseView.cpp	2009-03-06 11:11:58 UTC (rev 29413)
++++ haiku/trunk/src/kits/tracker/PoseView.cpp	2009-03-06 13:42:33 UTC (rev 29414)
+@@ -99,7 +99,7 @@
+ 
+ const uint32 kAddNewPoses = 'Tanp';
+ const uint32 kAddPosesCompleted = 'Tapc';
+-const int32 kMaxAddPosesChunk = 10;
++const int32 kMaxAddPosesChunk = 50;
+ 
+ namespace BPrivate {
+ extern bool delete_point(void *);
+@@ -1632,20 +1632,18 @@
+ 	for (int32 modelIndex = 0; modelIndex &lt; count; modelIndex++) {
+ 		Model *model = models[modelIndex];
+ 
+-		model-&gt;OpenNode();
+-		ASSERT(model-&gt;IsNodeOpen());
+-		PoseInfo *poseInfo = &amp;poseInfoArray[modelIndex];
+ 
+ 		// pose adopts model and deletes it when done
+-		BPose *pose = new BPose(model, this, clipboardMode);
+ 
+-		if (BSearch(fPoseList, pose, this, PoseCompareAddWidget, false) != NULL 
++		if (fInsertedNodes.find(*(model-&gt;NodeRef())) != fInsertedNodes.end() 
+ 			|| FindZombie(model-&gt;NodeRef())) {
+ 			watch_node(model-&gt;NodeRef(), B_STOP_WATCHING, this);
+-			delete pose;
++			delete model;
+ 			if (resultingPoses)
+ 				resultingPoses[modelIndex] = NULL;
+ 			continue;
++		} else {
++			fInsertedNodes.insert(*(model-&gt;NodeRef()));
+ 		}
+ 
+ 		if ((clipboardMode = FSClipboardFindNodeMode(model,false,true)) != 0
+@@ -1653,6 +1651,11 @@
+ 			SetHasPosesInClipboard(true);
+ 		}
+ 
++		model-&gt;OpenNode();
++		ASSERT(model-&gt;IsNodeOpen());
++		PoseInfo *poseInfo = &amp;poseInfoArray[modelIndex];
++		BPose *pose = new BPose(model, this, clipboardMode);
++
+ 		if (resultingPoses)
+ 			resultingPoses[modelIndex] = pose;
+ 
+
+Modified: haiku/trunk/src/kits/tracker/PoseView.h
+===================================================================
+--- haiku/trunk/src/kits/tracker/PoseView.h	2009-03-06 11:11:58 UTC (rev 29413)
++++ haiku/trunk/src/kits/tracker/PoseView.h	2009-03-06 13:42:33 UTC (rev 29414)
+@@ -57,11 +57,21 @@
+ #include &lt;String.h&gt;
+ #include &lt;ScrollBar.h&gt;
+ #include &lt;View.h&gt;
++#include &lt;hash_set&gt;
+ #include &lt;set&gt;
+ 
++
+ class BRefFilter;
+ class BList;
+ 
++__STL_TEMPLATE_NULL struct std::hash&lt;node_ref&gt;
++{
++	size_t operator()(node_ref ref) const { 
++		return ref.node;
++	}
++};
++
++
+ namespace BPrivate {
+ 
+ class BCountView;
+@@ -598,6 +608,7 @@
+ 		PoseList *fPoseList;
+ 		PoseList *fVSPoseList;
+ 		PoseList *fSelectionList;
++		std::hash_set&lt;node_ref, std::hash&lt;node_ref&gt; &gt; fInsertedNodes;
+ 		BObjectList&lt;BString&gt; fMimeTypesInSelectionCache;
+ 			// used for mime string based icon highliting during a drag
+ 		BObjectList&lt;Model&gt; *fZombieList;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014706.html">[Haiku-commits] r29413 - haiku/trunk/src/add-ons/input_server/devices/mouse
+</A></li>
+	<LI>Next message: <A HREF="014707.html">[Haiku-commits] r29415 - haiku/trunk/src/data/etc/timezones
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14699">[ date ]</a>
+              <a href="thread.html#14699">[ thread ]</a>
+              <a href="subject.html#14699">[ subject ]</a>
+              <a href="author.html#14699">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

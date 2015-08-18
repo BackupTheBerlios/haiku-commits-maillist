@@ -1,0 +1,352 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24940 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24940%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/stack&In-Reply-To=%3C200804120919.m3C9JiAn030216%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007712.html">
+   <LINK REL="Next"  HREF="007714.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24940 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24940%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/stack&In-Reply-To=%3C200804120919.m3C9JiAn030216%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24940 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Apr 12 11:19:44 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007712.html">[Haiku-commits] r24939 - haiku/trunk/src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="007714.html">[Haiku-commits] r24941 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7713">[ date ]</a>
+              <a href="thread.html#7713">[ thread ]</a>
+              <a href="subject.html#7713">[ subject ]</a>
+              <a href="author.html#7713">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-04-12 11:19:44 +0200 (Sat, 12 Apr 2008)
+New Revision: 24940
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24940&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24940&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/net/net_buffer.h
+   haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp
+Log:
+Added support for attaching ancillary data to a net_buffer. It's a naive
+implementation ATM, since it malloc()s the required memory.
+
+
+Modified: haiku/trunk/headers/private/net/net_buffer.h
+===================================================================
+--- haiku/trunk/headers/private/net/net_buffer.h	2008-04-12 08:50:17 UTC (rev 24939)
++++ haiku/trunk/headers/private/net/net_buffer.h	2008-04-12 09:19:44 UTC (rev 24940)
+@@ -37,6 +37,12 @@
+ 	uint8	protocol;
+ } net_buffer;
+ 
++typedef struct ancillary_data_header {
++	int		level;
++	int		type;
++	size_t	len;
++} ancillary_data_header;
++
+ struct net_buffer_module_info {
+ 	module_info info;
+ 
+@@ -68,6 +74,17 @@
+ 
+ 	status_t		(*associate_data)(net_buffer *buffer, void *data);
+ 
++	status_t		(*attach_ancillary_data)(net_buffer *buffer,
++						const ancillary_data_header *header, const void *data,
++						void (*destructor)(const ancillary_data_header*, void*),
++						void **_allocatedData);
++	status_t		(*detach_ancillary_data)(net_buffer *buffer, void *data,
++						bool destroy);
++	void *			(*transfer_ancillary_data)(net_buffer *from,
++						net_buffer *to);
++	void *			(*next_ancillary_data)(net_buffer *buffer,
++						void *previousData, ancillary_data_header *_header);
++
+ 	status_t		(*direct_access)(net_buffer *buffer, uint32 offset,
+ 						size_t bytes, void **_data);
+ 	status_t 		(*read)(net_buffer *buffer, uint32 offset, void *data,
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp	2008-04-12 08:50:17 UTC (rev 24939)
++++ haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp	2008-04-12 09:19:44 UTC (rev 24940)
+@@ -16,6 +16,7 @@
+ #include &lt;ByteOrder.h&gt;
+ #include &lt;KernelExport.h&gt;
+ #include &lt;util/AutoLock.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
+ 
+ #include &lt;algorithm&gt;
+ #include &lt;stdlib.h&gt;
+@@ -58,11 +59,31 @@
+ 	data_node	*first_node;
+ };
+ 
++#define MAX_ANCILLARY_DATA_SIZE	128
++
++struct ancillary_data : DoublyLinkedListLinkImpl&lt;ancillary_data&gt; {
++	void* Data()
++	{
++		return (char*)this + _ALIGN(sizeof(ancillary_data));
++	}
++
++	static ancillary_data* FromData(void* data)
++	{
++		return (ancillary_data*)((char*)data - _ALIGN(sizeof(ancillary_data)));
++	}
++
++	ancillary_data_header	header;
++	void (*destructor)(const ancillary_data_header*, void*);
++};
++
++typedef DoublyLinkedList&lt;ancillary_data&gt; ancillary_data_list;
++
+ #define MAX_FREE_BUFFER_SIZE (BUFFER_SIZE - sizeof(data_header))
+ 
+ struct net_buffer_private : net_buffer {
+-	struct list	buffers;
+-	data_node	first_node;
++	struct list			buffers;
++	data_node			first_node;
++	ancillary_data_list	ancillary_data;
+ 
+ 	struct {
+ 		struct sockaddr_storage source;
+@@ -353,6 +374,8 @@
+ 	list_init(&amp;buffer-&gt;buffers);
+ 	list_add_item(&amp;buffer-&gt;buffers, &amp;buffer-&gt;first_node);
+ 
++	new(&amp;buffer-&gt;ancillary_data) ancillary_data_list;
++
+ 	buffer-&gt;source = (sockaddr *)&amp;buffer-&gt;storage.source;
+ 	buffer-&gt;destination = (sockaddr *)&amp;buffer-&gt;storage.destination;
+ 
+@@ -382,6 +405,12 @@
+ 		remove_data_node(node);
+ 	}
+ 
++	while (ancillary_data* data = buffer-&gt;ancillary_data.RemoveHead()) {
++		if (data-&gt;destructor != NULL)
++			data-&gt;destructor(&amp;data-&gt;header, data-&gt;Data());
++		free(data);
++	}
++
+ 	free_net_buffer(buffer);
+ }
+ 
+@@ -1068,6 +1097,160 @@
+ 
+ 
+ /*!
++	Attaches ancillary data to the given buffer. The data are completely
++	orthogonal to the data the buffer stores.
++
++	\param buffer The buffer.
++	\param header Description of the data.
++	\param data If not \c NULL, the data are copied into the allocated storage.
++	\param destructor If not \c NULL, this function will be invoked with the
++		data as parameter when the buffer is destroyed.
++	\param _allocatedData Will be set to the storage allocated for the data.
++	\return \c B_OK when everything goes well, another error code otherwise.
++*/
++static status_t
++attach_ancillary_data(net_buffer *_buffer, const ancillary_data_header *header,
++	const void *data, void (*destructor)(const ancillary_data_header*, void*),
++	void **_allocatedData)
++{
++	// TODO: Obviously it would be nice to allocate the memory for the
++	// ancillary data in the buffer.
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	// check parameters
++	if (header == NULL)
++		return B_BAD_VALUE;
++
++	if (header-&gt;len &gt; MAX_ANCILLARY_DATA_SIZE)
++		return ENOBUFS;
++
++	// allocate buffer
++	void *dataBuffer = malloc(_ALIGN(sizeof(ancillary_data)) + header-&gt;len);
++	if (dataBuffer == NULL)
++		return B_NO_MEMORY;
++
++	// init and attach the structure
++	ancillary_data *ancillaryData = new(dataBuffer) ancillary_data;
++	ancillaryData-&gt;header = *header;
++	ancillaryData-&gt;destructor = destructor;
++
++	buffer-&gt;ancillary_data.Add(ancillaryData);
++
++	if (data != NULL)
++		memcpy(ancillaryData-&gt;Data(), data, header-&gt;len);
++
++	if (_allocatedData != NULL)
++		*_allocatedData = ancillaryData-&gt;Data();
++
++	return B_OK;
++}
++
++
++/*!
++	Detaches ancillary data from the given buffer. The associated memory is
++	free, i.e. the \a data pointer must no longer be used after calling this
++	function. Depending on \a destroy, the destructor is invoked before freeing
++	the data.
++
++	\param buffer The buffer.
++	\param data Pointer to the data to be removed (as returned by
++		attach_ancillary_data() or next_ancillary_data()).
++	\param destroy If \c true, the destructor, if one was passed to
++		attach_ancillary_data(), is invoked for the data.
++	\return \c B_OK when everything goes well, another error code otherwise.
++*/
++static status_t
++detach_ancillary_data(net_buffer *_buffer, void *data, bool destroy)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	if (data == NULL)
++		return B_BAD_VALUE;
++
++	ancillary_data *ancillaryData = ancillary_data::FromData(data);
++
++	buffer-&gt;ancillary_data.Remove(ancillaryData);
++
++	if (destroy &amp;&amp; ancillaryData-&gt;destructor != NULL) {
++		ancillaryData-&gt;destructor(&amp;ancillaryData-&gt;header,
++			ancillaryData-&gt;Data());
++	}
++
++	free(ancillaryData);
++
++	return B_OK;
++}
++
++
++/*!
++	Moves all ancillary data from buffer \c from to the end of the list of
++	ancillary data of buffer \c to. Note, that this is the only function that
++	transfers or copies ancillary data from one buffer to another.
++
++	\param from The buffer from which to remove the ancillary data.
++	\param to The buffer to which to add teh ancillary data.
++	\return A pointer to the first of the moved ancillary data, if any, \c NULL
++		otherwise.
++*/
++static void *
++transfer_ancillary_data(net_buffer *_from, net_buffer *_to)
++{
++	net_buffer_private *from = (net_buffer_private *)_from;
++	net_buffer_private *to = (net_buffer_private *)_to;
++
++	if (from == NULL || to == NULL)
++		return NULL;
++
++	ancillary_data *ancillaryData = from-&gt;ancillary_data.Head();
++	to-&gt;ancillary_data.MoveFrom(&amp;from-&gt;ancillary_data);
++
++	return ancillaryData != NULL ? ancillaryData-&gt;Data() : NULL;
++}
++
++
++/*!
++	Returns the next ancillary data. When iterating over the data, initially
++	a \c NULL pointer shall be passed as \a previousData, subsequently the
++	previously returned data pointer. After the last item, \c NULL is returned.
++
++	Note, that it is not safe to call detach_ancillary_data() for a data item
++	and then pass that pointer to this function. First get the next item, then
++	detach the previous one.
++
++	\param buffer The buffer.
++	\param previousData The pointer to the previous data returned by this
++		function. Initially \c NULL shall be passed.
++	\param header Pointer to allocated storage into which the data description
++		is written. May be \c NULL.
++	\return A pointer to the next ancillary data in the buffer. \c NULL after
++		the last one.
++*/
++static void*
++next_ancillary_data(net_buffer *_buffer, void *previousData,
++	ancillary_data_header *_header)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	ancillary_data *ancillaryData;
++
++	if (previousData == NULL) {
++		ancillaryData = buffer-&gt;ancillary_data.Head();
++	} else {
++		ancillaryData = ancillary_data::FromData(previousData);
++		ancillaryData = buffer-&gt;ancillary_data.GetNext(ancillaryData);
++	}
++
++	if (ancillaryData == NULL)
++		return NULL;
++
++	if (_header != NULL)
++		*_header = ancillaryData-&gt;header;
++
++	return ancillaryData-&gt;Data();
++}
++
++
++/*!
+ 	Tries to directly access the requested space in the buffer.
+ 	If the space is contiguous, the function will succeed and place a pointer
+ 	to that space into \a _contiguousBuffer.
+@@ -1257,6 +1440,11 @@
+ 
+ 	NULL,	// associate_data
+ 
++	attach_ancillary_data,
++	detach_ancillary_data,
++	transfer_ancillary_data,
++	next_ancillary_data,
++
+ 	direct_access,
+ 	read_data,
+ 	write_data,
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007712.html">[Haiku-commits] r24939 - haiku/trunk/src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="007714.html">[Haiku-commits] r24941 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7713">[ date ]</a>
+              <a href="thread.html#7713">[ thread ]</a>
+              <a href="subject.html#7713">[ subject ]</a>
+              <a href="author.html#7713">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

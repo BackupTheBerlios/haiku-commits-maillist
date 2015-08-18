@@ -1,0 +1,482 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26369 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26369%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200807101242.m6ACg3HH013247%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010183.html">
+   <LINK REL="Next"  HREF="010186.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26369 - haiku/trunk/src/system/kernel</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26369%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200807101242.m6ACg3HH013247%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26369 - haiku/trunk/src/system/kernel">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Jul 10 14:42:03 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010183.html">[Haiku-commits] r26368 - in haiku/trunk:	headers/private/kernel/disk_device_manager	src/system/kernel/disk_device_manager
+</A></li>
+        <LI>Next message: <A HREF="010186.html">[Haiku-commits] r26370 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10184">[ date ]</a>
+              <a href="thread.html#10184">[ thread ]</a>
+              <a href="subject.html#10184">[ subject ]</a>
+              <a href="author.html#10184">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-07-10 14:42:02 +0200 (Thu, 10 Jul 2008)
+New Revision: 26369
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26369&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26369&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/module.cpp
+Log:
+* Completed module watching mechanism.
+
+
+Modified: haiku/trunk/src/system/kernel/module.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/module.cpp	2008-07-10 12:21:05 UTC (rev 26368)
++++ haiku/trunk/src/system/kernel/module.cpp	2008-07-10 12:42:02 UTC (rev 26369)
+@@ -149,7 +149,13 @@
+ };
+ 
+ struct hash_entry : entry {
++	~hash_entry()
++	{
++		free((char*)path);
++	}
++
+ 	HashTableLink&lt;hash_entry&gt; link;
++	const char*			path;
+ };
+ 
+ struct NodeHashDefinition {
+@@ -187,6 +193,21 @@
+ 
+ typedef DoublyLinkedList&lt;module_listener&gt; ModuleListenerList;
+ 
++struct module_notification : DoublyLinkedListLinkImpl&lt;module_notification&gt; {
++	~module_notification()
++	{
++		free((char*)name);
++	}
++
++	int32		opcode;
++	dev_t		device;
++	ino_t		directory;
++	ino_t		node;
++	const char*	name;
++};
++
++typedef DoublyLinkedList&lt;module_notification&gt; NotificationList;
++
+ class DirectoryWatcher : public NotificationListener {
+ public:
+ 						DirectoryWatcher();
+@@ -221,13 +242,20 @@
+ 
+ 			bool		HasNode(dev_t device, ino_t node);
+ 
++			void		Notify(int32 opcode, dev_t device, ino_t directory,
++							ino_t node, const char* name);
++
+ 	virtual const char*	Name() { return &quot;modules&quot;; }
+ 
++	static	void		HandleNotifications(void *data, int iteration);
++
+ private:
+-			status_t	_AddNode(dev_t device, ino_t node, uint32 flags,
+-							NotificationListener&amp; listener);
++			status_t	_RemoveNode(dev_t device, ino_t node);
++			status_t	_AddNode(dev_t device, ino_t node, const char* path,
++							uint32 flags, NotificationListener&amp; listener);
+ 			status_t	_AddDirectoryNode(dev_t device, ino_t node);
+-			status_t	_AddModuleNode(dev_t device, ino_t node);
++			status_t	_AddModuleNode(dev_t device, ino_t node, int fd,
++							const char* name);
+ 
+ 			status_t	_AddDirectory(const char* prefix);
+ 			status_t	_ScanDirectory(char* directoryPath, const char* prefix,
+@@ -235,11 +263,16 @@
+ 			status_t	_ScanDirectory(Stack&lt;DIR*&gt;&amp; stack, DIR* dir,
+ 							const char* prefix, size_t prefixPosition);
+ 
++			void		_Notify(int32 opcode, dev_t device, ino_t directory,
++							ino_t node, const char* name);
++			void		_HandleNotifications();
++
+ 	recursive_lock		fLock;
+ 	ModuleListenerList	fListeners;
+ 	NodeHash			fNodes;
+ 	DirectoryWatcher	fDirectoryWatcher;
+ 	ModuleWatcher		fModuleWatcher;
++	NotificationList	fNotifications;
+ };
+ 
+ }	// namespace Module
+@@ -1177,6 +1210,7 @@
+ 	int32 opcode = event-&gt;GetInt32(&quot;opcode&quot;, -1);
+ 	dev_t device = event-&gt;GetInt32(&quot;device&quot;, -1);
+ 	ino_t directory = event-&gt;GetInt64(&quot;directory&quot;, -1);
++	ino_t node = event-&gt;GetInt64(&quot;node&quot;, -1);
+ 	const char *name = event-&gt;GetString(&quot;name&quot;, NULL);
+ 
+ 	if (opcode == B_ENTRY_MOVED) {
+@@ -1192,16 +1226,7 @@
+ 		}
+ 	}
+ 
+-	KPath path(B_PATH_NAME_LENGTH + 1);
+-	if (path.InitCheck() != B_OK || vfs_entry_ref_to_path(device, directory,
+-			name, path.LockBuffer(), path.BufferSize()) != B_OK)
+-		return;
+-
+-	path.UnlockBuffer();
+-
+-	dprintf(&quot;module \&quot;%s\&quot; %s\n&quot;, path.Leaf(),
+-		opcode == B_ENTRY_CREATED ? &quot;added&quot; : &quot;removed&quot;);
+-	//sModuleNotificationService.Notify(path.Path(), opcode);
++	sModuleNotificationService.Notify(opcode, device, directory, node, name);
+ }
+ 
+ 
+@@ -1224,6 +1249,11 @@
+ 	if (event-&gt;GetInt32(&quot;opcode&quot;, -1) != B_STAT_CHANGED
+ 		|| (event-&gt;GetInt32(&quot;fields&quot;, 0) &amp; B_STAT_MODIFICATION_TIME) == 0)
+ 		return;
++
++	dev_t device = event-&gt;GetInt32(&quot;device&quot;, -1);
++	ino_t node = event-&gt;GetInt64(&quot;node&quot;, -1);
++
++	sModuleNotificationService.Notify(B_STAT_CHANGED, device, -1, node, NULL);
+ }
+ 
+ 
+@@ -1300,9 +1330,30 @@
+ 
+ 
+ status_t
+-ModuleNotificationService::_AddNode(dev_t device, ino_t node, uint32 flags,
+-	NotificationListener&amp; listener)
++ModuleNotificationService::_RemoveNode(dev_t device, ino_t node)
+ {
++	RecursiveLocker _(fLock);
++
++	struct entry key = {device, node};
++	hash_entry* entry = fNodes.Lookup(&amp;key);
++	if (entry == NULL)
++		return B_ENTRY_NOT_FOUND;
++
++	remove_node_listener(device, node, entry-&gt;path != NULL
++		? (NotificationListener&amp;)fModuleWatcher
++		: (NotificationListener&amp;)fDirectoryWatcher);
++
++	fNodes.Remove(entry);
++	delete entry;
++
++	return B_OK;
++}
++
++
++status_t
++ModuleNotificationService::_AddNode(dev_t device, ino_t node, const char* path,
++	uint32 flags, NotificationListener&amp; listener)
++{
+ 	RecursiveLocker locker(fLock);
+ 
+ 	if (HasNode(device, node))
+@@ -1312,13 +1363,23 @@
+ 	if (entry == NULL)
+ 		return B_NO_MEMORY;
+ 
++	if (path != NULL) {
++		entry-&gt;path = strdup(path);
++		if (entry-&gt;path == NULL) {
++			delete entry;
++			return B_NO_MEMORY;
++		}
++	} else
++		entry-&gt;path = NULL;
++
+ 	status_t status = add_node_listener(device, node, flags, listener);
+ 	if (status != B_OK) {
+ 		delete entry;
+ 		return status;
+ 	}
+ 
+-	//dprintf(&quot;  add %s %ld:%Ld\n&quot;, flags == B_WATCH_DIRECTORY ? &quot;dir&quot; : &quot;file&quot;, device, node);
++	//dprintf(&quot;  add %s %ld:%Ld (%s)\n&quot;, flags == B_WATCH_DIRECTORY
++	//	? &quot;dir&quot; : &quot;file&quot;, device, node, path);
+ 
+ 	entry-&gt;device = device;
+ 	entry-&gt;node = node;
+@@ -1331,20 +1392,42 @@
+ status_t
+ ModuleNotificationService::_AddDirectoryNode(dev_t device, ino_t node)
+ {
+-	return _AddNode(device, node, B_WATCH_DIRECTORY, fDirectoryWatcher);
++	return _AddNode(device, node, NULL, B_WATCH_DIRECTORY, fDirectoryWatcher);
+ }
+ 
+ 
+ status_t
+-ModuleNotificationService::_AddModuleNode(dev_t device, ino_t node)
++ModuleNotificationService::_AddModuleNode(dev_t device, ino_t node, int fd,
++	const char* name)
+ {
+-	return _AddNode(device, node, B_WATCH_STAT, fModuleWatcher);
++	struct vnode* vnode;
++	status_t status = vfs_get_vnode_from_fd(fd, true, &amp;vnode);
++	if (status != B_OK)
++		return status;
++
++	ino_t directory;
++	vfs_vnode_to_node_ref(vnode, &amp;device, &amp;directory);
++
++	KPath path;
++	status = path.InitCheck();
++	if (status == B_OK) {
++		status = vfs_entry_ref_to_path(device, directory, name,
++			path.LockBuffer(), path.BufferSize());
++	}
++	if (status != B_OK)
++		return status;
++
++	path.UnlockBuffer();
++
++	return _AddNode(device, node, path.Path(), B_WATCH_STAT, fModuleWatcher);
+ }
+ 
+ 
+ status_t
+ ModuleNotificationService::_AddDirectory(const char* prefix)
+ {
++	status_t status = B_ERROR;
++
+ 	for (uint32 i = 0; i &lt; kNumModulePaths; i++) {
+ 		if (sDisableUserAddOns &amp;&amp; i &gt;= kFirstNonSystemModulePath)
+ 			break;
+@@ -1359,16 +1442,17 @@
+ 		pathBuffer.Append(prefix);
+ 
+ 		size_t prefixPosition = strlen(prefix);
+-		status_t status = _ScanDirectory(pathBuffer.LockBuffer(), prefix,
++		status_t scanStatus = _ScanDirectory(pathBuffer.LockBuffer(), prefix,
+ 			prefixPosition);
+ 
+ 		pathBuffer.UnlockBuffer();
+ 
++		// It's enough if we succeed for one directory
+ 		if (status != B_OK)
+-			return status;
++			status = scanStatus;
+ 	}
+ 
+-	return B_OK;
++	return status;
+ }
+ 
+ 
+@@ -1469,7 +1553,8 @@
+ 				&amp;&amp; directMatch)
+ 				directMatchAdded = true;
+ 		} else if (S_ISREG(stat.st_mode)) {
+-			if (_AddModuleNode(stat.st_dev, stat.st_ino) == B_OK &amp;&amp; directMatch)
++			if (_AddModuleNode(stat.st_dev, stat.st_ino, dir-&gt;fd,
++					dirent-&gt;d_name) == B_OK &amp;&amp; directMatch)
+ 				directMatchAdded = true;
+ 		}
+ 	}
+@@ -1488,6 +1573,143 @@
+ }
+ 
+ 
++void
++ModuleNotificationService::_Notify(int32 opcode, dev_t device, ino_t directory,
++	ino_t node, const char* name)
++{
++	// construct path
++
++	KPath pathBuffer;
++	const char* path;
++
++	if (name != NULL) {
++		// we have an entry ref
++		if (pathBuffer.InitCheck() != B_OK
++			|| vfs_entry_ref_to_path(device, directory, name,
++				pathBuffer.LockBuffer(), pathBuffer.BufferSize()) != B_OK)
++			return;
++
++		pathBuffer.UnlockBuffer();
++		path = pathBuffer.Path();
++	} else {
++		// we only have a node ref
++		RecursiveLocker _(fLock);
++
++		struct entry key = {device, node};
++		hash_entry* entry = fNodes.Lookup(&amp;key);
++		if (entry == NULL || entry-&gt;path == NULL)
++			return;
++
++		path = entry-&gt;path;
++	}
++
++	// remove kModulePaths from path
++
++	for (uint32 i = 0; i &lt; kNumModulePaths; i++) {
++		KPath modulePath;
++		if (find_directory(kModulePaths[i], gBootDevice, true,
++				modulePath.LockBuffer(), modulePath.BufferSize()) != B_OK)
++			continue;
++
++		modulePath.UnlockBuffer();
++		modulePath.Append(&quot;kernel&quot;);
++
++		if (strncmp(path, modulePath.Path(), modulePath.Length()))
++			continue;
++
++		path += modulePath.Length();
++		if (path[i] == '/')
++			path++;
++
++		break;
++	}
++
++	KMessage event;
++
++	// find listeners by prefix/path
++
++	ModuleListenerList::Iterator iterator = fListeners.GetIterator();
++	while (iterator.HasNext()) {
++		module_listener* listener = iterator.Next();
++
++		if (strncmp(path, listener-&gt;prefix, strlen(listener-&gt;prefix)))
++			continue;
++
++		if (event.IsEmpty()) {
++			// construct message only when needed
++			event.AddInt32(&quot;opcode&quot;, opcode);
++			event.AddString(&quot;path&quot;, path);
++		}
++
++		// notify them!
++		listener-&gt;listener-&gt;EventOccured(*this, &amp;event);
++
++		// we might need to watch new files now
++		if (opcode == B_ENTRY_CREATED)
++			_AddDirectory(listener-&gt;prefix);
++
++	}
++
++	// remove notification listeners, if needed
++
++	if (opcode == B_ENTRY_REMOVED)
++		_RemoveNode(device, node);
++}
++
++
++void
++ModuleNotificationService::_HandleNotifications()
++{
++	RecursiveLocker _(fLock);
++
++	NotificationList::Iterator iterator = fNotifications.GetIterator();
++	while (iterator.HasNext()) {
++		module_notification* notification = iterator.Next();
++
++		_Notify(notification-&gt;opcode, notification-&gt;device,
++			notification-&gt;directory, notification-&gt;node, notification-&gt;name);
++
++		iterator.Remove();
++		delete notification;
++	}
++}
++
++
++void
++ModuleNotificationService::Notify(int32 opcode, dev_t device, ino_t directory,
++	ino_t node, const char* name)
++{
++	module_notification* notification = new(std::nothrow) module_notification;
++	if (notification == NULL)
++		return;
++
++	if (name != NULL) {
++		notification-&gt;name = strdup(name);
++		if (notification-&gt;name == NULL) {
++			delete notification;
++			return;
++		}
++	} else
++		notification-&gt;name = NULL;
++
++	notification-&gt;opcode = opcode;
++	notification-&gt;device = device;
++	notification-&gt;directory = directory;
++	notification-&gt;node = node;
++
++	RecursiveLocker _(fLock);
++	fNotifications.Add(notification);
++}
++
++
++/*static*/ void
++ModuleNotificationService::HandleNotifications(void */*data*/,
++	int /*iteration*/)
++{
++	sModuleNotificationService._HandleNotifications();
++}
++
++
+ //	#pragma mark - Exported Kernel API (private part)
+ 
+ 
+@@ -1591,6 +1813,10 @@
+ 
+ 	new(&amp;sModuleNotificationService) ModuleNotificationService();
+ 
++	register_kernel_daemon(&amp;ModuleNotificationService::HandleNotifications,
++		NULL, 10);
++		// once every second
++
+ 	sDisableUserAddOns = get_safemode_boolean(B_SAFEMODE_DISABLE_USER_ADD_ONS,
+ 		false);
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010183.html">[Haiku-commits] r26368 - in haiku/trunk:	headers/private/kernel/disk_device_manager	src/system/kernel/disk_device_manager
+</A></li>
+	<LI>Next message: <A HREF="010186.html">[Haiku-commits] r26370 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10184">[ date ]</a>
+              <a href="thread.html#10184">[ thread ]</a>
+              <a href="subject.html#10184">[ subject ]</a>
+              <a href="author.html#10184">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

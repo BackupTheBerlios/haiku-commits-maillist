@@ -1,0 +1,272 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21040 - in haiku/trunk: headers/os/drivers	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21040%20-%20in%20haiku/trunk%3A%20headers/os/drivers%0A%09src/system/kernel&In-Reply-To=%3C200705061508.l46F88lR000846%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002141.html">
+   <LINK REL="Next"  HREF="002144.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21040 - in haiku/trunk: headers/os/drivers	src/system/kernel</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21040%20-%20in%20haiku/trunk%3A%20headers/os/drivers%0A%09src/system/kernel&In-Reply-To=%3C200705061508.l46F88lR000846%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21040 - in haiku/trunk: headers/os/drivers	src/system/kernel">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Sun May  6 17:08:08 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002141.html">[Haiku-commits] r21039 - haiku/trunk/src/tools/fs_shell
+</A></li>
+        <LI>Next message: <A HREF="002144.html">[Haiku-commits] r21040 - in haiku/trunk: headers/os/drivers	src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2142">[ date ]</a>
+              <a href="thread.html#2142">[ thread ]</a>
+              <a href="subject.html#2142">[ subject ]</a>
+              <a href="author.html#2142">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-05-06 17:07:56 +0200 (Sun, 06 May 2007)
+New Revision: 21040
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21040&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21040&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/os/drivers/KernelExport.h
+   haiku/trunk/src/system/kernel/int.c
+Log:
+added io_interrupt_handler methods for dynamic handling of IO interrupts, including enabling/disabling without allocation and in interrupt context.
+
+
+Modified: haiku/trunk/headers/os/drivers/KernelExport.h
+===================================================================
+--- haiku/trunk/headers/os/drivers/KernelExport.h	2007-05-06 13:48:07 UTC (rev 21039)
++++ haiku/trunk/headers/os/drivers/KernelExport.h	2007-05-06 15:07:56 UTC (rev 21040)
+@@ -54,6 +54,18 @@
+ 						interrupt_handler handler, void	*data);
+ 
+ 
++/* Private, Haiku specific */
++
++/* Flags that can be passwd to disable_io_interrupt_handle() */
++#define B_IN_INTERRUPT_CONTEXT	1
++
++extern status_t		create_io_interrupt_handler(long interrupt_number,
++						interrupt_handler handler, void *data, void **context);
++void				enable_io_interrupt_handler(void *context);
++void				disable_io_interrupt_handler(void *context, uint32 flags);
++void				delete_io_interrupt_handler(void *context);
++
++
+ /*-------------------------------------------------------------*/
+ /* timer interrupts services */
+ 
+
+Modified: haiku/trunk/src/system/kernel/int.c
+===================================================================
+--- haiku/trunk/src/system/kernel/int.c	2007-05-06 13:48:07 UTC (rev 21039)
++++ haiku/trunk/src/system/kernel/int.c	2007-05-06 15:07:56 UTC (rev 21040)
+@@ -31,6 +31,7 @@
+ struct io_handler {
+ 	struct io_handler	*next;
+ 	struct io_handler	*prev;
++	long				vector;
+ 	interrupt_handler	func;
+ 	void				*data;
+ 	bool				use_enable_counter;
+@@ -144,41 +145,17 @@
+ status_t
+ install_io_interrupt_handler(long vector, interrupt_handler handler, void *data, ulong flags)
+ {
+-	struct io_handler *io = NULL; 
+-	cpu_status state;
++	struct io_handler *io;
++	status_t status;
+ 
+-	if (vector &lt; 0 || vector &gt;= NUM_IO_VECTORS)
+-		return B_BAD_VALUE;
++	status = create_io_interrupt_handler(vector, handler, data, (void **)&amp;io);
++	if (status &lt; B_OK)
++		return status;
+ 
+-	io = (struct io_handler *)malloc(sizeof(struct io_handler));
+-	if (io == NULL)
+-		return B_NO_MEMORY;
+-
+-	arch_debug_remove_interrupt_handler(vector);
+-		// There might be a temporary debug interrupt installed on this
+-		// vector that should be removed now.
+-
+-	io-&gt;func = handler;
+-	io-&gt;data = data;
+ 	io-&gt;use_enable_counter = (flags &amp; B_NO_ENABLE_COUNTER) == 0;
+ 
+-	// Disable the interrupts, get the spinlock for this irq only
+-	// and then insert the handler
+-	state = disable_interrupts();
+-	acquire_spinlock(&amp;io_vectors[vector].vector_lock);
++	enable_io_interrupt_handler(io);
+ 
+-	insque(io, &amp;io_vectors[vector].handler_list);
+-
+-	// If B_NO_ENABLE_COUNTER is set, we're being asked to not alter
+-	// whether the interrupt should be enabled or not
+-	if (io-&gt;use_enable_counter) {
+-		if (io_vectors[vector].enable_count++ == 0)
+-			arch_int_enable_io_interrupt(vector);
+-	}
+-
+-	release_spinlock(&amp;io_vectors[vector].vector_lock);
+-	restore_interrupts(state);
+-
+ 	return B_OK;
+ }
+ 
+@@ -230,6 +207,90 @@
+ } 
+ 
+ 
++status_t
++create_io_interrupt_handler(long vector, interrupt_handler handler, void *data,
++	void **context)
++{
++	struct io_handler *io = NULL;
++
++	if (vector &lt; 0 || vector &gt;= NUM_IO_VECTORS)
++		return B_BAD_VALUE;
++
++	io = (struct io_handler *)malloc(sizeof(struct io_handler));
++	if (io == NULL)
++		return B_NO_MEMORY;
++
++	io-&gt;vector = vector;
++	io-&gt;func = handler;
++	io-&gt;data = data;
++	io-&gt;use_enable_counter = true;
++
++	*context = io;
++	return B_OK;
++}
++
++
++void
++enable_io_interrupt_handler(void *context)
++{
++	struct io_handler *io = context;
++	long vector = io-&gt;vector;
++	cpu_status state;
++
++	// Disable the interrupts, get the spinlock for this irq only
++	// and then insert the handler
++	state = disable_interrupts();
++	acquire_spinlock(&amp;io_vectors[vector].vector_lock);
++
++	insque(io, &amp;io_vectors[vector].handler_list);
++
++	// If B_NO_ENABLE_COUNTER is set, we're being asked to not alter
++	// whether the interrupt should be enabled or not
++	if (io-&gt;use_enable_counter) {
++		if (io_vectors[vector].enable_count++ == 0)
++			arch_int_enable_io_interrupt(vector);
++	}
++
++	release_spinlock(&amp;io_vectors[vector].vector_lock);
++	restore_interrupts(state);
++}
++
++
++void
++disable_io_interrupt_handler(void *context, uint32 flags)
++{
++	struct io_handler *io = context;
++	long vector = io-&gt;vector;
++	cpu_status state = 0;
++
++	if ((flags &amp; B_IN_INTERRUPT_CONTEXT) == 0) {
++		/* lock the structures down so it is not modified while we search */
++		state = disable_interrupts();
++		acquire_spinlock(&amp;io_vectors[vector].vector_lock);
++	}
++
++	remque(io);
++
++	// Check if we need to disable the interrupt
++	if (io-&gt;use_enable_counter &amp;&amp; --io_vectors[vector].enable_count == 0)
++		arch_int_disable_io_interrupt(vector);
++
++	if ((flags &amp; B_IN_INTERRUPT_CONTEXT) == 0) {
++		release_spinlock(&amp;io_vectors[vector].vector_lock);
++		restore_interrupts(state);
++	}
++}
++
++
++void
++delete_io_interrupt_handler(void *context)
++{
++	struct io_handler *io = context;
++
++	free(io);
++}
++
++
+ /** actually process an interrupt via the handlers registered for that
+  *	vector (irq)
+  */
+@@ -259,9 +320,10 @@
+ 	 * whatever the driver thought would be useful (ie. B_INVOKE_SCHEDULER)
+ 	 */
+ 
+-	for (io = io_vectors[vector].handler_list.next;
+-			io != &amp;io_vectors[vector].handler_list; // Are we already at the end of the list?
+-			io = io-&gt;next) {
++	io = io_vectors[vector].handler_list.next;
++	while (io != &amp;io_vectors[vector].handler_list) {
++		struct io_handler *next = io-&gt;next;
++
+ 		status = io-&gt;func(io-&gt;data);
+ 
+ 		if (levelTriggered &amp;&amp; status != B_UNHANDLED_INTERRUPT)
+@@ -271,6 +333,8 @@
+ 			handled = true;
+ 		else if (status == B_INVOKE_SCHEDULER)
+ 			invokeScheduler = true;
++
++		io = next;
+ 	}
+ 
+ #ifdef DEBUG_INT
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002141.html">[Haiku-commits] r21039 - haiku/trunk/src/tools/fs_shell
+</A></li>
+	<LI>Next message: <A HREF="002144.html">[Haiku-commits] r21040 - in haiku/trunk: headers/os/drivers	src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2142">[ date ]</a>
+              <a href="thread.html#2142">[ thread ]</a>
+              <a href="subject.html#2142">[ subject ]</a>
+              <a href="author.html#2142">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,1080 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23585 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23585%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200801171404.m0HE46dt031897%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005576.html">
+   <LINK REL="Next"  HREF="005578.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23585 - haiku/trunk/src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23585%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200801171404.m0HE46dt031897%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23585 - haiku/trunk/src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Jan 17 15:04:07 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005576.html">[Haiku-commits] r23584 - haiku/trunk/src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="005578.html">[Haiku-commits] r23586 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5577">[ date ]</a>
+              <a href="thread.html#5577">[ thread ]</a>
+              <a href="subject.html#5577">[ subject ]</a>
+              <a href="author.html#5577">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-01-17 15:04:06 +0100 (Thu, 17 Jan 2008)
+New Revision: 23585
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23585&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23585&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/port.cpp
+   haiku/trunk/src/system/kernel/sem.cpp
+Removed:
+   haiku/trunk/src/system/kernel/port.c
+   haiku/trunk/src/system/kernel/sem.c
+Modified:
+   haiku/trunk/src/system/kernel/Jamfile
+Log:
+sem.c -&gt; sem.cpp, port.c -&gt; port.cpp
+
+
+Modified: haiku/trunk/src/system/kernel/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/Jamfile	2008-01-17 13:58:17 UTC (rev 23584)
++++ haiku/trunk/src/system/kernel/Jamfile	2008-01-17 14:04:06 UTC (rev 23585)
+@@ -29,10 +29,10 @@
+ 	main.c
+ 	module.cpp
+ 	Notifications.cpp
+-	port.c
++	port.cpp
+ 	real_time_clock.c
+ 	scheduler.cpp
+-	sem.c
++	sem.cpp
+ 	shutdown.c
+ 	signal.cpp
+ 	system_info.c
+
+Deleted: haiku/trunk/src/system/kernel/port.c
+
+Copied: haiku/trunk/src/system/kernel/port.cpp (from rev 23583, haiku/trunk/src/system/kernel/port.c)
+===================================================================
+--- haiku/trunk/src/system/kernel/port.c	2008-01-17 12:03:11 UTC (rev 23583)
++++ haiku/trunk/src/system/kernel/port.cpp	2008-01-17 14:04:06 UTC (rev 23585)
+@@ -0,0 +1,1384 @@
++/*
++ * Copyright 2002-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Distributed under the terms of the MIT License.
++ *
++ * Copyright 2001, Mark-Jan Bastian. All rights reserved.
++ * Distributed under the terms of the NewOS License.
++ */
++
++/*!	Ports for IPC */
++
++
++#include &lt;OS.h&gt;
++
++#include &lt;port.h&gt;
++#include &lt;kernel.h&gt;
++#include &lt;sem.h&gt;
++#include &lt;team.h&gt;
++#include &lt;util/list.h&gt;
++#include &lt;arch/int.h&gt;
++#include &lt;cbuf.h&gt;
++#include &lt;wait_for_objects.h&gt;
++
++#include &lt;iovec.h&gt;
++#include &lt;string.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;ctype.h&gt;
++
++
++//#define TRACE_PORTS
++#ifdef TRACE_PORTS
++#	define TRACE(x) dprintf x
++#else
++#	define TRACE(x)
++#endif
++
++
++typedef struct port_msg {
++	list_link	link;
++	int32		code;
++	cbuf		*buffer_chain;
++	size_t		size;
++} port_msg;
++
++struct port_entry {
++	port_id 	id;
++	team_id 	owner;
++	int32 		capacity;
++	spinlock	lock;
++	const char	*name;
++	sem_id		read_sem;
++	sem_id		write_sem;
++	int32		total_count;	// messages read from port since creation
++	select_info	*select_infos;
++	struct list	msg_queue;
++};
++
++
++#define MAX_QUEUE_LENGTH 4096
++#define PORT_MAX_MESSAGE_SIZE 65536
++
++// sMaxPorts must be power of 2
++static int32 sMaxPorts = 4096;
++static int32 sUsedPorts = 0;
++
++static struct port_entry *sPorts = NULL;
++static area_id sPortArea = 0;
++static bool sPortsActive = false;
++static port_id sNextPort = 1;
++static int32 sFirstFreeSlot = 1;
++
++static spinlock sPortSpinlock = 0;
++
++#define GRAB_PORT_LIST_LOCK() acquire_spinlock(&amp;sPortSpinlock)
++#define RELEASE_PORT_LIST_LOCK() release_spinlock(&amp;sPortSpinlock)
++#define GRAB_PORT_LOCK(s) acquire_spinlock(&amp;(s).lock)
++#define RELEASE_PORT_LOCK(s) release_spinlock(&amp;(s).lock)
++
++
++static int
++dump_port_list(int argc, char **argv)
++{
++	const char *name = NULL;
++	team_id owner = -1;
++	int32 i;
++
++	if (argc &gt; 2) {
++		if (!strcmp(argv[1], &quot;team&quot;) || !strcmp(argv[1], &quot;owner&quot;))
++			owner = strtoul(argv[2], NULL, 0);
++		else if (!strcmp(argv[1], &quot;name&quot;))
++			name = argv[2];
++	} else if (argc &gt; 1)
++		owner = strtoul(argv[1], NULL, 0);
++
++	kprintf(&quot;port           id  cap  r-sem  w-sem   team  name\n&quot;);
++
++	for (i = 0; i &lt; sMaxPorts; i++) {
++		struct port_entry *port = &amp;sPorts[i];
++		if (port-&gt;id &lt; 0
++			|| (owner != -1 &amp;&amp; port-&gt;owner != owner)
++			|| (name != NULL &amp;&amp; strstr(port-&gt;name, name) == NULL))
++			continue;
++
++		kprintf(&quot;%p %6ld %4ld %6ld %6ld %6ld  %s\n&quot;, port, port-&gt;id,
++			port-&gt;capacity, port-&gt;read_sem, port-&gt;write_sem, port-&gt;owner,
++			port-&gt;name);
++	}
++	return 0;
++}
++
++
++static void
++_dump_port_info(struct port_entry *port)
++{
++	int32 count;
++
++	kprintf(&quot;PORT: %p\n&quot;, port);
++	kprintf(&quot; id:              %#lx\n&quot;, port-&gt;id);
++	kprintf(&quot; name:            \&quot;%s\&quot;\n&quot;, port-&gt;name);
++	kprintf(&quot; owner:           %#lx\n&quot;, port-&gt;owner);
++	kprintf(&quot; capacity:        %ld\n&quot;, port-&gt;capacity);
++	kprintf(&quot; read_sem:        %#lx\n&quot;, port-&gt;read_sem);
++	kprintf(&quot; write_sem:       %#lx\n&quot;, port-&gt;write_sem);
++ 	get_sem_count(port-&gt;read_sem, &amp;count);
++ 	kprintf(&quot; read_sem count:  %ld\n&quot;, count);
++ 	get_sem_count(port-&gt;write_sem, &amp;count);
++	kprintf(&quot; write_sem count: %ld\n&quot;, count);
++	kprintf(&quot; total count:     %ld\n&quot;, port-&gt;total_count);
++}
++
++
++static int
++dump_port_info(int argc, char **argv)
++{
++	const char *name = NULL;
++	sem_id sem = -1;
++	int i;
++
++	if (argc &lt; 2) {
++		kprintf(&quot;usage: port [id|name|sem|address]\n&quot;);
++		return 0;
++	}
++
++	if (argc &gt; 2) {
++		if (!strcmp(argv[1], &quot;address&quot;)) {
++			_dump_port_info((struct port_entry *)strtoul(argv[2], NULL, 0));
++			return 0;
++		} else if (!strcmp(argv[1], &quot;sem&quot;))
++			sem = strtoul(argv[2], NULL, 0);
++		else if (!strcmp(argv[1], &quot;name&quot;))
++			name = argv[2];
++	} else if (isdigit(argv[1][0])) {
++		// if the argument looks like a number, treat it as such
++		uint32 num = strtoul(argv[1], NULL, 0);
++		uint32 slot = num % sMaxPorts;
++		if (sPorts[slot].id != (int)num) {
++			kprintf(&quot;port %ld (%#lx) doesn't exist!\n&quot;, num, num);
++			return 0;
++		}
++		_dump_port_info(&amp;sPorts[slot]);
++		return 0;
++	} else
++		name = argv[1];
++
++	// walk through the ports list, trying to match name
++	for (i = 0; i &lt; sMaxPorts; i++) {
++		if ((name != NULL &amp;&amp; sPorts[i].name != NULL
++				&amp;&amp; !strcmp(name, sPorts[i].name))
++			|| (sem != -1 &amp;&amp; (sPorts[i].read_sem == sem
++				|| sPorts[i].write_sem == sem))) {
++			_dump_port_info(&amp;sPorts[i]);
++			return 0;
++		}
++	}
++
++	return 0;
++}
++
++
++static void
++notify_port_select_events(int slot, uint16 events)
++{
++	if (sPorts[slot].select_infos)
++		notify_select_events_list(sPorts[slot].select_infos, events);
++}
++
++
++static void
++put_port_msg(port_msg *msg)
++{
++	cbuf_free_chain(msg-&gt;buffer_chain);
++	free(msg);
++}
++
++
++static port_msg *
++get_port_msg(int32 code, size_t bufferSize)
++{
++	// ToDo: investigate preallocation of port_msgs (or use a slab allocator)
++	cbuf *bufferChain = NULL;
++
++	port_msg *msg = (port_msg *)malloc(sizeof(port_msg));
++	if (msg == NULL)
++		return NULL;
++
++	if (bufferSize &gt; 0) {
++		bufferChain = cbuf_get_chain(bufferSize);
++		if (bufferChain == NULL) {
++			free(msg);
++			return NULL;
++		}
++	}
++
++	msg-&gt;code = code;
++	msg-&gt;buffer_chain = bufferChain;
++	msg-&gt;size = bufferSize;
++	return msg;
++}
++
++
++/*!	You need to own the port's lock when calling this function */
++static bool
++is_port_closed(int32 slot)
++{
++	return sPorts[slot].capacity == 0;
++}
++
++
++/*!	Fills the port_info structure with information from the specified
++	port.
++	The port lock must be held when called.
++*/
++static void
++fill_port_info(struct port_entry *port, port_info *info, size_t size)
++{
++	int32 count;
++
++	info-&gt;port = port-&gt;id;
++	info-&gt;team = port-&gt;owner;
++	info-&gt;capacity = port-&gt;capacity;
++
++	get_sem_count(port-&gt;read_sem, &amp;count);
++	if (count &lt; 0)
++		count = 0;
++
++	info-&gt;queue_count = count;
++	info-&gt;total_count = port-&gt;total_count;
++
++	strlcpy(info-&gt;name, port-&gt;name, B_OS_NAME_LENGTH);
++}
++
++
++//	#pragma mark - private kernel API
++
++
++/*! This function cycles through the ports table, deleting all
++	the ports that are owned by the passed team_id
++*/
++int
++delete_owned_ports(team_id owner)
++{
++	// ToDo: investigate maintaining a list of ports in the team
++	//	to make this simpler and more efficient.
++	cpu_status state;
++	int i;
++	int count = 0;
++
++	TRACE((&quot;delete_owned_ports(owner = %ld)\n&quot;, owner));
++
++	if (!sPortsActive)
++		return B_BAD_PORT_ID;
++
++	state = disable_interrupts();
++	GRAB_PORT_LIST_LOCK();
++
++	for (i = 0; i &lt; sMaxPorts; i++) {
++		if (sPorts[i].id != -1 &amp;&amp; sPorts[i].owner == owner) {
++			port_id id = sPorts[i].id;
++
++			RELEASE_PORT_LIST_LOCK();
++			restore_interrupts(state);
++
++			delete_port(id);
++			count++;
++
++			state = disable_interrupts();
++			GRAB_PORT_LIST_LOCK();
++		}
++	}
++
++	RELEASE_PORT_LIST_LOCK();
++	restore_interrupts(state);
++
++	return count;
++}
++
++
++int32
++port_max_ports(void)
++{
++	return sMaxPorts;
++}
++
++
++int32
++port_used_ports(void)
++{
++	return sUsedPorts;
++}
++
++
++status_t
++port_init(kernel_args *args)
++{
++	size_t size = sizeof(struct port_entry) * sMaxPorts;
++	int32 i;
++
++	// create and initialize ports table
++	sPortArea = create_area(&quot;port_table&quot;, (void **)&amp;sPorts, B_ANY_KERNEL_ADDRESS,
++		size, B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	if (sPortArea &lt; 0) {
++		panic(&quot;unable to allocate kernel port table!\n&quot;);
++		return sPortArea;
++	}
++
++	// ToDo: investigate preallocating a list of port_msgs to
++	//	speed up actual message sending/receiving, a slab allocator
++	//	might do it as well, though :-)
++
++	memset(sPorts, 0, size);
++	for (i = 0; i &lt; sMaxPorts; i++)
++		sPorts[i].id = -1;
++
++	// add debugger commands
++	add_debugger_command(&quot;ports&quot;, &amp;dump_port_list, &quot;Dump a list of all active ports&quot;);
++	add_debugger_command(&quot;port&quot;, &amp;dump_port_info, &quot;Dump info about a particular port&quot;);
++
++	sPortsActive = true;
++	return B_OK;
++}
++
++
++//	#pragma mark - public kernel API
++
++
++port_id		
++create_port(int32 queueLength, const char *name)
++{
++	cpu_status state;
++	char nameBuffer[B_OS_NAME_LENGTH];
++	sem_id readSem, writeSem;
++	status_t status;
++	team_id	owner;
++	int32 slot;
++
++	TRACE((&quot;create_port(queueLength = %ld, name = \&quot;%s\&quot;)\n&quot;, queueLength, name));
++
++	if (!sPortsActive)
++		return B_BAD_PORT_ID;
++
++	// check queue length
++	if (queueLength &lt; 1
++		|| queueLength &gt; MAX_QUEUE_LENGTH)
++		return B_BAD_VALUE;
++
++	// check early on if there are any free port slots to use
++	if (atomic_add(&amp;sUsedPorts, 1) &gt;= sMaxPorts) {
++		status = B_NO_MORE_PORTS;
++		goto err1;
++	}
++
++	// check &amp; dup name
++	if (name == NULL)
++		name = &quot;unnamed port&quot;;
++
++	// ToDo: we could save the memory and use the semaphore name only instead
++	strlcpy(nameBuffer, name, B_OS_NAME_LENGTH);
++	name = strdup(nameBuffer);
++	if (name == NULL) {
++		status = B_NO_MEMORY;
++		goto err1;
++	}
++
++	// create read sem with owner set to -1
++	// ToDo: should be B_SYSTEM_TEAM
++	readSem = create_sem_etc(0, name, -1);
++	if (readSem &lt; B_OK) {
++		status = readSem;
++		goto err2;
++	}
++
++	// create write sem
++	writeSem = create_sem_etc(queueLength, name, -1);
++	if (writeSem &lt; B_OK) {
++		status = writeSem;
++		goto err3;
++	}
++
++	owner = team_get_current_team_id();
++
++	state = disable_interrupts();
++	GRAB_PORT_LIST_LOCK();
++
++	// find the first empty spot
++	for (slot = 0; slot &lt; sMaxPorts; slot++) {
++		int32 i = (slot + sFirstFreeSlot) % sMaxPorts;
++
++		if (sPorts[i].id == -1) {
++			port_id id;
++
++			// make the port_id be a multiple of the slot it's in
++			if (i &gt;= sNextPort % sMaxPorts)
++				sNextPort += i - sNextPort % sMaxPorts;
++			else
++				sNextPort += sMaxPorts - (sNextPort % sMaxPorts - i);
++			sFirstFreeSlot = slot + 1;
++
++			GRAB_PORT_LOCK(sPorts[i]);
++			sPorts[i].id = sNextPort++;
++			RELEASE_PORT_LIST_LOCK();
++
++			sPorts[i].capacity = queueLength;
++			sPorts[i].owner = owner;
++			sPorts[i].name = name;
++
++			sPorts[i].read_sem	= readSem;
++			sPorts[i].write_sem	= writeSem;
++
++			list_init(&amp;sPorts[i].msg_queue);
++			sPorts[i].total_count = 0;
++			sPorts[i].select_infos = NULL;
++			id = sPorts[i].id;
++
++			RELEASE_PORT_LOCK(sPorts[i]);
++			restore_interrupts(state);
++
++			TRACE((&quot;create_port() done: port created %ld\n&quot;, id));
++
++			return id;
++		}
++	}
++
++	// not enough ports...
++
++	// ToDo: due to sUsedPorts, this cannot happen anymore - as
++	//		long as sMaxPorts stays constant over the kernel run
++	//		time (which it should be). IOW we could simply panic()
++	//		here.
++
++	RELEASE_PORT_LIST_LOCK();
++	restore_interrupts(state);
++
++	status = B_NO_MORE_PORTS;
++
++	delete_sem(writeSem);
++err3:
++	delete_sem(readSem);
++err2:
++	free((char *)name);
++err1:
++	atomic_add(&amp;sUsedPorts, -1);
++
++	return status;
++}
++
++
++status_t
++close_port(port_id id)
++{
++	sem_id readSem, writeSem;
++	cpu_status state;
++	int32 slot;
++
++	TRACE((&quot;close_port(id = %ld)\n&quot;, id));
++
++	if (!sPortsActive || id &lt; 0)
++		return B_BAD_PORT_ID;
++
++	slot = id % sMaxPorts;
++
++	// walk through the sem list, trying to match name
++	state = disable_interrupts();
++	GRAB_PORT_LOCK(sPorts[slot]);
++
++	if (sPorts[slot].id != id) {
++		RELEASE_PORT_LOCK(sPorts[slot]);
++		restore_interrupts(state);
++		TRACE((&quot;close_port: invalid port_id %ld\n&quot;, id));
++		return B_BAD_PORT_ID;
++	}
++
++	// mark port to disable writing - deleting the semaphores will
++	// wake up waiting read/writes
++	sPorts[slot].capacity = 0;
++	readSem = sPorts[slot].read_sem;
++	writeSem = sPorts[slot].write_sem;
++
++	notify_port_select_events(slot, B_EVENT_INVALID);
++	sPorts[slot].select_infos = NULL;
++
++	RELEASE_PORT_LOCK(sPorts[slot]);
++	restore_interrupts(state);
++
++	delete_sem(readSem);
++	delete_sem(writeSem);
++
++	return B_NO_ERROR;
++}
++
++
++status_t
++delete_port(port_id id)
++{
++	cpu_status state;
++	sem_id readSem, writeSem;
++	const char *name;
++	struct list list;
++	port_msg *msg;
++	int32 slot;
++
++	TRACE((&quot;delete_port(id = %ld)\n&quot;, id));
++
++	if (!sPortsActive || id &lt; 0)
++		return B_BAD_PORT_ID;
++
++	slot = id % sMaxPorts;
++
++	state = disable_interrupts();
++	GRAB_PORT_LOCK(sPorts[slot]);
++
++	if (sPorts[slot].id != id) {
++		RELEASE_PORT_LOCK(sPorts[slot]);
++		restore_interrupts(state);
++
++		TRACE((&quot;delete_port: invalid port_id %ld\n&quot;, id));
++		return B_BAD_PORT_ID;
++	}
++
++	/* mark port as invalid */
++	sPorts[slot].id	= -1;
++	name = sPorts[slot].name;
++	readSem = sPorts[slot].read_sem;
++	writeSem = sPorts[slot].write_sem;
++	sPorts[slot].name = NULL;
++	list_move_to_list(&amp;sPorts[slot].msg_queue, &amp;list);
++
++	notify_port_select_events(slot, B_EVENT_INVALID);
++	sPorts[slot].select_infos = NULL;
++
++	RELEASE_PORT_LOCK(sPorts[slot]);
++
++	// update the first free slot hint in the array	
++	GRAB_PORT_LIST_LOCK();
++	if (slot &lt; sFirstFreeSlot)
++		sFirstFreeSlot = slot;
++	RELEASE_PORT_LIST_LOCK();
++
++	restore_interrupts(state);
++
++	atomic_add(&amp;sUsedPorts, -1);
++
++	// free the queue
++	while ((msg = (port_msg *)list_remove_head_item(&amp;list)) != NULL) {
++		put_port_msg(msg);
++	}
++
++	free((char *)name);
++
++	// release the threads that were blocking on this port by deleting the sem
++	// read_port() will see the B_BAD_SEM_ID acq_sem() return value, and act accordingly
++	delete_sem(readSem);
++	delete_sem(writeSem);
++
++	return B_OK;
++}
++
++
++status_t
++select_port(int32 id, struct select_info *info, bool kernel)
++{
++	cpu_status state;
++	int32 slot;
++	status_t error = B_OK;
++
++	if (id &lt; 0)
++		return B_BAD_PORT_ID;
++
++	slot = id % sMaxPorts;
++
++	state = disable_interrupts();
++	GRAB_PORT_LOCK(sPorts[slot]);
++
++	if (sPorts[slot].id != id || is_port_closed(slot)) {
++		// bad port ID
++		error = B_BAD_SEM_ID;
++	} else if (!kernel &amp;&amp; sPorts[slot].owner == team_get_kernel_team_id()) {
++		// kernel port, but call from userland
++		error = B_NOT_ALLOWED;
++	} else {
++		info-&gt;selected_events &amp;= B_EVENT_READ | B_EVENT_WRITE | B_EVENT_INVALID;
++
++		if (info-&gt;selected_events != 0) {
++			uint16 events = 0;
++			int32 writeCount = 0;
++
++			info-&gt;next = sPorts[slot].select_infos;
++			sPorts[slot].select_infos = info;
++
++			// check for events
++			if ((info-&gt;selected_events &amp; B_EVENT_READ) != 0
++				&amp;&amp; !list_is_empty(&amp;sPorts[slot].msg_queue)) {
++				events |= B_EVENT_READ;
++			}
++
++			if (get_sem_count(sPorts[slot].write_sem, &amp;writeCount) == B_OK
++				&amp;&amp; writeCount &gt; 0) {
++				events |= B_EVENT_WRITE;
++			}
++
++			if (events != 0)
++				notify_select_events(info, events);
++		}
++	}
++
++	RELEASE_PORT_LOCK(sPorts[slot]);
++	restore_interrupts(state);
++
++	return error;
++}
++
++
++status_t
++deselect_port(int32 id, struct select_info *info, bool kernel)
++{
++	cpu_status state;
++	int32 slot;
++
++	if (id &lt; 0)
++		return B_BAD_PORT_ID;
++
++	if (info-&gt;selected_events == 0)
++		return B_OK;
++
++	slot = id % sMaxPorts;
++
++	state = disable_interrupts();
++	GRAB_PORT_LOCK(sPorts[slot]);
++
++	if (sPorts[slot].id == id) {
++		select_info** infoLocation = &amp;sPorts[slot].select_infos;
++		while (*infoLocation != NULL &amp;&amp; *infoLocation != info)
++			infoLocation = &amp;(*infoLocation)-&gt;next;
++
++		if (*infoLocation == info)
++			*infoLocation = info-&gt;next;
++	}
++
++	RELEASE_PORT_LOCK(sPorts[slot]);
++	restore_interrupts(state);
++
++	return B_OK;
++}
++
++
++port_id
++find_port(const char *name)
++{
++	port_id portFound = B_NAME_NOT_FOUND;
++	cpu_status state;
++	int32 i;
++
++	TRACE((&quot;find_port(name = \&quot;%s\&quot;)\n&quot;, name));
++
++	if (!sPortsActive)
++		return B_NAME_NOT_FOUND;
++	if (name == NULL)
++		return B_BAD_VALUE;
++
++	// Since we have to check every single port, and we don't
++	// care if it goes away at any point, we're only grabbing
++	// the port lock in question, not the port list lock
++
++	// loop over list
++	for (i = 0; i &lt; sMaxPorts &amp;&amp; portFound &lt; B_OK; i++) {
++		// lock every individual port before comparing
++		state = disable_interrupts();
++		GRAB_PORT_LOCK(sPorts[i]);
++
++		if (sPorts[i].id &gt;= 0 &amp;&amp; !strcmp(name, sPorts[i].name))
++			portFound = sPorts[i].id;
++
++		RELEASE_PORT_LOCK(sPorts[i]);
++		restore_interrupts(state);
++	}
++
++	return portFound;
++}
++
++
++status_t
++_get_port_info(port_id id, port_info *info, size_t size)
++{
++	cpu_status state;
++	int slot;
++
++	TRACE((&quot;get_port_info(id = %ld)\n&quot;, id));
++
++	if (info == NULL || size != sizeof(port_info))
++		return B_BAD_VALUE;
++	if (!sPortsActive || id &lt; 0)
++		return B_BAD_PORT_ID;
++
++	slot = id % sMaxPorts;
++
++	state = disable_interrupts();
++	GRAB_PORT_LOCK(sPorts[slot]);
++
++	if (sPorts[slot].id != id || sPorts[slot].capacity == 0) {
++		RELEASE_PORT_LOCK(sPorts[slot]);
++		restore_interrupts(state);
++		TRACE((&quot;get_port_info: invalid port_id %ld\n&quot;, id));
++		return B_BAD_PORT_ID;
++	}
++
++	// fill a port_info struct with info
++	fill_port_info(&amp;sPorts[slot], info, size);
++
++	RELEASE_PORT_LOCK(sPorts[slot]);
++	restore_interrupts(state);
++
++	return B_OK;
++}
++
++
++status_t
++_get_next_port_info(team_id team, int32 *_cookie, struct port_info *info, size_t size)
++{
++	cpu_status state;
++	int slot;
++
++	TRACE((&quot;get_next_port_info(team = %ld)\n&quot;, team));
++
++	if (info == NULL || size != sizeof(port_info) || _cookie == NULL || team &lt; B_OK)
++		return B_BAD_VALUE;
++	if (!sPortsActive)
++		return B_BAD_PORT_ID;
++
++	slot = *_cookie;
++	if (slot &gt;= sMaxPorts)
++		return B_BAD_PORT_ID;
++
++	if (team == B_CURRENT_TEAM)
++		team = team_get_current_team_id();
++
++	info-&gt;port = -1; // used as found flag
++
++	// spinlock
++	state = disable_interrupts();
++	GRAB_PORT_LIST_LOCK();
++
++	while (slot &lt; sMaxPorts) {
++		GRAB_PORT_LOCK(sPorts[slot]);
++		if (sPorts[slot].id != -1 &amp;&amp; sPorts[slot].capacity != 0 &amp;&amp; sPorts[slot].owner == team) {
++			// found one!
++			fill_port_info(&amp;sPorts[slot], info, size);
++
++			RELEASE_PORT_LOCK(sPorts[slot]);
++			slot++;
++			break;
++		}
++		RELEASE_PORT_LOCK(sPorts[slot]);
++		slot++;
++	}
++	RELEASE_PORT_LIST_LOCK();
++	restore_interrupts(state);
++
++	if (info-&gt;port == -1)
++		return B_BAD_PORT_ID;
++
++	*_cookie = slot;
++	return B_NO_ERROR;
++}
++
++
++ssize_t
++port_buffer_size(port_id id)
++{
++	return port_buffer_size_etc(id, 0, 0);
++}
++
++
++ssize_t
++port_buffer_size_etc(port_id id, uint32 flags, bigtime_t timeout)
++{
++	cpu_status state;
++	sem_id cachedSem;
++	status_t status;
++	port_msg *msg;
++	ssize_t size;
++	int32 slot;
++
++	if (!sPortsActive || id &lt; 0)
++		return B_BAD_PORT_ID;
++
++	slot = id % sMaxPorts;
++
++	state = disable_interrupts();
++	GRAB_PORT_LOCK(sPorts[slot]);
++
++	if (sPorts[slot].id != id
++		|| (is_port_closed(slot) &amp;&amp; list_is_empty(&amp;sPorts[slot].msg_queue))) {
++		RELEASE_PORT_LOCK(sPorts[slot]);
++		restore_interrupts(state);
++		TRACE((&quot;port_buffer_size_etc(): %s port %ld\n&quot;,
++			sPorts[slot].id == id ? &quot;closed&quot; : &quot;invalid&quot;, id));
++		return B_BAD_PORT_ID;
++	}
++
++	cachedSem = sPorts[slot].read_sem;
++
++	RELEASE_PORT_LOCK(sPorts[slot]);
++	restore_interrupts(state);
++
++	// block if no message, or, if B_TIMEOUT flag set, block with timeout
++
++	status = acquire_sem_etc(cachedSem, 1, flags, timeout);
++	if (status != B_OK &amp;&amp; status != B_BAD_SEM_ID)
++		return status;
++
++	// in case of B_BAD_SEM_ID, the port might have been closed but not yet
++	// deleted, ie. there could still be messages waiting for us
++
++	state = disable_interrupts();
++	GRAB_PORT_LOCK(sPorts[slot]);
++
++	if (sPorts[slot].id != id) {
++		// the port is no longer there
++		RELEASE_PORT_LOCK(sPorts[slot]);
++		restore_interrupts(state);
++		return B_BAD_PORT_ID;
++	}
++
++	// determine tail &amp; get the length of the message
++	msg = (port_msg*)list_get_first_item(&amp;sPorts[slot].msg_queue);
++	if (msg == NULL) {
++		if (status == B_OK)
++			panic(&quot;port %ld: no messages found\n&quot;, sPorts[slot].id);
++
++		size = B_BAD_PORT_ID;
++	} else
++		size = msg-&gt;size;
++
++	RELEASE_PORT_LOCK(sPorts[slot]);
++	restore_interrupts(state);
++
++	// restore read_sem, as we haven't read from the port
++	release_sem(cachedSem);
++
++	// return length of item at end of queue
++	return size;
++}
++
++
++ssize_t
++port_count(port_id id)
++{
++	cpu_status state;
++	int32 count = 0;
++	int32 slot;
++
++	if (!sPortsActive || id &lt; 0)
++		return B_BAD_PORT_ID;
++
++	slot = id % sMaxPorts;
++
++	state = disable_interrupts();
++	GRAB_PORT_LOCK(sPorts[slot]);
++
++	if (sPorts[slot].id != id) {
++		RELEASE_PORT_LOCK(sPorts[slot]);
++		restore_interrupts(state);
++		TRACE((&quot;port_count: invalid port_id %ld\n&quot;, id));
++		return B_BAD_PORT_ID;
++	}
++
++	if (get_sem_count(sPorts[slot].read_sem, &amp;count) == B_OK) {
++		// do not return negative numbers
++		if (count &lt; 0)
++			count = 0;
++	} else {
++		// the port might have been closed - we need to actually count the messages
++		void *message = NULL;
++		while ((message = list_get_next_item(&amp;sPorts[slot].msg_queue, message)) != NULL) {
++			count++;
++		}
++	}
++
++	RELEASE_PORT_LOCK(sPorts[slot]);
++	restore_interrupts(state);
++
++	// return count of messages
++	return count;
++}
++
++
++ssize_t
++read_port(port_id port, int32 *msgCode, void *msgBuffer, size_t bufferSize)
++{
++	return read_port_etc(port, msgCode, msgBuffer, bufferSize, 0, 0);
++}
++
++
++ssize_t
++read_port_etc(port_id id, int32 *_msgCode, void *msgBuffer, size_t bufferSize,
++	uint32 flags, bigtime_t timeout)
++{
++	cpu_status state;
++	sem_id cachedSem;
++	status_t status;
++	bool userCopy = (flags &amp; PORT_FLAG_USE_USER_MEMCPY) &gt; 0;
++	port_msg *msg;
++	size_t size;
++	int slot;
++
++	if (!sPortsActive || id &lt; 0)
++		return B_BAD_PORT_ID;
++
++	if ((msgBuffer == NULL &amp;&amp; bufferSize &gt; 0)
++		|| timeout &lt; 0)
++		return B_BAD_VALUE;
++
++	flags = flags &amp; (B_CAN_INTERRUPT | B_KILL_CAN_INTERRUPT
++				| B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT);
++	slot = id % sMaxPorts;
++
++	state = disable_interrupts();
++	GRAB_PORT_LOCK(sPorts[slot]);
++
++	if (sPorts[slot].id != id
++		|| (is_port_closed(slot) &amp;&amp; list_is_empty(&amp;sPorts[slot].msg_queue))) {
++		RELEASE_PORT_LOCK(sPorts[slot]);
++		restore_interrupts(state);
++		TRACE((&quot;read_port_etc(): %s port %ld\n&quot;,
++			sPorts[slot].id == id ? &quot;closed&quot; : &quot;invalid&quot;, id));
++		return B_BAD_PORT_ID;
++	}
++	// store sem_id in local variable
++	cachedSem = sPorts[slot].read_sem;
++
++	// unlock port &amp;&amp; enable ints/
++	RELEASE_PORT_LOCK(sPorts[slot]);
++	restore_interrupts(state);
++
++	status = acquire_sem_etc(cachedSem, 1, flags, timeout);
++		// get 1 entry from the queue, block if needed
++
++	if (status != B_OK &amp;&amp; status != B_BAD_SEM_ID)
++		return status;
++
++	// in case of B_BAD_SEM_ID, the port might have been closed but not yet
++	// deleted, ie. there could still be messages waiting for us
++
++	state = disable_interrupts();
++	GRAB_PORT_LOCK(sPorts[slot]);
++
++	// first, let's check if the port is still alive
++	if (sPorts[slot].id == -1) {
++		// the port has been deleted in the meantime
++		RELEASE_PORT_LOCK(sPorts[slot]);
++		restore_interrupts(state);
++		return B_BAD_PORT_ID;
++	}
++
++	msg = (port_msg*)list_get_first_item(&amp;sPorts[slot].msg_queue);
++	if (msg == NULL) {
++		if (status == B_OK)
+
+[... truncated: 1787 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005576.html">[Haiku-commits] r23584 - haiku/trunk/src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="005578.html">[Haiku-commits] r23586 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5577">[ date ]</a>
+              <a href="thread.html#5577">[ thread ]</a>
+              <a href="subject.html#5577">[ subject ]</a>
+              <a href="author.html#5577">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,933 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24383 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24383%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/audio/hda&In-Reply-To=%3C200803131225.m2DCPUVh020051%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006801.html">
+   <LINK REL="Next"  HREF="006805.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24383 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24383%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/audio/hda&In-Reply-To=%3C200803131225.m2DCPUVh020051%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24383 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Mar 13 13:25:30 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006801.html">[Haiku-commits] r24382 - haiku/trunk/src/kits/media
+</A></li>
+        <LI>Next message: <A HREF="006805.html">[Haiku-commits] r24383 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6804">[ date ]</a>
+              <a href="thread.html#6804">[ thread ]</a>
+              <a href="subject.html#6804">[ subject ]</a>
+              <a href="author.html#6804">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-03-13 13:25:29 +0100 (Thu, 13 Mar 2008)
+New Revision: 24383
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24383&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24383&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec_defs.h
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp
+Log:
+* Rewrote widget output path discovery, it's now very similar to what the
+  FreeBSD driver is doing.
+* hda_codec_new_audio_group() did not free the audio group's widgets on
+  failure.
+* No longer create the input stream for now.
+* Reworked multiaudio-support to work regardless if there is only a playback
+  or record stream.
+* With these changes, I hear nothing on my laptop anymore (before there was
+  noise), but on another system, I can finally hear something that sounds very
+  much like the sinus wave the multi_audio_test application produces; the
+  sound quality is pretty bad though (lots of periodical noise and glitches).
+* Made B_MULTI_GET_DESCRIPTION safe to be called from userland.
+* Minor other cleanup.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h	2008-03-12 23:19:52 UTC (rev 24382)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h	2008-03-13 12:25:29 UTC (rev 24383)
+@@ -37,6 +37,7 @@
+ #define HDA_MAX_STREAMS			16
+ #define MAX_CODEC_RESPONSES		10
+ #define MAX_INPUTS				32
++#define MAX_IO_WIDGETS			8
+ 
+ /* FIXME: Find out why we need so much! */
+ #define DEFAULT_FRAMES_PER_BUFFER	4096
+@@ -62,7 +63,8 @@
+ 	uint32		type;
+ 
+ 	uint32		pin_widget;			/* PIN Widget ID */
+-	uint32		io_widget;			/* Input/Output Converter Widget ID */
++	uint32		io_widgets[MAX_IO_WIDGETS];	/* Input/Output Converter Widget ID */
++	uint32		num_io_widgets;
+ 
+ 	uint32		sample_rate;	
+ 	uint32		sample_format;
+@@ -108,12 +110,8 @@
+ 		struct {
+ 			uint32	formats;
+ 			uint32	rates;
+-		} output;
++		} io;
+ 		struct {
+-			uint32	formats;
+-			uint32	rates;
+-		} input;
+-		struct {
+ 		} mixer;
+ 		struct {
+ 			uint32	output;
+@@ -123,6 +121,9 @@
+ 	} d;
+ };
+ 
++#define WIDGET_FLAG_OUTPUT_PATH	0x01
++#define WIDGET_FLAG_INPUT_PATH	0x02
++
+ /*!	This structure describes a single Audio Function Group. An AFG
+ 	is a group of audio widgets which can be used to configure multiple
+ 	streams of audio either from the HDA Link to an output device (= playback)
+@@ -215,6 +216,8 @@
+ extern uint32 gNumCards;
+ 
+ /* hda_codec.c */
++status_t hda_audio_group_get_widgets(hda_audio_group* audioGroup,
++	hda_stream* stream);
+ hda_codec* hda_codec_new(hda_controller* controller, uint32 cad);
+ void hda_codec_delete(hda_codec* codec);
+ 
+@@ -229,7 +232,7 @@
+ 	uint32 count);
+ 
+ /* hda_controller.c: Stream support */
+-hda_stream* hda_stream_new(hda_controller* controller, int type);
++hda_stream* hda_stream_new(hda_audio_group* audioGroup, int type);
+ void hda_stream_delete(hda_stream* stream);
+ status_t hda_stream_setup_buffers(hda_audio_group* audioGroup,
+ 	hda_stream* stream, const char* desc);
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp	2008-03-12 23:19:52 UTC (rev 24382)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp	2008-03-13 12:25:29 UTC (rev 24383)
+@@ -248,13 +248,13 @@
+ {
+ 	if ((widget-&gt;capabilities.audio &amp; AUDIO_CAP_FORMAT_OVERRIDE) == 0) {
+ 		// adopt capabilities of the audio group
+-		widget-&gt;d.output.formats = audioGroup-&gt;supported_formats;
+-		widget-&gt;d.output.rates = audioGroup-&gt;supported_rates;
++		widget-&gt;d.io.formats = audioGroup-&gt;supported_formats;
++		widget-&gt;d.io.rates = audioGroup-&gt;supported_rates;
+ 		return B_OK;
+ 	}
+ 
+ 	return hda_get_stream_support(audioGroup-&gt;codec, widget-&gt;node_id,
+-		&amp;widget-&gt;d.output.formats, &amp;widget-&gt;d.output.rates);
++		&amp;widget-&gt;d.io.formats, &amp;widget-&gt;d.io.rates);
+ }
+ 
+ 
+@@ -303,6 +303,17 @@
+ }
+ 
+ 
++static hda_widget*
++hda_audio_group_get_widget(hda_audio_group* audioGroup, uint32 nodeID)
++{
++	if (audioGroup-&gt;widget_start &gt; nodeID
++		|| audioGroup-&gt;widget_start + audioGroup-&gt;widget_count &lt; nodeID)
++		return NULL;
++
++	return &amp;audioGroup-&gt;widgets[nodeID - audioGroup-&gt;widget_start];
++}
++
++
+ static status_t
+ hda_widget_get_connections(hda_audio_group* audioGroup, hda_widget* widget)
+ {
+@@ -378,7 +389,7 @@
+ 	widget-&gt;num_inputs = numInputs;
+ 
+ 	if (widget-&gt;num_inputs == 1)
+-		widget-&gt;active_input = widget-&gt;inputs[0];
++		widget-&gt;active_input = 0;
+ 
+ 	return B_OK;
+ }
+@@ -403,7 +414,7 @@
+ 	verbs[1] = MAKE_VERB(audioGroup-&gt;codec-&gt;addr, audioGroup-&gt;root_node_id,
+ 		VID_GET_PARAMETER, PID_GPIO_COUNT);
+ 	verbs[2] = MAKE_VERB(audioGroup-&gt;codec-&gt;addr, audioGroup-&gt;root_node_id,
+-		VID_GET_PARAMETER, PID_SUBORDINATE_NODE_COUNT);
++		VID_GET_PARAMETER, PID_SUB_NODE_COUNT);
+ 
+ 	if (hda_send_verbs(audioGroup-&gt;codec, verbs, resp, 3) != B_OK)
+ 		return B_ERROR;
+@@ -511,51 +522,123 @@
+ }
+ 
+ 
+-/*! Find path from 'widget' to a widget of type \a widgetType, returning its
+-	widget id.
+-	Returns 0 if not found.
+-*/
+-static uint32
+-hda_codec_audio_group_find_path(hda_audio_group* audioGroup, uint32 widget,
+-	hda_widget_type widgetType, uint32 depth)
++/*! Find output path for widget */
++static bool
++hda_widget_find_output_path(hda_audio_group* audioGroup, hda_widget* widget,
++	uint32 depth)
+ {
+-	int groupIndex = widget - audioGroup-&gt;widget_start;
++	if (widget == NULL || depth &gt; 16)
++		return false;
+ 
+-	switch (audioGroup-&gt;widgets[groupIndex].type) {
++	switch (widget-&gt;type) {
++		case WT_AUDIO_OUTPUT:
++			widget-&gt;flags |= WIDGET_FLAG_OUTPUT_PATH;
++dprintf(&quot;      %*soutput: added output widget %ld\n&quot;, (int)depth * 2, &quot;&quot;, widget-&gt;node_id);
++			return true;
++
+ 		case WT_AUDIO_MIXER:
+-			for (uint32 i = 0; i &lt; audioGroup-&gt;widgets[groupIndex].num_inputs; i++) {
+-				if (hda_codec_audio_group_find_path(audioGroup,
+-						audioGroup-&gt;widgets[groupIndex].inputs[i], widgetType,
++		case WT_AUDIO_SELECTOR:
++		{
++			// search for output in this path
++			bool found = false;
++			for (uint32 i = 0; i &lt; widget-&gt;num_inputs; i++) {
++				hda_widget* inputWidget = hda_audio_group_get_widget(audioGroup,
++					widget-&gt;inputs[i]);
++
++				if (hda_widget_find_output_path(audioGroup, inputWidget,
+ 						depth + 1)) {
+-					if (audioGroup-&gt;widgets[groupIndex].active_input == -1)
+-						audioGroup-&gt;widgets[groupIndex].active_input = i;
++					if (widget-&gt;active_input == -1)
++						widget-&gt;active_input = i;
+ 
+-					return audioGroup-&gt;widgets[groupIndex].inputs[i];
++					widget-&gt;flags |= WIDGET_FLAG_OUTPUT_PATH;
++dprintf(&quot;      %*soutput: added mixer/selector widget %ld\n&quot;, (int)depth * 2, &quot;&quot;, widget-&gt;node_id);
++					found = true;
+ 				}
+ 			}
+-			break;
++if (!found) dprintf(&quot;      %*soutput: not added mixer/selector widget %ld\n&quot;, (int)depth * 2, &quot;&quot;, widget-&gt;node_id);
++			return found;
++		}
+ 
+-		case WT_AUDIO_SELECTOR:
+-		{
+-			int32 i = audioGroup-&gt;widgets[groupIndex].active_input;
+-			if (i != -1) {
+-				widget = audioGroup-&gt;widgets[groupIndex].inputs[i];
+-				if (hda_codec_audio_group_find_path(audioGroup, widget,
+-						widgetType, depth + 1)) {
+-					return widget;
+-				}
++		default:
++			return false;
++	}
++}
++
++
++static bool
++hda_audio_group_build_output_tree(hda_audio_group* audioGroup, bool useMixer)
++{
++	bool found = false;
++
++dprintf(&quot;build output tree: %suse mixer\n&quot;, useMixer ? &quot;&quot; : &quot;don't &quot;);
++	for (uint32 i = 0; i &lt; audioGroup-&gt;widget_count; i++) {
++		hda_widget&amp; widget = audioGroup-&gt;widgets[i];
++
++		if (widget.type != WT_PIN_COMPLEX || !widget.d.pin.output
++			|| (widget.d.pin.device != PIN_DEV_HEAD_PHONE_OUT
++				&amp;&amp; widget.d.pin.device != PIN_DEV_SPEAKER
++				&amp;&amp; widget.d.pin.device != PIN_DEV_LINE_OUT))
++			continue;
++
++dprintf(&quot;  look at pin widget %ld (%ld inputs)\n&quot;, widget.node_id, widget.num_inputs);
++		for (uint32 j = 0; j &lt; widget.num_inputs; j++) {
++			hda_widget* inputWidget = hda_audio_group_get_widget(audioGroup,
++				widget.inputs[j]);
++dprintf(&quot;    try widget %ld: %p\n&quot;, widget.inputs[j], inputWidget);
++			if (inputWidget == NULL)
++				continue;
++
++			if (useMixer &amp;&amp; inputWidget-&gt;type != WT_AUDIO_MIXER
++				&amp;&amp; inputWidget-&gt;type != WT_AUDIO_SELECTOR)
++				continue;
++dprintf(&quot;    widget %ld is candidate\n&quot;, inputWidget-&gt;node_id);
++
++			if (hda_widget_find_output_path(audioGroup, inputWidget, 0)) {
++dprintf(&quot;    add pin widget %ld\n&quot;, widget.node_id);
++				if (widget.active_input == -1)
++					widget.active_input = j;
++				widget.flags |= WIDGET_FLAG_OUTPUT_PATH;
++				found = true;
+ 			}
+-			break;
+ 		}
++	}
+ 
+-		default:
+-			if (audioGroup-&gt;widgets[groupIndex].type == widgetType)
+-				return widget;
++	return found;
++}
+ 
+-			break;
++
++static status_t
++hda_audio_group_build_tree(hda_audio_group* audioGroup)
++{
++	if (!hda_audio_group_build_output_tree(audioGroup, true)) {
++		// didn't find a mixer path, try again without
++dprintf(&quot;try without mixer!\n&quot;);
++		if (!hda_audio_group_build_output_tree(audioGroup, false))
++			return ENODEV;
+ 	}
+ 
+-	return 0;
++dprintf(&quot;build tree!\n&quot;);
++	// TODO: input path!
++
++	// select active connections
++
++	for (uint32 i = 0; i &lt; audioGroup-&gt;widget_count; i++) {
++		hda_widget&amp; widget = audioGroup-&gt;widgets[i];
++
++		if (widget.active_input == -1)
++			widget.active_input = 0;
++		if (widget.num_inputs &lt; 2)
++			continue;
++
++		corb_t verb = MAKE_VERB(audioGroup-&gt;codec-&gt;addr,
++			widget.node_id, VID_SET_CONNECTION_SELECT, widget.active_input);
++		if (hda_send_verbs(audioGroup-&gt;codec, &amp;verb, NULL, 1) != B_OK) {
++			dprintf(&quot;hda: Setting output selector %ld failed on widget %ld!\n&quot;,
++				widget.active_input, widget.node_id);
++		}
++	}
++
++	return B_OK;
+ }
+ 
+ 
+@@ -596,143 +679,101 @@
+ 	/* Setup for worst-case scenario; we cannot find any output Pin Widgets */
+ 	status = ENODEV;
+ 
+-	/* Try to locate all input/output channels */
+-	for (uint32 i = 0; i &lt; audioGroup-&gt;widget_count; i++) {
+-		uint32 outputWidget = 0, inputWidget = 0;
++	if (hda_audio_group_build_tree(audioGroup) != B_OK)
++		goto err;
+ 
+-		if (audioGroup-&gt;playback_stream == NULL
+-			&amp;&amp; audioGroup-&gt;widgets[i].type == WT_PIN_COMPLEX
+-			&amp;&amp; audioGroup-&gt;widgets[i].d.pin.output) {
+-			if (audioGroup-&gt;widgets[i].d.pin.device == PIN_DEV_HEAD_PHONE_OUT
+-				|| audioGroup-&gt;widgets[i].d.pin.device == PIN_DEV_SPEAKER
+-				|| audioGroup-&gt;widgets[i].d.pin.device == PIN_DEV_LINE_OUT) {
+-				int32 inputIndex = audioGroup-&gt;widgets[i].active_input;
+-				if (inputIndex != -1) {
+-					outputWidget = hda_codec_audio_group_find_path(audioGroup,
+-						audioGroup-&gt;widgets[i].inputs[inputIndex],
+-						WT_AUDIO_OUTPUT, 0);
+-				} else {
+-					// find and select output widget
+-					for (inputIndex = 0; (uint32)inputIndex
+-							&lt; audioGroup-&gt;widgets[i].num_inputs; inputIndex++) {
+-						outputWidget = hda_codec_audio_group_find_path(audioGroup,
+-							audioGroup-&gt;widgets[i].inputs[inputIndex],
+-							WT_AUDIO_OUTPUT, 0);
+-						if (outputWidget) {
+-							corb_t verb = MAKE_VERB(codec-&gt;addr,
+-								i + audioGroup-&gt;widget_start,
+-								VID_SET_CONNECTION_SELECT, inputIndex);
+-							if (hda_send_verbs(codec, &amp;verb, NULL, 1) != B_OK)
+-								dprintf(&quot;%s: Setting output selector failed!\n&quot;, __func__);
+-							break;
+-						}
+-					}
+-				}
++	audioGroup-&gt;playback_stream = hda_stream_new(audioGroup, STREAM_PLAYBACK);
++	//audioGroup-&gt;record_stream = hda_stream_new(audioGroup, STREAM_RECORD);
+ 
+-				if (outputWidget) {
+-					if (!audioGroup-&gt;playback_stream) {
+-						corb_t verb[2];
++	if (audioGroup-&gt;playback_stream != NULL
++		|| audioGroup-&gt;record_stream != NULL) {
++		codec-&gt;audio_groups[codec-&gt;num_audio_groups++] = audioGroup;
++		return B_OK;
++	}
+ 
+-						/* Setup playback/record streams for Multi Audio API */
+-						audioGroup-&gt;playback_stream = hda_stream_new(
+-							audioGroup-&gt;codec-&gt;controller, STREAM_PLAYBACK);
+-						audioGroup-&gt;record_stream = hda_stream_new(
+-							audioGroup-&gt;codec-&gt;controller, STREAM_RECORD);
++err:
++	free(audioGroup-&gt;widgets);
++	free(audioGroup);
++	return status;
++}
+ 
+-						audioGroup-&gt;playback_stream-&gt;pin_widget = i
+-							+ audioGroup-&gt;widget_start;
+-						audioGroup-&gt;playback_stream-&gt;io_widget = outputWidget;
+ 
+-						/* FIXME: Force Pin Widget to unmute; enable hp/output */
+-						verb[0] = MAKE_VERB(codec-&gt;addr,
+-							audioGroup-&gt;playback_stream-&gt;pin_widget,
+-							VID_SET_AMPLIFIER_GAIN_MUTE,
+-							AMP_SET_OUTPUT | AMP_SET_LEFT_CHANNEL
+-								| AMP_SET_RIGHT_CHANNEL);
+-						verb[1] = MAKE_VERB(codec-&gt;addr,
+-							audioGroup-&gt;playback_stream-&gt;pin_widget,
+-							VID_SET_PIN_WIDGET_CONTROL,
+-							PIN_ENABLE_HEAD_PHONE | PIN_ENABLE_OUTPUT);
+-						hda_send_verbs(codec, verb, NULL, 2);
++//	#pragma mark -
+ 
+-						dprintf(&quot;%s: Found output PIN (%s) connected to output &quot;
+-							&quot;CONV wid:%ld\n&quot;, __func__,
+-							kDefaultDevice[audioGroup-&gt;widgets[i].d.pin.device], outputWidget);
+-					}	
+-				}
+-			}
+-		}
+ 
+-		if (audioGroup-&gt;widgets[i].type == WT_AUDIO_INPUT) {
+-			int32 inputIndex = audioGroup-&gt;widgets[i].active_input;
+-			if (inputIndex != -1) {
+-				inputWidget = hda_codec_audio_group_find_path(audioGroup,
+-					audioGroup-&gt;widgets[i].inputs[inputIndex], WT_PIN_COMPLEX,
+-					0);
+-			} else {
+-				// find and select input widget
+-				for (inputIndex = 0; (uint32)inputIndex
+-						&lt; audioGroup-&gt;widgets[i].num_inputs; inputIndex++) {
+-					inputWidget = hda_codec_audio_group_find_path(audioGroup,
+-						audioGroup-&gt;widgets[i].inputs[inputIndex],
+-						WT_PIN_COMPLEX, 0);
+-					if (inputWidget) {
+-						corb_t verb = MAKE_VERB(codec-&gt;addr,
+-							i + audioGroup-&gt;widget_start,
+-							VID_SET_CONNECTION_SELECT, inputIndex);
+-						if (hda_send_verbs(codec, &amp;verb, NULL, 1) != B_OK) {
+-							dprintf(&quot;%s: Setting input selector failed!\n&quot;,
+-								__func__);
+-						}
+-						break;
+-					}
+-				}
+-			}
++status_t
++hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
++{
++	hda_widget_type type;
++	uint32 flags;
+ 
+-			if (inputWidget) {
+-				if (!audioGroup-&gt;record_stream) {
+-					corb_t verb;
++	if (stream-&gt;type == STREAM_PLAYBACK) {
++		type = WT_AUDIO_OUTPUT;
++		flags = WIDGET_FLAG_OUTPUT_PATH;
++	} else {
++		// record
++		type = WT_AUDIO_INPUT;
++		flags = WIDGET_FLAG_INPUT_PATH;
++	}
+ 
+-					/* Setup playback/record streams for Multi Audio API */
+-					audioGroup-&gt;record_stream = hda_stream_new(
+-						audioGroup-&gt;codec-&gt;controller, STREAM_RECORD);
++	uint32 count = 0;
+ 
+-					audioGroup-&gt;record_stream-&gt;pin_widget = inputWidget;
+-					audioGroup-&gt;record_stream-&gt;io_widget = i
+-						+ audioGroup-&gt;widget_start;
++	for (uint32 i = 0; i &lt; audioGroup-&gt;widget_count &amp;&amp; count &lt; MAX_IO_WIDGETS;
++			i++) {
++		hda_widget&amp; widget = audioGroup-&gt;widgets[i];
+ 
+-					/* FIXME: Force Pin Widget to unmute */
+-					verb = MAKE_VERB(codec-&gt;addr,
+-						audioGroup-&gt;record_stream-&gt;pin_widget,
+-						VID_SET_AMPLIFIER_GAIN_MUTE,
+-						AMP_SET_INPUT | AMP_SET_LEFT_CHANNEL
+-							| AMP_SET_RIGHT_CHANNEL);
+-					hda_send_verbs(codec, &amp;verb, NULL, 1);
+-				}
++		if ((widget.flags &amp; flags) != 0) {
++			if (widget.type == WT_PIN_COMPLEX) {
++				stream-&gt;pin_widget = widget.node_id;
+ 
+-				dprintf(&quot;%s: Found input PIN (%s) connected to input CONV &quot;
+-					&quot;wid:%ld\n&quot;, __func__, kDefaultDevice[audioGroup-&gt;widgets[
+-						inputWidget - audioGroup-&gt;widget_start].d.pin.device],
+-					i + audioGroup-&gt;widget_start);
++dprintf(&quot;ENABLE pin widget %ld\n&quot;, widget.node_id);
++				/* FIXME: Force Pin Widget to unmute; enable hp/output */
++				uint32 verb = MAKE_VERB(audioGroup-&gt;codec-&gt;addr,
++					widget.node_id,
++					VID_SET_PIN_WIDGET_CONTROL,
++					PIN_ENABLE_HEAD_PHONE | PIN_ENABLE_OUTPUT);
++				hda_send_verbs(audioGroup-&gt;codec, &amp;verb, NULL, 1);
+ 			}
++
++			if (widget.capabilities.output_amplifier != 0) {
++dprintf(&quot;UNMUTE/SET GAIN widget %ld (offset %ld)\n&quot;, widget.node_id,
++	widget.capabilities.output_amplifier &amp; AMP_CAP_OFFSET_MASK);
++				uint32 verb = MAKE_VERB(audioGroup-&gt;codec-&gt;addr,
++					widget.node_id,
++					VID_SET_AMPLIFIER_GAIN_MUTE,
++					AMP_SET_OUTPUT | AMP_SET_LEFT_CHANNEL
++						| AMP_SET_RIGHT_CHANNEL
++						| (widget.capabilities.output_amplifier
++							&amp; AMP_CAP_OFFSET_MASK));
++				hda_send_verbs(audioGroup-&gt;codec, &amp;verb, NULL, 1);
++			}
+ 		}
+-	}
+ 
+-	/* If we found any valid output channels, we're in the clear */
+-	if (audioGroup &amp;&amp; audioGroup-&gt;playback_stream) {
+-		codec-&gt;audio_groups[codec-&gt;num_audio_groups++] = audioGroup;
+-		return B_OK;
++		if (widget.type != type || (widget.flags &amp; flags) == 0
++			|| (widget.capabilities.audio
++				&amp; (AUDIO_CAP_STEREO | AUDIO_CAP_DIGITAL)) != AUDIO_CAP_STEREO
++			|| widget.d.io.formats == 0)
++			continue;
++
++		if (count == 0) {
++			stream-&gt;sample_format = widget.d.io.formats;
++			stream-&gt;sample_rate = widget.d.io.rates;
++		} else {
++			stream-&gt;sample_format &amp;= widget.d.io.formats;
++			stream-&gt;sample_rate &amp;= widget.d.io.rates;
++		}
++
++		stream-&gt;io_widgets[count++] = widget.node_id;
+ 	}
+ 
+-err:
+-	free(audioGroup);
+-	return status;
++	if (count == 0)
++		return B_ENTRY_NOT_FOUND;
++
++	stream-&gt;num_io_widgets = count;
++	return B_OK;
+ }
+ 
+ 
+-//	#pragma mark -
+-
+-
+ void
+ hda_codec_delete(hda_codec* codec)
+ {
+@@ -783,7 +824,7 @@
+ 	verbs[0] = MAKE_VERB(codecAddress, 0, VID_GET_PARAMETER, PID_VENDOR_ID);
+ 	verbs[1] = MAKE_VERB(codecAddress, 0, VID_GET_PARAMETER, PID_REVISION_ID);
+ 	verbs[2] = MAKE_VERB(codecAddress, 0, VID_GET_PARAMETER,
+-		PID_SUBORDINATE_NODE_COUNT);
++		PID_SUB_NODE_COUNT);
+ 
+ 	if (hda_send_verbs(codec, verbs, (uint32*)&amp;response, 3) != B_OK)
+ 		goto err;
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec_defs.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec_defs.h	2008-03-12 23:19:52 UTC (rev 24382)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_codec_defs.h	2008-03-13 12:25:29 UTC (rev 24383)
+@@ -121,7 +121,7 @@
+ /* Parameter IDs */
+ #define PID_VENDOR_ID					0x00
+ #define PID_REVISION_ID					0x02
+-#define PID_SUBORDINATE_NODE_COUNT		0x04
++#define PID_SUB_NODE_COUNT				0x04
+ #define PID_FUNCTION_GROUP_TYPE			0x05
+ #define PID_AUDIO_GROUP_CAP				0x08
+ #define PID_AUDIO_WIDGET_CAP			0x09
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp	2008-03-12 23:19:52 UTC (rev 24382)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp	2008-03-13 12:25:29 UTC (rev 24383)
+@@ -325,8 +325,10 @@
+ 
+ 
+ hda_stream*
+-hda_stream_new(hda_controller* controller, int type)
++hda_stream_new(hda_audio_group* audioGroup, int type)
+ {
++	hda_controller* controller = audioGroup-&gt;codec-&gt;controller;
++
+ 	hda_stream* stream = (hda_stream*)calloc(1, sizeof(hda_stream));
+ 	if (stream == NULL)
+ 		return NULL;
+@@ -339,7 +341,7 @@
+ 	switch (type) {
+ 		case STREAM_PLAYBACK:
+ 			stream-&gt;id = 1;
+-			stream-&gt;off = (controller-&gt;num_input_streams * HDAC_SDSIZE);
++			stream-&gt;off = controller-&gt;num_input_streams * HDAC_SDSIZE;
+ 			controller-&gt;streams[controller-&gt;num_input_streams] = stream;
+ 			break;
+ 
+@@ -356,7 +358,13 @@
+ 			break;
+ 	}
+ 
+-	return stream;
++	// find I/O and Pin widgets for this stream
++
++	if (hda_audio_group_get_widgets(audioGroup, stream) == B_OK)
++		return stream;
++
++	free(stream);
++	return NULL;
+ }
+ 
+ 
+@@ -543,11 +551,16 @@
+ 	REG32(audioGroup-&gt;codec-&gt;controller, DMA_POSITION_BASE_LOWER)
+ 		|= DMA_POSITION_ENABLED;
+ 
+-	verb[0] = MAKE_VERB(audioGroup-&gt;codec-&gt;addr, stream-&gt;io_widget,
+-		VID_SET_CONVERTER_FORMAT, format);
+-	verb[1] = MAKE_VERB(audioGroup-&gt;codec-&gt;addr, stream-&gt;io_widget,
+-		VID_SET_CONVERTER_STREAM_CHANNEL, stream-&gt;id &lt;&lt; 4);
+-	return hda_send_verbs(audioGroup-&gt;codec, verb, response, 2);
++	for (uint32 i = 0; i &lt; stream-&gt;num_io_widgets; i++) {
++		verb[0] = MAKE_VERB(audioGroup-&gt;codec-&gt;addr, stream-&gt;io_widgets[i],
++			VID_SET_CONVERTER_FORMAT, format);
++		verb[1] = MAKE_VERB(audioGroup-&gt;codec-&gt;addr, stream-&gt;io_widgets[i],
++			VID_SET_CONVERTER_STREAM_CHANNEL, stream-&gt;id &lt;&lt; 4);
++		hda_send_verbs(audioGroup-&gt;codec, verb, response, 2);
++	}
++
++	snooze(1000);
++	return B_OK;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp	2008-03-12 23:19:52 UTC (rev 24382)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp	2008-03-13 12:25:29 UTC (rev 24383)
+@@ -4,6 +4,7 @@
+  *
+  * Authors:
+  *		Ithamar Adema, ithamar AT unet DOT nl
++ *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
+  */
+ 
+ 
+@@ -67,10 +68,18 @@
+ 	strcpy(data-&gt;friendly_name, &quot;HD Audio&quot;);
+ 	strcpy(data-&gt;vendor_info, &quot;Haiku&quot;);
+ 
+-	data-&gt;output_channel_count = 2;
+-	data-&gt;input_channel_count = 2;
+-	data-&gt;output_bus_channel_count = 2;
+-	data-&gt;input_bus_channel_count = 2;
++	int32 inChannels = 0;
++	if (audioGroup-&gt;record_stream != NULL)
++		inChannels = 2;
++
++	int32 outChannels = 0;
++	if (audioGroup-&gt;playback_stream != NULL)
++		outChannels = 2;
++
++	data-&gt;output_channel_count = outChannels;
++	data-&gt;output_bus_channel_count = outChannels;
++	data-&gt;input_channel_count = inChannels;
++	data-&gt;input_bus_channel_count = inChannels;
+ 	data-&gt;aux_bus_channel_count = 0;
+ 
+ 	dprintf(&quot;%s: request_channel_count: %ld\n&quot;, __func__,
+@@ -81,7 +90,7 @@
+ 		memcpy(data-&gt;channels, &amp;sChannels, sizeof(sChannels));
+ 	}
+ 
+-	/* determine output/input rates */	
++	/* determine output/input rates */
+ 	data-&gt;output_rates = audioGroup-&gt;supported_rates;
+ 	data-&gt;input_rates = audioGroup-&gt;supported_rates;
+ 
+@@ -127,11 +136,21 @@
+ 	data-&gt;input_latency = 0;
+ 	data-&gt;timecode_kind = 0;
+ 
+-	data-&gt;output.format = audioGroup-&gt;playback_stream-&gt;sample_format;
+-	data-&gt;output.rate = audioGroup-&gt;playback_stream-&gt;sample_rate;
++	if (audioGroup-&gt;playback_stream != NULL) {
++		data-&gt;output.format = audioGroup-&gt;playback_stream-&gt;sample_format;
++		data-&gt;output.rate = audioGroup-&gt;playback_stream-&gt;sample_rate;
++	} else {
++		data-&gt;output.format = 0;
++		data-&gt;output.rate = 0;
++	}
+ 
+-	data-&gt;input.format = audioGroup-&gt;record_stream-&gt;sample_format;
+-	data-&gt;input.rate = audioGroup-&gt;record_stream-&gt;sample_format;
++	if (audioGroup-&gt;record_stream != NULL) {
++		data-&gt;input.format = audioGroup-&gt;record_stream-&gt;sample_format;
++		data-&gt;input.rate = audioGroup-&gt;record_stream-&gt;sample_format;
++	} else {
++		data-&gt;input.format = 0;
++		data-&gt;input.rate = 0;
++	}
+ 
+ 	return B_OK;
+ }
+@@ -147,15 +166,19 @@
+ 		return B_BAD_VALUE;
+ #endif
+ 
+-	audioGroup-&gt;playback_stream-&gt;sample_format = data-&gt;output.format;
+-	audioGroup-&gt;playback_stream-&gt;sample_rate = data-&gt;output.rate;
+-	audioGroup-&gt;playback_stream-&gt;sample_size = format2size(
+-		audioGroup-&gt;playback_stream-&gt;sample_format);
++	if (audioGroup-&gt;playback_stream != NULL) {
++		audioGroup-&gt;playback_stream-&gt;sample_format = data-&gt;output.format;
++		audioGroup-&gt;playback_stream-&gt;sample_rate = data-&gt;output.rate;
++		audioGroup-&gt;playback_stream-&gt;sample_size = format2size(
++			audioGroup-&gt;playback_stream-&gt;sample_format);
++	}
+ 
+-	audioGroup-&gt;record_stream-&gt;sample_rate = data-&gt;input.rate;
+-	audioGroup-&gt;record_stream-&gt;sample_format = data-&gt;input.format;
+-	audioGroup-&gt;record_stream-&gt;sample_size = format2size(
+-		audioGroup-&gt;record_stream-&gt;sample_format);
++	if (audioGroup-&gt;record_stream != NULL) {
++		audioGroup-&gt;record_stream-&gt;sample_rate = data-&gt;input.rate;
++		audioGroup-&gt;record_stream-&gt;sample_format = data-&gt;input.format;
++		audioGroup-&gt;record_stream-&gt;sample_size = format2size(
++			audioGroup-&gt;record_stream-&gt;sample_format);
++	}
+ 
+ 	return B_OK;
+ }
+@@ -227,56 +250,66 @@
+ 	data-&gt;flags = B_MULTI_BUFFER_PLAYBACK;
+ 
+ 	/* Copy the settings into the streams */
+-	audioGroup-&gt;playback_stream-&gt;num_buffers = data-&gt;return_playback_buffers;
+-	audioGroup-&gt;playback_stream-&gt;num_channels = data-&gt;return_playback_channels;
+-	audioGroup-&gt;playback_stream-&gt;buffer_length
+-		= data-&gt;return_playback_buffer_size;
+ 
+-	status_t status = hda_stream_setup_buffers(audioGroup,
+-		audioGroup-&gt;playback_stream, &quot;Playback&quot;);
+-	if (status != B_OK) {
+-		dprintf(&quot;hda: Error setting up playback buffers: %s\n&quot;,
+-			strerror(status));
+-		return status;
++	if (audioGroup-&gt;playback_stream != NULL) {
++		audioGroup-&gt;playback_stream-&gt;num_buffers = data-&gt;return_playback_buffers;
++		audioGroup-&gt;playback_stream-&gt;num_channels = data-&gt;return_playback_channels;
++		audioGroup-&gt;playback_stream-&gt;buffer_length
++			= data-&gt;return_playback_buffer_size;
++
++		status_t status = hda_stream_setup_buffers(audioGroup,
++			audioGroup-&gt;playback_stream, &quot;Playback&quot;);
++		if (status != B_OK) {
++			dprintf(&quot;hda: Error setting up playback buffers: %s\n&quot;,
++				strerror(status));
++			return status;
++		}
+ 	}
+ 
+-	audioGroup-&gt;record_stream-&gt;num_buffers = data-&gt;return_record_buffers;
+-	audioGroup-&gt;record_stream-&gt;num_channels = data-&gt;return_record_channels;
+-	audioGroup-&gt;record_stream-&gt;buffer_length
+-		= data-&gt;return_record_buffer_size;
++	if (audioGroup-&gt;record_stream != NULL) {
++		audioGroup-&gt;record_stream-&gt;num_buffers = data-&gt;return_record_buffers;
++		audioGroup-&gt;record_stream-&gt;num_channels = data-&gt;return_record_channels;
++		audioGroup-&gt;record_stream-&gt;buffer_length
++			= data-&gt;return_record_buffer_size;
+ 
+-	status = hda_stream_setup_buffers(audioGroup, audioGroup-&gt;record_stream,
+-		&quot;Recording&quot;);
+-	if (status != B_OK) {
+-		dprintf(&quot;hda: Error setting up recording buffers: %s\n&quot;,
+-			strerror(status));
+-		return status;
++		status_t status = hda_stream_setup_buffers(audioGroup,
++			audioGroup-&gt;record_stream, &quot;Recording&quot;);
++		if (status != B_OK) {
++			dprintf(&quot;hda: Error setting up recording buffers: %s\n&quot;,
++				strerror(status));
++			return status;
++		}
+ 	}
+ 
+ 	/* Setup data structure for multi_audio API... */
+ 
+-	uint32 playbackSampleSize = audioGroup-&gt;playback_stream-&gt;sample_size;
+-	uint32 recordSampleSize = audioGroup-&gt;record_stream-&gt;sample_size;
++	if (audioGroup-&gt;playback_stream != NULL) {
++		uint32 playbackSampleSize = audioGroup-&gt;playback_stream-&gt;sample_size;
+ 
+-	for (int32 i = 0; i &lt; data-&gt;return_playback_buffers; i++) {
+-		for (int32 channelIndex = 0;
+-				channelIndex &lt; data-&gt;return_playback_channels; channelIndex++) {
+-			data-&gt;playback_buffers[i][channelIndex].base
+-				= (char*)audioGroup-&gt;playback_stream-&gt;buffers[i]
+-					+ playbackSampleSize * channelIndex;
+-			data-&gt;playback_buffers[i][channelIndex].stride
+-				= playbackSampleSize * data-&gt;return_playback_channels;
++		for (int32 i = 0; i &lt; data-&gt;return_playback_buffers; i++) {
++			for (int32 channelIndex = 0;
++					channelIndex &lt; data-&gt;return_playback_channels; channelIndex++) {
++				data-&gt;playback_buffers[i][channelIndex].base
++					= (char*)audioGroup-&gt;playback_stream-&gt;buffers[i]
++						+ playbackSampleSize * channelIndex;
++				data-&gt;playback_buffers[i][channelIndex].stride
++					= playbackSampleSize * data-&gt;return_playback_channels;
++			}
+ 		}
+ 	}
+ 
+-	for (int32 i = 0; i &lt; data-&gt;return_record_buffers; i++) {
+-		for (int32 channelIndex = 0;
+-				channelIndex &lt; data-&gt;return_record_channels; channelIndex++) {
+-			data-&gt;record_buffers[i][channelIndex].base
+-				= (char*)audioGroup-&gt;record_stream-&gt;buffers[i]
+-					+ recordSampleSize * channelIndex;
+-			data-&gt;record_buffers[i][channelIndex].stride
+-				= recordSampleSize * data-&gt;return_record_channels;
++	if (audioGroup-&gt;record_stream != NULL) {
++		uint32 recordSampleSize = audioGroup-&gt;record_stream-&gt;sample_size;
++
++		for (int32 i = 0; i &lt; data-&gt;return_record_buffers; i++) {
++			for (int32 channelIndex = 0;
++					channelIndex &lt; data-&gt;return_record_channels; channelIndex++) {
++				data-&gt;record_buffers[i][channelIndex].base
++					= (char*)audioGroup-&gt;record_stream-&gt;buffers[i]
++						+ recordSampleSize * channelIndex;
++				data-&gt;record_buffers[i][channelIndex].stride
++					= recordSampleSize * data-&gt;return_record_channels;
++			}
+ 		}
+ 	}
+ 
+@@ -292,6 +325,10 @@
+ 	cpu_status status;
+ 	status_t rc;
+ 
++	// TODO: support recording!
++	if (audioGroup-&gt;playback_stream == NULL)
++		return B_ERROR;
++
+ 	if (!audioGroup-&gt;playback_stream-&gt;running) {
+ 		hda_stream_start(audioGroup-&gt;codec-&gt;controller,
+ 			audioGroup-&gt;playback_stream);
+@@ -328,7 +365,10 @@
+ static status_t
+ buffer_force_stop(hda_audio_group* audioGroup)
+ {
+-	hda_stream_stop(audioGroup-&gt;codec-&gt;controller, audioGroup-&gt;playback_stream);
++	if (audioGroup-&gt;playback_stream != NULL) {
++		hda_stream_stop(audioGroup-&gt;codec-&gt;controller,
++			audioGroup-&gt;playback_stream);
++	}
+ 	//hda_stream_stop(audioGroup-&gt;codec-&gt;controller, audioGroup-&gt;record_stream);
+ 
+ 	return B_OK;
+@@ -351,7 +391,34 @@
+ 
+ 	switch (op) {
+ 		case B_MULTI_GET_DESCRIPTION:
++		{
++#ifdef __HAIKU
++			multi_description description;
++			multi_channel_info channels[16];
++			multi_channel_info* originalChannels;
++
++			if (user_memcpy(&amp;description, arg, sizeof(multi_description))
++					!= B_OK)
++				return B_BAD_ADDRESS;
++
++			originalChannels = description.channels;
++			description.channels = channels;
++			if (description.request_channel_count &gt; 16)
++				description.request_channel_count = 16;
++
++			status_t status = get_description(audioGroup, &amp;description);
++			if (status != B_OK)
++				return status;
++
++			description.channels = originalChannels;
++			return user_memcpy(arg, &amp;description, sizeof(multi_description))
++				&amp;&amp; user_memcpy(originalChannels, channels,
++					sizeof(multi_channel_info)
++						* description.request_channel_count;
++#else
+ 			return get_description(audioGroup, (multi_description*)arg);
++#endif
++		}
+ 
+ 		case B_MULTI_GET_ENABLED_CHANNELS:
+ 			return get_enabled_channels(audioGroup, (multi_channel_enable*)arg);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006801.html">[Haiku-commits] r24382 - haiku/trunk/src/kits/media
+</A></li>
+	<LI>Next message: <A HREF="006805.html">[Haiku-commits] r24383 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6804">[ date ]</a>
+              <a href="thread.html#6804">[ thread ]</a>
+              <a href="subject.html#6804">[ subject ]</a>
+              <a href="author.html#6804">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

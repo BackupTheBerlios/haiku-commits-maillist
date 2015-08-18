@@ -1,0 +1,439 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20075 - haiku/trunk/src/kits/interface
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20075%20-%20haiku/trunk/src/kits/interface&In-Reply-To=%3C200702052040.l15KeF7x010314%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000702.html">
+   <LINK REL="Next"  HREF="000660.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20075 - haiku/trunk/src/kits/interface</H1>
+    <B>laplace at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20075%20-%20haiku/trunk/src/kits/interface&In-Reply-To=%3C200702052040.l15KeF7x010314%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20075 - haiku/trunk/src/kits/interface">laplace at mail.berlios.de
+       </A><BR>
+    <I>Mon Feb  5 21:40:15 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000702.html">[Haiku-commits] r20074 - haiku/trunk/src/kits/app
+</A></li>
+        <LI>Next message: <A HREF="000660.html">[Haiku-commits] r20076 - haiku/trunk/src/bin
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#659">[ date ]</a>
+              <a href="thread.html#659">[ thread ]</a>
+              <a href="subject.html#659">[ subject ]</a>
+              <a href="author.html#659">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: laplace
+Date: 2007-02-05 21:40:15 +0100 (Mon, 05 Feb 2007)
+New Revision: 20075
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20075&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20075&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/kits/interface/PrintJob.cpp
+Log:
+* Fixed bug #1009. Update window while in BPrintJob.ConfigPage() or
+ConfigPage().
+* Set mime type of spool file so print_server accepts the file.
+
+
+Modified: haiku/trunk/src/kits/interface/PrintJob.cpp
+===================================================================
+--- haiku/trunk/src/kits/interface/PrintJob.cpp	2007-02-05 16:04:46 UTC (rev 20074)
++++ haiku/trunk/src/kits/interface/PrintJob.cpp	2007-02-05 20:40:15 UTC (rev 20075)
+@@ -12,11 +12,14 @@
+ 
+ #include &lt;Alert.h&gt;
+ #include &lt;Application.h&gt;
++#include &lt;Button.h&gt;
+ #include &lt;Debug.h&gt;
+ #include &lt;Entry.h&gt;
+ #include &lt;File.h&gt;
+ #include &lt;FindDirectory.h&gt;
+ #include &lt;Messenger.h&gt;
++#include &lt;NodeInfo.h&gt;
++#include &lt;OS.h&gt;
+ #include &lt;Path.h&gt;
+ #include &lt;PrintJob.h&gt;
+ #include &lt;Roster.h&gt;
+@@ -28,6 +31,11 @@
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+ 
++static const int kSemTimeOut = 50000;
++
++static const char *kPrintServerNotRespondingText = &quot;Print Server is not responding.&quot;;
++static const char *kNoPagesToPrintText = &quot;No Pages to print!&quot;;
++
+ // Summery of spool file format:
+ // See articel &quot;How to Write a BeOS R5 Printer Driver&quot; for description
+ // of spool file format: <A HREF="http://haiku-os.org/node/82">http://haiku-os.org/node/82</A>
+@@ -48,12 +56,174 @@
+ };
+ 
+ 
+-static status_t GetPrinterServerMessenger(BMessenger&amp; messenger)
++static status_t 
++GetPrinterServerMessenger(BMessenger&amp; messenger)
+ {
+ 	messenger = BMessenger(PSRV_SIGNATURE_TYPE);
+ 	return messenger.IsValid() ? B_OK : B_ERROR;
+ }
+ 
++
++static void 
++ShowError(const char *message)
++{
++	BAlert* alert = new BAlert(&quot;Error&quot;, message, &quot;OK&quot;); 
++	alert-&gt;Go();
++}
++
++
++namespace BPrivate {
++	
++	class Configuration {
++		public:
++			Configuration(uint32 what, BMessage *input);
++			~Configuration();
++			
++			status_t SendRequest(thread_func function);
++	
++			BMessage* Request();		
++	
++			void SetResult(BMessage* result);		
++			BMessage* Result() const { return fResult; }		
++		
++		private:
++			void RejectUserInput();
++			void AllowUserInput();	
++			void DeleteSemaphore();
++		
++			uint32 fWhat;	
++			BMessage *fInput;
++			BMessage *fRequest;
++			BMessage *fResult;
++			sem_id fThreadCompleted;
++			BAlert *fHiddenApplicationModalWindow;
++	};
++	
++	
++	Configuration::Configuration(uint32 what, BMessage *input)
++		: fWhat(what), 
++		fInput(input),
++		fRequest(NULL),
++		fResult(NULL),
++		fThreadCompleted(-1),
++		fHiddenApplicationModalWindow(NULL)
++	{
++		RejectUserInput();
++	}
++	
++	
++	Configuration::~Configuration()
++	{
++		DeleteSemaphore();
++			// in case SendRequest could not start the thread
++		delete fRequest; fRequest = NULL;
++		AllowUserInput();
++	}
++	
++	
++	void 
++	Configuration::RejectUserInput()
++	{
++		BAlert* alert = new BAlert(&quot;bogus&quot;, &quot;app_modal_dialog&quot;, &quot;OK&quot;);
++		fHiddenApplicationModalWindow = alert;
++		alert-&gt;DefaultButton()-&gt;SetEnabled(false);
++		alert-&gt;SetDefaultButton(NULL);
++		alert-&gt;MoveTo(-65000, -65000);
++		alert-&gt;Go(NULL);
++	}
++	
++	
++	void 
++	Configuration::AllowUserInput()
++	{
++		fHiddenApplicationModalWindow-&gt;Lock();
++		fHiddenApplicationModalWindow-&gt;Quit();
++	}
++	
++	
++	void
++	Configuration::DeleteSemaphore()
++	{
++		if (fThreadCompleted &gt;= B_OK) {
++			sem_id id = fThreadCompleted;
++			fThreadCompleted = -1;
++			delete_sem(id);
++		}
++	}
++	
++	
++	status_t
++	Configuration::SendRequest(thread_func function)
++	{
++		fThreadCompleted = create_sem(0, &quot;Configuration&quot;);	
++		if (fThreadCompleted &lt; B_OK) {
++			return B_ERROR;
++		}
++		
++		thread_id id = spawn_thread(function, &quot;async_request&quot;, B_NORMAL_PRIORITY, this);
++		if (id &lt;= 0 || resume_thread(id) != B_OK) {
++			return B_ERROR;
++		}
++		
++		// Code copied from BAlert::Go()	
++		BWindow* window = dynamic_cast&lt;BWindow*&gt;(BLooper::LooperForThread(find_thread(NULL)));
++			// Get the originating window, if it exists
++		
++		// Heavily modified from TextEntryAlert code; the original didn't let the
++		// blocked window ever draw.
++		if (window != NULL) {
++			status_t err;
++			for (;;) {
++				do {
++					err = acquire_sem_etc(fThreadCompleted, 1, B_RELATIVE_TIMEOUT,
++										  kSemTimeOut);
++						// We've (probably) had our time slice taken away from us
++				} while (err == B_INTERRUPTED);
++	
++				if (err == B_BAD_SEM_ID) {
++					// Semaphore was finally nuked in SetResult(BMessage *)
++					break;
++				}
++				window-&gt;UpdateIfNeeded();
++			}
++		} else {
++			// No window to update, so just hang out until we're done.
++			while (acquire_sem(fThreadCompleted) == B_INTERRUPTED);
++		}
++		
++		status_t status;
++		wait_for_thread(id, &amp;status);
++	
++		return Result() != NULL ? B_OK : B_ERROR;
++	}
++	
++	
++	BMessage *
++	Configuration::Request()
++	{
++		if (fRequest != NULL)
++			return fRequest;
++		
++		if (fInput != NULL) {
++			fRequest = new BMessage(*fInput);
++			fRequest-&gt;what = fWhat;
++		} else
++			fRequest = new BMessage(fWhat);
++		return fRequest;
++	}
++	
++	
++	void
++	Configuration::SetResult(BMessage *result)
++	{
++		fResult = result;
++		DeleteSemaphore();
++			// terminate loop in thread spawned by SendRequest
++	}
++
++} // BPrivate
++
++
+ BPrintJob::BPrintJob(const char *job_name)
+ 	:
+ 	fPrintJobName(NULL),
+@@ -96,82 +266,90 @@
+ 	fCurrentPageHeader = NULL;
+ }
+ 
+-
+-status_t
+-BPrintJob::ConfigPage()
+-{	
++static
++status_t ConfigPageThread(void *data)
++{
++	BPrivate::Configuration* configuration = static_cast&lt;BPrivate::Configuration*&gt;(data);
++	
+ 	BMessenger printServer;
+ 	if (GetPrinterServerMessenger(printServer) != B_OK) {
+-		BAlert* alert = new BAlert(&quot;Error&quot;, &quot;Print Server is not responding.&quot;, &quot;OK&quot;); 
+-		alert-&gt;Go();
++		ShowError(kPrintServerNotRespondingText);
++		configuration-&gt;SetResult(NULL);
+ 		return B_ERROR;
+ 	}
+-	
+-	if (fSetupMessage == NULL) {
+-		LoadDefaultSettings();
+-		if (fDefaultSetupMessage == NULL) {
+-			return B_ERROR;
+-		}
+-		
+-		fSetupMessage = new BMessage(*fDefaultSetupMessage);
+-	}
+ 
+-	BMessage request(*fSetupMessage);
+-	request.what = PSRV_SHOW_PAGE_SETUP;
+-	
+-	BMessage* reply = new BMessage();
+-	if (printServer.SendMessage(&amp;request, reply) != B_OK) {
+-		delete reply;
++	BMessage *request = configuration-&gt;Request();
++	if (request == NULL) {
++		configuration-&gt;SetResult(NULL);
+ 		return B_ERROR;
+ 	}
+ 
+-	if (reply-&gt;what != 'okok') {
+-		delete reply;
++	
++	BMessage reply;
++	if (printServer.SendMessage(request, &amp;reply) != B_OK
++		|| reply.what != 'okok') {
++		configuration-&gt;SetResult(NULL);
+ 		return B_ERROR;
+ 	}
++	
++	configuration-&gt;SetResult(new BMessage(reply));
++	return B_OK;
++}
+ 
++
++status_t
++BPrintJob::ConfigPage()
++{	
++	BPrivate::Configuration configuration(PSRV_SHOW_PAGE_SETUP, fSetupMessage);
++	status_t status = configuration.SendRequest(ConfigPageThread);
++	if (status != B_OK)
++		return status;
+ 	delete fSetupMessage;
+-	fSetupMessage = reply;
++	fSetupMessage = configuration.Result();
+ 	HandlePageSetup(fSetupMessage);
+ 	return B_OK;
+ }
+ 
+ 
+-status_t
+-BPrintJob::ConfigJob()
++static status_t
++ConfigJobThread(void *data)
+ {
++	BPrivate::Configuration* configuration = static_cast&lt;BPrivate::Configuration*&gt;(data);
++	
+ 	BMessenger printServer;
+ 	if (GetPrinterServerMessenger(printServer) != B_OK) {
+-		BAlert* alert = new BAlert(&quot;Error&quot;, &quot;Print Server is not responding.&quot;, &quot;OK&quot;); 
+-		alert-&gt;Go();
++		ShowError(kPrintServerNotRespondingText);
++		configuration-&gt;SetResult(NULL);
+ 		return B_ERROR;
+ 	}
+-	
+-	if (fSetupMessage == NULL) {
+-		LoadDefaultSettings();
+-		if (fDefaultSetupMessage == NULL) {
+-			return B_ERROR;
+-		}
+-		
+-		fSetupMessage = new BMessage(*fDefaultSetupMessage);
+-	}
+ 
+-	BMessage request(*fSetupMessage);
+-	request.what = PSRV_SHOW_PRINT_SETUP;
+-	
+-	BMessage* reply = new BMessage();
+-	if (printServer.SendMessage(&amp;request, reply) != B_OK) {
+-		delete reply;
++	BMessage *request = configuration-&gt;Request();
++	if (request == NULL) {
++		configuration-&gt;SetResult(NULL);
+ 		return B_ERROR;
+ 	}
+ 
+-	if (reply-&gt;what != 'okok') {
+-		delete reply;
++	
++	BMessage reply;
++	if (printServer.SendMessage(request, &amp;reply) != B_OK
++		|| reply.what != 'okok') {
++		configuration-&gt;SetResult(NULL);
+ 		return B_ERROR;
+ 	}
++	
++	configuration-&gt;SetResult(new BMessage(reply));
++	return B_OK;
++}
+ 
++status_t
++BPrintJob::ConfigJob()
++{
++	BPrivate::Configuration configuration(PSRV_SHOW_PRINT_SETUP, fSetupMessage);
++	status_t status = configuration.SendRequest(ConfigJobThread);
++	if (status != B_OK)
++		return status;
+ 	delete fSetupMessage;
+-	fSetupMessage = reply;
++	fSetupMessage = configuration.Result();	
+ 	HandlePrintSetup(fSetupMessage);
+ 	return B_OK;
+ }
+@@ -260,8 +438,7 @@
+ 	}
+ 	
+ 	if (fPageNumber &lt;= 0) {
+-		BAlert *alert = new BAlert(&quot;Alert&quot;, &quot;No Pages to print!&quot;, &quot;Okay&quot;);
+-		alert-&gt;Go();
++		ShowError(kNoPagesToPrintText);
+ 		CancelJob();
+ 		return;
+ 	}
+@@ -279,6 +456,9 @@
+ 	const char* printerName = &quot;&quot;;
+ 	fSetupMessage-&gt;FindString(PSRV_FIELD_CURRENT_PRINTER, &amp;printerName);
+     
++	BNodeInfo info(fSpoolFile);
++	info.SetType(PSRV_SPOOL_FILETYPE);
++
+ 	fSpoolFile-&gt;WriteAttr(PSRV_SPOOL_ATTR_PAGECOUNT, B_INT32_TYPE, 0, &amp;fPageNumber, sizeof(int32));    
+ 	fSpoolFile-&gt;WriteAttr(PSRV_SPOOL_ATTR_DESCRIPTION, B_STRING_TYPE, 0, fPrintJobName, strlen(fPrintJobName) + 1); 
+ 	fSpoolFile-&gt;WriteAttr(PSRV_SPOOL_ATTR_PRINTER, B_STRING_TYPE, 0, printerName, strlen(printerName) + 1);    
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000702.html">[Haiku-commits] r20074 - haiku/trunk/src/kits/app
+</A></li>
+	<LI>Next message: <A HREF="000660.html">[Haiku-commits] r20076 - haiku/trunk/src/bin
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#659">[ date ]</a>
+              <a href="thread.html#659">[ thread ]</a>
+              <a href="subject.html#659">[ subject ]</a>
+              <a href="author.html#659">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

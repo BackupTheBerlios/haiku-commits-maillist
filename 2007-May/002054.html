@@ -1,0 +1,313 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20988 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20988%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd&In-Reply-To=%3C200705030108.l4318b0Y000883%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002053.html">
+   <LINK REL="Next"  HREF="002055.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20988 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd</H1>
+    <B>mmu_man at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20988%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd&In-Reply-To=%3C200705030108.l4318b0Y000883%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20988 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd">mmu_man at mail.berlios.de
+       </A><BR>
+    <I>Thu May  3 03:08:37 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002053.html">[Haiku-commits] r20987 - haiku/trunk/src/libs/compat/freebsd_network
+</A></li>
+        <LI>Next message: <A HREF="002055.html">[Haiku-commits] r20989 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat/sys
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2054">[ date ]</a>
+              <a href="thread.html#2054">[ thread ]</a>
+              <a href="subject.html#2054">[ subject ]</a>
+              <a href="author.html#2054">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmu_man
+Date: 2007-05-03 03:08:36 +0200 (Thu, 03 May 2007)
+New Revision: 20988
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20988&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20988&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c
+Log:
+Locking for Haiku &amp; R5. Init stuff (driver_settings, not finished). open/free().
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c	2007-05-03 00:46:07 UTC (rev 20987)
++++ haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c	2007-05-03 01:08:36 UTC (rev 20988)
+@@ -4,18 +4,37 @@
+  */
+ 
+ /*
+-	nbd driver for Haiku
++ * nbd driver for Haiku
++ *
++ * Maps a Network Block Device as virtual partitions.
++ */
+ 
+-	Maps a Network Block Device as virtual partitions.
+-*/
+-
+ #include &lt;KernelExport.h&gt;
+ #include &lt;Drivers.h&gt;
+ #include &lt;Errors.h&gt;
++#include &lt;driver_settings.h&gt;
+ #include &lt;ksocket.h&gt;
++#include &lt;netinet/in.h&gt;
+ 
++#ifdef __HAIKU__
++#include &lt;kernel/lock.h&gt;
++#else
++/* wrappers */
++#ifndef _IMPEXP_KERNEL
++#define _IMPEXP_KERNEL
++#endif
++#include &quot;lock.h&quot;
++#define benaphore lock
++#define benaphore_init new_lock
++#define benaphore_destroy free_lock
++#define benaphore_lock LOCK
++#define benaphore_unlock UNLOCK
++#endif
++
+ #include &quot;nbd.h&quot;
+ 
++#define DRV &quot;nbd&quot;
++#define D &quot;nbd:&quot;
+ #define MAX_NBDS 4
+ #define DEVICE_PREFIX &quot;disk/virtual/nbd/&quot;
+ #define DEVICE_FMT DEVICE_PREFIX &quot;%2d/raw&quot;
+@@ -31,7 +50,9 @@
+ };
+ 
+ struct nbd_device {
+-	//lock
++	char target[64]; // &quot;ip:port&quot;
++	struct sockaddr_in server;
++	benaphore ben;
+ 	vint32 refcnt;
+ 	uint64 req; /* next ID for requests */
+ 	int sock;
+@@ -53,6 +74,8 @@
+ 
+ struct nbd_device *nbd_find_device(const char* name);
+ 
++KSOCKET_MODULE_DECL;
++
+ #pragma mark ==== request manager ====
+ 
+ 
+@@ -68,36 +91,86 @@
+ 	return 0;
+ }
+ 
++status_t nbd_connect(struct nbd_device *dev)
++{
++	
++	return B_OK;
++}
++
++status_t nbd_teardown(struct nbd_device *dev)
++{
++	close(dev-&gt;sock);
++	return B_OK;
++}
++
+ #pragma mark ==== device hooks ====
+ 
+ static struct nbd_device nbd_devices[MAX_NBDS];
+ 
+ status_t nbd_open(const char *name, uint32 flags, cookie_t **cookie) {
++	status_t err;
+ 	struct nbd_device *dev = NULL;
+ 	(void)name; (void)flags;
+ 	dev = nbd_find_device(name);
+ 	if (!dev)
+ 		return ENOENT;
++	err = ENOMEM;
+ 	*cookie = (void*)malloc(sizeof(cookie_t));
+-	if (*cookie == NULL) {
+-		dprintf(&quot;nbd_open : error allocating cookie\n&quot;);
++	if (*cookie == NULL)
+ 		goto err0;
+-	}
+ 	memset(*cookie, 0, sizeof(cookie_t));
+ 	(*cookie)-&gt;dev = dev;
++	err = benaphore_lock(&amp;dev-&gt;ben);
++	if (err)
++		goto err1;
++	/*  */
++	if (dev-&gt;sock &lt; 0)
++		err = nbd_connect(dev);
++	if (err)
++		goto err2;
++	dev-&gt;refcnt++;
++	benaphore_unlock(&amp;dev-&gt;ben);
+ 	return B_OK;
++	
++err2:
++	benaphore_unlock(&amp;dev-&gt;ben);
++err1:
++	free(*cookie);
+ err0:
+-	return B_ERROR;
++	dprintf(&quot;nbd_open : error 0x%08lx\n&quot;, err);
++	return err;
+ }
+ 
+-status_t nbd_close(void *cookie) {
+-	(void)cookie;
++status_t nbd_close(cookie_t *cookie) {
++	struct nbd_device *dev = cookie-&gt;dev;
++	status_t err;
++	
++	err = benaphore_lock(&amp;dev-&gt;ben);
++	if (err)
++		return err;
++	
++	// XXX: do something ?
++	
++	benaphore_unlock(&amp;dev-&gt;ben);
+ 	return B_OK;
+ }
+ 
+ status_t nbd_free(cookie_t *cookie) {
++	struct nbd_device *dev = cookie-&gt;dev;
++	status_t err;
++	
++	err = benaphore_lock(&amp;dev-&gt;ben);
++	if (err)
++		return err;
++	
++	if (--dev-&gt;refcnt == 0) {
++		err = nbd_teardown(dev);
++	}
++	
++	benaphore_unlock(&amp;dev-&gt;ben);
++	
+ 	free(cookie);
+-	return B_OK;
++	return err;
+ }
+ 
+ status_t nbd_control(cookie_t *cookie, uint32 op, void *data, size_t len) {
+@@ -193,9 +266,26 @@
+ status_t
+ init_driver (void)
+ {
+-	int i;
+-	// load settings
++	status_t err;
++	int i, j;
++	// XXX: load settings
++	void *handle;
++
++	err = ksocket_init();
++	if (err &lt; B_OK)
++		return err;
++	
+ 	for (i = 0; i &lt; MAX_NBDS; i++) {
++		memset(nbd_devices[i].target, 0, 64);
++		err = benaphore_init(&amp;nbd_devices[i].ben, &quot;nbd lock&quot;);
++		if (err &lt; B_OK)
++			return err; // XXX
++		nbd_devices[i].refcnt = 0;
++		nbd_devices[i].req = 0LL; /* next ID for requests */
++		nbd_devices[i].sock = -1;
++		nbd_devices[i].postoffice = -1;
++		nbd_devices[i].size = 0LL;
++		nbd_devices[i].reqs = NULL;
+ 		nbd_name[i] = malloc(DEVICE_NAME_MAX);
+ 		if (nbd_name[i] == NULL)
+ 			break;
+@@ -203,16 +293,50 @@
+ 		// XXX: init nbd_devices[i]
+ 	}
+ 	nbd_name[i] = NULL;
++	
++	handle = load_driver_settings(DRV);
++	if (handle) {
++		for (i = 0; i &lt; MAX_NBDS; i++) {
++			char keyname[10];
++			char *v;
++			sprintf(keyname, &quot;nbd%d&quot;, i);
++			v = get_driver_parameter(handle, keyname, NULL, NULL);
++			/* should be &quot;ip:port&quot; */
++			// XXX: test
++			if (v || 0) {
++				//strncpy(nbd_devices[i].target, v, 64);
++				//XXX:TEST
++				//strncpy(nbd_devices[i].target, &quot;127.0.0.1:1337&quot;, 64);
++				//XXX:parse it
++				nbd_devices[i].server.sin_len = sizeof(struct sockaddr_in);
++				nbd_devices[i].server.sin_family = AF_INET;
++				nbd_devices[i].server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++				nbd_devices[i].server.sin_port = htons(1337 + i);
++			}
++		}
++		/*should parse as a tree:
++		  settings = get_driver_settings(handle);
++		  for (i = 0; i &lt; settings-&gt;parameter_count; i++) {
++		    
++		  }
++		*/
++		
++		unload_driver_settings(handle);
++	}
++
+ 	return B_OK;
+ }
+ 
+ void
+ uninit_driver (void)
+ {
++	status_t err;
+ 	int i;
+ 	for (i = 0; i &lt; MAX_NBDS; i++) {
+ 		free(nbd_name[i]);
++		err = benaphore_destroy(&amp;nbd_devices[i].ben);
+ 	}
++	err = ksocket_cleanup();
+ }
+ 
+ const char**
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002053.html">[Haiku-commits] r20987 - haiku/trunk/src/libs/compat/freebsd_network
+</A></li>
+	<LI>Next message: <A HREF="002055.html">[Haiku-commits] r20989 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat/sys
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2054">[ date ]</a>
+              <a href="thread.html#2054">[ thread ]</a>
+              <a href="subject.html#2054">[ subject ]</a>
+              <a href="author.html#2054">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,255 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25095 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25095%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200804221457.m3MEvoEP012822%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008039.html">
+   <LINK REL="Next"  HREF="008041.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25095 - haiku/trunk/src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25095%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200804221457.m3MEvoEP012822%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25095 - haiku/trunk/src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Apr 22 16:57:50 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008039.html">[Haiku-commits] r25094 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="008041.html">[Haiku-commits] r25096 - in haiku/trunk: build/config_headers	src/kits/support
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8040">[ date ]</a>
+              <a href="thread.html#8040">[ thread ]</a>
+              <a href="subject.html#8040">[ subject ]</a>
+              <a href="author.html#8040">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-04-22 16:57:50 +0200 (Tue, 22 Apr 2008)
+New Revision: 25095
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25095&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25095&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/syscalls.cpp
+Log:
+Added &quot;straced&quot; debugger command which basically works like &quot;traced&quot;,
+but also prints post syscall entries not matching the filter, if the
+respective pre syscall entry matched. This way one also sees the syscall
+return values. Works only in forward direction ATM.
+
+
+Modified: haiku/trunk/src/system/kernel/syscalls.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/syscalls.cpp	2008-04-22 14:52:48 UTC (rev 25094)
++++ haiku/trunk/src/system/kernel/syscalls.cpp	2008-04-22 14:57:50 UTC (rev 25095)
+@@ -58,6 +58,9 @@
+ static struct list sGenericSyscalls;
+ 
+ 
++static int dump_syscall_tracing(int argc, char** argv);
++
++
+ static generic_syscall *
+ find_generic_syscall(const char *subsystem)
+ {
+@@ -206,7 +209,23 @@
+ generic_syscall_init(void)
+ {
+ 	list_init(&amp;sGenericSyscalls);
+-	return mutex_init(&amp;sGenericSyscallLock, &quot;generic syscall&quot;);
++	if (mutex_init(&amp;sGenericSyscallLock, &quot;generic syscall&quot;) != B_OK) {
++		panic(&quot;generic_syscall_init(): mutex init failed&quot;);
++		return B_ERROR;
++	}
++
++#if	ENABLE_TRACING &amp;&amp; defined(SYSCALL_TRACING)
++	add_debugger_command_etc(&quot;straced&quot;, &amp;dump_syscall_tracing,
++		&quot;Dump recorded syscall trace entries&quot;,
++		&quot;Prints recorded trace entries. It is wrapper for the \&quot;traced\&quot;\n&quot;
++		&quot;command and supports all of its command line options (though\n&quot;
++		&quot;backward tracing doesn't really work). The difference is that if a\n&quot;
++		&quot;pre syscall trace entry is encountered, the corresponding post\n&quot;
++		&quot;syscall traced entry is also printed, even if it doesn't match the\n&quot;
++		&quot;given filter.\n&quot;, 0);
++#endif	// ENABLE_TRACING
++
++	return B_OK;
+ }
+ 
+ 
+@@ -463,6 +482,139 @@
+ }
+ 
+ 
++using namespace SyscallTracing;
++
++class SyscallWrapperTraceFilter : public WrapperTraceFilter {
++public:
++	virtual void Init(TraceFilter* filter, int direction, bool continued)
++	{
++		fFilter = filter;
++		fHitThreadLimit = false;
++		fDirection = direction;
++
++		if (!continued)
++			fPendingThreadCount = 0;
++	}
++
++	virtual bool Filter(const TraceEntry* _entry, LazyTraceOutput&amp; out)
++	{
++		if (fFilter == NULL)
++			return true;
++
++		if (fDirection &lt; 0)
++			return fFilter-&gt;Filter(_entry, out);
++
++		if (const PreSyscall* entry = dynamic_cast&lt;const PreSyscall*&gt;(_entry)) {
++			_RemovePendingThread(entry-&gt;Thread());
++
++			bool accepted = fFilter-&gt;Filter(entry, out);
++			if (accepted)
++				_AddPendingThread(entry-&gt;Thread());
++			return accepted;
++
++		} else if (const PostSyscall* entry
++				= dynamic_cast&lt;const PostSyscall*&gt;(_entry)) {
++			bool wasPending = _RemovePendingThread(entry-&gt;Thread());
++
++			return wasPending || fFilter-&gt;Filter(entry, out);
++
++		} else if (const AbstractTraceEntry* entry
++				= dynamic_cast&lt;const AbstractTraceEntry*&gt;(_entry)) {
++			bool isPending = _IsPendingThread(entry-&gt;Thread());
++
++			return isPending || fFilter-&gt;Filter(entry, out);
++
++		} else {
++			return fFilter-&gt;Filter(_entry, out);
++		}
++	}
++
++	bool HitThreadLimit() const
++	{
++		return fHitThreadLimit;
++	}
++
++	int Direction() const
++	{
++		return fDirection;
++	}
++
++private:
++	enum {
++		MAX_PENDING_THREADS = 32
++	};
++
++	bool _AddPendingThread(thread_id thread)
++	{
++		int32 index = _PendingThreadIndex(thread);
++		if (index &gt;= 0)
++			return true;
++
++		if (fPendingThreadCount == MAX_PENDING_THREADS) {
++			fHitThreadLimit = true;
++			return false;
++		}
++
++		fPendingThreads[fPendingThreadCount++] = thread;
++		return true;
++	}
++
++	bool _RemovePendingThread(thread_id thread)
++	{
++		int32 index = _PendingThreadIndex(thread);
++		if (index &lt; 0)
++			return false;
++
++		if (index + 1 &lt; fPendingThreadCount) {
++			memmove(fPendingThreads + index, fPendingThreads + index + 1,
++				fPendingThreadCount - index - 1);
++		}
++
++		fPendingThreadCount--;
++		return true;
++	}
++
++	bool _IsPendingThread(thread_id thread)
++	{
++		return _PendingThreadIndex(thread) &gt;= 0;
++	}
++
++	int32 _PendingThreadIndex(thread_id thread)
++	{
++		for (int32 i = 0; i &lt; fPendingThreadCount; i++) {
++			if (fPendingThreads[i] == thread)
++				return i;
++		}
++		return -1;
++	}
++
++	TraceFilter*	fFilter;
++	thread_id		fPendingThreads[MAX_PENDING_THREADS];
++	int32			fPendingThreadCount;
++	int				fDirection;
++	bool			fHitThreadLimit;
++};
++
++
++static SyscallWrapperTraceFilter sFilter;
++
++static int
++dump_syscall_tracing(int argc, char** argv)
++{
++	new(&amp;sFilter) SyscallWrapperTraceFilter;
++	int result = dump_tracing(argc, argv, &amp;sFilter);
++
++	if (sFilter.HitThreadLimit()) {
++		kprintf(&quot;Warning: The thread buffer was too small to track all &quot;
++			&quot;threads!\n&quot;);
++	} else if (sFilter.HitThreadLimit()) {
++		kprintf(&quot;Warning: Can't track syscalls backwards!\n&quot;);
++	}
++
++	return result;
++}
++
++
+ #endif	// SYSCALL_TRACING
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008039.html">[Haiku-commits] r25094 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="008041.html">[Haiku-commits] r25096 - in haiku/trunk: build/config_headers	src/kits/support
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8040">[ date ]</a>
+              <a href="thread.html#8040">[ thread ]</a>
+              <a href="subject.html#8040">[ subject ]</a>
+              <a href="author.html#8040">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

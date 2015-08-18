@@ -1,0 +1,239 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21655 - in haiku/trunk/src/system/kernel:	disk_device_manager disk_device_manager/jobs fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21655%20-%20in%20haiku/trunk/src/system/kernel%3A%0A%09disk_device_manager%20disk_device_manager/jobs%20fs&In-Reply-To=%3C200707191332.l6JDWXSc014955%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003102.html">
+   <LINK REL="Next"  HREF="003104.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21655 - in haiku/trunk/src/system/kernel:	disk_device_manager disk_device_manager/jobs fs</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21655%20-%20in%20haiku/trunk/src/system/kernel%3A%0A%09disk_device_manager%20disk_device_manager/jobs%20fs&In-Reply-To=%3C200707191332.l6JDWXSc014955%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21655 - in haiku/trunk/src/system/kernel:	disk_device_manager disk_device_manager/jobs fs">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Jul 19 15:32:33 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003102.html">[Haiku-commits] r21654 - haiku/trunk/src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="003104.html">[Haiku-commits] r21656 -	haiku/trunk/headers/private/kernel/disk_device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3103">[ date ]</a>
+              <a href="thread.html#3103">[ thread ]</a>
+              <a href="subject.html#3103">[ subject ]</a>
+              <a href="author.html#3103">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-07-19 15:32:33 +0200 (Thu, 19 Jul 2007)
+New Revision: 21655
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21655&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21655&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp
+   haiku/trunk/src/system/kernel/disk_device_manager/jobs/KScanPartitionJob.cpp
+   haiku/trunk/src/system/kernel/fs/vfs_boot.cpp
+Log:
+axeld+bonefish:
+* Refactored RescanDiskSystems(). Pulled out a function
+  _RescanDiskSystems() that scans for either file or partitioning
+  systems. RescanDiskSystems(), which scanned for file systems only
+  before, is used from the constructor as well (open_module_list()
+  works in the early boot process since a while).
+* Made InitialDeviceScan() and partition scanning safe to be called a second
+  time. We call it directly after the kernel has mounted the boot
+  volume, now, so that additional disk systems from the boot volume have a
+  chance to recognize previously unrecognized partitions. This is a
+  temporary change only; later the disk device manager shall
+  automatically find out when new disk systems/devices/whatever are
+  available.
+
+
+Modified: haiku/trunk/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp	2007-07-19 13:16:08 UTC (rev 21654)
++++ haiku/trunk/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp	2007-07-19 13:32:33 UTC (rev 21655)
+@@ -131,35 +131,8 @@
+ 	if (InitCheck() != B_OK)
+ 		return;
+ 
+-	// We are in early boot mode, so open_module_list() won't find what
+-	// we're looking for; we need to use get_next_loaded_module_name()
+-	// instead.
++	RescanDiskSystems();
+ 
+-	uint32 cookie = 0;
+-	size_t partitioningPrefixLength = strlen(kPartitioningSystemPrefix);
+-	size_t filePrefixLength = strlen(kFileSystemPrefix);
+-
+-	while (true) {
+-		KPath name;
+-		if (name.InitCheck() != B_OK)
+-			break;
+-		size_t nameLength = name.BufferSize();
+-		if (get_next_loaded_module_name(&amp;cookie, name.LockBuffer(),
+-			&amp;nameLength) != B_OK) {
+-			break;
+-		}
+-		name.UnlockBuffer();
+-
+-		if (!strncmp(name.Path(), kPartitioningSystemPrefix,
+-				partitioningPrefixLength)) {
+-			DBG(OUT(&quot;partitioning system: %s\n&quot;, name.Path()));
+-			_AddPartitioningSystem(name.Path());
+-		} else if (!strncmp(name.Path(), kFileSystemPrefix, filePrefixLength)) {
+-			DBG(OUT(&quot;file system: %s\n&quot;, name.Path()));
+-			_AddFileSystem(name.Path());
+-		}
+-	}
+-
+ 	DBG(OUT(&quot;number of disk systems: %ld\n&quot;, CountDiskSystems()));
+ 	// TODO: Watch the disk systems and the relevant directories.
+ }
+@@ -929,31 +902,53 @@
+ 	return error;
+ }
+ 
+-//RescanDiskSystems
++// _RescanDiskSystems
+ status_t
+-KDiskDeviceManager::RescanDiskSystems()
++KDiskDeviceManager::_RescanDiskSystems(bool fileSystems)
+ {
+-	// load file systems list
+-	void *cookie = open_module_list(kFileSystemPrefix);
+-	
++	void *cookie = open_module_list(fileSystems
++		? kFileSystemPrefix : kPartitioningSystemPrefix);
++	if (cookie == NULL)
++		return B_NO_MEMORY;
++
+ 	while (true) {
+-		char name[B_FILE_NAME_LENGTH];
+-		size_t nameLength = sizeof(name);
+-		module_info *module;
+-
+-		if (read_next_module_name(cookie, name, &amp;nameLength) != B_OK)
++		KPath name;
++		if (name.InitCheck() != B_OK)
+ 			break;
+-		if (FindDiskSystem(name))
++		size_t nameLength = name.BufferSize();
++		if (read_next_module_name(cookie, name.LockBuffer(),
++				&amp;nameLength) != B_OK) {
++			break;
++		}
++		name.UnlockBuffer();
++	
++		if (FindDiskSystem(name.Path()))
+ 			continue;
+-		_AddFileSystem(name);
+-        }
+-        close_module_list(cookie);
+ 
+-	// TODO rescan partition tree for unrecognized partitions
++		if (fileSystems) {
++			DBG(OUT(&quot;file system: %s\n&quot;, name.Path()));
++			_AddFileSystem(name.Path());
++		} else {
++			DBG(OUT(&quot;partitioning system: %s\n&quot;, name.Path()));
++			_AddPartitioningSystem(name.Path());
++		}
++	}
+ 
++	close_module_list(cookie);
+ 	return B_OK;
+ }
+ 
++// RescanDiskSystems
++status_t
++KDiskDeviceManager::RescanDiskSystems()
++{
++	// rescan for partitioning and file systems
++	_RescanDiskSystems(false);
++	_RescanDiskSystems(true);
++
++	return B_OK;
++}
++
+ // _AddPartitioningSystem
+ status_t
+ KDiskDeviceManager::_AddPartitioningSystem(const char *name)
+@@ -1161,6 +1156,11 @@
+ 		int32 leafLen = strlen(&quot;/raw&quot;);
+ 		if (len &lt;= leafLen || strcmp(path + len - leafLen, &quot;/raw&quot;))
+ 			return B_ERROR;
++		if (FindDevice(path) != NULL) {
++			// we already know this device
++			return B_OK;
++		}
++
+ DBG(OUT(&quot;  found device: %s\n&quot;, path));
+ 		// create a KDiskDevice for it
+ 		KDiskDevice *device = new(nothrow) KDiskDevice;
+
+Modified: haiku/trunk/src/system/kernel/disk_device_manager/jobs/KScanPartitionJob.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/disk_device_manager/jobs/KScanPartitionJob.cpp	2007-07-19 13:16:08 UTC (rev 21654)
++++ haiku/trunk/src/system/kernel/disk_device_manager/jobs/KScanPartitionJob.cpp	2007-07-19 13:32:33 UTC (rev 21655)
+@@ -63,6 +63,10 @@
+ 	// the partition's device must be write-locked
+ 	if (!partition)
+ 		return B_BAD_VALUE;
++	if (partition-&gt;DiskSystem() != NULL) {
++		// TODO: this is more or less a hack to prevent rescanning a partition
++		return B_OK;
++	}
+ 
+ 	DBG(
+ 		KPath partitionPath;
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs_boot.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs_boot.cpp	2007-07-19 13:16:08 UTC (rev 21654)
++++ haiku/trunk/src/system/kernel/fs/vfs_boot.cpp	2007-07-19 13:32:33 UTC (rev 21655)
+@@ -508,5 +508,8 @@
+ 	// search for other disk systems
+ 	KDiskDeviceManager *manager = KDiskDeviceManager::Default();
+ 	manager-&gt;RescanDiskSystems();
++	manager-&gt;InitialDeviceScan();
++		// TODO: later, the DDM should notice when there are new
++		// partitions/devices available
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003102.html">[Haiku-commits] r21654 - haiku/trunk/src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="003104.html">[Haiku-commits] r21656 -	haiku/trunk/headers/private/kernel/disk_device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3103">[ date ]</a>
+              <a href="thread.html#3103">[ thread ]</a>
+              <a href="subject.html#3103">[ subject ]</a>
+              <a href="author.html#3103">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

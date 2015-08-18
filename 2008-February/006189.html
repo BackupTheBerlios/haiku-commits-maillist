@@ -1,0 +1,1089 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24036 - in haiku/trunk/src/system/kernel:	device_manager fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24036%20-%20in%20haiku/trunk/src/system/kernel%3A%0A%09device_manager%20fs&In-Reply-To=%3C200802201655.m1KGt6eL030499%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006188.html">
+   <LINK REL="Next"  HREF="006190.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24036 - in haiku/trunk/src/system/kernel:	device_manager fs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24036%20-%20in%20haiku/trunk/src/system/kernel%3A%0A%09device_manager%20fs&In-Reply-To=%3C200802201655.m1KGt6eL030499%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24036 - in haiku/trunk/src/system/kernel:	device_manager fs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Feb 20 17:55:06 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006188.html">[Haiku-commits] r24035 - in haiku/trunk: headers/private/kernel/fs	src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="006190.html">[Haiku-commits] r24037 -	haiku/trunk/src/add-ons/kernel/drivers/bluetooth/h2/h2generic
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6189">[ date ]</a>
+              <a href="thread.html#6189">[ thread ]</a>
+              <a href="subject.html#6189">[ subject ]</a>
+              <a href="author.html#6189">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-02-20 17:55:05 +0100 (Wed, 20 Feb 2008)
+New Revision: 24036
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24036&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24036&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/device_manager/Jamfile
+   haiku/trunk/src/system/kernel/device_manager/probe.cpp
+   haiku/trunk/src/system/kernel/fs/devfs.cpp
+Log:
+* Started implementing node monitoring in the devfs and device manager.
+* Right now, only already known loaded drivers will be monitored for changes;
+  their devices aren't republished, though, since that would cause a deadlock
+  in the node notification mechanism (listeners are called synchronously);
+  need to offload that the event handling to another thread.
+* On changes of (known) driver directories, the device manager will now print
+  some info to the syslog.
+* Fixed republish_driver() I broke recently (would skip every other node), and
+  moved it to the driver functions section of the devfs.cpp.
+* Implemented currently unused unpublish_driver() function that would have to
+  be called before reloading a driver.
+* If a driver is in use when it's updated, we mark it, but we don't do anything
+  with that info when we could.
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/system/kernel/device_manager/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/Jamfile	2008-02-20 16:48:16 UTC (rev 24035)
++++ haiku/trunk/src/system/kernel/device_manager/Jamfile	2008-02-20 16:55:05 UTC (rev 24036)
+@@ -1,7 +1,7 @@
+ SubDir HAIKU_TOP src system kernel device_manager ;
+ 
+ UsePrivateHeaders [ FDirName kernel boot platform $(TARGET_BOOT_PLATFORM) ] ;
+-UsePrivateHeaders [ FDirName kernel util ] ;
++UsePrivateHeaders [ FDirName kernel util ] shared ;
+ 
+ KernelMergeObject kernel_device_manager.o : 
+ 	attributes.c
+
+Modified: haiku/trunk/src/system/kernel/device_manager/probe.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/probe.cpp	2008-02-20 16:48:16 UTC (rev 24035)
++++ haiku/trunk/src/system/kernel/device_manager/probe.cpp	2008-02-20 16:55:05 UTC (rev 24036)
+@@ -1,14 +1,12 @@
+ /*
+- * Copyright 2004-2005, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
++ * Copyright 2004-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
+  * Copyright 2002-2004, Thomas Kurschel. All rights reserved.
+  *
+  * Distributed under the terms of the MIT License.
+  */
+ 
+ /*
+-	Part of Device Manager
+ 	Probing for consumers.
+-
+ 	Here is all the core logic how consumers are found for one node.
+ */
+ 
+@@ -17,14 +15,17 @@
+ 
+ #include &lt;boot_device.h&gt;
+ #include &lt;elf.h&gt;
++#include &lt;fs/devfs.h&gt;
++#include &lt;fs/KPath.h&gt;
++#include &lt;fs/node_monitor.h&gt;
+ #include &lt;kmodule.h&gt;
+-#include &lt;fs/KPath.h&gt;
+-#include &lt;fs/devfs.h&gt;
++#include &lt;Notifications.h&gt;
+ #include &lt;util/Stack.h&gt;
+ #include &lt;util/kernel_cpp.h&gt;
+ 
+ #include &lt;image.h&gt;
+ #include &lt;KernelExport.h&gt;
++#include &lt;NodeMonitor.h&gt;
+ 
+ #include &lt;stdlib.h&gt;
+ #include &lt;dirent.h&gt;
+@@ -68,19 +69,22 @@
+ static const char *kModulePaths[] = {
+ 	COMMON_MODULES_DIR,
+ 	&quot;/boot/beos/system/add-ons/kernel&quot;,//SYSTEM_MODULES_DIR,
+-	&quot;/boot&quot;,	// ToDo: this is for the bootfs boot - to be removed
+ 	NULL
+ };
+ 
+ 
+ class DirectoryIterator {
+ 	public:
+-		DirectoryIterator(const char *path, const char *subPath = NULL, bool recursive = false);
+-		DirectoryIterator(const char **paths, const char *subPath = NULL, bool recursive = false);
++		DirectoryIterator(const char *path, const char *subPath = NULL,
++			bool recursive = false);
++		DirectoryIterator(const char **paths, const char *subPath = NULL,
++			bool recursive = false);
+ 		~DirectoryIterator();
+ 
+-		void SetTo(const char *path, const char *subPath = NULL, bool recursive = false);
+-		void SetTo(const char **paths, const char *subPath = NULL, bool recursive = false);
++		void SetTo(const char *path, const char *subPath = NULL,
++			bool recursive = false);
++		void SetTo(const char **paths, const char *subPath = NULL,
++			bool recursive = false);
+ 
+ 		status_t GetNext(KPath &amp;path, struct stat &amp;stat);
+ 		const char *CurrentName() const { return fCurrentName; }
+@@ -97,7 +101,22 @@
+ };
+ 
+ 
+-DirectoryIterator::DirectoryIterator(const char *path, const char *subPath, bool recursive)
++class DirectoryWatcher : public NotificationListener {
++	public:
++		DirectoryWatcher();
++		virtual ~DirectoryWatcher();
++
++		virtual void EventOccured(NotificationService&amp; service,
++			const KMessage* event);
++};
++
++
++static DirectoryWatcher sDirectoryWatcher;
++static bool sWatching;
++
++
++DirectoryIterator::DirectoryIterator(const char *path, const char *subPath,
++		bool recursive)
+ 	:
+ 	fDirectory(NULL),
+ 	fBasePath(NULL),
+@@ -107,7 +126,8 @@
+ }
+ 
+ 
+-DirectoryIterator::DirectoryIterator(const char **paths, const char *subPath, bool recursive)
++DirectoryIterator::DirectoryIterator(const char **paths, const char *subPath,
++		bool recursive)
+ 	:
+ 	fDirectory(NULL),
+ 	fBasePath(NULL)
+@@ -226,7 +246,52 @@
+ //	#pragma mark -
+ 
+ 
+-struct path_entry *
++DirectoryWatcher::DirectoryWatcher()
++{
++}
++
++
++DirectoryWatcher::~DirectoryWatcher()
++{
++}
++
++
++void
++DirectoryWatcher::EventOccured(NotificationService&amp; service,
++	const KMessage* event)
++{
++	int32 opcode = event-&gt;GetInt32(&quot;opcode&quot;, -1);
++/*
++	if (opcode == B_ENTRY_CREATED)
++		devfs_publish_directory();
++*/
++	dprintf(&quot;DRIVER DIRECTORY EVENT: %ld\n&quot;, opcode);
++	dprintf(&quot;  device %ld\n&quot;, event-&gt;GetInt32(&quot;device&quot;, -1));
++	dprintf(&quot;  node %Ld\n&quot;, event-&gt;GetInt64(&quot;node&quot;, -1));
++	dprintf(&quot;  name %s\n&quot;, event-&gt;GetString(&quot;name&quot;, &quot;&lt;none&gt;&quot;));
++}
++
++
++//	#pragma mark -
++
++
++static void
++start_watching(const char *base, const char *sub)
++{
++	KPath path(base);
++	path.Append(sub);
++
++	// TODO: create missing directories?
++	struct stat stat;
++	if (::stat(path.Path(), &amp;stat) != 0)
++		return;
++
++	add_node_listener(stat.st_dev, stat.st_ino, B_WATCH_DIRECTORY,
++		sDirectoryWatcher);
++}
++
++
++static struct path_entry *
+ new_path_entry(const char *path, dev_t device, ino_t node)
+ {
+ 	path_entry *entry = (path_entry *)malloc(sizeof(path_entry));
+@@ -246,7 +311,7 @@
+ }
+ 
+ 
+-struct path_entry *
++static struct path_entry *
+ copy_path_entry(path_entry *entry)
+ {
+ 	path_entry *newEntry = (path_entry *)malloc(sizeof(struct path_entry));
+@@ -264,7 +329,7 @@
+ }
+ 
+ 
+-void
++static void
+ free_module_entry(module_entry *entry)
+ {
+ 	if (entry-&gt;name != NULL &amp;&amp; entry-&gt;driver != NULL)
+@@ -275,7 +340,7 @@
+ }
+ 
+ 
+-struct module_entry *
++static struct module_entry *
+ new_module_entry(const char *name, driver_module_info *driver)
+ {
+ 	module_entry *entry = (module_entry *)malloc(sizeof(module_entry));
+@@ -331,7 +396,8 @@
+ 
+ 
+ static status_t
+-get_next_device_node(struct list *list, uint32 *_cookie, device_node_info **_node)
++get_next_device_node(struct list *list, uint32 *_cookie,
++	device_node_info **_node)
+ {
+ 	node_entry *entry = (node_entry *)list_get_next_item(list, (void *)*_cookie);
+ 	if (entry == NULL)
+@@ -355,11 +421,10 @@
+ }
+ 
+ 
+-/** notify a consumer that a device he might handle is added
+- *	fileName - file name of consumer
+- *	(moved to end of file to avoid inlining)
+- */
+-
++/*!	Notify a consumer that a device he might handle is added
++	fileName - file name of consumer
++	(moved to end of file to avoid inlining)
++*/
+ static status_t
+ notify_probe_by_file(device_node_info *node, const char *fileName)
+ {
+@@ -387,7 +452,9 @@
+ 		TRACE((&quot;notify_probe_by_file trying %s %s %s\n&quot;, module_name, bus, module_name + (strlen(module_name) - suffix_length + 1)));
+ 		if (strlen(module_name) &gt; suffix_length
+ 			&amp;&amp; !strncmp(module_name + (strlen(module_name) - suffix_length + 1), bus, strlen(bus))
+-			&amp;&amp; !strncmp(module_name + (strlen(module_name) - sizeof(device_suffix) + 1), device_suffix, sizeof(device_suffix))) {
++			&amp;&amp; !strncmp(module_name + (strlen(module_name)
++					- sizeof(device_suffix) + 1), device_suffix,
++				sizeof(device_suffix))) {
+ 			// found the module
+ 			res = dm_register_child_device(node, module_name, true);
+ 			break;
+@@ -401,15 +468,14 @@
+ }
+ 
+ 
+-/**	compose all possible names of Specific drivers; as there are
+- *	multiple names which only differ in length, the most specific
+- *	driver name gets stored in &lt;path&gt;, whereas &lt;term_array&gt; is a
+- *	list of lengths of individual driver names with index 0
+- *	containing the length of the shortest and num_parts-1 the
+- *	length of the longest name; &lt;buffer&gt; is a supplied buffer of
+- *	MAX_PATH+1 size
+- */
+-
++/*!	Compose all possible names of Specific drivers; as there are
++	multiple names which only differ in length, the most specific
++	driver name gets stored in &lt;path&gt;, whereas &lt;term_array&gt; is a
++	list of lengths of individual driver names with index 0
++	containing the length of the shortest and num_parts-1 the
++	length of the longest name; &lt;buffer&gt; is a supplied buffer of
++	MAX_PATH+1 size
++*/
+ static status_t
+ compose_driver_names(device_node_info *node, const char *dir,
+ 	const char *filename_pattern, int num_parts, 
+@@ -454,12 +520,11 @@
+ }
+ 
+ 
+-/**	notify all drivers under &lt;directory&gt;. If &lt;tell_all&gt; is true, notify all,
+- *	if false, stop once a drivers notification function returned B_OK 
+- *	buffer - scratch buffer of size B_PATH_NAME_LENGTH + 1 ; destroyed on exit
+- *	return: B_NAME_NOT_FOUND, if tell_all is false and no driver returned B_OK
+- */
+-
++/*!	Notify all drivers under &lt;directory&gt;. If &lt;tell_all&gt; is true, notify all,
++	if false, stop once a drivers notification function returned B_OK 
++	buffer - scratch buffer of size B_PATH_NAME_LENGTH + 1 ; destroyed on exit
++	return: B_NAME_NOT_FOUND, if tell_all is false and no driver returned B_OK
++*/
+ static status_t
+ try_drivers(device_node_info *node, char *directory, 
+ 	bool tell_all, char *buffer)
+@@ -511,12 +576,11 @@
+ }
+ 
+ 
+-/**	find normal child of node that are stored under &lt;dir&gt;; first, we
+- *	look for a specific driver; if none could be found, find a generic
+- *	one path, buffer - used as scratch buffer (all of size B_PATH_NAME_LENGTH + 1)
+- *	return: B_NAME_NOT_FOUND if no consumer could be found
+- */
+-
++/*!	Find normal child of node that are stored under &lt;dir&gt;; first, we
++	look for a specific driver; if none could be found, find a generic
++	one path, buffer - used as scratch buffer (all of size B_PATH_NAME_LENGTH + 1)
++	return: B_NAME_NOT_FOUND if no consumer could be found
++*/
+ static status_t
+ find_normal_child(device_node_info *node, const char *dir,
+ 	const char *filename_pattern, int num_parts,
+@@ -584,16 +648,15 @@
+ }
+ 
+ 
+-/**	pre-process dynamic child name pattern.
+- *	split into directory and pattern and count split positions;
+- *	further, remove quotes from directory
+- *	pattern		- pattern of consumer name
+- *	buffer		- buffer to store results in 
+- *				  (returned strings all point to &lt;buffer&gt;!)
+- *	filename_pattern - pattern of file name
+- *	*num_parts	- number of split positions
+- */
+-
++/*!	Pre-process dynamic child name pattern.
++	split into directory and pattern and count split positions;
++	further, remove quotes from directory
++	pattern		- pattern of consumer name
++	buffer		- buffer to store results in 
++				  (returned strings all point to &lt;buffer&gt;!)
++	filename_pattern - pattern of file name
++	*num_parts	- number of split positions
++*/
+ static status_t
+ preprocess_child_names(const char *pattern, char *buffer,
+ 	char **filename_pattern, int *const num_parts)
+@@ -660,11 +723,10 @@
+ }
+ 
+ 
+-/**	find consumers for one given pattern
+- *	has_normal_drivers - in: true - don't search for specific driver
+- *		out: true - specific driver was found
+- */
+-
++/*!	Find consumers for one given pattern
++	has_normal_drivers - in: true - don't search for specific driver
++		out: true - specific driver was found
++*/
+ static status_t
+ register_dynamic_child_device(device_node_info *node, const char *bus,
+ 	const char *pattern, bool *has_normal_driver)
+@@ -738,14 +800,13 @@
+ }
+ 
+ 
+-/**	Iterates over the given list and tries to load all drivers and modules
+- *	in that list.
+- *	The list is emptied and freed during the traversal.
+- *
+- *	ToDo: Old style drivers will be initialized as well, new style driver
+- *	handling is not yet done.
+- */
++/*!	Iterates over the given list and tries to load all drivers and modules
++	in that list.
++	The list is emptied and freed during the traversal.
+ 
++	ToDo: Old style drivers will be initialized as well, new style driver
++	handling is not yet done.
++*/
+ static status_t
+ try_drivers(struct list &amp;list, bool tryBusDrivers)
+ {
+@@ -960,7 +1021,8 @@
+ 
+ 
+ static status_t
+-get_nodes_for_device_type(device_node_info *node, struct list *list, const char *type)
++get_nodes_for_device_type(device_node_info *node, struct list *list,
++	const char *type)
+ {
+ 	bool matches = false;
+ 
+@@ -977,8 +1039,9 @@
+ 	if (!matches) {
+ 		// we also accept any dump busses
+ 		uint8 onDemand = false;
+-		pnp_get_attr_uint8(node, B_DRIVER_FIND_DEVICES_ON_DEMAND, &amp;onDemand, false);
+-		
++		pnp_get_attr_uint8(node, B_DRIVER_FIND_DEVICES_ON_DEMAND, &amp;onDemand,
++			false);
++
+ 		if (onDemand)
+ 			matches = true;
+ 	}
+@@ -1009,12 +1072,12 @@
+ //	device manager private API
+ 
+ 
+-/** Register the device of a child for the \a node that might accept it.
+- *	childName - module name of child/consumer
+- */
+-
++/*!	Register the device of a child for the \a node that might accept it.
++	childName - module name of child/consumer
++*/
+ status_t
+-dm_register_child_device(device_node_info *node, const char *childName, bool checkSupport)
++dm_register_child_device(device_node_info *node, const char *childName,
++	bool checkSupport)
+ {
+ 	driver_module_info *child;
+ 	status_t status;
+@@ -1057,11 +1120,10 @@
+ }
+ 
+ 
+-/** find and notify dynamic consumers that device was added
+- *	errors returned by consumers aren't reported, only problems
+- *	like malformed consumer patterns
+- */
+-
++/*!	Find and notify dynamic consumers that device was added
++	errors returned by consumers aren't reported, only problems
++	like malformed consumer patterns
++*/
+ status_t
+ dm_register_dynamic_child_devices(device_node_info *node)
+ {
+@@ -1143,11 +1205,10 @@
+ }
+ 
+ 
+-/**	Register all fixed child devices of of the given \a node; in contrast
+- *	to dynamic child devices, errors reported by fixed child devices are
+- *	not ignored but returned, and regarded critical.
+- */
+-
++/*!	Register all fixed child devices of of the given \a node; in contrast
++	to dynamic child devices, errors reported by fixed child devices are
++	not ignored but returned, and regarded critical.
++*/
+ status_t
+ dm_register_fixed_child_devices(device_node_info *node)
+ {
+@@ -1236,9 +1297,13 @@
+ 
+ 	while (iterator.GetNext(path, stat) == B_OK) {
+ 		if (S_ISDIR(stat.st_mode)) {
++			add_node_listener(stat.st_dev, stat.st_ino, B_WATCH_DIRECTORY,
++				sDirectoryWatcher);
++
+ 			// We need to make sure that drivers in ie. &quot;audio/raw/&quot; can
+ 			// be found as well - therefore, we must make sure that &quot;audio&quot;
+ 			// exists on /dev.
++
+ 			size_t length = strlen(&quot;drivers/dev&quot;);
+ 			if (strncmp(type, &quot;drivers/dev&quot;, length))
+ 				continue;
+@@ -1274,7 +1339,8 @@
+ 		dprintf(&quot;bus: %s\n&quot;, path.Leaf());
+ 
+ 		while (busIterator.GetNext(path, stat) == B_OK) {
+-			path_entry *entry = find_node_ref_in_list(&amp;drivers, stat.st_dev, stat.st_ino);
++			path_entry *entry = find_node_ref_in_list(&amp;drivers, stat.st_dev,
++				stat.st_ino);
+ 			if (entry == NULL)
+ 				continue;
+ 
+@@ -1310,7 +1376,20 @@
+ 	TRACE((&quot;probe_for_device_type(type = %s)\n&quot;, type));
+ 
+ 	char deviceType[64];
+-	snprintf(deviceType, sizeof(deviceType), &quot;drivers/dev%s%s&quot;, type[0] ? &quot;/&quot; : &quot;&quot;, type);
++	snprintf(deviceType, sizeof(deviceType), &quot;drivers/dev%s%s&quot;,
++		type[0] ? &quot;/&quot; : &quot;&quot;, type);
+ 
++	if (!sWatching &amp;&amp; gBootDevice &gt; 0) {
++		// We're probing the actual boot volume for the first time,
++		// let's watch its driver directories for changes
++
++		new(&amp;sDirectoryWatcher) DirectoryWatcher;
++		for (uint32 i = 0; kModulePaths[i] != NULL; i++) {
++			start_watching(kModulePaths[i], &quot;drivers/dev&quot;);
++			start_watching(kModulePaths[i], &quot;drivers/bin&quot;);
++		}
++		sWatching = true;
++	}
++
+ 	return probe_for_driver_modules(deviceType);
+ }
+
+Modified: haiku/trunk/src/system/kernel/fs/devfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/devfs.cpp	2008-02-20 16:48:16 UTC (rev 24035)
++++ haiku/trunk/src/system/kernel/fs/devfs.cpp	2008-02-20 16:55:05 UTC (rev 24036)
+@@ -7,35 +7,37 @@
+  */
+ 
+ 
+-#include &quot;IOScheduler.h&quot;
++#include &lt;devfs.h&gt;
+ 
++#include &lt;errno.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/stat.h&gt;
++
++#include &lt;Drivers.h&gt;
+ #include &lt;KernelExport.h&gt;
+-#include &lt;Drivers.h&gt;
++#include &lt;NodeMonitor.h&gt;
+ #include &lt;pnp_devfs.h&gt;
+-#include &lt;NodeMonitor.h&gt;
+ 
++#include &lt;arch/cpu.h&gt;
++#include &lt;boot/kernel_args.h&gt;
+ #include &lt;boot_device.h&gt;
++#include &lt;debug.h&gt;
++#include &lt;elf.h&gt;
+ #include &lt;kdevice_manager.h&gt;
+ #include &lt;KPath.h&gt;
++#include &lt;lock.h&gt;
++#include &lt;node_monitor.h&gt;
++#include &lt;Notifications.h&gt;
++#include &lt;util/AutoLock.h&gt;
++#include &lt;util/khash.h&gt;
+ #include &lt;vfs.h&gt;
+-#include &lt;debug.h&gt;
+-#include &lt;util/khash.h&gt;
+-#include &lt;util/AutoLock.h&gt;
+-#include &lt;elf.h&gt;
+-#include &lt;lock.h&gt;
+ #include &lt;vm.h&gt;
+-#include &lt;arch/cpu.h&gt;
+-#include &lt;boot/kernel_args.h&gt;
+ 
+-#include &lt;devfs.h&gt;
++#include &quot;IOScheduler.h&quot;
+ 
+-#include &lt;string.h&gt;
+-#include &lt;stdlib.h&gt;
+-#include &lt;stdio.h&gt;
+-#include &lt;errno.h&gt;
+-#include &lt;sys/stat.h&gt;
+ 
+-
+ //#define TRACE_DEVFS
+ #ifdef TRACE_DEVFS
+ #	define TRACE(x) dprintf x
+@@ -131,6 +133,8 @@
+ 	time_t			last_modified;
+ 	image_id		image;
+ 	uint32			devices_published;
++	uint32			devices_used;
++	bool			binary_updated;
+ 
+ 	// driver image information
+ 	int32			*api_version;
+@@ -140,14 +144,24 @@
+ 	status_t		(*uninit_hardware)(void);
+ };
+ 
+-
+ struct node_path_entry : DoublyLinkedListLinkImpl&lt;node_path_entry&gt; {
+ 	char			path[B_PATH_NAME_LENGTH];
+ };
+ 
++class DriverWatcher : public NotificationListener {
++	public:
++		DriverWatcher();
++		virtual ~DriverWatcher();
+ 
++		virtual void EventOccured(NotificationService&amp; service,
++			const KMessage* event);
++};
++
++
+ static void get_device_name(struct devfs_vnode *vnode, char *buffer,
+ 	size_t size);
++static status_t unpublish_node(struct devfs *fs, devfs_vnode *node,
++	mode_t type);
+ static status_t publish_device(struct devfs *fs, const char *path,
+ 	device_node_info *deviceNode, pnp_devfs_driver_info *info,
+ 	driver_entry *driver, device_hooks *ops, int32 apiVersion);
+@@ -156,6 +170,7 @@
+ /* the one and only allowed devfs instance */
+ static struct devfs *sDeviceFileSystem = NULL;
+ static int32 sDefaultApiVersion = 1;
++static DriverWatcher sDriverWatcher;
+ 
+ 
+ //	#pragma mark - driver private
+@@ -211,24 +226,25 @@
+ #error Add checks here for new vs old api version!
+ #endif
+ 		if (*driver-&gt;api_version &gt; B_CUR_DRIVER_API_VERSION) {
+-			dprintf(&quot;%s: api_version %ld not handled\n&quot;, driver-&gt;name,
++			dprintf(&quot;devfs: \&quot;%s\&quot; api_version %ld not handled\n&quot;, driver-&gt;name,
+ 				*driver-&gt;api_version);
+ 			status = B_BAD_VALUE;
+ 			goto error1;
+ 		}
+ 		if (*driver-&gt;api_version &lt; 1) {
+-			dprintf(&quot;%s: api_version invalid\n&quot;, driver-&gt;name);
++			dprintf(&quot;devfs: \&quot;%s\&quot; api_version invalid\n&quot;, driver-&gt;name);
+ 			status = B_BAD_VALUE;
+ 			goto error1;
+ 		}
+ 	} else
+-		dprintf(&quot;%s: api_version missing\n&quot;, driver-&gt;name);
++		dprintf(&quot;devfs: \&quot;%s\&quot; api_version missing\n&quot;, driver-&gt;name);
+ 
+ 	if (get_image_symbol(image, &quot;publish_devices&quot;, B_SYMBOL_TYPE_TEXT,
+ 				(void **)&amp;driver-&gt;publish_devices) != B_OK
+ 		|| get_image_symbol(image, &quot;find_device&quot;, B_SYMBOL_TYPE_TEXT,
+ 				(void **)&amp;driver-&gt;find_device) != B_OK) {
+-		dprintf(&quot;%s: mandatory driver symbol(s) missing!\n&quot;, driver-&gt;name);
++		dprintf(&quot;devfs: \&quot;%s\&quot; mandatory driver symbol(s) missing!\n&quot;,
++			driver-&gt;name);
+ 		status = B_BAD_VALUE;
+ 		goto error1;
+ 	}
+@@ -238,8 +254,8 @@
+ 	if (get_image_symbol(image, &quot;init_hardware&quot;, B_SYMBOL_TYPE_TEXT,
+ 			(void **)&amp;init_hardware) == B_OK
+ 		&amp;&amp; (status = init_hardware()) != B_OK) {
+-		dprintf(&quot;%s: init_hardware() failed: %s\n&quot;, driver-&gt;name,
+-			strerror(status));
++		TRACE((&quot;%s: init_hardware() failed: %s\n&quot;, driver-&gt;name,
++			strerror(status)));
+ 		status = ENXIO;
+ 		goto error1;
+ 	}
+@@ -247,8 +263,8 @@
+ 	if (get_image_symbol(image, &quot;init_driver&quot;, B_SYMBOL_TYPE_TEXT,
+ 			(void **)&amp;init_driver) == B_OK
+ 		&amp;&amp; (status = init_driver()) != B_OK) {
+-		dprintf(&quot;%s: init_driver() failed: %s\n&quot;, driver-&gt;name,
+-			strerror(status));
++		TRACE((&quot;%s: init_driver() failed: %s\n&quot;, driver-&gt;name,
++			strerror(status)));
+ 		status = ENXIO;
+ 		goto error2;
+ 	}
+@@ -267,7 +283,7 @@
+ 	// we keep the driver loaded if it exports at least a single interface
+ 	devicePaths = driver-&gt;publish_devices();
+ 	if (devicePaths == NULL) {
+-		dprintf(&quot;%s: publish_devices() returned NULL.\n&quot;, driver-&gt;name);
++		TRACE((&quot;%s: publish_devices() returned NULL.\n&quot;, driver-&gt;name));
+ 		status = ENXIO;
+ 		goto error3;
+ 	}
+@@ -327,6 +343,133 @@
+ }
+ 
+ 
++/*!	Collects all devices belonging to the \a driver and unpublishs them.
++*/
++static void
++unpublish_driver(driver_entry *driver)
++{
++	RecursiveLocker locker(&amp;sDeviceFileSystem-&gt;lock);
++
++	// Iterate through all nodes until all devices of this driver have
++	// been unpublished
++
++	while (driver-&gt;devices_published &gt; 0) {
++		struct hash_iterator i;
++		hash_open(sDeviceFileSystem-&gt;vnode_hash, &amp;i);
++
++		while (true) {
++			devfs_vnode *vnode = (devfs_vnode *)hash_next(
++				sDeviceFileSystem-&gt;vnode_hash, &amp;i);
++			if (vnode == NULL)
++				break;
++
++			if (S_ISCHR(vnode-&gt;stream.type)
++				&amp;&amp; vnode-&gt;stream.u.dev.driver == driver)
++				unpublish_node(sDeviceFileSystem, vnode, S_IFCHR);
++		}
++
++		hash_close(sDeviceFileSystem-&gt;vnode_hash, &amp;i, false);
++	}
++}
++
++
++/*!	Collects all published devices of a driver, compares them to what the
++	driver would publish now, and then publishes/unpublishes the devices
++	as needed.
++	If the driver does not publish any devices anymore, it is unloaded.
++*/
++static status_t
++republish_driver(driver_entry *driver)
++{
++	if (driver-&gt;image &lt; 0) {
++		// The driver is not yet loaded - go through the normal load procedure
++		return load_driver(driver);
++	}
++
++	RecursiveLocker locker(&amp;sDeviceFileSystem-&gt;lock);
++
++	// build the list of currently present devices of this driver
++	// by iterating through all present nodes
++	struct hash_iterator i;
++	hash_open(sDeviceFileSystem-&gt;vnode_hash, &amp;i);
++
++	DoublyLinkedList&lt;node_path_entry&gt; currentNodes;
++	while (true) {
++		devfs_vnode *vnode = (devfs_vnode *)hash_next(
++			sDeviceFileSystem-&gt;vnode_hash, &amp;i);
++		if (vnode == NULL)
++			break;
++
++		if (S_ISCHR(vnode-&gt;stream.type)
++			&amp;&amp; vnode-&gt;stream.u.dev.driver == driver) {
++			node_path_entry *path = new(std::nothrow) node_path_entry;
++			if (!path) {
++				while ((path = currentNodes.RemoveHead()))
++					delete path;
++				hash_close(sDeviceFileSystem-&gt;vnode_hash, &amp;i, false);
++				return B_NO_MEMORY;
++			}
++
++			get_device_name(vnode, path-&gt;path, sizeof(path-&gt;path));
++			currentNodes.Add(path);
++		}
++	}
++	hash_close(sDeviceFileSystem-&gt;vnode_hash, &amp;i, false);
++
++	// now ask the driver for it's currently published devices
++	const char **devicePaths = driver-&gt;publish_devices();
++
++	int32 exported = 0;
++	for (; devicePaths != NULL &amp;&amp; devicePaths[0]; devicePaths++) {
++		bool present = false;
++		node_path_entry *entry = currentNodes.Head();
++		while (entry) {
++			if (strncmp(entry-&gt;path, devicePaths[0], B_PATH_NAME_LENGTH) == 0) {
++				// this device was present before and still is -&gt; no republish
++				currentNodes.Remove(entry);
++				delete entry;
++				exported++;
++				present = true;
++				break;
++			}
++
++			entry = currentNodes.GetNext(entry);
++		}
++
++		if (present)
++			continue;
++
++		// the device was not present before -&gt; publish it now
++		device_hooks *hooks = driver-&gt;find_device(devicePaths[0]);
++		if (hooks == NULL)
++			continue;
++
++		TRACE((&quot;devfs: publishing new device \&quot;%s\&quot;\n&quot;, devicePaths[0]));
++		if (publish_device(sDeviceFileSystem, devicePaths[0], NULL, NULL,
++			driver, hooks, *driver-&gt;api_version) == B_OK)
++			exported++;
++	}
++
++	// what's left in currentNodes was present but is not anymore -&gt; unpublish
++	node_path_entry *entry = currentNodes.Head();
++	while (entry) {
++		TRACE((&quot;devfs: unpublishing no more present \&quot;%s\&quot;\n&quot;, entry-&gt;path));
++		devfs_unpublish_device(entry-&gt;path, true);
++		node_path_entry *next = currentNodes.GetNext(entry);
++		currentNodes.Remove(entry);
++		delete entry;
++		entry = next;
++	}
++
++	if (exported == 0) {
++		TRACE((&quot;devfs: driver \&quot;%s\&quot; does not publish any more nodes and is unloaded\n&quot;, driver-&gt;path));
++		unload_driver(driver);
++	}
++
++	return B_OK;
++}
++
++
+ static const char *
+ get_leaf(const char *path)
+ {
+@@ -338,6 +481,25 @@
+ }
+ 
+ 
++static driver_entry *
++find_driver(dev_t device, ino_t node)
++{
++	hash_iterator iterator;
++	hash_open(sDeviceFileSystem-&gt;driver_hash, &amp;iterator);
++	driver_entry *driver;
++	while (true) {
++		driver = (driver_entry *)hash_next(sDeviceFileSystem-&gt;driver_hash,
++			&amp;iterator);
++		if (driver == NULL
++			|| driver-&gt;device == device &amp;&amp; driver-&gt;node == node)
++			break;
++	}
++
++	hash_close(sDeviceFileSystem-&gt;driver_hash, &amp;iterator, false);
++	return driver;
++}
++
++
+ static status_t
+ add_driver(const char *path, image_id image)
+ {
+@@ -361,6 +523,8 @@
+ 		sDeviceFileSystem-&gt;driver_hash, get_leaf(path));
+ 	if (driver != NULL) {
+ 		// we know this driver
++		// TODO: check if this driver is a different one and has precendence
++		// (ie. common supersedes system).
+ 		// TODO: test for changes here and/or via node monitoring and reload
+ 		//	the driver if necessary
+ 		if (driver-&gt;image &lt; B_OK)
+@@ -386,6 +550,9 @@
+ 	driver-&gt;node = stat.st_ino;
+ 	driver-&gt;image = image;
+ 	driver-&gt;last_modified = stat.st_mtime;
++	driver-&gt;devices_published = 0;
++	driver-&gt;devices_used = 0;
++	driver-&gt;binary_updated = false;
+ 
+ 	driver-&gt;api_version = NULL;
+ 	driver-&gt;find_device = NULL;
+@@ -394,6 +561,8 @@
+ 	driver-&gt;uninit_hardware = NULL;
+ 
+ 	hash_insert(sDeviceFileSystem-&gt;driver_hash, driver);
++	if (stat.st_dev &gt; 0)
++		add_node_listener(stat.st_dev, stat.st_ino, B_WATCH_STAT, sDriverWatcher);
+ 
+ 	// Even if loading the driver fails - its entry will stay with us
+ 	// so that we don't have to go through it again
+@@ -446,6 +615,51 @@
+ }
+ 
+ 
++//	#pragma mark - DriverWatcher
++
++
++DriverWatcher::DriverWatcher()
++{
++}
++
++
++DriverWatcher::~DriverWatcher()
++{
++}
++
++
++void
++DriverWatcher::EventOccured(NotificationService&amp; service,
++	const KMessage* event)
++{
++	if (event-&gt;GetInt32(&quot;opcode&quot;, -1) != B_STAT_CHANGED
++		|| (event-&gt;GetInt32(&quot;fields&quot;, 0) &amp; B_STAT_MODIFICATION_TIME) == 0)
++		return;
++
++	RecursiveLocker locker(&amp;sDeviceFileSystem-&gt;lock);
++
++	driver_entry *driver = find_driver(event-&gt;GetInt32(&quot;device&quot;, -1),
++		event-&gt;GetInt64(&quot;node&quot;, 0));
++	if (driver == NULL)
++		return;
++
++	if (driver-&gt;devices_used == 0) {
++		// reload driver
++		dprintf(&quot;devfs: reload driver \&quot;%s\&quot;\n&quot;, driver-&gt;name);
++		//unpublish_driver(driver);
++			// TODO: even though we would need to unpublish the driver, this
++			// doesn't work right now from here (dead lock in the node monitor
++			// notifications)
++		unload_driver(driver);
++		load_driver(driver);
++	} else {
++		// driver is in use right now, only mark it to be updated when possible
++		dprintf(&quot;devfs: changed driver \&quot;%s\&quot; is still in use\n&quot;, driver-&gt;name);
++		driver-&gt;binary_updated = true;
++	}
++}
++
++
+ //	#pragma mark - devfs private
+ 
+ 
+@@ -1028,105 +1242,6 @@
+ }
+ 
+ 
+-/*!	Collects all published devices of a driver, compares them to what the
+-	driver would publish now, and then publishes/unpublishes the devices
+-	as needed.
+-	If the driver does not publish any devices anymore, it is unloaded.
+-*/
+-static status_t
+-republish_driver(driver_entry *driver)
+-{
+-	if (driver-&gt;image &lt; 0) {
+-		// The driver is not yet loaded - go through the normal load procedure
+-		return load_driver(driver);
+-	}
+-
+-	RecursiveLocker locker(&amp;sDeviceFileSystem-&gt;lock);
+-
+-	// build the list of currently present devices of this driver
+-	// by iterating through all present nodes
+-	struct hash_iterator i;
+-	hash_open(sDeviceFileSystem-&gt;vnode_hash, &amp;i);
+-
+-	DoublyLinkedList&lt;node_path_entry&gt; currentNodes;
+-	while (true) {
+-		devfs_vnode *vnode = (devfs_vnode *)hash_next(
+-			sDeviceFileSystem-&gt;vnode_hash, &amp;i);
+-		if (vnode == NULL)
+-			break;
+-
+-		if (S_ISCHR(vnode-&gt;stream.type)
+-			&amp;&amp; vnode-&gt;stream.u.dev.driver == driver) {
+-			node_path_entry *path = new(std::nothrow) node_path_entry;
+-			if (!path) {
+-				while ((path = currentNodes.RemoveHead()))
+-					delete path;
+-				hash_close(sDeviceFileSystem-&gt;vnode_hash, &amp;i, false);
+-				return B_NO_MEMORY;
+-			}
+-
+-			get_device_name(vnode, path-&gt;path, sizeof(path-&gt;path));
+-			currentNodes.Add(path);
+-		}
+-
+-		vnode = (devfs_vnode *)hash_next(sDeviceFileSystem-&gt;vnode_hash, &amp;i);
+-	}
+-	hash_close(sDeviceFileSystem-&gt;vnode_hash, &amp;i, false);
+-
+-	// now ask the driver for it's currently published devices
+-	const char **devicePaths = driver-&gt;publish_devices();
+-
+-	int32 exported = 0;
+-	for (; devicePaths != NULL &amp;&amp; devicePaths[0]; devicePaths++) {
+-		bool present = false;
+-		node_path_entry *entry = currentNodes.Head();
+-		while (entry) {
+-			if (strncmp(entry-&gt;path, devicePaths[0], B_PATH_NAME_LENGTH) == 0) {
+-				// this device was present before and still is -&gt; no republish
+-				currentNodes.Remove(entry);
+-				delete entry;
+-				exported++;
+-				present = true;
+-				break;
+-			}
+-
+-			entry = currentNodes.GetNext(entry);
+-		}
+-
+-		if (present)
+-			continue;
+-
+-		// the device was not present before -&gt; publish it now
+-		device_hooks *hooks = driver-&gt;find_device(devicePaths[0]);
+-		if (hooks == NULL)
+-			continue;
+-
+-		TRACE((&quot;devfs: publishing new device \&quot;%s\&quot;\n&quot;, devicePaths[0]));
+-		if (publish_device(sDeviceFileSystem, devicePaths[0], NULL, NULL,
+-			driver, hooks, *driver-&gt;api_version) == B_OK)
+-			exported++;
+-	}
+-
+-	// what's left in currentNodes was present but is not anymore -&gt; unpublish
+-	node_path_entry *entry = currentNodes.Head();
+-	while (entry) {
+-		TRACE((&quot;devfs: unpublishing no more present \&quot;%s\&quot;\n&quot;, entry-&gt;path));
+-		devfs_unpublish_device(entry-&gt;path, true);
+-		node_path_entry *next = currentNodes.GetNext(entry);
+-		currentNodes.Remove(entry);
+-		delete entry;
+-		entry = next;
+-	}
+-
+-	if (exported == 0) {
+-		TRACE((&quot;devfs: driver \&quot;%s\&quot; does not publish any more nodes and is unloaded\n&quot;, driver-&gt;path));
+-		unload_driver(driver);
+-	}
+-
+-	return B_OK;
+-}
+-
+-
+ /** Construct complete device name (as used for device_open()).
+  *	This is safe to use only when the device is in use (and therefore
+  *	cannot be unpublished during the iteration).
+@@ -1200,7 +1315,7 @@
+ 	TRACE((&quot;devfs_mount: entry\n&quot;));
+ 
+ 	if (sDeviceFileSystem) {
+-		dprintf(&quot;double mount of devfs attempted\n&quot;);
++		TRACE((&quot;double mount of devfs attempted\n&quot;));
+ 		err = B_ERROR;
+ 		goto err;
+ 	}
+@@ -1233,6 +1348,8 @@
+ 		goto err3;
+ 	}
+ 
++	new(&amp;sDriverWatcher) DriverWatcher;
++
+
+[... truncated: 53 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006188.html">[Haiku-commits] r24035 - in haiku/trunk: headers/private/kernel/fs	src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="006190.html">[Haiku-commits] r24037 -	haiku/trunk/src/add-ons/kernel/drivers/bluetooth/h2/h2generic
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6189">[ date ]</a>
+              <a href="thread.html#6189">[ thread ]</a>
+              <a href="subject.html#6189">[ subject ]</a>
+              <a href="author.html#6189">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

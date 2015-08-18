@@ -1,0 +1,898 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22088 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22088%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200708280329.l7S3TGT4031489%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003708.html">
+   <LINK REL="Next"  HREF="003710.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22088 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22088%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200708280329.l7S3TGT4031489%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22088 - in haiku/trunk: headers/private/kernel	src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Aug 28 05:29:16 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003708.html">[Haiku-commits] r22087 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="003710.html">[Haiku-commits] r22089 - haiku/trunk/src/system/libroot/posix/sys
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3709">[ date ]</a>
+              <a href="thread.html#3709">[ thread ]</a>
+              <a href="subject.html#3709">[ subject ]</a>
+              <a href="author.html#3709">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-08-28 05:29:14 +0200 (Tue, 28 Aug 2007)
+New Revision: 22088
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22088&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22088&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/team.h
+   haiku/trunk/headers/private/kernel/thread_types.h
+   haiku/trunk/src/system/kernel/signal.cpp
+   haiku/trunk/src/system/kernel/team.cpp
+   haiku/trunk/src/system/kernel/thread.cpp
+Log:
+* Introduced new job_control_entry structure which, among other things,
+  is used instead of death_entry for team::dead_children.
+* Added team::{stopped,continued}_children, which, analoguously to
+  dead_children, are used to track the state of stopped/continued
+  children.
+* A team does have a job_control_entry, which is allocated at team
+  creation time. It will be inserted into the parent's
+  {stopped,continued}_children lists as the team's main thread is
+  stopped/continued and removed when waitpid() retrieves the child
+  state. When the team dies the entry is detached from the team and goes
+  into the parent's dead_children list.
+* Removed the wait_for_any field from team_dead_children. It was solely
+  used to avoid deletion of the contained entries in certain situations.
+  wait_for_child() (the waitpid() backend) always deletes an entry now,
+  regardless of whether other threads are waiting; that's in
+  accordance with the waidpid() specification. wait_for_thread() removes
+  the entry only, if the caller is the parent of the respective team.
+* Introduced team_set_job_control_state() which performes the job
+  control entry transitions between the respective lists and wakes up
+  threads waiting in wait_for_child(). It is invoked on team death and
+  when the team's main thread receives job control signals.
+* Reorganized wait_for_child(). It handles WCONTINUED and WUNTRACED now,
+  too. Removed a block that interpreted the supplied ID as thread ID.
+* Added missing parts in waitpid().
+
+Job control starts to work, though it seems to have some glitches.
+
+
+
+Modified: haiku/trunk/headers/private/kernel/team.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/team.h	2007-08-28 02:25:14 UTC (rev 22087)
++++ haiku/trunk/headers/private/kernel/team.h	2007-08-28 03:29:14 UTC (rev 22088)
+@@ -29,13 +29,16 @@
+ 			struct vm_address_space **_addressSpace);
+ char **user_team_get_arguments(void);
+ int user_team_get_arg_count(void);
+-status_t team_get_death_entry(struct team *team, thread_id child,
+-			struct death_entry *death, struct death_entry **_freeDeath);
++struct job_control_entry* team_get_death_entry(struct team *team,
++			thread_id child, bool* _deleteEntry);
+ bool team_is_valid(team_id id);
+ struct team *team_get_team_struct_locked(team_id id);
+ int32 team_max_teams(void);
+ int32 team_used_teams(void);
+ 
++void team_set_job_control_state(struct team* team, job_control_state newState,
++			int signal, bool threadsLocked);
++
+ status_t start_watching_team(team_id team, void (*hook)(team_id, void *),
+ 			void *data);
+ status_t stop_watching_team(team_id team, void (*hook)(team_id, void *),
+
+Modified: haiku/trunk/headers/private/kernel/thread_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/thread_types.h	2007-08-28 02:25:14 UTC (rev 22087)
++++ haiku/trunk/headers/private/kernel/thread_types.h	2007-08-28 03:29:14 UTC (rev 22088)
+@@ -40,8 +40,17 @@
+ 	TEAM_STATE_DEATH	// being killed
+ };
+ 
++typedef enum job_control_state {
++	JOB_CONTROL_STATE_NONE,
++	JOB_CONTROL_STATE_STOPPED,
++	JOB_CONTROL_STATE_CONTINUED,
++	JOB_CONTROL_STATE_DEAD
++} job_control_state;
++
+ #define THREAD_RETURN_EXIT			0x1
+ #define THREAD_RETURN_INTERRUPTED	0x2
++#define THREAD_STOPPED				0x3
++#define THREAD_CONTINUED			0x4
+ 
+ struct image;
+ 	// defined in image.c
+@@ -83,23 +92,44 @@
+ 	// this is a soft limit for the number of dead entries in a team
+ 
+ typedef struct team_dead_children team_dead_children;
++typedef struct team_job_control_children  team_job_control_children;
++typedef struct job_control_entry job_control_entry;
+ 
+ 
+ #ifdef __cplusplus
+ 
+ #include &lt;condition_variable.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
+ 
+-struct team_dead_children {
+-	ConditionVariable&lt;team_dead_children&gt; condition_variable;
+-									// wait for dead child entries
+-	struct list	list;
++
++struct job_control_entry : DoublyLinkedListLinkImpl&lt;job_control_entry&gt; {
++	job_control_state	state;		// current team job control state
++	thread_id			thread;		// main thread ID == team ID
++
++	// valid while state != JOB_CONTROL_STATE_DEAD
++	struct team*		team;
++
++	// valid when state == JOB_CONTROL_STATE_DEAD
++	pid_t				group_id;
++	status_t			status;
++	uint16				reason;
++	uint16				signal;
++};
++
++typedef DoublyLinkedList&lt;job_control_entry&gt; JobControlEntryList;
++
++struct team_job_control_children {
++	ConditionVariable&lt;team_job_control_children&gt;	condition_variable;
++	JobControlEntryList								entries;
++};
++
++struct team_dead_children : team_job_control_children {
+ 	uint32		count;
+-	vint32		wait_for_any;	// count of wait_for_child() that wait for any
+-								// child
+ 	bigtime_t	kernel_time;
+ 	bigtime_t	user_time;
+ };
+ 
++
+ #endif	// __cplusplus
+ 
+ 
+@@ -120,7 +150,12 @@
+ 	int				pending_signals;
+ 	void			*io_context;
+ 	sem_id			death_sem;		// semaphore to wait on for dying threads
++
+ 	team_dead_children *dead_children;
++	team_job_control_children *stopped_children;
++	team_job_control_children *continued_children;
++	struct job_control_entry* job_control_entry;
++
+ 	struct vm_address_space *address_space;
+ 	struct thread	*main_thread;
+ 	struct thread	*thread_list;
+
+Modified: haiku/trunk/src/system/kernel/signal.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/signal.cpp	2007-08-28 02:25:14 UTC (rev 22087)
++++ haiku/trunk/src/system/kernel/signal.cpp	2007-08-28 03:29:14 UTC (rev 22088)
+@@ -7,6 +7,9 @@
+ 
+ /* POSIX signals handling routines */
+ 
++#include &lt;stddef.h&gt;
++#include &lt;string.h&gt;
++
+ #include &lt;OS.h&gt;
+ #include &lt;KernelExport.h&gt;
+ 
+@@ -19,9 +22,8 @@
+ #include &lt;team.h&gt;
+ #include &lt;thread.h&gt;
+ #include &lt;user_debugger.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ 
+-#include &lt;stddef.h&gt;
+-#include &lt;string.h&gt;
+ 
+ //#define TRACE_SIGNAL
+ #ifdef TRACE_SIGNAL
+@@ -133,13 +135,26 @@
+ 			switch (signal) {
+ 				case SIGCHLD:
+ 				case SIGWINCH:
+-				case SIGCONT:
+ 				case SIGURG:
+ 					// notify the debugger
+ 					if (debugSignal)
+ 						notify_debugger(thread, signal, handler, false);
+ 					continue;
+ 
++				case SIGCONT:
++					// notify the debugger
++					if (debugSignal
++						&amp;&amp; !notify_debugger(thread, signal, handler, false))
++						continue;
++
++					// notify threads waiting for team state changes
++					if (thread == thread-&gt;team-&gt;main_thread) {
++						InterruptsSpinLocker locker(team_spinlock);
++						team_set_job_control_state(thread-&gt;team,
++							JOB_CONTROL_STATE_CONTINUED, signal, false);
++					}
++					continue;
++
+ 				case SIGSTOP:
+ 				case SIGTSTP:
+ 				case SIGTTIN:
+@@ -151,6 +166,13 @@
+ 
+ 					thread-&gt;next_state = B_THREAD_SUSPENDED;
+ 					reschedule = true;
++
++					// notify threads waiting for team state changes
++					if (thread == thread-&gt;team-&gt;main_thread) {
++						InterruptsSpinLocker locker(team_spinlock);
++						team_set_job_control_state(thread-&gt;team,
++							JOB_CONTROL_STATE_STOPPED, signal, false);
++					}
+ 					continue;
+ 
+ 				case SIGQUIT:
+
+Modified: haiku/trunk/src/system/kernel/team.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/team.cpp	2007-08-28 02:25:14 UTC (rev 22087)
++++ haiku/trunk/src/system/kernel/team.cpp	2007-08-28 03:29:14 UTC (rev 22088)
+@@ -33,6 +33,7 @@
+ #include &lt;vfs.h&gt;
+ #include &lt;vm.h&gt;
+ #include &lt;vm_address_space.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ #include &lt;util/khash.h&gt;
+ 
+ //#define TRACE_TEAM
+@@ -564,32 +565,63 @@
+ 	team-&gt;dead_threads_kernel_time = 0;
+ 	team-&gt;dead_threads_user_time = 0;
+ 
+-	team-&gt;dead_children
+-		= (team_dead_children*)malloc(sizeof(team_dead_children));
++	// dead children
++	team-&gt;dead_children = new(nothrow) team_dead_children;
+ 	if (team-&gt;dead_children == NULL)
+ 		return NULL;
+-	MemoryDeleter deadChildrenDeleter(team-&gt;dead_children);
++	ObjectDeleter&lt;team_dead_children&gt; deadChildrenDeleter(team-&gt;dead_children);
+ 
+-	list_init(&amp;team-&gt;dead_children-&gt;list);
+ 	team-&gt;dead_children-&gt;count = 0;
+-	team-&gt;dead_children-&gt;wait_for_any = 0;
+ 	team-&gt;dead_children-&gt;kernel_time = 0;
+ 	team-&gt;dead_children-&gt;user_time = 0;
+-	team-&gt;dead_children-&gt;condition_variable.Publish(team-&gt;dead_children,
+-		&quot;dead children&quot;);
+ 
++	// stopped children
++	team-&gt;stopped_children = new(nothrow) team_job_control_children;
++	if (team-&gt;stopped_children == NULL)
++		return NULL;
++	ObjectDeleter&lt;team_job_control_children&gt; stoppedChildrenDeleter(
++		team-&gt;stopped_children);
++
++	// continued children
++	team-&gt;continued_children = new(nothrow) team_job_control_children;
++	if (team-&gt;continued_children == NULL)
++		return NULL;
++	ObjectDeleter&lt;team_job_control_children&gt; continuedChildrenDeleter(
++		team-&gt;continued_children);
++
++	// job control entry
++	team-&gt;job_control_entry = new(nothrow) job_control_entry;
++	if (team-&gt;job_control_entry == NULL)
++		return NULL;
++	ObjectDeleter&lt;job_control_entry&gt; jobControlEntryDeleter(
++		team-&gt;job_control_entry);
++	team-&gt;job_control_entry-&gt;state = JOB_CONTROL_STATE_NONE;
++	team-&gt;job_control_entry-&gt;thread = team-&gt;id;
++	team-&gt;job_control_entry-&gt;team = team;
++
+ 	list_init(&amp;team-&gt;image_list);
+ 	list_init(&amp;team-&gt;watcher_list);
+ 
+ 	clear_team_debug_info(&amp;team-&gt;debug_info, true);
+ 
+-	if (arch_team_init_team_struct(team, kernel) &lt; 0) {
+-		team-&gt;dead_children-&gt;condition_variable.Unpublish();
++	if (arch_team_init_team_struct(team, kernel) &lt; 0)
+ 		return NULL;
+-	}
+ 
++	// publish dead/stopped/continued children condition vars
++	team-&gt;dead_children-&gt;condition_variable.Publish(team-&gt;dead_children,
++		&quot;dead children&quot;);
++	team-&gt;stopped_children-&gt;condition_variable.Publish(team-&gt;stopped_children,
++		&quot;stopped children&quot;);
++	team-&gt;continued_children-&gt;condition_variable.Publish(
++		team-&gt;continued_children, &quot;continued children&quot;);
++
++	// keep all allocated structures
++	jobControlEntryDeleter.Detach();
++	continuedChildrenDeleter.Detach();
++	stoppedChildrenDeleter.Detach();
+ 	deadChildrenDeleter.Detach();
+ 	teamDeleter.Detach();
++
+ 	return team;
+ }
+ 
+@@ -597,16 +629,19 @@
+ static void
+ delete_team_struct(struct team *team)
+ {
+-	struct death_entry *death;
++	team-&gt;stopped_children-&gt;condition_variable.Unpublish();
++	team-&gt;continued_children-&gt;condition_variable.Unpublish();
+ 
+ 	team-&gt;dead_children-&gt;condition_variable.Unpublish();
+ 
+-	while ((death = (struct death_entry*)list_remove_head_item(
+-			&amp;team-&gt;dead_children-&gt;list)) != NULL) {
+-		free(death);
+-	}
++	while (job_control_entry* entry = team-&gt;dead_children-&gt;entries.RemoveHead())
++		delete entry;
+ 
+-	free(team-&gt;dead_children);
++	delete team-&gt;job_control_entry;
++		// usually already NULL and transferred to the parent
++	delete team-&gt;continued_children;
++	delete team-&gt;stopped_children;
++	delete team-&gt;dead_children;
+ 	free(team);
+ }
+ 
+@@ -1262,17 +1297,40 @@
+ }
+ 
+ 
+-/** This is the kernel backend for waitpid(). It is a bit more powerful when it comes
+- *	to the reason why a thread has died than waitpid() can be.
+- */
++static job_control_entry*
++get_job_control_entry(team_job_control_children* children, pid_t id)
++{
++	for (JobControlEntryList::Iterator it = children-&gt;entries.GetIterator();
++		 job_control_entry* entry = it.Next();) {
+ 
++		if (id &gt; 0) {
++			if (entry-&gt;thread == id)
++				return entry;
++		} else if (id == -1) {
++			return entry;
++		} else {
++			pid_t processGroup
++				= (entry-&gt;team ? entry-&gt;team-&gt;group_id : entry-&gt;group_id);
++			if (processGroup == -id)
++				return entry;
++		}
++	}
++
++	return NULL;
++}
++
++
++/*! This is the kernel backend for waitpid(). It is a bit more powerful when it
++	comes to the reason why a thread has died than waitpid() can be.
++*/
+ static thread_id
+-wait_for_child(thread_id child, uint32 flags, int32 *_reason, status_t *_returnCode)
++wait_for_child(pid_t child, uint32 flags, int32 *_reason,
++	status_t *_returnCode)
+ {
+ 	struct team *team = thread_get_current_thread()-&gt;team;
+-	struct death_entry death, *freeDeath = NULL;
++	struct job_control_entry foundEntry;
++	struct job_control_entry* freeDeathEntry = NULL;
+ 	status_t status = B_OK;
+-	bool childrenExist = false;
+ 
+ 	TRACE((&quot;wait_for_child(child = %ld, flags = %ld)\n&quot;, child, flags));
+ 
+@@ -1280,52 +1338,34 @@
+ 		// wait for all children in the process group of the calling team
+ 		child = -team-&gt;group_id;
+ 	}
+-	if (child &lt; 0) {
+-		// we need to make sure the death entries won't get deleted too soon
+-		atomic_add(&amp;team-&gt;dead_children-&gt;wait_for_any, 1);
+-	}
+ 
+ 	while (true) {
+-		ConditionVariableEntry&lt;team_dead_children&gt; waitEntry;
++		InterruptsSpinLocker locker(team_spinlock);
+ 
+-		cpu_status state = disable_interrupts();
+-		GRAB_THREAD_LOCK();
++		// check whether any condition holds
++		job_control_entry* entry = get_job_control_entry(team-&gt;dead_children,
++			child);
+ 
+-		if (child &gt; 0 &amp;&amp; !childrenExist) {
+-			// wait for the specified child
++		if (entry == NULL &amp;&amp; (flags &amp; WCONTINUED) != 0)
++			entry = get_job_control_entry(team-&gt;continued_children, child);
+ 
+-			struct thread *childThread = thread_get_thread_struct_locked(child);
+-			if (childThread != NULL) {
+-				// team is still running, so we would need to block
+-				if ((flags &amp; WNOHANG) != 0)
+-					status = B_WOULD_BLOCK;
++		if (entry == NULL &amp;&amp; (flags &amp; WUNTRACED) != 0)
++			entry = get_job_control_entry(team-&gt;stopped_children, child);
+ 
+-				// make sure this child is one of ours
+-				if (childThread-&gt;team-&gt;parent != team)
+-					status = ECHILD;
+-
+-				childrenExist = true;
+-			}
+-		}
+-
+-		RELEASE_THREAD_LOCK();
+-
+-		if (status != B_OK) {
+-			restore_interrupts(state);
+-			return status;
+-		}
+-
+-		// see if there is any death entry for us already
+-
+-		GRAB_TEAM_LOCK();
+-
+-		status = team_get_death_entry(team, child, &amp;death, &amp;freeDeath);
+-		if (status &lt; B_OK) {
+-			// there is no matching death entry
+-			if (child == -1)
++		// If we don't have an entry yet, check whether there are any children
++		// complying to the process group specification at all.
++		if (entry == NULL) {
++			// No success yet -- check whether there are any children we could
++			// wait for.
++			bool childrenExist = false;
++			if (child == -1) {
+ 				childrenExist = team-&gt;children != NULL;
+-			else if (child &lt; -1)
++			} else if (child &lt; -1) {
+ 				childrenExist = has_children_in_group(team, -child);
++			} else {
++				if (struct team* childTeam = team_get_team_struct_locked(child))
++					childrenExist = team-&gt;parent == team;
++			}
+ 
+ 			if (!childrenExist) {
+ 				// there is no child we could wait for
+@@ -1334,41 +1374,76 @@
+ 				// the children we're waiting for are still running
+ 				status = B_WOULD_BLOCK;
+ 			}
++		} else {
++			// got something
++			foundEntry = *entry;
++			if (entry-&gt;state == JOB_CONTROL_STATE_DEAD) {
++				// The child is dead. Reap its death entry.
++				freeDeathEntry = entry;
++				team-&gt;dead_children-&gt;entries.Remove(entry);
++				team-&gt;dead_children-&gt;count--;
++			} else {
++				// The child is well. Reset its job control state.
++				team_set_job_control_state(entry-&gt;team,
++					JOB_CONTROL_STATE_NONE, 0, false);
++			}
+ 		}
++
++		// If we haven't got anything yet, add prepare for waiting for the
++		// condition variables.
++		ConditionVariableEntry&lt;team_dead_children&gt; deadWaitEntry;
++		ConditionVariableEntry&lt;team_job_control_children&gt; continuedWaitEntry;
++		ConditionVariableEntry&lt;team_job_control_children&gt; stoppedWaitEntry;
++
+ 		if (status == B_WOULD_BLOCK &amp;&amp; (flags &amp; WNOHANG) == 0) {
+-			// We need to hold the team lock when changing this counter,
+-			// but of course only if we really will wait later
+-			waitEntry.Add(team-&gt;dead_children);
++			deadWaitEntry.Add(team-&gt;dead_children);
++
++			if ((flags &amp; WCONTINUED) != 0) {
++				continuedWaitEntry.Add(team-&gt;continued_children,
++					&amp;deadWaitEntry);
++			}
++
++			if ((flags &amp; WUNTRACED) != 0)
++				stoppedWaitEntry.Add(team-&gt;stopped_children, &amp;deadWaitEntry);
+ 		}
+ 
+-		RELEASE_TEAM_LOCK();
+-		restore_interrupts(state);
++		locker.Unlock();
+ 
+-		// we got our death entry and can return to our caller
++		// we got our entry and can return to our caller
+ 		if (status == B_OK)
+ 			break;
+ 		if (status != B_WOULD_BLOCK || (flags &amp; WNOHANG) != 0)
+-			goto err;
++			return status;
+ 
+-		status = waitEntry.Wait(B_CAN_INTERRUPT);
++		status = deadWaitEntry.Wait(B_CAN_INTERRUPT);
+ 		if (status == B_INTERRUPTED)
+-			goto err;
++			return status;
+ 	}
+ 
+-	free(freeDeath);
++	delete freeDeathEntry;
+ 
+ 	// when we got here, we have a valid death entry, and
+ 	// already got unregistered from the team or group
+-	*_returnCode = death.status;
+-	*_reason = (death.signal &lt;&lt; 16) | death.reason;
++	int reason = 0;
++	switch (foundEntry.state) {
++		case JOB_CONTROL_STATE_DEAD:
++			reason = foundEntry.reason;
++			break;
++		case JOB_CONTROL_STATE_STOPPED:
++			reason = THREAD_STOPPED;
++			break;
++		case JOB_CONTROL_STATE_CONTINUED:
++			reason = THREAD_CONTINUED;
++			break;
++		case JOB_CONTROL_STATE_NONE:
++			// can't happen
++			break;
++	}
+ 
+-	return death.thread;
++	*_returnCode = foundEntry.status;
++	*_reason = (foundEntry.signal &lt;&lt; 16) | reason;
+ 
+-err:
+-	if (child &lt; 0)
+-		atomic_add(&amp;team-&gt;dead_children-&gt;wait_for_any, -1);
+-
+-	return status;
++	return foundEntry.thread;
+ }
+ 
+ 
+@@ -1466,45 +1541,29 @@
+ }
+ 
+ 
+-/** Fills the provided death entry if it's in the team.
+- *	The \a child parameter follows waitpid() semantics.
+- *	You need to have the team lock held when calling this function.
+- */
+-
+-status_t
+-team_get_death_entry(struct team *team, thread_id child, struct death_entry *death,
+-	struct death_entry **_freeDeath)
++/*! Fills the provided death entry if it's in the team.
++	You need to have the team lock held when calling this function.
++*/
++job_control_entry*
++team_get_death_entry(struct team *team, thread_id child, bool* _deleteEntry)
+ {
+-	struct death_entry *entry = NULL;
++	if (child &lt;= 0)
++		return NULL;
+ 
+-	// find matching death entry structure
+-
+-	if (child == 0) {
+-		// wait for all children in the process group of the calling team
+-		child = -team-&gt;group_id;
+-	}
+-
+-	while ((entry = (struct death_entry*)list_get_next_item(
+-			&amp;team-&gt;dead_children-&gt;list, entry)) != NULL) {
+-		if (child != -1 &amp;&amp; entry-&gt;thread != child &amp;&amp; entry-&gt;group_id != -child)
+-			continue;
+-
+-		// we found one
+-
+-		*death = *entry;
+-
+-		// only remove the death entry if there aren't any other interested parties
+-		if ((child &lt; 0 &amp;&amp; atomic_add(&amp;team-&gt;dead_children-&gt;wait_for_any, -1) == 1)
+-			|| (child &gt; 0 &amp;&amp; team-&gt;dead_children-&gt;wait_for_any == 0)) {
+-			list_remove_link(entry);
++	job_control_entry* entry = get_job_control_entry(team-&gt;dead_children,
++		child);
++	if (entry) {
++		// remove the entry only, if the caller is the parent of the found team
++		if (team_get_current_team_id() == entry-&gt;thread) {
++			team-&gt;dead_children-&gt;entries.Remove(entry);
+ 			team-&gt;dead_children-&gt;count--;
+-			*_freeDeath = entry;
++			*_deleteEntry = true;
++		} else {
++			*_deleteEntry = false;
+ 		}
+-
+-		return B_OK;
+ 	}
+ 
+-	return B_ERROR;
++	return entry;
+ }
+ 
+ 
+@@ -1722,7 +1781,6 @@
+ 	remove_images(team);
+ 	vfs_free_io_context(team-&gt;io_context);
+ 
+-	// ToDo: should our death_entries be moved one level up?
+ 	delete_team_struct(team);
+ 
+ 	// notify the debugger, that the team is gone
+@@ -1787,6 +1845,74 @@
+ }
+ 
+ 
++/*!	Sets the team's job control state.
++	Interrupts must be disabled and the team lock being held.
++	\a threadsLocked indicates whether the thread lock is being held, too.
++*/
++void
++team_set_job_control_state(struct team* team, job_control_state newState,
++	int signal, bool threadsLocked)
++{
++	if (team == NULL || team-&gt;job_control_entry == NULL)
++		return;
++
++	// don't touch anything, if the state stays the same or the team is already
++	// dead
++	job_control_entry* entry = team-&gt;job_control_entry;
++	if (entry-&gt;state == newState || entry-&gt;state == JOB_CONTROL_STATE_DEAD)
++		return;
++
++	// remove from the old list
++	switch (entry-&gt;state) {
++		case JOB_CONTROL_STATE_NONE:
++			// entry is in no list ATM
++			break;
++		case JOB_CONTROL_STATE_DEAD:
++			// can't get here
++			break;
++		case JOB_CONTROL_STATE_STOPPED:
++			team-&gt;parent-&gt;stopped_children-&gt;entries.Remove(entry);
++			break;
++		case JOB_CONTROL_STATE_CONTINUED:
++			team-&gt;parent-&gt;continued_children-&gt;entries.Remove(entry);
++			break;
++	}
++
++	entry-&gt;state = newState;
++	entry-&gt;signal = signal;
++
++	// add to new list
++	team_job_control_children* childList = NULL;
++	switch (entry-&gt;state) {
++		case JOB_CONTROL_STATE_NONE:
++			// entry doesn't get into any list
++			break;
++		case JOB_CONTROL_STATE_DEAD:
++			childList = team-&gt;parent-&gt;dead_children;
++			team-&gt;parent-&gt;dead_children-&gt;count++;
++			// When a child dies, we need to notify all lists, since that might
++			// have been the last of the parent's children, and a waiting
++			// parent thread wouldn't wake up otherwise.
++			team-&gt;parent-&gt;stopped_children-&gt;condition_variable.NotifyAll(
++				threadsLocked);
++			team-&gt;parent-&gt;continued_children-&gt;condition_variable.NotifyAll(
++				threadsLocked);
++			break;
++		case JOB_CONTROL_STATE_STOPPED:
++			childList = team-&gt;parent-&gt;stopped_children;
++			break;
++		case JOB_CONTROL_STATE_CONTINUED:
++			childList = team-&gt;parent-&gt;continued_children;
++			break;
++	}
++
++	if (childList != NULL) {
++		childList-&gt;entries.Add(entry);
++		childList-&gt;condition_variable.NotifyAll(threadsLocked);
++	}
++}
++
++
+ /** Adds a hook to the team that is called as soon as this
+  *	team goes away.
+  *	This call might get public in the future.
+
+Modified: haiku/trunk/src/system/kernel/thread.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/thread.cpp	2007-08-28 02:25:14 UTC (rev 22087)
++++ haiku/trunk/src/system/kernel/thread.cpp	2007-08-28 03:29:14 UTC (rev 22088)
+@@ -1094,7 +1094,6 @@
+ 	struct thread *thread = thread_get_current_thread();
+ 	struct process_group *freeGroup = NULL;
+ 	struct team *team = thread-&gt;team;
+-	struct death_entry *death = NULL;
+ 	thread_id parentID = -1;
+ 	bool deleteTeam = false;
+ 	sem_id cachedDeathSem = -1;
+@@ -1122,20 +1121,11 @@
+ 		delete_area_etc(team, area);
+ 	}
+ 
++	struct job_control_entry *death = NULL;
+ 	if (team != team_get_kernel_team()) {
+ 		if (team-&gt;main_thread == thread) {
+ 			// this was the main thread in this team, so we will delete that as well
+ 			deleteTeam = true;
+-
+-			// put a death entry into the dead children list of our parent
+-			death = (struct death_entry *)malloc(sizeof(struct death_entry));
+-			if (death != NULL) {
+-				death-&gt;group_id = team-&gt;group_id;
+-				death-&gt;thread = thread-&gt;id;
+-				death-&gt;status = thread-&gt;exit.status;
+-				death-&gt;reason = thread-&gt;exit.reason;
+-				death-&gt;signal = thread-&gt;exit.signal;
+-			}
+ 		}
+ 
+ 		// remove this thread from the current team and add it to the kernel
+@@ -1161,22 +1151,30 @@
+ 			// remember who our parent was so we can send a signal
+ 			parentID = parent-&gt;id;
+ 
++			// Set the team job control state to &quot;dead&quot; and detach the job
++			// control entry from our team struct.
++			team_set_job_control_state(team, JOB_CONTROL_STATE_DEAD, 0, true);
++			death = team-&gt;job_control_entry;
++			team-&gt;job_control_entry = NULL;
++
+ 			if (death != NULL) {
+-				// insert death entry into the parent's list
++				death-&gt;team = NULL;
++				death-&gt;group_id = team-&gt;group_id;
++				death-&gt;thread = thread-&gt;id;
++				death-&gt;status = thread-&gt;exit.status;
++				death-&gt;reason = thread-&gt;exit.reason;
++				death-&gt;signal = thread-&gt;exit.signal;
+ 
+-				list_add_link_to_tail(&amp;parent-&gt;dead_children-&gt;list, death);
+-				if (++parent-&gt;dead_children-&gt;count &gt; MAX_DEAD_CHILDREN) {
+-					death = (struct death_entry*)list_remove_head_item(
+-						&amp;parent-&gt;dead_children-&gt;list);
++				// team_set_job_control_state() already moved our entry
++				// into the parent's list. We just check the soft limit of
++				// death entries.
++				if (parent-&gt;dead_children-&gt;count &gt; MAX_DEAD_CHILDREN) {
++					death = parent-&gt;dead_children-&gt;entries.RemoveHead();
+ 					parent-&gt;dead_children-&gt;count--;
+ 				} else
+ 					death = NULL;
+ 
+ 				RELEASE_THREAD_LOCK();
+-
+-				// notify listeners that a new death entry is available
+-				// TODO: should that be moved to handle_signal() (for SIGCHLD)?
+-				parent-&gt;dead_children-&gt;condition_variable.NotifyOne();
+ 			} else
+ 				RELEASE_THREAD_LOCK();
+ 
+@@ -1198,9 +1196,9 @@
+ 		team_delete_process_group(freeGroup);
+ 		team_delete_team(team);
+ 
+-		// we need to remove any death entry that made it to here
++		// we need to delete any death entry that made it to here
+ 		if (death != NULL)
+-			free(death);
++			delete death;
+ 
+ 		send_signal_etc(parentID, SIGCHLD, B_DO_NOT_RESCHEDULE);
+ 		cachedDeathSem = -1;
+@@ -1251,12 +1249,12 @@
+ 		thread-&gt;exit.sem = -1;
+ 
+ 		// fill all death entries
+-		death = NULL;
+-		while ((death = (struct death_entry*)list_get_next_item(
+-				&amp;thread-&gt;exit.waiters, death)) != NULL) {
+-			death-&gt;status = thread-&gt;exit.status;
+-			death-&gt;reason = thread-&gt;exit.reason;
+-			death-&gt;signal = thread-&gt;exit.signal;
++		death_entry* entry = NULL;
++		while ((entry = (struct death_entry*)list_get_next_item(
++				&amp;thread-&gt;exit.waiters, entry)) != NULL) {
++			entry-&gt;status = thread-&gt;exit.status;
++			entry-&gt;reason = thread-&gt;exit.reason;
++			entry-&gt;signal = thread-&gt;exit.signal;
+ 		}
+ 
+ 		RELEASE_THREAD_LOCK();
+@@ -1513,7 +1511,8 @@
+ 	status_t *_returnCode)
+ {
+ 	sem_id exitSem = B_BAD_THREAD_ID;
+-	struct death_entry death, *freeDeath = NULL;
++	struct death_entry death;
++	job_control_entry* freeDeath = NULL;
+ 	struct thread *thread;
+ 	cpu_status state;
+ 	status_t status = B_OK;
+@@ -1540,8 +1539,15 @@
+ 		// find its death entry in our team
+ 		GRAB_TEAM_LOCK();
+ 
+-		status = team_get_death_entry(thread_get_current_thread()-&gt;team,
+-			id, &amp;death, &amp;freeDeath);
++		bool deleteEntry;
++		freeDeath = team_get_death_entry(thread_get_current_thread()-&gt;team, id,
++			&amp;deleteEntry);
++		if (freeDeath != NULL) {
++			death.status = freeDeath-&gt;status;
++			if (!deleteEntry)
++				freeDeath = NULL;
++		} else
++			status = B_BAD_THREAD_ID;
+ 
+ 		RELEASE_TEAM_LOCK();
+ 	}
+@@ -1553,7 +1559,7 @@
+ 		if (_returnCode)
+ 			*_returnCode = death.status;
+ 
+-		free(freeDeath);
++		delete freeDeath;
+ 		return B_OK;
+ 	}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003708.html">[Haiku-commits] r22087 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="003710.html">[Haiku-commits] r22089 - haiku/trunk/src/system/libroot/posix/sys
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3709">[ date ]</a>
+              <a href="thread.html#3709">[ thread ]</a>
+              <a href="subject.html#3709">[ subject ]</a>
+              <a href="author.html#3709">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,231 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25408 - haiku/trunk/src/add-ons/kernel/drivers/tty
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25408%20-%20haiku/trunk/src/add-ons/kernel/drivers/tty&In-Reply-To=%3C200805100207.m4A27F7v029669%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008672.html">
+   <LINK REL="Next"  HREF="008671.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25408 - haiku/trunk/src/add-ons/kernel/drivers/tty</H1>
+    <B>mmu_man at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25408%20-%20haiku/trunk/src/add-ons/kernel/drivers/tty&In-Reply-To=%3C200805100207.m4A27F7v029669%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25408 - haiku/trunk/src/add-ons/kernel/drivers/tty">mmu_man at mail.berlios.de
+       </A><BR>
+    <I>Sat May 10 04:07:15 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008672.html">[Haiku-commits] r25407 - haiku/trunk/src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="008671.html">[Haiku-commits] r25409 - haiku/trunk/src/apps/terminal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8670">[ date ]</a>
+              <a href="thread.html#8670">[ thread ]</a>
+              <a href="subject.html#8670">[ subject ]</a>
+              <a href="author.html#8670">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmu_man
+Date: 2008-05-10 04:07:12 +0200 (Sat, 10 May 2008)
+New Revision: 25408
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25408&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25408&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h
+Log:
+- dump termios struct for ttys
+- implement VMIN &amp; VTIME, at least it seems to work but it's 4am and it's overly weird, so please review.
+See <A HREF="http://man.cx/termios">http://man.cx/termios</A> and <A HREF="http://www.unixwiz.net/techtips/termios-vmin-vtime.html">http://www.unixwiz.net/techtips/termios-vmin-vtime.html</A> .
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp	2008-05-10 00:53:13 UTC (rev 25407)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/tty.cpp	2008-05-10 02:07:12 UTC (rev 25408)
+@@ -135,7 +135,7 @@
+ 		ReaderLocker(tty_cookie *cookie);
+ 		~ReaderLocker();
+ 
+-		status_t AcquireReader(bigtime_t timeout);
++		status_t AcquireReader(bigtime_t timeout, size_t minBytes);
+ 		status_t AcquireReader(bool dontBlock);
+ 
+ 	private:
+@@ -678,7 +678,7 @@
+ 
+ 
+ status_t 
+-ReaderLocker::AcquireReader(bigtime_t timeout)
++ReaderLocker::AcquireReader(bigtime_t timeout, size_t minBytes)
+ {
+ 	if (fCookie-&gt;closed)
+ 		return B_FILE_ERROR;
+@@ -690,7 +690,7 @@
+ 	// check, if we're first in queue, and if there is something to read
+ 	if (fRequestOwner.IsFirstInQueues()) {
+ 		fBytes = _CheckAvailableBytes();
+-		if (fBytes &gt; 0)
++		if (fBytes &gt; minBytes)
+ 			return B_OK;
+ 	}
+ 
+@@ -717,7 +717,7 @@
+ status_t 
+ ReaderLocker::AcquireReader(bool dontBlock)
+ {
+-	return AcquireReader(dontBlock ? 0 : B_INFINITE_TIMEOUT);
++	return AcquireReader(dontBlock ? 0 : B_INFINITE_TIMEOUT, 0);
+ }
+ 
+ 
+@@ -1500,9 +1500,11 @@
+ 	bool dontBlock = (mode &amp; O_NONBLOCK) != 0;
+ 	size_t length = *_length;
+ 	ssize_t bytesRead = 0;
++	bool canon = true;
+ 	bigtime_t timeout = dontBlock ? 0 : B_INFINITE_TIMEOUT;
+-	bigtime_t vtime = 0LL;
++	bigtime_t vtime = timeout;
+ 	size_t vmin = 0;
++	size_t minRead = 0;
+ 
+ 	TRACE((&quot;tty_input_read(tty = %p, length = %lu, mode = %lu)\n&quot;, tty, length, mode));
+ 
+@@ -1516,22 +1518,56 @@
+ 
+ 	ReaderLocker locker(cookie);
+ 
++	// handle raw mode
++	if ((!tty-&gt;is_master) &amp;&amp; ((tty-&gt;settings-&gt;termios.c_lflag &amp; ICANON) == 0)) {
++		canon = false;
++		vmin = tty-&gt;settings-&gt;termios.c_cc[VMIN];
++		// for now behaviour is undefined when nonblocking is enabled
++		//if (!dontBlock) // XXX does it take precedence or not ?
++		vtime = tty-&gt;settings-&gt;termios.c_cc[VTIME] * 100000LL;
++		TRACE((&quot;tty_input_read: -icanon vmin %lu, vtime %Ldus\n&quot;, vmin, vtime));
++
++		// yes it's weird but termios is!
++		if (vmin &amp;&amp; vtime == 0LL)
++			vtime = B_INFINITE_TIMEOUT;
++		if (!vmin)
++			timeout = vtime;
++		// timeout starts at 1st char when vmin &gt; 0
++		// so we first wait for 1 char only
++		minRead = 0;
++	}
++
+ 	while (bytesRead == 0) {
+-		status_t status = locker.AcquireReader(timeout);
++		TRACE((&quot;tty_input_read: AcquireReader(%Ldus, %ld)\n&quot;, timeout, minRead));
++		status_t status = locker.AcquireReader(timeout, minRead);
++		if (status == B_WOULD_BLOCK) {
++			*_length = 0;
++			return 0;
++		}
+ 		if (status != B_OK) {
+ 			*_length = 0;
+ 			return status;
+ 		}
+ 
+ 		size_t toRead = locker.AvailableBytes();
+-		if (toRead == 0)
++
++		if (toRead) {
++			// raw mode: we have something, now retry with vmin and vtime
++			minRead = MAX(vmin-1, 0);
++			timeout = vtime;
++		}
++
++		if (toRead &lt; vmin &amp;&amp; timeout == B_INFINITE_TIMEOUT)
+ 			continue;
+ 		if (toRead &gt; length)
+ 			toRead = length;
+ 
+ 		bool _hitEOF = false;
+-		bool* hitEOF = (tty-&gt;pending_eof &gt; 0 ? &amp;_hitEOF : NULL);
++		bool* hitEOF = NULL;
+ 
++		if (canon &amp;&amp; tty-&gt;pending_eof &gt; 0)
++			hitEOF = &amp;_hitEOF;
++
+ 		bytesRead = line_buffer_user_read(tty-&gt;input_buffer, (char *)buffer,
+ 			toRead, tty-&gt;settings-&gt;termios.c_cc[VEOF], hitEOF);
+ 		if (bytesRead &lt; B_OK) {
+@@ -1923,7 +1959,18 @@
+ {
+ 	kprintf(&quot;  pgrp_id:      %ld\n&quot;, settings.pgrp_id);
+ 	kprintf(&quot;  session_id:   %ld\n&quot;, settings.session_id);
+-	// struct termios		termios;
++
++	kprintf(&quot;  termios:\n&quot;);
++	kprintf(&quot;    c_iflag:    0x%08lx\n&quot;, settings.termios.c_iflag);
++	kprintf(&quot;    c_oflag:    0x%08lx\n&quot;, settings.termios.c_oflag);
++	kprintf(&quot;    c_cflag:    0x%08lx\n&quot;, settings.termios.c_cflag);
++	kprintf(&quot;    c_lflag:    0x%08lx\n&quot;, settings.termios.c_lflag);
++	kprintf(&quot;    c_line:     %d\n&quot;, settings.termios.c_line);
++	kprintf(&quot;    c_ispeed:   %u\n&quot;, settings.termios.c_ispeed);
++	kprintf(&quot;    c_ospeed:   %u\n&quot;, settings.termios.c_ospeed);
++	for (int i = 0; i &lt; NCCS; i++)
++		kprintf(&quot;    c_cc[%02d]:   %d\n&quot;, i, settings.termios.c_cc[i]);
++
+ 	kprintf(&quot;  wsize:        %u x %u c, %u x %u pxl\n&quot;, 
+ 		settings.window_size.ws_row, settings.window_size.ws_col, 
+ 		settings.window_size.ws_xpixel, settings.window_size.ws_ypixel);
+@@ -1932,6 +1979,7 @@
+ static void
+ dump_tty_struct(struct tty&amp; tty)
+ {
++	kprintf(&quot;  tty @:        %p\n&quot;, &amp;tty);
+ 	kprintf(&quot;  index:        %ld\n&quot;, tty.index);
+ 	kprintf(&quot;  is_master:    %s\n&quot;, tty.is_master ? &quot;true&quot; : &quot;false&quot;);
+ 	kprintf(&quot;  open_count:   %ld\n&quot;, tty.open_count);
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h	2008-05-10 00:53:13 UTC (rev 25407)
++++ haiku/trunk/src/add-ons/kernel/drivers/tty/tty_private.h	2008-05-10 02:07:12 UTC (rev 25408)
+@@ -91,7 +91,7 @@
+ 		void SetBytesNeeded(size_t bytesNeeded);
+ 		size_t BytesNeeded() const	{ return fBytesNeeded; }
+ 
+-		status_t Wait(bool interruptable, bigtime_t timeout=B_INFINITE_TIMEOUT);
++		status_t Wait(bool interruptable, bigtime_t timeout = B_INFINITE_TIMEOUT);
+ 
+ 		bool IsFirstInQueues();
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008672.html">[Haiku-commits] r25407 - haiku/trunk/src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="008671.html">[Haiku-commits] r25409 - haiku/trunk/src/apps/terminal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8670">[ date ]</a>
+              <a href="thread.html#8670">[ thread ]</a>
+              <a href="subject.html#8670">[ subject ]</a>
+              <a href="author.html#8670">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

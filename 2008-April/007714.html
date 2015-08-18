@@ -1,0 +1,225 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24941 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24941%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/stack&In-Reply-To=%3C200804120928.m3C9S75h031129%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007713.html">
+   <LINK REL="Next"  HREF="007715.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24941 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24941%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/stack&In-Reply-To=%3C200804120928.m3C9S75h031129%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24941 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Apr 12 11:28:07 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007713.html">[Haiku-commits] r24940 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack
+</A></li>
+        <LI>Next message: <A HREF="007715.html">[Haiku-commits] r24942 - haiku/trunk/src/bin/bzip2
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7714">[ date ]</a>
+              <a href="thread.html#7714">[ thread ]</a>
+              <a href="subject.html#7714">[ subject ]</a>
+              <a href="author.html#7714">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-04-12 11:28:05 +0200 (Sat, 12 Apr 2008)
+New Revision: 24941
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24941&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24941&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/net/net_protocol.h
+   haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp
+Log:
+Added support for sending/receiving ancillary data. The protocol modules
+have two more optional hooks for attaching supplied ancillary data to a
+net_buffer and for processing received ancillary data. Not sure, if that
+is flexible enough for all kinds of ancillary data, but it is for
+SCM_RIGHTS and also should for SCM_CRED[ENTIAL]S (if we ever decide to
+implement one of those) -- don't know any other types on other protocol
+levels.
+
+
+Modified: haiku/trunk/headers/private/net/net_protocol.h
+===================================================================
+--- haiku/trunk/headers/private/net/net_protocol.h	2008-04-12 09:19:44 UTC (rev 24940)
++++ haiku/trunk/headers/private/net/net_protocol.h	2008-04-12 09:28:05 UTC (rev 24941)
+@@ -68,6 +68,12 @@
+ 	status_t	(*error)(uint32 code, net_buffer *data);
+ 	status_t	(*error_reply)(net_protocol *self, net_buffer *causedError,
+ 					uint32 code, void *errorData);
++
++	status_t	(*attach_ancillary_data)(net_protocol *self, net_buffer *buffer,
++					const cmsghdr *header);
++	ssize_t		(*process_ancillary_data)(net_protocol *self,
++					const ancillary_data_header *header, const void *data,
++					void *buffer, size_t bufferSize);
+ };
+ 
+ #endif	// NET_PROTOCOL_H
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp	2008-04-12 09:19:44 UTC (rev 24940)
++++ haiku/trunk/src/add-ons/kernel/network/stack/net_socket.cpp	2008-04-12 09:28:05 UTC (rev 24941)
+@@ -133,6 +133,62 @@
+ }
+ 
+ 
++static status_t
++attach_ancillary_data(net_socket *socket, net_buffer *buffer, void *data,
++	size_t dataLen)
++{
++	cmsghdr *header = (cmsghdr*)data;
++
++	while (dataLen &gt; 0) {
++		if (header-&gt;cmsg_len &lt; sizeof(cmsghdr) || header-&gt;cmsg_len &gt; dataLen)
++			return B_BAD_VALUE;
++
++		if (socket-&gt;first_info-&gt;attach_ancillary_data == NULL)
++			return EOPNOTSUPP;
++
++		status_t status = socket-&gt;first_info-&gt;attach_ancillary_data(
++			socket-&gt;first_protocol, buffer, header);
++		if (status != B_OK)
++			return status;
++
++		dataLen -= _ALIGN(header-&gt;cmsg_len);
++		header = (cmsghdr*)((uint8*)header + _ALIGN(header-&gt;cmsg_len));
++	}
++
++	return B_OK;
++}
++
++
++static status_t
++process_ancillary_data(net_socket *socket, net_buffer *buffer, msghdr *_header)
++{
++	uint8 *dataBuffer = (uint8*)_header-&gt;msg_control;
++	int dataBufferLen = _header-&gt;msg_controllen;
++
++	ancillary_data_header header;
++	void *data = NULL;
++
++	while ((data = gNetBufferModule.next_ancillary_data(buffer, data, &amp;header))
++			!= NULL) {
++
++		if (socket-&gt;first_info-&gt;process_ancillary_data == NULL)
++			return EOPNOTSUPP;
++
++		ssize_t bytesWritten = socket-&gt;first_info-&gt;process_ancillary_data(
++			socket-&gt;first_protocol, &amp;header, data, dataBuffer, dataBufferLen);
++		if (bytesWritten &lt; 0)
++			return bytesWritten;
++
++		dataBuffer += bytesWritten;
++		dataBufferLen -= bytesWritten;		
++	}
++
++	_header-&gt;msg_controllen -= dataBufferLen;
++
++	return B_OK;
++}
++
++
+ //	#pragma mark -
+ 
+ 
+@@ -891,6 +947,18 @@
+ 	if (status &lt; B_OK)
+ 		return status;
+ 
++	// process ancillary data
++	if (header != NULL) {
++		if (buffer != NULL &amp;&amp; header-&gt;msg_control != NULL) {
++			status = process_ancillary_data(socket, buffer, header);
++			if (status != B_OK) {
++				gNetBufferModule.free(buffer);
++				return status;
++			}
++		} else
++			header-&gt;msg_controllen = 0;
++	}
++
+ 	// TODO: - returning a NULL buffer when received 0 bytes
+ 	//         may not make much sense as we still need the address
+ 	//       - gNetBufferModule.read() uses memcpy() instead of user_memcpy
+@@ -969,9 +1037,14 @@
+ 	// present, { data, length } would have been iovec[0] and is
+ 	// always considered like that
+ 
++	cmsghdr *ancillaryData = NULL;
++	size_t ancillaryDataLen = 0;
++
+ 	if (header != NULL) {
+ 		address = (const sockaddr *)header-&gt;msg_name;
+ 		addressLength = header-&gt;msg_namelen;
++		ancillaryData = (cmsghdr *)header-&gt;msg_control;
++		ancillaryDataLen = header-&gt;msg_controllen;
+ 
+ 		if (header-&gt;msg_iovlen &lt;= 1)
+ 			header = NULL;
+@@ -1060,13 +1133,23 @@
+ 			}
+ 		}
+ 
++		// attach ancillary data to the first buffer
++		status_t status = B_OK;
++		if (ancillaryData != NULL) {
++			status = attach_ancillary_data(socket, buffer, ancillaryData,
++				ancillaryDataLen);
++			ancillaryData = NULL;
++		}
++
+ 		size_t bufferSize = buffer-&gt;size;
+ 		buffer-&gt;flags = flags;
+ 		memcpy(buffer-&gt;source, &amp;socket-&gt;address, socket-&gt;address.ss_len);
+ 		memcpy(buffer-&gt;destination, address, addressLength);
+ 
+-		status_t status = socket-&gt;first_info-&gt;send_data(socket-&gt;first_protocol,
+-			buffer);
++		if (status == B_OK) {
++			status = socket-&gt;first_info-&gt;send_data(socket-&gt;first_protocol,
++				buffer);
++		}
+ 		if (status &lt; B_OK) {
+ 			size_t sizeAfterSend = buffer-&gt;size;
+ 			gNetBufferModule.free(buffer);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007713.html">[Haiku-commits] r24940 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack
+</A></li>
+	<LI>Next message: <A HREF="007715.html">[Haiku-commits] r24942 - haiku/trunk/src/bin/bzip2
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7714">[ date ]</a>
+              <a href="thread.html#7714">[ thread ]</a>
+              <a href="subject.html#7714">[ subject ]</a>
+              <a href="author.html#7714">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,281 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24269 - haiku/trunk/src/servers/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24269%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200803061255.m26CtfYj026782%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006579.html">
+   <LINK REL="Next"  HREF="006581.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24269 - haiku/trunk/src/servers/app</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24269%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200803061255.m26CtfYj026782%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24269 - haiku/trunk/src/servers/app">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Mar  6 13:55:41 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006579.html">[Haiku-commits] r24268 - haiku/trunk/build/jam
+</A></li>
+        <LI>Next message: <A HREF="006581.html">[Haiku-commits] r24270 - haiku/trunk/data/system/boot
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6580">[ date ]</a>
+              <a href="thread.html#6580">[ thread ]</a>
+              <a href="subject.html#6580">[ subject ]</a>
+              <a href="author.html#6580">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-03-06 13:55:41 +0100 (Thu, 06 Mar 2008)
+New Revision: 24269
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24269&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24269&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/Desktop.cpp
+   haiku/trunk/src/servers/app/Desktop.h
+   haiku/trunk/src/servers/app/WindowLayer.cpp
+Log:
+* In normal mouse mode, the focus list is no longer used to find the 
+  next window to get focus after the current one is gone. This fixes the
+  strange behaviour when using right-click to send the current window to
+  the back.
+* When FFM is active, Desktop::SendWindowBehind() will now choose the 
+  new focus window to be the one under the mouse, overriding the focus 
+  list.
+* Desktop::SendWindowBehind() will now also call _SendFakeMouseMoved()
+  if necessary.
+* Removed Desktop::fFocusFollowsMouse; it was not used or 
+  maintained anywhere.
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/servers/app/Desktop.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/Desktop.cpp	2008-03-06 12:42:16 UTC (rev 24268)
++++ haiku/trunk/src/servers/app/Desktop.cpp	2008-03-06 12:55:41 UTC (rev 24269)
+@@ -322,8 +322,6 @@
+ 
+ 	fWindowLock(&quot;window lock&quot;),
+ 
+-	fFocusFollowsMouse(false),
+-
+ 	fMouseEventWindow(NULL),
+ 	fWindowUnderMouse(NULL),
+ 	fViewUnderMouse(B_NULL_TOKEN),
+@@ -1316,7 +1314,7 @@
+ 
+ 	bool hasModal = _WindowHasModal(focus);
+ 
+-	// TODO: test for FFM and B_LOCK_WINDOW_FOCUS
++	// TODO: test for B_LOCK_WINDOW_FOCUS
+ 
+ 	if (focus == fFocus &amp;&amp; focus != NULL &amp;&amp; !focus-&gt;IsHidden()
+ 		&amp;&amp; (focus-&gt;Flags() &amp; B_AVOID_FOCUS) == 0 &amp;&amp; !hasModal) {
+@@ -1325,16 +1323,30 @@
+ 		return;
+ 	}
+ 
+-	if (focus == NULL || hasModal)
+-		focus = fFocusList.LastWindow();
++	uint32 list = fCurrentWorkspace;
+ 
++	if (fSettings-&gt;FocusFollowsMouse())
++		list = kFocusList;
++
++	if (focus == NULL || hasModal) {
++		if (!fSettings-&gt;FocusFollowsMouse()) {
++			focus = FrontWindow();
++			if (focus == NULL) {
++				// there might be no front window in case of only a single
++				// window with B_FLOATING_ALL_WINDOW_FEEL
++				focus = _CurrentWindows().LastWindow();
++			}
++		} else
++			focus = fFocusList.LastWindow();
++	}
++
+ 	// make sure no window is chosen that doesn't want focus or cannot have it
+ 	while (focus != NULL
+ 		&amp;&amp; (!focus-&gt;InWorkspace(fCurrentWorkspace)
+ 			|| (focus-&gt;Flags() &amp; B_AVOID_FOCUS) != 0
+ 			|| _WindowHasModal(focus)
+ 			|| focus-&gt;IsHidden())) {
+-		focus = focus-&gt;PreviousWindow(kFocusList);
++		focus = focus-&gt;PreviousWindow(list);
+ 	}
+ 
+ 	if (fFocus == focus) {
+@@ -1571,10 +1583,19 @@
+ 	MarkDirty(dirty);
+ 
+ 	_UpdateFronts();
+-	SetFocusWindow();
++	SetFocusWindow(fSettings-&gt;FocusFollowsMouse() ?
++		WindowAt(fLastMousePosition) : NULL);
++
++	bool sendFakeMouseMoved = false;
++	if (FocusWindow() != window)
++		sendFakeMouseMoved = true;
++
+ 	_WindowChanged(window);
+ 
+ 	UnlockAllWindows();
++
++	if (sendFakeMouseMoved)
++		_SendFakeMouseMoved();
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/servers/app/Desktop.h
+===================================================================
+--- haiku/trunk/src/servers/app/Desktop.h	2008-03-06 12:42:16 UTC (rev 24268)
++++ haiku/trunk/src/servers/app/Desktop.h	2008-03-06 12:55:41 UTC (rev 24269)
+@@ -269,8 +269,6 @@
+ 		BRegion					fBackgroundRegion;
+ 		BRegion					fScreenRegion;
+ 
+-		bool					fFocusFollowsMouse;
+-
+ 		WindowLayer*			fMouseEventWindow;
+ 		const WindowLayer*		fWindowUnderMouse;
+ 		int32					fViewUnderMouse;
+
+Modified: haiku/trunk/src/servers/app/WindowLayer.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/WindowLayer.cpp	2008-03-06 12:42:16 UTC (rev 24268)
++++ haiku/trunk/src/servers/app/WindowLayer.cpp	2008-03-06 12:55:41 UTC (rev 24269)
+@@ -128,7 +128,7 @@
+ 	fMinHeight(1),
+ 	fMaxHeight(32768)
+ {
+-	// make sure our arguments are valid 
++	// make sure our arguments are valid
+ 	if (!IsValidLook(fLook))
+ 		fLook = B_TITLED_WINDOW_LOOK;
+ 	if (!IsValidFeel(fFeel))
+@@ -432,7 +432,7 @@
+ 			region-&gt;OffsetBy(-xOffset, -yOffset);
+ 			// the part which we can copy is not dirty
+ 			newDirty-&gt;Exclude(region);
+-	
++
+ 			fDrawingEngine-&gt;CopyRegion(region, xOffset, yOffset);
+ 
+ 			// move along the already dirty regions that are common
+@@ -485,22 +485,22 @@
+ WindowLayer::SetTopLayer(ViewLayer* topLayer)
+ {
+ 	fTopLayer = topLayer;
+-	
++
+ 	if (fTopLayer) {
+ 		// the top layer is special, it has a coordinate system
+ 		// as if it was attached directly to the desktop, therefor,
+ 		// the coordinate conversion through the layer tree works
+ 		// as expected, since the top layer has no &quot;parent&quot; but has
+ 		// fFrame as if it had
+-	
++
+ 		// make sure the location of the top layer on screen matches ours
+ 		fTopLayer-&gt;MoveBy(fFrame.left - fTopLayer-&gt;Frame().left,
+ 			fFrame.top - fTopLayer-&gt;Frame().top, NULL);
+-	
++
+ 		// make sure the size of the top layer matches ours
+ 		fTopLayer-&gt;ResizeBy(fFrame.Width() - fTopLayer-&gt;Frame().Width(),
+ 			fFrame.Height() - fTopLayer-&gt;Frame().Height(), NULL);
+-	
++
+ 		fTopLayer-&gt;AttachedToWindow(this);
+ 	}
+ }
+@@ -592,7 +592,7 @@
+ 		// when the dirty region was empty.
+ 		// NOTE: when the window thread has processed
+ 		// the dirty region in MessageReceived(),
+-		// it will make the region empty again, 
++		// it will make the region empty again,
+ 		// when it is empty here, we need to send
+ 		// the message to initiate the next update round.
+ 		// Until the message is processed in the window
+@@ -614,7 +614,7 @@
+ 	if (IsVisible()) {
+ 		_DrawBorder();
+ 
+-		BRegion* dirtyContentRegion = 
++		BRegion* dirtyContentRegion =
+ 			fRegionPool.GetRegion(VisibleContentRegion());
+ 		dirtyContentRegion-&gt;IntersectWith(&amp;fDirtyRegion);
+ 
+@@ -812,7 +812,7 @@
+ 
+ 			// activate window if not in FFM mode
+ 			DesktopSettings desktopSettings(fDesktop);
+-			if (desktopSettings.MouseMode() == B_NORMAL_MOUSE) {
++			if (!desktopSettings.FocusFollowsMouse()) {
+ 				fDesktop-&gt;ActivateWindow(this);
+ 			} else {
+ 				// actually, the window should already be
+@@ -838,7 +838,7 @@
+ 				// Activate window in case it doesn't accept first click, and
+ 				// we're not in FFM mode
+ 				if ((Flags() &amp; B_WILL_ACCEPT_FIRST_CLICK) == 0
+-					&amp;&amp; desktopSettings.MouseMode() == B_NORMAL_MOUSE)
++					&amp;&amp; !desktopSettings.FocusFollowsMouse())
+ 					fDesktop-&gt;ActivateWindow(this);
+ 
+ 				// Eat the click if we don't accept first click
+@@ -1046,7 +1046,7 @@
+ 
+ 	// change focus in FFM mode
+ 	DesktopSettings desktopSettings(fDesktop);
+-	if (desktopSettings.MouseMode() != B_NORMAL_MOUSE
++	if (desktopSettings.FocusFollowsMouse()
+ 		&amp;&amp; !IsFocus() &amp;&amp; !(Flags() &amp; B_AVOID_FOCUS)) {
+ 		fDesktop-&gt;SetFocusWindow(this);
+ 	}
+@@ -1078,7 +1078,7 @@
+ 	activatedMsg.AddBool(&quot;active&quot;, active);
+ 
+ 	ServerWindow()-&gt;SendMessageToClient(&amp;activatedMsg);
+-	
++
+ 	if (active)
+ 		fWindow-&gt;HandleDirectConnection(B_DIRECT_START | B_BUFFER_RESET);
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006579.html">[Haiku-commits] r24268 - haiku/trunk/build/jam
+</A></li>
+	<LI>Next message: <A HREF="006581.html">[Haiku-commits] r24270 - haiku/trunk/data/system/boot
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6580">[ date ]</a>
+              <a href="thread.html#6580">[ thread ]</a>
+              <a href="subject.html#6580">[ subject ]</a>
+              <a href="author.html#6580">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

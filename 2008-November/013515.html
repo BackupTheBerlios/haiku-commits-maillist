@@ -1,0 +1,280 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28648 - in haiku/trunk/src:	add-ons/kernel/file_systems/ext2 system/kernel/cache	system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28648%20-%20in%20haiku/trunk/src%3A%0A%09add-ons/kernel/file_systems/ext2%20system/kernel/cache%0A%09system/kernel/fs&In-Reply-To=%3C200811141206.mAEC6loP020031%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013514.html">
+   <LINK REL="Next"  HREF="013516.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28648 - in haiku/trunk/src:	add-ons/kernel/file_systems/ext2 system/kernel/cache	system/kernel/fs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28648%20-%20in%20haiku/trunk/src%3A%0A%09add-ons/kernel/file_systems/ext2%20system/kernel/cache%0A%09system/kernel/fs&In-Reply-To=%3C200811141206.mAEC6loP020031%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28648 - in haiku/trunk/src:	add-ons/kernel/file_systems/ext2 system/kernel/cache	system/kernel/fs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Nov 14 13:06:47 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013514.html">[Haiku-commits] r28647 - in haiku/trunk: build/jam	src/add-ons/input_server/devices	src/add-ons/input_server/devices/mouse
+</A></li>
+        <LI>Next message: <A HREF="013516.html">[Haiku-commits] r28649 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13515">[ date ]</a>
+              <a href="thread.html#13515">[ thread ]</a>
+              <a href="subject.html#13515">[ subject ]</a>
+              <a href="author.html#13515">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-11-14 13:06:44 +0100 (Fri, 14 Nov 2008)
+New Revision: 28648
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28648&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28648&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/ext2/kernel_interface.cpp
+   haiku/trunk/src/system/kernel/cache/file_map.cpp
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+Log:
+* When a file system reports -1 offsets in its fs_get_file_map() function, this
+  will now accepted and regarded as sparse file data. FileMap::_Add() also
+  correctly joins multiple vecs with that offset together, FileMap::Translate()
+  will always report offset -1 even for offsets into that extent.
+* read_file_io_vec_pages() (or rather, its backend common_file_io_vec_pages())
+  now supports sparse files, and will just clear the memory it should read from
+  offset -1 instead of passing a request to the vnode.
+* ext2 now correctly reports sparse files. This should close bug #2889, as well
+  as #975.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/ext2/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/ext2/kernel_interface.cpp	2008-11-14 10:41:22 UTC (rev 28647)
++++ haiku/trunk/src/add-ons/kernel/file_systems/ext2/kernel_interface.cpp	2008-11-14 12:06:44 UTC (rev 28648)
+@@ -258,7 +258,8 @@
+ 		off_t blockOffset = (off_t)block &lt;&lt; volume-&gt;BlockShift();
+ 		uint32 blockLength = volume-&gt;BlockSize();
+ 
+-		if (index &gt; 0 &amp;&amp; vecs[index - 1].offset == blockOffset - blockLength) {
++		if (index &gt; 0 &amp;&amp; (vecs[index - 1].offset == blockOffset - blockLength
++				|| (vecs[index - 1].offset == -1 &amp;&amp; block == 0))) {
+ 			vecs[index - 1].length += blockLength;
+ 		} else {
+ 			if (index &gt;= max) {
+@@ -267,7 +268,12 @@
+ 				return B_BUFFER_OVERFLOW;
+ 			}
+ 
+-			vecs[index].offset = blockOffset;
++			// 'block' is 0 for sparse blocks
++			if (block != 0)
++				vecs[index].offset = blockOffset;
++			else
++				vecs[index].offset = -1;
++
+ 			vecs[index].length = blockLength;
+ 			index++;
+ 		}
+
+Modified: haiku/trunk/src/system/kernel/cache/file_map.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_map.cpp	2008-11-14 10:41:22 UTC (rev 28647)
++++ haiku/trunk/src/system/kernel/cache/file_map.cpp	2008-11-14 12:06:44 UTC (rev 28648)
+@@ -26,9 +26,9 @@
+ 
+ //#define TRACE_FILE_MAP
+ #ifdef TRACE_FILE_MAP
+-#	define TRACE(x) dprintf x
++#	define TRACE(x...) dprintf_no_syslog(x)
+ #else
+-#	define TRACE(x) ;
++#	define TRACE(x...) ;
+ #endif
+ 
+ // TODO: use a sparse array - eventually, the unused BlockMap would be something
+@@ -223,7 +223,7 @@
+ status_t
+ FileMap::_Add(file_io_vec* vecs, size_t vecCount, off_t&amp; lastOffset)
+ {
+-	TRACE((&quot;FileMap@%p::Add(vecCount = %ld)\n&quot;, this, vecCount));
++	TRACE(&quot;FileMap@%p::Add(vecCount = %ld)\n&quot;, this, vecCount);
+ 
+ 	uint32 start = fCount;
+ 	off_t offset = 0;
+@@ -241,7 +241,8 @@
+ 	for (uint32 i = 0; i &lt; vecCount; i++) {
+ 		if (lastExtent != NULL) {
+ 			if (lastExtent-&gt;disk.offset + lastExtent-&gt;disk.length
+-					== vecs[i].offset) {
++					== vecs[i].offset
++				|| lastExtent-&gt;disk.offset == -1 &amp;&amp; vecs[i].offset == -1) {
+ 				lastExtent-&gt;disk.length += vecs[i].length;
+ 				offset += vecs[i].length;
+ 				start--;
+@@ -261,7 +262,7 @@
+ #ifdef TRACE_FILE_MAP
+ 	for (uint32 i = 0; i &lt; fCount; i++) {
+ 		file_extent* extent = ExtentAt(i);
+-		dprintf(&quot;[%ld] extent offset %Ld, disk offset %Ld, length %Ld\n&quot;,
++		TRACE(&quot;[%ld] extent offset %Ld, disk offset %Ld, length %Ld\n&quot;,
+ 			i, extent-&gt;offset, extent-&gt;disk.offset, extent-&gt;disk.length);
+ 	}
+ #endif
+@@ -420,7 +421,10 @@
+ 	file_extent* fileExtent = _FindExtent(offset, &amp;index);
+ 
+ 	offset -= fileExtent-&gt;offset;
+-	vecs[0].offset = fileExtent-&gt;disk.offset + offset;
++	if (fileExtent-&gt;disk.offset != -1)
++		vecs[0].offset = fileExtent-&gt;disk.offset + offset;
++	else
++		vecs[0].offset = -1;
+ 	vecs[0].length = fileExtent-&gt;disk.length - offset;
+ 
+ 	if (vecs[0].length &gt;= size) {
+@@ -575,8 +579,8 @@
+ extern &quot;C&quot; void*
+ file_map_create(dev_t mountID, ino_t vnodeID, off_t size)
+ {
+-	TRACE((&quot;file_map_create(mountID = %ld, vnodeID = %Ld, size = %Ld)\n&quot;,
+-		mountID, vnodeID, size));
++	TRACE(&quot;file_map_create(mountID = %ld, vnodeID = %Ld, size = %Ld)\n&quot;,
++		mountID, vnodeID, size);
+ 
+ 	// Get the vnode for the object
+ 	// (note, this does not grab a reference to the node)
+@@ -595,7 +599,7 @@
+ 	if (map == NULL)
+ 		return;
+ 
+-	TRACE((&quot;file_map_delete(map = %p)\n&quot;, map));
++	TRACE(&quot;file_map_delete(map = %p)\n&quot;, map);
+ 	delete map;
+ }
+ 
+@@ -637,8 +641,8 @@
+ file_map_translate(void* _map, off_t offset, size_t size, file_io_vec* vecs,
+ 	size_t* _count, size_t align)
+ {
+-	TRACE((&quot;file_map_translate(map %p, offset %Ld, size %ld)\n&quot;,
+-		_map, offset, size));
++	TRACE(&quot;file_map_translate(map %p, offset %Ld, size %ld)\n&quot;,
++		_map, offset, size);
+ 
+ 	FileMap* map = (FileMap*)_map;
+ 	if (map == NULL)
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-11-14 10:41:22 UTC (rev 28647)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-11-14 12:06:44 UTC (rev 28648)
+@@ -3266,6 +3266,31 @@
+ 
+ #endif	// ADD_DEBUGGER_COMMANDS
+ 
++//!	Clears an iovec array of physical pages.
++static status_t
++zero_pages(const iovec* vecs, size_t vecCount, size_t* _bytes)
++{
++	size_t bytes = *_bytes;
++	size_t index = 0;
++
++	while (bytes &gt; 0) {
++		size_t length = min_c(vecs[index].iov_len, bytes);
++
++		status_t status = vm_memset_physical((addr_t)vecs[index].iov_base, 0,
++			length);
++		if (status != B_OK) {
++			*_bytes = bytes;
++			return status;
++		}
++
++		bytes -= length;
++	}
++
++	*_bytes = bytes;
++	return B_OK;
++}
++
++
+ /*!	Does the dirty work of combining the file_io_vecs with the iovecs
+ 	and calls the file system hooks to read/write the request to disk.
+ */
+@@ -3296,8 +3321,13 @@
+ 		if (size &gt; numBytes)
+ 			size = numBytes;
+ 
+-		status = FS_CALL(vnode, read_pages, cookie, fileVecs[0].offset,
+-			&amp;vecs[vecIndex], vecCount - vecIndex, &amp;size);
++		if (fileVecs[0].offset &gt;= 0) {
++			status = FS_CALL(vnode, read_pages, cookie, fileVecs[0].offset,
++				&amp;vecs[vecIndex], vecCount - vecIndex, &amp;size);
++		} else {
++			// sparse read
++			status = zero_pages(&amp;vecs[vecIndex], vecCount - vecIndex, &amp;size);
++		}
+ 		if (status &lt; B_OK)
+ 			return status;
+ 
+@@ -3390,7 +3420,16 @@
+ 			}
+ 
+ 			size_t bytes = size;
+-			if (doWrite) {
++
++			if (fileOffset == -1) {
++				if (doWrite) {
++					panic(&quot;sparse write attempt: vnode %p&quot;, vnode);
++					status = B_IO_ERROR;
++				} else {
++					// sparse read
++					status = zero_pages(tempVecs, tempCount, &amp;bytes);
++				}
++			} else if (doWrite) {
+ 				status = FS_CALL(vnode, write_pages, cookie, fileOffset,
+ 					tempVecs, tempCount, &amp;bytes);
+ 			} else {
+@@ -3402,7 +3441,8 @@
+ 
+ 			totalSize += bytes;
+ 			bytesLeft -= size;
+-			fileOffset += size;
++			if (fileOffset &gt;= 0)
++				fileOffset += size;
+ 			fileLeft -= size;
+ 			//dprintf(&quot;-&gt; file left = %Lu\n&quot;, fileLeft);
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013514.html">[Haiku-commits] r28647 - in haiku/trunk: build/jam	src/add-ons/input_server/devices	src/add-ons/input_server/devices/mouse
+</A></li>
+	<LI>Next message: <A HREF="013516.html">[Haiku-commits] r28649 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13515">[ date ]</a>
+              <a href="thread.html#13515">[ thread ]</a>
+              <a href="subject.html#13515">[ subject ]</a>
+              <a href="author.html#13515">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

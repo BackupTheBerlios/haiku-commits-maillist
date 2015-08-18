@@ -1,0 +1,210 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22185 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22185%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200709051936.l85JadpN010473%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003820.html">
+   <LINK REL="Next"  HREF="003823.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22185 - haiku/trunk/src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22185%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200709051936.l85JadpN010473%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22185 - haiku/trunk/src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Sep  5 21:36:39 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003820.html">[Haiku-commits] r22184 - in haiku/trunk: . build/jam
+</A></li>
+        <LI>Next message: <A HREF="003823.html">[Haiku-commits] r22186 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3822">[ date ]</a>
+              <a href="thread.html#3822">[ thread ]</a>
+              <a href="subject.html#3822">[ subject ]</a>
+              <a href="author.html#3822">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-09-05 21:36:38 +0200 (Wed, 05 Sep 2007)
+New Revision: 22185
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22185&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22185&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/team.cpp
+Log:
+* Some cleanup in _user_setpgid() (use of autolocking, don't use
+  shadowing variables).
+* Resolved TODO: We wake up the parent if waiting in wait_for_child()
+  now, if the process group changes.
+* Added another TODO: setpgid() is supposed to fail on a child after
+  it has executed exec*().
+
+
+Modified: haiku/trunk/src/system/kernel/team.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/team.cpp	2007-09-05 18:36:17 UTC (rev 22184)
++++ haiku/trunk/src/system/kernel/team.cpp	2007-09-05 19:36:38 UTC (rev 22185)
+@@ -2411,15 +2411,9 @@
+ {
+ 	struct thread *thread = thread_get_current_thread();
+ 	struct team *currentTeam = thread-&gt;team;
+-	struct process_group *group = NULL, *freeGroup = NULL;
+ 	struct team *team;
+-	cpu_status state;
+ 	team_id teamID = -1;
+-	status_t status = B_OK;
+ 
+-	// TODO: we might want to notify waiting wait_for_child() threads in case
+-	//	they wait for children of the former process group ID (see wait_test_4.cpp)
+-
+ 	if (groupID &lt; 0)
+ 		return B_BAD_VALUE;
+ 
+@@ -2439,39 +2433,35 @@
+ 
+ 			return B_NOT_ALLOWED;
+ 		}
+-
+-		status = B_OK;
+ 	} else {
+-		state = disable_interrupts();
+-		GRAB_THREAD_LOCK();
++		InterruptsSpinLocker _(thread_spinlock);
+ 
+ 		thread = thread_get_thread_struct_locked(processID);
+ 
+ 		// the thread must be the team's main thread, as that
+ 		// determines its process ID
+-		if (thread != NULL &amp;&amp; thread == thread-&gt;team-&gt;main_thread) {
+-			// check if the thread is in a child team of the calling team and
+-			// if it's already a process group leader and in the same session
+-			if (thread-&gt;team-&gt;parent != currentTeam
+-				|| is_process_group_leader(thread-&gt;team)
+-				|| thread-&gt;team-&gt;session_id != currentTeam-&gt;session_id)
+-				status = B_NOT_ALLOWED;
+-			else
+-				teamID = thread-&gt;team-&gt;id;
+-		} else
+-			status = B_BAD_THREAD_ID;
++		if (thread == NULL &amp;&amp; thread != thread-&gt;team-&gt;main_thread)
++			return B_BAD_THREAD_ID;
+ 
+-		RELEASE_THREAD_LOCK();
+-		restore_interrupts(state);
++		// check if the thread is in a child team of the calling team and
++		// if it's already a process group leader and in the same session
++		if (thread-&gt;team-&gt;parent != currentTeam
++			|| is_process_group_leader(thread-&gt;team)
++			|| thread-&gt;team-&gt;session_id != currentTeam-&gt;session_id) {
++			return B_NOT_ALLOWED;
++		}
++
++		// TODO: According to the standard, the call is also supposed to fail
++		// on a child, when the child already has executed exec*().
++
++		teamID = thread-&gt;team-&gt;id;
+ 	}
+ 
+-	if (status != B_OK)
+-		return status;
+-
+ 	// if the group ID is not specified, a new group should be created
+ 	if (groupID == 0)
+ 		groupID = processID;
+ 
++	struct process_group *group = NULL;
+ 	if (groupID == processID) {
+ 		// We need to create a new process group for this team
+ 		group = create_process_group(groupID);
+@@ -2479,35 +2469,45 @@
+ 			return B_NO_MEMORY;
+ 	}
+ 
+-	state = disable_interrupts();
+-	GRAB_TEAM_LOCK();
++	status_t status = B_OK;
++	struct process_group *freeGroup = NULL;
+ 
++	InterruptsSpinLocker locker(team_spinlock);
++
+ 	team = team_get_team_struct_locked(teamID);
+ 	if (team != NULL) {
+ 		if (processID == groupID) {
+-			// we created a new process group, let us insert it into the team's session
++			// we created a new process group, let us insert it into the team's
++			// session
+ 			insert_group_into_session(team-&gt;group-&gt;session, group);
+ 			remove_team_from_group(team, &amp;freeGroup);
+ 			insert_team_into_group(group, team);
+ 		} else {
+-			// check if this team can have the group ID; there must be one matching
+-			// process ID in the team's session
++			// check if this team can have the group ID; there must be one
++			// matching process ID in the team's session
+ 
+-			struct process_group *group =
++			struct process_group *targetGroup =
+ 				team_get_process_group_locked(team-&gt;group-&gt;session, groupID);
+-			if (group) {
++			if (targetGroup != NULL) {
+ 				// we got a group, let's move the team there
+ 				remove_team_from_group(team, &amp;freeGroup);
+-				insert_team_into_group(group, team);
++				insert_team_into_group(targetGroup, team);
+ 			} else
+ 				status = B_NOT_ALLOWED;
+ 		}
+ 	} else
+ 		status = B_NOT_ALLOWED;
+ 
+-	RELEASE_TEAM_LOCK();
+-	restore_interrupts(state);
++	// Changing the process group might have changed the situation for a parent
++	// waiting in wait_for_child(). Hence we notify it.
++	if (status == B_OK) {
++		team-&gt;parent-&gt;dead_children-&gt;condition_variable.NotifyAll(false);
++		team-&gt;parent-&gt;stopped_children-&gt;condition_variable.NotifyAll(false);
++		team-&gt;parent-&gt;continued_children-&gt;condition_variable.NotifyAll(false);
++	}
+ 
++	locker.Unlock();
++
+ 	if (status != B_OK &amp;&amp; group != NULL) {
+ 		// in case of error, the group hasn't been added into the hash
+ 		team_delete_process_group(group);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003820.html">[Haiku-commits] r22184 - in haiku/trunk: . build/jam
+</A></li>
+	<LI>Next message: <A HREF="003823.html">[Haiku-commits] r22186 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3822">[ date ]</a>
+              <a href="thread.html#3822">[ thread ]</a>
+              <a href="subject.html#3822">[ subject ]</a>
+              <a href="author.html#3822">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

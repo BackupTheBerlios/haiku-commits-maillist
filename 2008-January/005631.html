@@ -1,0 +1,574 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23638 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23638%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200801191546.m0JFkfuZ026165%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005630.html">
+   <LINK REL="Next"  HREF="005633.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23638 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23638%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200801191546.m0JFkfuZ026165%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23638 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sat Jan 19 16:46:41 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005630.html">[Haiku-commits] r23637 - haiku/trunk/headers/private/kernel/arch/ppc
+</A></li>
+        <LI>Next message: <A HREF="005633.html">[Haiku-commits] r23638 - haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5631">[ date ]</a>
+              <a href="thread.html#5631">[ thread ]</a>
+              <a href="subject.html#5631">[ subject ]</a>
+              <a href="author.html#5631">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-01-19 16:46:41 +0100 (Sat, 19 Jan 2008)
+New Revision: 23638
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23638&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23638&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Utility.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Utility.h
+Log:
+* When I ported over BFS to the new FS API, I pretty much toasted the logging
+  code:
+  - The vec array to contain the block list and the index block was one entry
+    to small.
+  - But that didn't really matter, as RunArrays/run_array was broken and never
+    put anything into the log; we only ever wrote index headers. BFS would
+    totally screw up the disk when trying to replay the log (even though the
+    replay code itself was and is working fine).
+  - If a log entry ended at the end of the log area, BFS could overwrite the
+    first block after the log with the next entry.
+* run_array now adopt the sorting stuff from the sorted_array. Blocks in the
+  log are now always sorted.
+* Added TODO item to sorted_array as it's not endian safe (will only work
+  correctly when BFS is used in the native endian).
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2008-01-19 15:43:45 UTC (rev 23637)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2008-01-19 15:46:41 UTC (rev 23638)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2001-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * This file may be used under the terms of the MIT License.
+  */
+ 
+@@ -13,12 +13,12 @@
+ 
+ struct run_array {
+ 	int32		count;
+-	union {
+-		int32	max_runs;
+-		int32	block_count;
+-	};
++	int32		max_runs;
+ 	block_run	runs[0];
+ 
++	void Init(int32 blockSize);
++	void Insert(block_run &amp;run);
++
+ 	int32 CountRuns() const { return BFS_ENDIAN_TO_HOST_INT32(count); }
+ 	int32 MaxRuns() const { return BFS_ENDIAN_TO_HOST_INT32(max_runs) - 1; }
+ 		// that -1 accounts for an off-by-one error in Be's BFS implementation
+@@ -26,6 +26,10 @@
+ 
+ 	static int32 MaxRuns(int32 blockSize)
+ 		{ return (blockSize - sizeof(run_array)) / sizeof(block_run); }
++
++private:
++	static int _Compare(block_run &amp;a, block_run &amp;b);
++	int32 _FindInsertionIndex(block_run &amp;run);
+ };
+ 
+ class RunArrays {
+@@ -41,7 +45,6 @@
+ 		int32 CountArrays() const { return fArrays.CountItems(); }
+ 
+ 		int32 MaxArrayLength();
+-		void PrepareForWriting();
+ 
+ 	private:
+ 		status_t _AddArray();
+@@ -95,7 +98,7 @@
+ }
+ 
+ 
+-//	#pragma mark -
++//	#pragma mark - LogEntry
+ 
+ 
+ LogEntry::LogEntry(Journal *journal, uint32 start, uint32 length)
+@@ -112,9 +115,90 @@
+ }
+ 
+ 
+-//	#pragma mark -
++//	#pragma mark - run_array
+ 
+ 
++/*!	The run_array's size equals the block size of the BFS volume, so we
++	cannot use a (non-overridden) new.
++	This makes a freshly allocated run_array ready to run.
++*/
++void
++run_array::Init(int32 blockSize)
++{
++	memset(this, 0, blockSize);
++	count = 0;
++	max_runs = HOST_ENDIAN_TO_BFS_INT32(MaxRuns(blockSize));
++}
++
++
++/*!	Inserts the block_run into the array. You will have to make sure the
++	array is large enough to contain the entry before calling this function.
++*/
++void
++run_array::Insert(block_run &amp;run)
++{
++	int32 index = _FindInsertionIndex(run);
++	if (index == -1) {
++		// add to the end
++		runs[CountRuns()] = run;
++	} else {
++		// insert at index
++		memmove(&amp;runs[index + 1], &amp;runs[index],
++			(CountRuns() - index) * sizeof(off_t));
++		runs[index] = run;
++	}
++
++	count = HOST_ENDIAN_TO_BFS_INT32(CountRuns() + 1);
++}
++
++
++/*static*/ int
++run_array::_Compare(block_run &amp;a, block_run &amp;b)
++{
++	int cmp = a.AllocationGroup() - b.AllocationGroup();
++	if (cmp == 0)
++		return a.Start() - b.Start();
++
++	return cmp;
++}
++
++
++int32
++run_array::_FindInsertionIndex(block_run &amp;run)
++{
++	int32 min = 0, max = CountRuns() - 1;
++	int32 i = 0;
++	if (max &gt;= 8) {
++		while (min &lt;= max) {
++			i = (min + max) / 2;
++
++			int cmp = _Compare(runs[i], run);
++			if (cmp &lt; 0)
++				min = i + 1;
++			else if (cmp &gt; 0)
++				max = i - 1;
++			else
++				return -1;
++		}
++
++		if (_Compare(runs[i], run) &lt; 0)
++			i++;
++	} else {
++		for (; i &lt;= max; i++) {
++			if (_Compare(runs[i], run) &gt; 0)
++				break;
++		}
++		if (i == count)
++			return -1;
++	}
++
++	return i;
++}
++
++
++//	#pragma mark - RunArrays
++
++
+ RunArrays::RunArrays(Journal *journal)
+ 	:
+ 	fJournal(journal),
+@@ -166,44 +250,11 @@
+ 
+ 	// Be's BFS log replay routine can only deal with block_runs of size 1
+ 	// A pity, isn't it? Too sad we have to be compatible.
+-#if 0
+-	// search for an existing adjacent block_run
+-	// ToDo: this could be improved by sorting and a binary search
+ 
+-	for (int32 i = 0; i &lt; CountArrays(); i++) {
+-		run_array *array = ArrayAt(i);
+-
+-		for (int32 j = 0; j &lt; array-&gt;CountRuns(); j++) {
+-			block_run &amp;arrayRun = array-&gt;runs[j];
+-			if (run.AllocationGroup() != arrayRun.AllocationGroup())
+-				continue;
+-	
+-			if (run.Start() == arrayRun.Start() + arrayRun.Length()) {
+-				// matches the end
+-				arrayRun.length = HOST_ENDIAN_TO_BFS_INT16(arrayRun.Length() + 1);
+-				array-&gt;block_count++;
+-				fLength++;
+-				return true;
+-			} else if (run.start + 1 == arrayRun.start) {
+-				// matches the start
+-				arrayRun.start = run.start;
+-				arrayRun.length = HOST_ENDIAN_TO_BFS_INT16(arrayRun.Length() + 1);
+-				array-&gt;block_count++;
+-				fLength++;
+-				return true;
+-			}
+-		}
+-	}
+-#endif
+-
+-	// no entry found, add new to the last array
+-
+ 	if (fLastArray == NULL || fLastArray-&gt;CountRuns() == fLastArray-&gt;MaxRuns())
+ 		return false;
+ 
+-	fLastArray-&gt;runs[fLastArray-&gt;CountRuns()] = run;
+-	fLastArray-&gt;count = HOST_ENDIAN_TO_BFS_INT16(fLastArray-&gt;CountRuns() + 1);
+-	fLastArray-&gt;block_count++;
++	fLastArray-&gt;Insert(run);
+ 	fLength++;
+ 	return true;
+ }
+@@ -213,6 +264,7 @@
+ RunArrays::_AddArray()
+ {
+ 	int32 blockSize = fJournal-&gt;GetVolume()-&gt;BlockSize();
++
+ 	run_array *array = (run_array *)malloc(blockSize);
+ 	if (array == NULL)
+ 		return B_NO_MEMORY;
+@@ -222,11 +274,8 @@
+ 		return B_NO_MEMORY;
+ 	}
+ 
+-	memset(array, 0, blockSize);
+-	array-&gt;block_count = 1;
++	array-&gt;Init(blockSize);
+ 	fLastArray = array;
+-	fLength++;
+-
+ 	return B_OK;
+ }
+ 
+@@ -247,15 +296,8 @@
+ 
+ 	if (!_AddRun(run)) {
+ 		// array is full
+-		if (_AddArray() != B_OK)
++		if (_AddArray() != B_OK || !_AddRun(run))
+ 			return B_NO_MEMORY;
+-
+-		// insert entry manually, because _AddRun() would search the
+-		// all arrays again for a free spot
+-		fLastArray-&gt;runs[0] = run;
+-		fLastArray-&gt;count = HOST_ENDIAN_TO_BFS_INT16(1);
+-		fLastArray-&gt;block_count++;
+-		fLength++;
+ 	}
+ 
+ 	return B_OK;
+@@ -267,29 +309,17 @@
+ {
+ 	int32 max = 0;
+ 	for (int32 i = 0; i &lt; CountArrays(); i++) {
+-		if (ArrayAt(i)-&gt;block_count &gt; max)
+-			max = ArrayAt(i)-&gt;block_count;
++		if (ArrayAt(i)-&gt;CountRuns() &gt; max)
++			max = ArrayAt(i)-&gt;CountRuns();
+ 	}
+ 
+ 	return max;
+ }
+ 
+ 
+-void
+-RunArrays::PrepareForWriting()
+-{
+-	int32 blockSize = fJournal-&gt;GetVolume()-&gt;BlockSize();
++//	#pragma mark - Journal
+ 
+-	for (int32 i = 0; i &lt; CountArrays(); i++) {
+-		ArrayAt(i)-&gt;max_runs = HOST_ENDIAN_TO_BFS_INT32(
+-			run_array::MaxRuns(blockSize));
+-	}
+-}
+ 
+-
+-//	#pragma mark -
+-
+-
+ Journal::Journal(Volume *volume)
+ 	:
+ 	fVolume(volume),
+@@ -313,6 +343,8 @@
+ status_t
+ Journal::InitCheck()
+ {
++	// TODO: this logic won't work whenever the size of the pending transaction
++	//	equals the size of the log (happens with the original BFS only)
+ 	if (fVolume-&gt;LogStart() != fVolume-&gt;LogEnd()) {
+ 		if (fVolume-&gt;SuperBlock().flags != SUPER_BLOCK_DISK_DIRTY)
+ 			FATAL((&quot;log_start and log_end differ, but disk is marked clean - trying to replay log...\n&quot;));
+@@ -472,11 +504,11 @@
+ 			int32 length = next-&gt;Start() - logEntry-&gt;Start();
+ 				// log entries inbetween could have been already released, so
+ 				// we can't just use LogEntry::Length() here
+-			superBlock.log_start = (superBlock.log_start + length)
+-				% journal-&gt;fLogSize;
++			superBlock.log_start = superBlock.log_start + length;
+ 		} else
+ 			superBlock.log_start = journal-&gt;fVolume-&gt;LogEnd();
+ 
++		superBlock.log_start %= journal-&gt;fLogSize;
+ 		update = true;
+ 	}
+ 
+@@ -538,8 +570,8 @@
+ 
+ 	int32 blockShift = fVolume-&gt;BlockShift();
+ 	off_t logOffset = fVolume-&gt;ToBlock(fVolume-&gt;Log()) &lt;&lt; blockShift;
+-	off_t logStart = fVolume-&gt;LogEnd();
+-	off_t logPosition = logStart % fLogSize;
++	off_t logStart = fVolume-&gt;LogEnd() % fLogSize;
++	off_t logPosition = logStart;
+ 	status_t status;
+ 
+ 	// create run_array structures for all changed blocks
+@@ -572,23 +604,10 @@
+ 		return B_OK;
+ 	}
+ 
+-	// Make sure there is enough space in the log.
+-	// If that fails for whatever reason, panic!
+-	// ToDo:
+-/*	force_cache_flush(fVolume-&gt;Device(), false);
+-	int32 tries = fLogSize / 2 + 1;
+-	while (TransactionSize() &gt; FreeLogBlocks() &amp;&amp; tries-- &gt; 0)
+-		force_cache_flush(fVolume-&gt;Device(), true);
+-
+-	if (tries &lt;= 0) {
+-		fVolume-&gt;Panic();
+-		return B_BAD_DATA;
+-	}
+-*/
+-
+ 	// Write log entries to disk
+ 
+-	int32 maxVecs = runArrays.MaxArrayLength();
++	int32 maxVecs = runArrays.MaxArrayLength() + 1;
++		// one extra for the index block
+ 
+ 	iovec *vecs = (iovec *)malloc(sizeof(iovec) * maxVecs);
+ 	if (vecs == NULL) {
+@@ -596,8 +615,6 @@
+ 		return B_NO_MEMORY;
+ 	}
+ 
+-	runArrays.PrepareForWriting();
+-
+ 	for (int32 k = 0; k &lt; runArrays.CountArrays(); k++) {
+ 		run_array *array = runArrays.ArrayAt(k);
+ 		int32 index = 0, count = 1;
+@@ -613,12 +630,13 @@
+ 
+ 			for (int32 j = 0; j &lt; run.Length(); j++) {
+ 				if (count &gt;= wrap) {
+-					// we need to write back the first half of the entry directly
+-					logPosition = logStart + count;
++					// We need to write back the first half of the entry
++					// directly as the log wraps around
+ 					if (writev_pos(fVolume-&gt;Device(), logOffset
+ 						+ (logStart &lt;&lt; blockShift), vecs, index) &lt; 0)
+ 						FATAL((&quot;could not write log area!\n&quot;));
+ 
++					logPosition = logStart + count;
+ 					logStart = 0;
+ 					wrap = fLogSize;
+ 					count = 0;
+@@ -638,7 +656,7 @@
+ 			}
+ 		}
+ 
+-		// write back log entry
++		// write back the rest of the log entry
+ 		if (count &gt; 0) {
+ 			logPosition = logStart + count;
+ 			if (writev_pos(fVolume-&gt;Device(), logOffset
+@@ -697,13 +715,6 @@
+ 		fUnwrittenTransactions = 0;
+ 	}
+ 
+-	// If the log goes to the next round (the log is written as a
+-	// circular buffer), all blocks will be flushed out which is
+-	// possible because we don't have any locked blocks at this
+-	// point.
+-	if (logPosition &lt; logStart)
+-		fVolume-&gt;FlushDevice();
+-
+ 	return status;
+ }
+ 
+@@ -835,7 +846,7 @@
+ }
+ 
+ 
+-//	#pragma mark -
++//	#pragma mark - Transaction
+ 
+ 
+ status_t 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Utility.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Utility.cpp	2008-01-19 15:43:45 UTC (rev 23637)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Utility.cpp	2008-01-19 15:46:41 UTC (rev 23638)
+@@ -1,18 +1,19 @@
+-/* Utility - some helper classes
+- *
+- * Copyright 2001-2005, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++/*
++ * Copyright 2001-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * This file may be used under the terms of the MIT License.
+  */
+ 
++//!	Some helper classes
+ 
++
+ #include &quot;Utility.h&quot;
+ #include &quot;Debug.h&quot;
+ 
+ 
+ bool
+-sorted_array::FindInternal(off_t value, int32 &amp;index) const
++sorted_array::_FindInternal(off_t value, int32 &amp;index) const
+ {
+-	int32 min = 0, max = count-1;
++	int32 min = 0, max = count - 1;
+ 	off_t cmp;
+ 	while (min &lt;= max) {
+ 		index = (min + max) / 2;
+@@ -37,16 +38,16 @@
+ 	// the insertion point
+ 	int32 i;
+ 	if (count &gt; 8 ) {
+-		if (!FindInternal(value,i)
+-			&amp;&amp; values[i] &lt;= value)
++		if (!_FindInternal(value, i) &amp;&amp; values[i] &lt;= value)
+ 			i++;
+ 	} else {
+-		for (i = 0;i &lt; count; i++)
++		for (i = 0; i &lt; count; i++) {
+ 			if (values[i] &gt; value)
+ 				break;
++		}
+ 	}
+ 
+-	memmove(&amp;values[i+1],&amp;values[i],(count - i) * sizeof(off_t));
++	memmove(&amp;values[i + 1], &amp;values[i], (count - i) * sizeof(off_t));
+ 	values[i] = value;
+ 	count++;
+ }
+@@ -59,7 +60,7 @@
+ 	if (index == -1)
+ 		return false;
+ 
+-	memmove(&amp;values[index],&amp;values[index + 1],(count - index) * sizeof(off_t));
++	memmove(&amp;values[index], &amp;values[index + 1], (count - index) * sizeof(off_t));
+ 	count--;
+ 
+ 	return true;
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Utility.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Utility.h	2008-01-19 15:43:45 UTC (rev 23637)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Utility.h	2008-01-19 15:46:41 UTC (rev 23638)
+@@ -1,6 +1,5 @@
+-/* Utility - some helper classes
+- *
+- * Copyright 2001-2005, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++/*
++ * Copyright 2001-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * This file may be used under the terms of the MIT License.
+  */
+ #ifndef UTILITY_H
+@@ -10,8 +9,8 @@
+ #include &quot;system_dependencies.h&quot;
+ 
+ 
+-// Simple array, used for the duplicate handling in the B+Tree,
+-// and for the log entries.
++// Simple array, used for the duplicate handling in the B+Tree
++// TODO: this is not endian safe!!!
+ 
+ struct sorted_array {
+ 	public:
+@@ -23,7 +22,7 @@
+ 		bool Remove(off_t value);
+ 
+ 	private:
+-		bool FindInternal(off_t value,int32 &amp;index) const;
++		bool _FindInternal(off_t value, int32 &amp;index) const;
+ };
+ 
+ 
+@@ -31,7 +30,7 @@
+ sorted_array::Find(off_t value) const
+ {
+ 	int32 i;
+-	return FindInternal(value,i) ? i : -1;
++	return _FindInternal(value, i) ? i : -1;
+ }
+ 
+ #endif	/* UTILITY_H */
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005630.html">[Haiku-commits] r23637 - haiku/trunk/headers/private/kernel/arch/ppc
+</A></li>
+	<LI>Next message: <A HREF="005633.html">[Haiku-commits] r23638 - haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5631">[ date ]</a>
+              <a href="thread.html#5631">[ thread ]</a>
+              <a href="subject.html#5631">[ subject ]</a>
+              <a href="author.html#5631">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

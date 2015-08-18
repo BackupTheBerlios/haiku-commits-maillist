@@ -1,0 +1,361 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24020 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24020%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200802191916.m1JJGbNW011928%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006165.html">
+   <LINK REL="Next"  HREF="006169.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24020 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24020%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200802191916.m1JJGbNW011928%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24020 - haiku/trunk/src/system/kernel/fs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Feb 19 20:16:37 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006165.html">[Haiku-commits] r24019 -	haiku/trunk/src/add-ons/kernel/drivers/input/wacom
+</A></li>
+        <LI>Next message: <A HREF="006169.html">[Haiku-commits] r24021 - haiku/trunk/src/apps/mail
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6168">[ date ]</a>
+              <a href="thread.html#6168">[ thread ]</a>
+              <a href="subject.html#6168">[ subject ]</a>
+              <a href="author.html#6168">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-02-19 20:16:36 +0100 (Tue, 19 Feb 2008)
+New Revision: 24020
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24020&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24020&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+Log:
+Improved (and tested) the advisory file locking mechanism a bit:
+* our flock::l_len was inclusive, while it's exclusive (the last byte locked
+  is (l_start - 1 + l_len) not just (l_start + l_len).
+* F_UNLCK removes all locks of the calling process that are within the specified
+  region - existing locks might also cut or divided.
+* Apparently, a single team can lock the same region as often as it wants.
+* advisory_locking is now using a DoublyLinkedList instead of its C counterpart.
+* advisory_lock now has start + end fields, instead of offset + len, it's
+  handier this way.
+* This fixes bug #1791.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-02-19 16:06:32 UTC (rev 24019)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-02-19 19:16:36 UTC (rev 24020)
+@@ -121,21 +121,23 @@
+ 	bool			owns_file_device;
+ };
+ 
+-struct advisory_locking {
+-	sem_id			lock;
+-	sem_id			wait_sem;
+-	struct list		locks;
+-};
+-
+-struct advisory_lock {
++struct advisory_lock : public DoublyLinkedListLinkImpl&lt;advisory_lock&gt; {
+ 	list_link		link;
+ 	team_id			team;
+ 	pid_t			session;
+-	off_t			offset;
+-	off_t			length;
++	off_t			start;
++	off_t			end;
+ 	bool			shared;
+ };
+ 
++typedef DoublyLinkedList&lt;advisory_lock&gt; LockList;
++
++struct advisory_locking {
++	sem_id			lock;
++	sem_id			wait_sem;
++	LockList		locks;
++};
++
+ static mutex sFileSystemsMutex;
+ 
+ /*!	\brief Guards sMountsTable.
+@@ -1047,8 +1049,7 @@
+ 	if (vnode == NULL)
+ 		return B_FILE_ERROR;
+ 
+-	struct advisory_locking *locking = (struct advisory_locking *)malloc(
+-		sizeof(struct advisory_locking));
++	struct advisory_locking *locking = new(std::nothrow) advisory_locking;
+ 	if (locking == NULL)
+ 		return B_NO_MEMORY;
+ 
+@@ -1066,13 +1067,11 @@
+ 		goto err2;
+ 	}
+ 
+-	list_init(&amp;locking-&gt;locks);
+-
+ 	// We need to set the locking structure atomically - someone
+ 	// else might set one at the same time
+ 	do {
+-		if (atomic_test_and_set((vint32 *)&amp;vnode-&gt;advisory_locking, (addr_t)locking,
+-				NULL) == NULL)
++		if (atomic_test_and_set((vint32 *)&amp;vnode-&gt;advisory_locking,
++				(addr_t)locking, NULL) == NULL)
+ 			return B_OK;
+ 	} while (get_advisory_locking(vnode) == NULL);
+ 
+@@ -1084,7 +1083,7 @@
+ err2:
+ 	delete_sem(locking-&gt;wait_sem);
+ err1:
+-	free(locking);
++	delete locking;
+ 	return status;
+ }
+ 
+@@ -1102,11 +1101,13 @@
+ 	team_id team = team_get_current_team_id();
+ 	status_t status = B_BAD_VALUE;
+ 
+-	struct advisory_lock *lock = NULL;
+-	while ((lock = (struct advisory_lock *)list_get_next_item(&amp;locking-&gt;locks, lock)) != NULL) {
++	LockList::Iterator iterator = locking-&gt;locks.GetIterator();
++	while (iterator.HasNext()) {
++		struct advisory_lock *lock = iterator.Next();
++
+ 		if (lock-&gt;team == team) {
+-			flock-&gt;l_start = lock-&gt;offset;
+-			flock-&gt;l_len = lock-&gt;length;
++			flock-&gt;l_start = lock-&gt;start;
++			flock-&gt;l_len = lock-&gt;end - lock-&gt;start + 1;
+ 			status = B_OK;
+ 			break;
+ 		}
+@@ -1117,6 +1118,20 @@
+ }
+ 
+ 
++/*! Returns \c true when either \a flock is \c NULL or the \a flock intersects
++	with the advisory_lock \a lock.
++*/
++static bool
++advisory_lock_intersects(struct advisory_lock *lock, struct flock *flock)
++{
++	if (flock == NULL)
++		return true;
++
++	return lock-&gt;start &lt;= flock-&gt;l_start - 1 + flock-&gt;l_len
++		&amp;&amp; lock-&gt;end &gt;= flock-&gt;l_start;
++}
++
++
+ /*!	Removes the specified lock, or all locks of the calling team
+ 	if \a flock is NULL.
+ */
+@@ -1127,49 +1142,87 @@
+ 
+ 	struct advisory_locking *locking = get_advisory_locking(vnode);
+ 	if (locking == NULL)
+-		return flock != NULL ? B_BAD_VALUE : B_OK;
++		return B_OK;
+ 
++	// TODO: use the thread ID instead??
+ 	team_id team = team_get_current_team_id();
+ 	pid_t session = thread_get_current_thread()-&gt;team-&gt;session_id;
+ 
+-	// find matching lock entry
++	// find matching lock entries
+ 
+-	status_t status = B_BAD_VALUE;
+-	struct advisory_lock *lock = NULL;
+-	while ((lock = (struct advisory_lock *)list_get_next_item(&amp;locking-&gt;locks,
+-			lock)) != NULL) {
+-		if (lock-&gt;team == team &amp;&amp; (flock == NULL
+-				|| (flock != NULL &amp;&amp; lock-&gt;offset == flock-&gt;l_start
+-					&amp;&amp; lock-&gt;length == flock-&gt;l_len))
+-			|| lock-&gt;session == session) {
+-			// we found our lock, free it
+-			list_remove_item(&amp;locking-&gt;locks, lock);
++	LockList::Iterator iterator = locking-&gt;locks.GetIterator();
++	while (iterator.HasNext()) {
++		struct advisory_lock *lock = iterator.Next();
++		bool removeLock = false;
++
++		if (lock-&gt;session == session)
++			removeLock = true;
++		else if (lock-&gt;team == team &amp;&amp; advisory_lock_intersects(lock, flock)) {
++			bool endsBeyond = false;
++			bool startsBefore = false;
++			if (flock != NULL) {
++				startsBefore = lock-&gt;start &lt; flock-&gt;l_start;
++				endsBeyond = lock-&gt;end &gt; flock-&gt;l_start - 1 + flock-&gt;l_len;
++			}
++
++			if (!startsBefore &amp;&amp; !endsBeyond) {
++				// lock is completely contained in flock
++				removeLock = true;
++			} else if (startsBefore &amp;&amp; !endsBeyond) {
++				// cut the end of the lock
++				lock-&gt;end = flock-&gt;l_start - 1;
++			} else if (!startsBefore &amp;&amp; endsBeyond) {
++				// cut the start of the lock
++				lock-&gt;start = flock-&gt;l_start + flock-&gt;l_len;
++			} else {
++				// divide the lock into two locks
++				struct advisory_lock *secondLock = new advisory_lock;
++				if (secondLock == NULL) {
++					// TODO: we should probably revert the locks we already
++					// changed... (ie. allocate upfront)
++					put_advisory_locking(locking);
++					return B_NO_MEMORY;
++				}
++
++				lock-&gt;end = flock-&gt;l_start - 1;
++
++				secondLock-&gt;team = lock-&gt;team;
++				secondLock-&gt;session = lock-&gt;session;
++				// values must already be normalized when getting here
++				secondLock-&gt;start = flock-&gt;l_start + flock-&gt;l_len;
++				secondLock-&gt;end = lock-&gt;end;
++				secondLock-&gt;shared = lock-&gt;shared;
++
++				locking-&gt;locks.Add(secondLock);
++			}
++		}
++
++		if (removeLock) {
++			// this lock is no longer used
++			iterator.Remove();
+ 			free(lock);
+-			status = B_OK;
+-			break;
+ 		}
+ 	}
+ 
+-	bool removeLocking = list_is_empty(&amp;locking-&gt;locks);
++	bool removeLocking = locking-&gt;locks.IsEmpty();
+ 	release_sem_etc(locking-&gt;wait_sem, 1, B_RELEASE_ALL);
+ 
+ 	put_advisory_locking(locking);
+ 
+-	if (status &lt; B_OK)
+-		return status;
+-
+ 	if (removeLocking) {
+-		// we can remove the whole advisory locking structure; it's no longer used
++		// We can remove the whole advisory locking structure; it's no
++		// longer used
+ 		locking = get_advisory_locking(vnode);
+ 		if (locking != NULL) {
+ 			// the locking could have been changed in the mean time
+-			if (list_is_empty(&amp;locking-&gt;locks)) {
++			if (locking-&gt;locks.IsEmpty()) {
+ 				vnode-&gt;advisory_locking = NULL;
+ 
+-				// we've detached the locking from the vnode, so we can safely delete it
++				// we've detached the locking from the vnode, so we can
++				// safely delete it
+ 				delete_sem(locking-&gt;lock);
+ 				delete_sem(locking-&gt;wait_sem);
+-				free(locking);
++				delete locking;
+ 			} else {
+ 				// the locking is in use again
+ 				release_sem_etc(locking-&gt;lock, 1, B_DO_NOT_RESCHEDULE);
+@@ -1206,15 +1259,17 @@
+ 	// if this vnode has an advisory_locking structure attached,
+ 	// lock that one and search for any colliding file lock
+ 	struct advisory_locking *locking = get_advisory_locking(vnode);
++	team_id team = team_get_current_team_id();
+ 	sem_id waitForLock = -1;
+ 
+ 	if (locking != NULL) {
+ 		// test for collisions
+-		struct advisory_lock *lock = NULL;
+-		while ((lock = (struct advisory_lock *)list_get_next_item(
+-				&amp;locking-&gt;locks, lock)) != NULL) {
+-			if (lock-&gt;offset &lt;= flock-&gt;l_start + flock-&gt;l_len
+-				&amp;&amp; lock-&gt;offset + lock-&gt;length &gt; flock-&gt;l_start) {
++		LockList::Iterator iterator = locking-&gt;locks.GetIterator();
++		while (iterator.HasNext()) {
++			struct advisory_lock *lock = iterator.Next();
++
++			// TODO: locks from the same team might be joinable!
++			if (lock-&gt;team != team &amp;&amp; advisory_lock_intersects(lock, flock)) {
+ 				// locks do overlap
+ 				if (!shared || !lock-&gt;shared) {
+ 					// we need to wait
+@@ -1271,11 +1326,11 @@
+ 	lock-&gt;team = team_get_current_team_id();
+ 	lock-&gt;session = session;
+ 	// values must already be normalized when getting here
+-	lock-&gt;offset = flock-&gt;l_start;
+-	lock-&gt;length = flock-&gt;l_len;
++	lock-&gt;start = flock-&gt;l_start;
++	lock-&gt;end = flock-&gt;l_start - 1 + flock-&gt;l_len;
+ 	lock-&gt;shared = shared;
+ 
+-	list_add_item(&amp;locking-&gt;locks, lock);
++	locking-&gt;locks.Add(lock);
+ 	put_advisory_locking(locking);
+ 
+ 	return status;
+@@ -2367,12 +2422,14 @@
+ 	kprintf(&quot;   lock:        %ld&quot;, locking-&gt;lock);
+ 	kprintf(&quot;   wait_sem:    %ld&quot;, locking-&gt;wait_sem);
+ 
+-	struct advisory_lock *lock = NULL;
+ 	int32 index = 0;
+-	while ((lock = (advisory_lock *)list_get_next_item(&amp;locking-&gt;locks, lock)) != NULL) {
+-		kprintf(&quot;   [%2ld] team:   %ld\n&quot;, index, lock-&gt;team);
+-		kprintf(&quot;        offset: %Ld\n&quot;, lock-&gt;offset);
+-		kprintf(&quot;        length: %Ld\n&quot;, lock-&gt;length);
++	LockList::Iterator iterator = locking-&gt;locks.GetIterator();
++	while (iterator.HasNext()) {
++		struct advisory_lock *lock = iterator.Next();
++
++		kprintf(&quot;   [%2ld] team:   %ld\n&quot;, index++, lock-&gt;team);
++		kprintf(&quot;        start:  %Ld\n&quot;, lock-&gt;start);
++		kprintf(&quot;        end:    %Ld\n&quot;, lock-&gt;end);
+ 		kprintf(&quot;        shared? %s\n&quot;, lock-&gt;shared ? &quot;yes&quot; : &quot;no&quot;);
+ 	}
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006165.html">[Haiku-commits] r24019 -	haiku/trunk/src/add-ons/kernel/drivers/input/wacom
+</A></li>
+	<LI>Next message: <A HREF="006169.html">[Haiku-commits] r24021 - haiku/trunk/src/apps/mail
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6168">[ date ]</a>
+              <a href="thread.html#6168">[ thread ]</a>
+              <a href="subject.html#6168">[ subject ]</a>
+              <a href="author.html#6168">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

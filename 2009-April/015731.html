@@ -1,0 +1,530 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30109 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30109%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200904102230.n3AMU36B028394%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015730.html">
+   <LINK REL="Next"  HREF="015732.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30109 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30109%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200904102230.n3AMU36B028394%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30109 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sat Apr 11 00:30:03 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015730.html">[Haiku-commits] r30108 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+</A></li>
+        <LI>Next message: <A HREF="015732.html">[Haiku-commits] r30110 - haiku/trunk/headers/private/drivers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15731">[ date ]</a>
+              <a href="thread.html#15731">[ thread ]</a>
+              <a href="subject.html#15731">[ subject ]</a>
+              <a href="author.html#15731">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-04-11 00:29:59 +0200 (Sat, 11 Apr 2009)
+New Revision: 30109
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30109&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30109&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPIDevice.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATARequest.cpp
+Log:
+* Rework ATAPI handling, removing all PIO interrupts. As Marcus pointed out the
+  complication is not really worth it and it would in any case be unreliable
+  in the shared interrupt case (even though you could always check the poll
+  condition in the interrupt handler).
+* Probably broke ATAPI with those changes though.
+* Change blocksLeft to bytesLeft to allow using it for arbitrary ATAPI requests.
+* Check some more error conditions and actually let those states get through
+  to the SCSI layer.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp	2009-04-10 20:47:23 UTC (rev 30108)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp	2009-04-10 22:29:59 UTC (rev 30109)
+@@ -393,9 +393,17 @@
+ 	while (true) {
+ 		uint8 status = AltStatus();
+ 		if ((flags &amp; ATA_CHECK_ERROR_BIT) != 0
+-			&amp;&amp; (status &amp; ATA_STATUS_ERROR) != 0)
++			&amp;&amp; (status &amp; ATA_STATUS_ERROR) != 0) {
++			TRACE(&quot;error bit set while waiting\n&quot;);
+ 			return B_ERROR;
++		}
+ 
++		if ((flags &amp; ATA_CHECK_DISK_FAILURE) != 0
++			&amp;&amp; (status &amp; ATA_STATUS_DISK_FAILURE) != 0) {
++			TRACE(&quot;disk failure bit set while waiting\n&quot;);
++			return B_ERROR;
++		}
++
+ 		if ((status &amp; clearedBits) == 0) {
+ 			if ((flags &amp; ATA_WAIT_ANY_BIT) != 0 &amp;&amp; (status &amp; setBits) != 0)
+ 				return B_OK;
+@@ -426,8 +434,7 @@
+ ATAChannel::WaitDataRequest(bool high)
+ {
+ 	return Wait(high ? ATA_STATUS_DATA_REQUEST : 0,
+-		high ? 0 : ATA_STATUS_DATA_REQUEST,
+-		ATA_CHECK_ERROR_BIT, (high ? 10 : 1) * 1000 * 1000);
++		high ? 0 : ATA_STATUS_DATA_REQUEST, 0, (high ? 10 : 1) * 1000 * 1000);
+ }
+ 
+ 
+@@ -514,7 +521,7 @@
+ {
+ 	if (flags &amp; ATA_WAIT_FINISH) {
+ 		// wait for the device to finish current command (device no longer busy)
+-		status_t result = Wait(0, ATA_STATUS_BUSY, 0, request-&gt;Timeout());
++		status_t result = Wait(0, ATA_STATUS_BUSY, flags, request-&gt;Timeout());
+ 		if (result != B_OK) {
+ 			TRACE_ERROR(&quot;timeout waiting for request finish\n&quot;);
+ 			request-&gt;SetStatus(SCSI_CMD_TIMEOUT);
+@@ -545,12 +552,19 @@
+ 		return B_ERROR;
+ 	}
+ 
+-	if ((taskFile-&gt;read.status &amp; ATA_STATUS_ERROR) == 0)
++	uint8 checkFlags = ATA_STATUS_ERROR;
++	if (flags &amp; ATA_CHECK_DISK_FAILURE)
++		checkFlags |= ATA_STATUS_DISK_FAILURE;
++
++	if ((taskFile-&gt;read.status &amp; checkFlags) == 0)
+ 		return B_OK;
+ 
+-	request-&gt;SetStatus(SCSI_SEQUENCE_FAIL);
+-	TRACE_ERROR(&quot;command failed, error bit is set: 0x%02x\n&quot;,
+-		taskFile-&gt;read.error);
++	if ((taskFile-&gt;read.error &amp; ATA_ERROR_MEDIUM_CHANGED)
++		!= ATA_ERROR_MEDIUM_CHANGED) {
++		TRACE_ERROR(&quot;command failed, error bit is set: 0x%02x\n&quot;,
++			taskFile-&gt;read.error);
++	}
++
+ 	uint8 error = taskFile-&gt;read.error &amp; errorMask;
+ 	if (error &amp; ATA_ERROR_INTERFACE_CRC) {
+ 		TRACE_ERROR(&quot;interface crc error\n&quot;);
+@@ -558,7 +572,7 @@
+ 		return B_ERROR;
+ 	}
+ 
+-	if (flags &amp; ATA_IS_WRITE) {
++	if (request-&gt;IsWrite()) {
+ 		if (error &amp; ATA_ERROR_WRITE_PROTECTED) {
+ 			request-&gt;SetSense(SCSIS_KEY_DATA_PROTECT, SCSIS_ASC_WRITE_PROTECTED);
+ 			return B_ERROR;
+@@ -630,32 +644,34 @@
+ {
+ 	bigtime_t timeout = request-&gt;Timeout();
+ 	status_t result = B_OK;
+-	uint32 *blocksLeft = request-&gt;BlocksLeft();
+-	while (*blocksLeft &gt; 0) {
+-		if (Wait(ATA_STATUS_DATA_REQUEST, ATA_STATUS_BUSY, 0, timeout) != B_OK) {
++	size_t *bytesLeft = request-&gt;BytesLeft();
++	while (*bytesLeft &gt; 0) {
++		if (Wait(ATA_STATUS_DATA_REQUEST, ATA_STATUS_BUSY, ATA_CHECK_ERROR_BIT
++			| ATA_CHECK_DISK_FAILURE, timeout) != B_OK) {
+ 			TRACE_ERROR(&quot;timeout waiting for device to request data\n&quot;);
+ 			result = B_TIMED_OUT;
+ 			break;
+ 		}
+ 
++		size_t currentLength = MIN(*bytesLeft, ATA_BLOCK_SIZE);
+ 		if (request-&gt;IsWrite()) {
+-			result = _WritePIOBlock(request, 512);
++			result = _WritePIOBlock(request, currentLength);
+ 			if (result != B_OK) {
+ 				TRACE_ERROR(&quot;failed to write pio block\n&quot;);
+ 				break;
+ 			}
+ 		} else {
+-			result = _ReadPIOBlock(request, 512);
++			result = _ReadPIOBlock(request, currentLength);
+ 			if (result != B_OK) {
+ 				TRACE_ERROR(&quot;failed to read pio block\n&quot;);
+ 				break;
+ 			}
+ 		}
+ 
+-		(*blocksLeft)--;
++		*bytesLeft -= currentLength;
+ 
+ 		// wait 1 pio cycle
+-		if (*blocksLeft &gt; 0)
++		if (*bytesLeft &gt; 0)
+ 			AltStatus();
+ 	}
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp	2009-04-10 20:47:23 UTC (rev 30108)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp	2009-04-10 22:29:59 UTC (rev 30109)
+@@ -169,8 +169,7 @@
+ 	}
+ 
+ 	scsi_res_read_capacity data;
+-	data.block_size = B_HOST_TO_BENDIAN_INT32(512);
+-		// TODO: 512 bytes fixed block size?
++	data.block_size = B_HOST_TO_BENDIAN_INT32(ATA_BLOCK_SIZE);
+ 
+ 	uint32 lastBlock = fTotalSectors - 1;
+ 	data.lba = B_HOST_TO_BENDIAN_INT32(lastBlock);
+@@ -462,7 +461,7 @@
+ ATADevice::Identify()
+ {
+ 	snprintf(fDebugContext, sizeof(fDebugContext), &quot;%s %lu-%u&quot;,
+-		IsATAPI() ? &quot;pi &quot; : &quot;&quot;, fChannel-&gt;ChannelID(), fIndex);
++		IsATAPI() ? &quot;pi&quot; : &quot;&quot;, fChannel-&gt;ChannelID(), fIndex);
+ 
+ 	ATARequest request(false);
+ 	request.SetDevice(this);
+@@ -485,8 +484,9 @@
+ 		return B_TIMED_OUT;
+ 	}
+ 
+-	if (fChannel-&gt;Wait(ATA_STATUS_DATA_REQUEST, ATA_STATUS_BUSY, 0,
+-			IsATAPI() ? 20 * 1000 * 1000 : 500 * 1000) != B_OK) {
++	if (fChannel-&gt;Wait(ATA_STATUS_DATA_REQUEST, ATA_STATUS_BUSY,
++		ATA_CHECK_ERROR_BIT | ATA_CHECK_DISK_FAILURE, IsATAPI()
++		? 20 * 1000 * 1000 : 500 * 1000) != B_OK) {
+ 		TRACE_ERROR(&quot;timeout waiting for identify request\n&quot;);
+ 		return B_TIMED_OUT;
+ 	}
+@@ -517,7 +517,7 @@
+ 	if (!request-&gt;UseDMA())
+ 		request-&gt;PrepareSGInfo();
+ 
+-	request-&gt;SetBlocksLeft(sectorCount);
++	request-&gt;SetBytesLeft(sectorCount * ATA_BLOCK_SIZE);
+ 	if (_FillTaskFile(request, address) != B_OK) {
+ 		TRACE_ERROR(&quot;failed to setup transfer request\n&quot;);
+ 		if (request-&gt;UseDMA())
+@@ -571,7 +571,7 @@
+ 	}
+ 
+ 	return fChannel-&gt;FinishRequest(request, ATA_WAIT_FINISH
+-		| ATA_DEVICE_READY_REQUIRED, ATA_ERROR_ABORTED);
++		| ATA_DEVICE_READY_REQUIRED, ATA_ERROR_ALL);
+ }
+ 
+ 
+@@ -590,7 +590,7 @@
+ 		{ ATA_COMMAND_READ_DMA, ATA_COMMAND_WRITE_DMA }
+ 	};
+ 
+-	uint32 sectorCount = *request-&gt;BlocksLeft();
++	uint32 sectorCount = *request-&gt;BytesLeft() / ATA_BLOCK_SIZE;
+ 	if (fUseLBA) {
+ 		if (fUse48Bits
+ 			&amp;&amp; (address + sectorCount &gt; 0xfffffff || sectorCount &gt; 0x100)) {
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPIDevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPIDevice.cpp	2009-04-10 20:47:23 UTC (rev 30108)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPIDevice.cpp	2009-04-10 22:29:59 UTC (rev 30109)
+@@ -49,10 +49,8 @@
+ 		return B_ERROR;
+ 	}
+ 
+-	if (fInterruptsForPacket)
+-		fChannel-&gt;PrepareWaitingForInterrupt();
+-
+-	status_t result = fChannel-&gt;SendRequest(request, ATA_DMA_TRANSFER);
++	status_t result = fChannel-&gt;SendRequest(request, request-&gt;UseDMA()
++		? ATA_DMA_TRANSFER : 0);
+ 	if (result != B_OK) {
+ 		TRACE_ERROR(&quot;failed to send packet request\n&quot;);
+ 		if (request-&gt;UseDMA())
+@@ -61,15 +59,8 @@
+ 	}
+ 
+ 	// wait for device to get ready for packet transmission
+-	bool timedOut = false;
+-	if (fInterruptsForPacket)
+-		timedOut = fChannel-&gt;WaitForInterrupt(request-&gt;Timeout()) != B_OK;
+-	else {
+-		timedOut = fChannel-&gt;Wait(ATA_STATUS_DATA_REQUEST, ATA_STATUS_BUSY, 0,
+-			100 * 1000) != B_OK;
+-	}
+-
+-	if (timedOut) {
++	if (fChannel-&gt;Wait(ATA_STATUS_DATA_REQUEST, ATA_STATUS_BUSY,
++		ATA_CHECK_ERROR_BIT | ATA_CHECK_DISK_FAILURE, 100 * 1000) != B_OK) {
+ 		TRACE_ERROR(&quot;timeout waiting for data request\n&quot;);
+ 		if (request-&gt;UseDMA())
+ 			fChannel-&gt;FinishDMA();
+@@ -95,8 +86,6 @@
+ 	// some old drives need a delay before submitting the packet
+ 	spin(10);
+ 
+-	fChannel-&gt;PrepareWaitingForInterrupt();
+-
+ 	// write packet
+ 	if (fChannel-&gt;WritePIO(fPacket, sizeof(fPacket)) != B_OK) {
+ 		TRACE_ERROR(&quot;failed to write packet\n&quot;);
+@@ -108,65 +97,73 @@
+ 	}
+ 
+ 	if (request-&gt;UseDMA()) {
++		fChannel-&gt;PrepareWaitingForInterrupt();
+ 		fChannel-&gt;StartDMA();
++
+ 		result = fChannel-&gt;WaitForInterrupt(request-&gt;Timeout());
+ 		status_t dmaResult = fChannel-&gt;FinishDMA();
+-		if (result == B_OK &amp;&amp; dmaResult == B_OK) {
+-			fDMAFailures = 0;
+-			request-&gt;CCB()-&gt;data_resid = 0;
+-		} else {
+-			if (dmaResult != B_OK) {
+-				request-&gt;SetSense(SCSIS_KEY_HARDWARE_ERROR,
+-					SCSIS_ASC_LUN_COM_FAILURE);
+-				fDMAFailures++;
+-				if (fDMAFailures &gt;= ATA_MAX_DMA_FAILURES) {
+-					TRACE_ALWAYS(&quot;disabling DMA after %u failures\n&quot;,
+-						fDMAFailures);
+-					fUseDMA = false;
+-				}
+-			} else {
+-				// timeout
+-				request-&gt;SetStatus(SCSI_CMD_TIMEOUT);
+-			}
+-		}
+-	} else {
+-		result = fChannel-&gt;WaitForInterrupt(request-&gt;Timeout());
+ 		if (result != B_OK) {
+-			TRACE_ERROR(&quot;timeout waiting for device to request data\n&quot;);
+-			request-&gt;SetStatus(SCSI_SEQUENCE_FAIL);
++			request-&gt;SetStatus(SCSI_CMD_TIMEOUT);
+ 			return B_TIMED_OUT;
+ 		}
+ 
+-		while (true) {
+-			uint8 altStatus = fChannel-&gt;AltStatus();
+-			if ((altStatus &amp; ATA_STATUS_DATA_REQUEST) == 0)
+-				break;
++		result = fChannel-&gt;FinishRequest(request, ATA_CHECK_DISK_FAILURE,
++			ATA_ERROR_ALL);
++		if (result != B_OK) {
++			TRACE_ERROR(&quot;device indicates transfer error after dma\n&quot;);
++			return result;
++		}
+ 
+-			fRegisterMask = ATA_MASK_ERROR | ATA_MASK_IREASON;
+-			fChannel-&gt;ReadRegs(this);
++		// for ATAPI it's ok for the device to send too much
++		if (dmaResult == B_OK || dmaResult == B_DEV_DATA_OVERRUN) {
++			fDMAFailures = 0;
++			request-&gt;CCB()-&gt;data_resid = 0;
++			return B_OK;
++		}
+ 
+-			if (fTaskFile.packet_res.cmd_or_data) {
+-				TRACE_ERROR(&quot;device expecting command instead of data\n&quot;);
+-				request-&gt;SetStatus(SCSI_SEQUENCE_FAIL);
+-				return B_ERROR;
+-			}
++		TRACE_ERROR(&quot;dma transfer failed\n&quot;);
++		request-&gt;SetSense(SCSIS_KEY_HARDWARE_ERROR,
++			SCSIS_ASC_LUN_COM_FAILURE);
++		fDMAFailures++;
++		if (fDMAFailures &gt;= ATA_MAX_DMA_FAILURES) {
++			TRACE_ALWAYS(&quot;disabling DMA after %u failures\n&quot;, fDMAFailures);
++			fUseDMA = false;
++		}
+ 
+-			fRegisterMask = ATA_MASK_BYTE_COUNT;
+-			fChannel-&gt;ReadRegs(this);
+-			size_t length = fTaskFile.packet_res.byte_count_0_7
+-				| ((size_t)fTaskFile.packet_res.byte_count_8_15 &lt;&lt; 8);
+-			TRACE(&quot;about to transfer %lu bytes\n&quot;, length);
++		return B_ERROR;
++	}
+ 
+-			request-&gt;SetBlocksLeft((length + 511) / 512);
+-			if (fChannel-&gt;ExecutePIOTransfer(request) != B_OK) {
+-				TRACE_ERROR(&quot;failed to transfer data\n&quot;);
+-				request-&gt;SetStatus(SCSI_SEQUENCE_FAIL);
+-				return B_ERROR;
+-			}
+-		}
++	// PIO data transfer
++	if (fChannel-&gt;Wait(ATA_STATUS_DATA_REQUEST, ATA_STATUS_BUSY,
++		ATA_CHECK_ERROR_BIT | ATA_CHECK_DISK_FAILURE,
++		request-&gt;Timeout()) != B_OK) {
++		TRACE_ERROR(&quot;timeout waiting for device to request data\n&quot;);
++		request-&gt;SetStatus(SCSI_CMD_TIMEOUT);
++		return B_TIMED_OUT;
+ 	}
+ 
+-	return fChannel-&gt;FinishRequest(request, ATA_WAIT_FINISH, ATA_ERROR_ABORTED);
++	fRegisterMask = ATA_MASK_IREASON | ATA_MASK_BYTE_COUNT;
++	fChannel-&gt;ReadRegs(this);
++
++	if (fTaskFile.packet_res.cmd_or_data) {
++		TRACE_ERROR(&quot;device expecting command instead of data\n&quot;);
++		request-&gt;SetStatus(SCSI_SEQUENCE_FAIL);
++		return B_ERROR;
++	}
++
++	size_t length = fTaskFile.packet_res.byte_count_0_7
++		| ((size_t)fTaskFile.packet_res.byte_count_8_15 &lt;&lt; 8);
++	TRACE(&quot;about to transfer %lu bytes\n&quot;, length);
++
++	request-&gt;SetBytesLeft(length);
++	fChannel-&gt;ExecutePIOTransfer(request);
++
++	result = fChannel-&gt;FinishRequest(request, ATA_WAIT_FINISH
++		| ATA_CHECK_DISK_FAILURE, ATA_ERROR_ALL);
++	if (result != B_OK)
++		TRACE_ERROR(&quot;device indicates transfer error after pio\n&quot;);
++
++	return result;
+ }
+ 
+ 
+@@ -199,7 +196,6 @@
+ 		return B_ERROR;
+ 
+ 	fTaskFile.packet.lun = 0;
+-	fInterruptsForPacket = fInfoBlock._0.atapi.drq_speed == 1;
+ 
+ 	status_t result = ConfigureDMA();
+ 	if (result != B_OK)
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h	2009-04-10 20:47:23 UTC (rev 30108)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h	2009-04-10 22:29:59 UTC (rev 30109)
+@@ -25,6 +25,7 @@
+ #include &quot;ATATracing.h&quot;
+ #include &quot;ata_device_infoblock.h&quot;
+ 
++#define ATA_BLOCK_SIZE				512 /* TODO: retrieve */
+ #define ATA_MAX_DMA_FAILURES		3
+ #define ATA_STANDARD_TIMEOUT		10 * 1000 * 1000
+ #define ATA_RELEASE_TIMEOUT			10 * 1000 * 1000
+@@ -39,7 +40,8 @@
+ 	ATA_DMA_TRANSFER			= 0x04,
+ 	ATA_CHECK_ERROR_BIT			= 0x08,
+ 	ATA_WAIT_FINISH				= 0x10,
+-	ATA_WAIT_ANY_BIT			= 0x20
++	ATA_WAIT_ANY_BIT			= 0x20,
++	ATA_CHECK_DISK_FAILURE		= 0x40
+ };
+ 
+ 
+@@ -103,6 +105,7 @@
+ 
+ 		status_t					ReadRegs(ATADevice *device);
+ 		uint8						AltStatus();
++		bool						IsDMAInterruptSet();
+ 
+ 		status_t					ReadPIO(uint8 *buffer, size_t length);
+ 		status_t					WritePIO(uint8 *buffer, size_t length);
+@@ -232,7 +235,6 @@
+ private:
+ 		status_t					_FillTaskFilePacket(ATARequest *request);
+ 
+-		bool						fInterruptsForPacket;
+ 		uint8						fPacket[12];
+ };
+ 
+@@ -263,8 +265,8 @@
+ 		void						SetUseDMA(bool useDMA);
+ 		bool						UseDMA() { return fUseDMA; };
+ 
+-		void						SetBlocksLeft(uint32 blocksLeft);
+-		uint32 *					BlocksLeft() { return &fBlocksLeft; };
++		void						SetBytesLeft(uint32 bytesLeft);
++		size_t *					BytesLeft() { return &fBytesLeft; };
+ 
+ 		status_t					Finish(bool resubmit);
+ 
+@@ -302,7 +304,7 @@
+ 
+ 		ATADevice *					fDevice;
+ 		bigtime_t					fTimeout;
+-		uint32						fBlocksLeft;
++		size_t						fBytesLeft;
+ 		bool						fIsWrite;
+ 		bool						fUseDMA;
+ 		scsi_ccb *					fCCB;
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATARequest.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATARequest.cpp	2009-04-10 20:47:23 UTC (rev 30108)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATARequest.cpp	2009-04-10 22:29:59 UTC (rev 30109)
+@@ -9,7 +9,7 @@
+ 	:	fHasLock(hasLock),
+ 		fDevice(NULL),
+ 		fTimeout(0),
+-		fBlocksLeft(0),
++		fBytesLeft(0),
+ 		fIsWrite(false),
+ 		fUseDMA(false),
+ 		fCCB(NULL)
+@@ -80,9 +80,9 @@
+ 
+ 
+ void
+-ATARequest::SetBlocksLeft(uint32 blocksLeft)
++ATARequest::SetBytesLeft(uint32 bytesLeft)
+ {
+-	fBlocksLeft = blocksLeft;
++	fBytesLeft = bytesLeft;
+ }
+ 
+ 
+@@ -94,6 +94,7 @@
+ 
+ 	fCCB = ccb;
+ 	fStatus = SCSI_REQ_CMP;
++	fIsWrite = false;
+ 	return B_OK;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015730.html">[Haiku-commits] r30108 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+</A></li>
+	<LI>Next message: <A HREF="015732.html">[Haiku-commits] r30110 - haiku/trunk/headers/private/drivers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15731">[ date ]</a>
+              <a href="thread.html#15731">[ thread ]</a>
+              <a href="subject.html#15731">[ subject ]</a>
+              <a href="author.html#15731">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

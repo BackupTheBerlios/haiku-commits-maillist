@@ -1,0 +1,500 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27327 - haiku/trunk/src/system/kernel/posix
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27327%20-%20haiku/trunk/src/system/kernel/posix&In-Reply-To=%3C200809041945.m84Jj28E027768%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011540.html">
+   <LINK REL="Next"  HREF="011542.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27327 - haiku/trunk/src/system/kernel/posix</H1>
+    <B>sbenedetto at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27327%20-%20haiku/trunk/src/system/kernel/posix&In-Reply-To=%3C200809041945.m84Jj28E027768%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27327 - haiku/trunk/src/system/kernel/posix">sbenedetto at mail.berlios.de
+       </A><BR>
+    <I>Thu Sep  4 21:45:02 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011540.html">[Haiku-commits] r27326 - in haiku/trunk/headers: os/kernel	private/shared
+</A></li>
+        <LI>Next message: <A HREF="011542.html">[Haiku-commits] r27328 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11541">[ date ]</a>
+              <a href="thread.html#11541">[ thread ]</a>
+              <a href="subject.html#11541">[ subject ]</a>
+              <a href="author.html#11541">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: sbenedetto
+Date: 2008-09-04 21:45:02 +0200 (Thu, 04 Sep 2008)
+New Revision: 27327
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27327&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27327&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp
+Log:
+* Implemented msgrcv and msgsnd. Not complete yet.
+* Reworked the way IDs are geneterad in the same way they are in xsi semaphores
+
+
+Modified: haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp	2008-09-04 19:08:05 UTC (rev 27326)
++++ haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp	2008-09-04 19:45:02 UTC (rev 27327)
+@@ -24,7 +24,7 @@
+ #include &lt;util/OpenHashTable.h&gt;
+ 
+ 
+-//#define TRACE_XSI_MSG_QUEUE
++#define TRACE_XSI_MSG_QUEUE
+ #ifdef TRACE_XSI_MSG_QUEUE
+ #	define TRACE(x)			dprintf x
+ #	define TRACE_ERROR(x)	dprintf x
+@@ -76,6 +76,15 @@
+ 			free(message);
+ 	}
+ 
++	status_t copy_to_user_buffer(void *_message, ssize_t _length)
++	{
++		if (user_memcpy(_message, &amp;type, sizeof(long)) != B_OK
++			|| user_memcpy((void *)((long *)_message + sizeof(long)), message,
++			_length) != B_OK)
++			return B_ERROR;
++		return B_OK;
++	}
++
+ 	bool		initOK;
+ 	ssize_t		length;
+ 	char		*message;
+@@ -91,7 +100,9 @@
+ public:
+ 	XsiMessageQueue(int flags)
+ 		:
+-		fBytesInQueue(0)
++		fBytesInQueue(0),
++		fThreadsWaitingToReceive(0),
++		fThreadsWaitingToSend(0)
+ 	{
+ 		mutex_init(&amp;fLock, &quot;XsiMessageQueue private mutex&quot;);
+ 		SetIpcKey((key_t)-1);
+@@ -105,10 +116,21 @@
+ 	~XsiMessageQueue()
+ 	{
+ 		mutex_destroy(&amp;fLock);
+-		UnsetID();
+ 		// TODO: free up all messages
++		// TODO: Wake up any thread still waiting
+ 	}
+ 
++	status_t BlockAndUnlock(struct thread *thread, MutexLocker *queueLocker)
++	{
++		thread_prepare_to_block(thread, B_CAN_INTERRUPT,
++				THREAD_BLOCK_TYPE_OTHER, (void*)&quot;xsi message queue&quot;);
++		// Unlock the queue before blocking
++		queueLocker-&gt;Unlock();
++
++		InterruptsSpinLocker _(gThreadSpinlock);
++		return thread_block_locked(thread);
++	}
++
+ 	void DoIpcSet(struct msqid_ds *result)
+ 	{
+ 		fMessageQueue.msg_perm.uid = result-&gt;msg_perm.uid;
+@@ -118,6 +140,36 @@
+ 		fMessageQueue.msg_ctime = (time_t)real_time_clock();
+ 	}
+ 
++	void Deque(queued_thread *queueEntry, bool waitForMessage)
++	{
++		if (queueEntry-&gt;queued) {
++			if (waitForMessage) {
++				fWaitingToReceive.Remove(queueEntry);
++				fThreadsWaitingToReceive--;
++			} else {
++				fWaitingToSend.Remove(queueEntry);
++				fThreadsWaitingToSend--;
++			}
++		}
++	}
++
++	void Enqueue(queued_thread *queueEntry, bool waitForMessage)
++	{
++		if (waitForMessage) {
++			fWaitingToReceive.Add(queueEntry);
++			fThreadsWaitingToReceive++;
++		} else {
++			fWaitingToSend.Add(queueEntry);
++			fThreadsWaitingToSend++;
++		}
++		queueEntry-&gt;queued = true;
++	}
++
++	struct msqid_ds &amp;GetMessageQueue()
++	{
++		return fMessageQueue;
++	}
++
+ 	bool HasPermission() const
+ 	{
+ 		if ((fMessageQueue.msg_perm.mode &amp; S_IWOTH) != 0)
+@@ -165,9 +217,12 @@
+ 		return fMessageQueue.msg_qbytes;
+ 	}
+ 
+-	struct msqid_ds &amp;GetMessageQueue()
++	// Implemented after sXsiMessageCountLock is declared
++	queued_message *Remove(long typeRequested);
++
++	uint32 SequenceNumber() const
+ 	{
+-		return fMessageQueue;
++		return fSequenceNumber;
+ 	}
+ 
+ 	// Implemented after sMessageQueueHashTable is declared
+@@ -185,14 +240,6 @@
+ 		fMessageQueue.msg_perm.mode = (flags &amp; 0x01ff);
+ 	}
+ 
+-	// Implemented after sMessageQueueHashTable is declared
+-	void UnsetID();
+-
+-	status_t Wait(queued_message *message)
+-	{
+-		return B_ERROR;
+-	}
+-
+ 	HashTableLink&lt;XsiMessageQueue&gt;* Link()
+ 	{
+ 		return &fLink;
+@@ -204,9 +251,13 @@
+ 	mutex				fLock;
+ 	MessageQueue		fMessage;
+ 	struct msqid_ds		fMessageQueue;
+-	ThreadQueue			fThreadWaitingToSend;
+-	ThreadQueue			fThreadWaitingToReceive;
++	uint32				fSequenceNumber;
++	uint32				fThreadsWaitingToReceive;
++	uint32				fThreadsWaitingToSend;
+ 
++	ThreadQueue			fWaitingToReceive;
++	ThreadQueue			fWaitingToSend;
++
+ 	::HashTableLink&lt;XsiMessageQueue&gt; fLink;
+ };
+ 
+@@ -309,7 +360,7 @@
+ static mutex sXsiMessageQueueLock;
+ static mutex sXsiMessageCountLock;
+ 
+-static vint32 sNextAvailableID = 1;
++static uint32 sGlobalSequenceNumber = 1;
+ static vint32 sXsiMessageCount = 0;
+ static vint32 sXsiMessageQueueCount = 0;
+ 
+@@ -334,30 +385,71 @@
+ 	fMessageQueue.msg_stime = real_time_clock();
+ 	fBytesInQueue += message-&gt;length;
+ 	sXsiMessageCount++;
++	// TODO: Wake up any thread waiting on receive
+ 	return false;
+ }
+ 
+ 
++queued_message*
++XsiMessageQueue::Remove(long typeRequested)
++{
++	queued_message *message = NULL;
++	if (typeRequested &lt; 0) {
++		// Return first message of the lowest type
++		// that is less than or equal to the absolute
++		// value of type requested.
++		MessageQueue::Iterator iterator = fMessage.GetIterator();
++		while (iterator.HasNext()) {
++			queued_message *current = iterator.Next();
++			if (current-&gt;type &lt;= -typeRequested) {
++				message = iterator.Remove();
++				break;
++			}
++		}
++	} else if (typeRequested == 0) {
++		// Return the first message on the queue
++		message = fMessage.RemoveHead();
++	} else {
++		// Return the first message of type requested
++		MessageQueue::Iterator iterator = fMessage.GetIterator();
++		while (iterator.HasNext()) {
++			queued_message *current = iterator.Next();
++			if (current-&gt;type == typeRequested) {
++				message = iterator.Remove();
++				break;
++			}
++		}
++	}
++
++	if (message == NULL)
++		return NULL;
++
++	fMessageQueue.msg_qnum--;
++	fMessageQueue.msg_lrpid = getpid();
++	fMessageQueue.msg_rtime = real_time_clock();
++	fBytesInQueue -= message-&gt;length;
++	MutexLocker _(sXsiMessageCountLock);
++	sXsiMessageCount--;
++	// TODO: Wake up any thread waiting on send
++	return message;
++}
++
++
+ void
+ XsiMessageQueue::SetID()
+ {
++	fID = real_time_clock();
+ 	// The lock is held before calling us
+ 	while (true) {
+-		if (sMessageQueueHashTable.Lookup(sNextAvailableID) == NULL)
++		if (sMessageQueueHashTable.Lookup(fID) == NULL)
+ 			break;
+-		sNextAvailableID++;
++		fID++;
+ 	}
+-	fID = sNextAvailableID++;
++	sGlobalSequenceNumber = (sGlobalSequenceNumber + 1) % UINT_MAX;
++	fSequenceNumber = sGlobalSequenceNumber;
+ }
+ 
+ 
+-void
+-XsiMessageQueue::UnsetID()
+-{
+-	sNextAvailableID = fID;
+-}
+-
+-
+ //	#pragma mark - Kernel exported API
+ 
+ 
+@@ -489,7 +581,7 @@
+ int
+ _user_xsi_msgget(key_t key, int flags)
+ {
+-	TRACE((&quot;xsi_msgget: key = %d, flags = %d\n&quot;, (nt)key, flags));
++	TRACE((&quot;xsi_msgget: key = %d, flags = %d\n&quot;, (int)key, flags));
+ 	XsiMessageQueue *messageQueue = NULL;
+ 	Ipc *ipcKey = NULL;
+ 	// Default assumptions
+@@ -513,7 +605,7 @@
+ 					&quot;for key %d\n&quot;, (int)key));
+ 				return ENOMEM;
+ 			}
+-			sIpcHashTable.Lookup(key);
++			sIpcHashTable.Insert(ipcKey);
+ 		} else {
+ 			// The IPC key exist and it already has a message queue
+ 			if ((flags &amp; IPC_CREAT) &amp;&amp; (flags &amp; IPC_EXCL)) {
+@@ -569,7 +661,99 @@
+ _user_xsi_msgrcv(int messageQueueID, void *messagePointer,
+ 	size_t messageSize, long messageType, int messageFlags)
+ {
+-	// TODO
++	TRACE((&quot;xsi_msgrcv: messageQueueID = %d, messageSize = %ld\n&quot;,
++		messageQueueID, messageSize));
++	MutexLocker messageQueueHashLocker(sXsiMessageQueueLock);
++	XsiMessageQueue *messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);
++	if (messageQueue == NULL) {
++		TRACE_ERROR((&quot;xsi_msgrcv: message queue id %d not valid\n&quot;,
++			messageQueueID));
++		return EINVAL;
++	}
++	MutexLocker messageQueueLocker(messageQueue-&gt;Lock());
++	messageQueueHashLocker.Unlock();
++
++	if (messageSize &lt; 0 || messageSize &gt; MAX_BYTES_PER_QUEUE) {
++		TRACE_ERROR((&quot;xsi_msgrcv: message size is out of range\n&quot;));
++		return EINVAL;
++	}
++	if (!messageQueue-&gt;HasPermission()) {
++		TRACE_ERROR((&quot;xsi_msgrcv: calling process has not permission &quot;
++			&quot;on message queue id %d, key %d\n&quot;, messageQueueID,
++			(int)messageQueue-&gt;IpcKey()));
++		return EACCES;
++	}
++	if (!IS_USER_ADDRESS(messagePointer)) {
++		TRACE_ERROR((&quot;xsi_msgrcv: message address is not valid\n&quot;));
++		return B_BAD_ADDRESS;
++	}
++
++	queued_message *message = NULL;
++	bool notReceived = true;
++	while (notReceived) {
++		message = messageQueue-&gt;Remove(messageType);
++
++		if (message == NULL &amp;&amp; !(messageFlags &amp; IPC_NOWAIT)) {
++			// We are going to sleep
++			struct thread *thread = thread_get_current_thread();
++			queued_thread queueEntry(thread, messageSize);
++			messageQueue-&gt;Enqueue(&amp;queueEntry, /* waitForMessage */ true);
++
++			uint32 sequenceNumber = messageQueue-&gt;SequenceNumber();
++
++			TRACE((&quot;xsi_msgrcv: thread %d going to sleep\n&quot;, (int)thread-&gt;id));
++			status_t result
++				= messageQueue-&gt;BlockAndUnlock(thread, &amp;messageQueueLocker);
++			TRACE((&quot;xsi_msgrcv: thread %d back to life\n&quot;, (int)thread-&gt;id));
++
++			messageQueueHashLocker.Lock();
++			messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);
++			if (result == EIDRM || messageQueue == NULL || (messageQueue != NULL
++				&amp;&amp; sequenceNumber != messageQueue-&gt;SequenceNumber())) {
++				TRACE_ERROR((&quot;xsi_msgrcv: message queue id %d (sequence = %ld) &quot;
++					&quot;got destroyed\n&quot;, messageQueueID, sequenceNumber));
++				notReceived = false;
++				result = EIDRM;
++			} else if (result == B_INTERRUPTED) {
++				TRACE_ERROR((&quot;xsi_msgrcv: thread %d got interrupted while &quot;
++					&quot;waiting on message queue %d\n&quot;,(int)thread-&gt;id,
++					messageQueueID));
++				messageQueue-&gt;Deque(&amp;queueEntry, /* waitForMessage */ true);
++				notReceived = false;
++				result = EINTR;
++			} else {
++				messageQueueLocker.Lock();
++				messageQueueHashLocker.Unlock();
++			}
++		} else if (message == NULL) {
++			// There is not message of type requested and
++			// we can't wait
++			return ENOMSG;
++		} else {
++			// Message received correctly (so far)
++			if ((ssize_t)messageSize &gt; message-&gt;length
++				&amp;&amp; !(messageFlags &amp; MSG_NOERROR)) {
++				TRACE_ERROR((&quot;xsi_msgrcv: message too big!\n&quot;));
++				// Put the message back inside. Since we hold the
++				// queue message lock, not one else could have filled
++				// up the queue meanwhile
++				messageQueue-&gt;Insert(message);
++				return E2BIG;
++			}
++
++			status_t result
++				= message-&gt;copy_to_user_buffer(messagePointer, messageSize);
++			if (result != B_OK) {
++				messageQueue-&gt;Insert(message);
++				return B_BAD_ADDRESS;
++			}
++
++			delete message;
++			TRACE((&quot;xsi_msgrcv: message received correctly\n&quot;));
++			notReceived = false;
++		}
++	}
++
+ 	return B_ERROR;
+ }
+ 
+@@ -578,7 +762,7 @@
+ _user_xsi_msgsnd(int messageQueueID, const void *messagePointer,
+ 	size_t messageSize, int messageFlags)
+ {
+-	TRACE((&quot;xsi_msgsnd: messageQueueID = %d, messageSize = %Ld\n&quot;,
++	TRACE((&quot;xsi_msgsnd: messageQueueID = %d, messageSize = %ld\n&quot;,
+ 		messageQueueID, messageSize));
+ 	MutexLocker messageQueueHashLocker(sXsiMessageQueueLock);
+ 	XsiMessageQueue *messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);
+@@ -605,19 +789,52 @@
+ 		return B_BAD_ADDRESS;
+ 	}
+ 
++	queued_message *message
++		= new(std::nothrow) queued_message(messagePointer, messageSize);
++	if (message == NULL || message-&gt;initOK != true) {
++		TRACE_ERROR((&quot;xsi_msgsnd: failed to create new message to queue\n&quot;));
++		delete message;
++		return ENOMEM;
++	}
++
+ 	bool notSent = true;
+ 	while (notSent) {
+-		queued_message *message
+-			= new(std::nothrow) queued_message(messagePointer, messageSize);
+-		if (message == NULL || message-&gt;initOK != true) {
+-			TRACE_ERROR((&quot;xsi_msgsnd: failed to create new message to queue\n&quot;));
+-			delete message;
+-			return ENOMEM;
+-		}
+ 		bool goToSleep = messageQueue-&gt;Insert(message);
++
+ 		if (goToSleep &amp;&amp; !(messageFlags &amp; IPC_NOWAIT)) {
+ 			// We are going to sleep
+-			messageQueue-&gt;Wait(message);
++			struct thread *thread = thread_get_current_thread();
++			queued_thread queueEntry(thread, messageSize);
++			messageQueue-&gt;Enqueue(&amp;queueEntry, /* waitForMessage */ false);
++
++			uint32 sequenceNumber = messageQueue-&gt;SequenceNumber();
++
++			TRACE((&quot;xsi_msgsnd: thread %d going to sleep\n&quot;, (int)thread-&gt;id));
++			status_t result
++				= messageQueue-&gt;BlockAndUnlock(thread, &amp;messageQueueLocker);
++			TRACE((&quot;xsi_msgsnd: thread %d back to life\n&quot;, (int)thread-&gt;id));
++
++			messageQueueHashLocker.Lock();
++			messageQueue = sMessageQueueHashTable.Lookup(messageQueueID);
++			if (result == EIDRM || messageQueue == NULL || (messageQueue != NULL
++				&amp;&amp; sequenceNumber != messageQueue-&gt;SequenceNumber())) {
++				TRACE_ERROR((&quot;xsi_msgsnd: message queue id %d (sequence = %ld) &quot;
++					&quot;got destroyed\n&quot;, messageQueueID, sequenceNumber));
++				delete message;
++				notSent = false;
++				result = EIDRM;
++			} else if (result == B_INTERRUPTED) {
++				TRACE_ERROR((&quot;xsi_msgsnd: thread %d got interrupted while &quot;
++					&quot;waiting on message queue %d\n&quot;,(int)thread-&gt;id,
++					messageQueueID));
++				messageQueue-&gt;Deque(&amp;queueEntry, /* waitForMessage */ false);
++				delete message;
++				notSent = false;
++				result = EINTR;
++			} else {
++				messageQueueLocker.Lock();
++				messageQueueHashLocker.Unlock();
++			}
+ 		} else if (goToSleep) {
+ 			// We did not send the message and we can't wait
+ 			delete message;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011540.html">[Haiku-commits] r27326 - in haiku/trunk/headers: os/kernel	private/shared
+</A></li>
+	<LI>Next message: <A HREF="011542.html">[Haiku-commits] r27328 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11541">[ date ]</a>
+              <a href="thread.html#11541">[ thread ]</a>
+              <a href="subject.html#11541">[ subject ]</a>
+              <a href="author.html#11541">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

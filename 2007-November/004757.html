@@ -1,0 +1,836 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22929 - in haiku/trunk/src/add-ons/kernel:	bus_managers/usb busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22929%20-%20in%20haiku/trunk/src/add-ons/kernel%3A%0A%09bus_managers/usb%20busses/usb&In-Reply-To=%3C200711142211.lAEMB6Fv009884%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004756.html">
+   <LINK REL="Next"  HREF="004759.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22929 - in haiku/trunk/src/add-ons/kernel:	bus_managers/usb busses/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22929%20-%20in%20haiku/trunk/src/add-ons/kernel%3A%0A%09bus_managers/usb%20busses/usb&In-Reply-To=%3C200711142211.lAEMB6Fv009884%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22929 - in haiku/trunk/src/add-ons/kernel:	bus_managers/usb busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Wed Nov 14 23:11:06 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004756.html">[Haiku-commits] r22928 -	haiku/trunk/src/add-ons/media/plugins/avcodec
+</A></li>
+        <LI>Next message: <A HREF="004759.html">[Haiku-commits] r22930 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4757">[ date ]</a>
+              <a href="thread.html#4757">[ thread ]</a>
+              <a href="subject.html#4757">[ subject ]</a>
+              <a href="author.html#4757">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2007-11-14 23:11:05 +0100 (Wed, 14 Nov 2007)
+New Revision: 22929
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22929&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22929&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Device.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+Log:
+Completely redesign the USB explore process. Replaces the scary race conditions of the previous locking mechanism and simplifies handling of device changes by a more centralized approach.
+Changes are now collected during explore and notifications as well as rescans are done at once. Through this a driver is also not rescanned multiple times anymore.
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/BusManager.cpp	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/BusManager.cpp	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -269,7 +269,7 @@
+ 
+ 
+ status_t
+-BusManager::CancelQueuedTransfers(Pipe *pipe)
++BusManager::CancelQueuedTransfers(Pipe *pipe, bool force)
+ {
+ 	// virtual function to be overridden
+ 	return B_ERROR;
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Device.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Device.cpp	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Device.cpp	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -15,6 +15,7 @@
+ 	:	Object(parent),
+ 		fDeviceDescriptor(desc),
+ 		fInitOK(false),
++		fAvailable(true),
+ 		fConfigurations(NULL),
+ 		fCurrentConfiguration(NULL),
+ 		fSpeed(speed),
+@@ -253,9 +254,28 @@
+ 
+ 
+ status_t
++Device::Changed(change_item **changeList, bool added)
++{
++	fAvailable = added;
++	change_item *changeItem = new(std::nothrow) change_item;
++	if (!changeItem)
++		return B_NO_MEMORY;
++
++	changeItem-&gt;added = added;
++	changeItem-&gt;device = this;
++	changeItem-&gt;link = *changeList;
++	*changeList = changeItem;
++	return B_OK;
++}
++
++
++status_t
+ Device::GetDescriptor(uint8 descriptorType, uint8 index, uint16 languageID,
+ 	void *data, size_t dataLength, size_t *actualLength)
+ {
++	if (!fAvailable)
++		return B_ERROR;
++
+ 	return fDefaultPipe-&gt;SendRequest(
+ 		USB_REQTYPE_DEVICE_IN | USB_REQTYPE_STANDARD,		// type
+ 		USB_REQUEST_GET_DESCRIPTOR,							// request
+@@ -304,6 +324,8 @@
+ status_t
+ Device::SetConfigurationAt(uint8 index)
+ {
++	if (!fAvailable)
++		return B_ERROR;
+ 	if (index &gt;= fDeviceDescriptor.num_configurations)
+ 		return B_BAD_VALUE;
+ 	if (&amp;fConfigurations[index] == fCurrentConfiguration)
+@@ -382,7 +404,7 @@
+ 	// another configuration unconfigure will be called with
+ 	// atDevice = false. otherwise we explicitly want to unconfigure
+ 	// the device and have to send it the corresponding request.
+-	if (atDeviceLevel) {
++	if (atDeviceLevel &amp;&amp; fAvailable) {
+ 		status_t result = fDefaultPipe-&gt;SendRequest(
+ 			USB_REQTYPE_DEVICE_OUT | USB_REQTYPE_STANDARD,	// type
+ 			USB_REQUEST_SET_CONFIGURATION,					// request
+@@ -426,7 +448,7 @@
+ status_t
+ Device::ReportDevice(usb_support_descriptor *supportDescriptors,
+ 	uint32 supportDescriptorCount, const usb_notify_hooks *hooks,
+-	usb_driver_cookie **cookies, bool added)
++	usb_driver_cookie **cookies, bool added, bool recursive)
+ {
+ 	TRACE((&quot;USB Device %d: reporting device\n&quot;, fDeviceAddress));
+ 	bool supported = false;
+@@ -526,6 +548,9 @@
+ status_t
+ Device::SetFeature(uint16 selector)
+ {
++	if (!fAvailable)
++		return B_ERROR;
++
+ 	return fDefaultPipe-&gt;SendRequest(
+ 		USB_REQTYPE_STANDARD | USB_REQTYPE_DEVICE_OUT,
+ 		USB_REQUEST_SET_FEATURE,
+@@ -541,6 +566,9 @@
+ status_t
+ Device::ClearFeature(uint16 selector)
+ {
++	if (!fAvailable)
++		return B_ERROR;
++
+ 	return fDefaultPipe-&gt;SendRequest(
+ 		USB_REQTYPE_STANDARD | USB_REQTYPE_DEVICE_OUT,
+ 		USB_REQUEST_CLEAR_FEATURE,
+@@ -556,6 +584,9 @@
+ status_t
+ Device::GetStatus(uint16 *status)
+ {
++	if (!fAvailable)
++		return B_ERROR;
++
+ 	return fDefaultPipe-&gt;SendRequest(
+ 		USB_REQTYPE_STANDARD | USB_REQTYPE_DEVICE_IN,
+ 		USB_REQUEST_GET_STATUS,
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -30,11 +30,6 @@
+ 	// Set to false again for the hub init.
+ 	fInitOK = false;
+ 
+-	if (benaphore_init(&amp;fLock, &quot;usb hub lock&quot;) &lt; B_OK) {
+-		TRACE_ERROR((&quot;USB Hub %d: failed to create hub lock\n&quot;, DeviceAddress()));
+-		return;
+-	}
+-
+ 	if (fDeviceDescriptor.device_class != 9) {
+ 		TRACE_ERROR((&quot;USB Hub %d: wrong class! bailing out\n&quot;, DeviceAddress()));
+ 		return;
+@@ -97,36 +92,26 @@
+ 
+ Hub::~Hub()
+ {
+-	Lock();
+-	benaphore_destroy(&amp;fLock);
+-
+-	// Remove all child devices
+-	for (int32 i = 0; i &lt; fHubDescriptor.num_ports; i++) {
+-		if (!fChildren[i])
+-			continue;
+-
+-		TRACE((&quot;USB Hub %d: removing device 0x%08lx\n&quot;, DeviceAddress(), fChildren[i]));
+-		rescan_item *rescanList = NULL;
+-		GetStack()-&gt;NotifyDeviceChange(fChildren[i], &amp;rescanList, false);
+-		GetBusManager()-&gt;FreeDevice(fChildren[i]);
+-		GetStack()-&gt;RescanDrivers(rescanList);
+-	}
+-
+ 	delete fInterruptPipe;
+ }
+ 
+ 
+-bool
+-Hub::Lock()
++status_t
++Hub::Changed(change_item **changeList, bool added)
+ {
+-	return (benaphore_lock(&amp;fLock) == B_OK);
+-}
++	status_t result = Device::Changed(changeList, added);
++	if (added || result &lt; B_OK)
++		return result;
+ 
++	for (int32 i = 0; i &lt; fHubDescriptor.num_ports; i++) {
++		if (fChildren[i] == NULL)
++			continue;
+ 
+-void
+-Hub::Unlock()
+-{
+-	benaphore_unlock(&amp;fLock);
++		fChildren[i]-&gt;Changed(changeList, false);
++		fChildren[i] = NULL;
++	}
++
++	return B_OK;
+ }
+ 
+ 
+@@ -189,7 +174,7 @@
+ 
+ 
+ void
+-Hub::Explore()
++Hub::Explore(change_item **changeList)
+ {
+ 	for (int32 i = 0; i &lt; fHubDescriptor.num_ports; i++) {
+ 		status_t result = UpdatePortStatus(i);
+@@ -209,7 +194,6 @@
+ 				USB_REQUEST_CLEAR_FEATURE, C_PORT_CONNECTION, i + 1,
+ 				0, NULL, 0, NULL);
+ 
+-			rescan_item *rescanList = NULL;
+ 			if (fPortStatus[i].status &amp; PORT_STATUS_CONNECTION) {
+ 				// new device attached!
+ 				TRACE((&quot;USB Hub %d: new device connected\n&quot;, DeviceAddress()));
+@@ -234,18 +218,8 @@
+ 
+ 				if (fChildren[i]) {
+ 					TRACE_ERROR((&quot;USB Hub %d: new device on a port that is already in use\n&quot;, DeviceAddress()));
+-
+-					// Remove previous device first
+-					TRACE((&quot;USB Hub %d: removing device 0x%08lx\n&quot;, DeviceAddress(), fChildren[i]));
+-					GetStack()-&gt;NotifyDeviceChange(fChildren[i], &amp;rescanList, false);
+-
+-					if (Lock()) {
+-						GetBusManager()-&gt;FreeDevice(fChildren[i]);
+-						fChildren[i] = NULL;
+-						Unlock();
+-					}
+-
+-					GetStack()-&gt;RescanDrivers(rescanList);
++					fChildren[i]-&gt;Changed(changeList, false);
++					fChildren[i] = NULL;
+ 				}
+ 
+ 				usb_speed speed = USB_SPEED_FULLSPEED;
+@@ -256,15 +230,10 @@
+ 
+ 				Device *newDevice = GetBusManager()-&gt;AllocateDevice(this, speed);
+ 
+-				if (newDevice &amp;&amp; Lock()) {
++				if (newDevice) {
++					newDevice-&gt;Changed(changeList, true);
+ 					fChildren[i] = newDevice;
+-					Unlock();
+-					GetStack()-&gt;NotifyDeviceChange(fChildren[i], &amp;rescanList, true);
+-					GetStack()-&gt;RescanDrivers(rescanList);
+ 				} else {
+-					if (newDevice)
+-						GetBusManager()-&gt;FreeDevice(newDevice);
+-
+ 					// the device failed to setup correctly, disable the port
+ 					// so that the device doesn't get in the way of future
+ 					// addressing.
+@@ -277,15 +246,8 @@
+ 				TRACE((&quot;USB Hub %d: device removed\n&quot;, DeviceAddress()));
+ 				if (fChildren[i]) {
+ 					TRACE((&quot;USB Hub %d: removing device 0x%08lx\n&quot;, DeviceAddress(), fChildren[i]));
+-					GetStack()-&gt;NotifyDeviceChange(fChildren[i], &amp;rescanList, false);
+-
+-					if (Lock()) {
+-						GetBusManager()-&gt;FreeDevice(fChildren[i]);
+-						fChildren[i] = NULL;
+-						Unlock();
+-					}
+-
+-					GetStack()-&gt;RescanDrivers(rescanList);
++					fChildren[i]-&gt;Changed(changeList, false);
++					fChildren[i] = NULL;
+ 				}
+ 			}
+ 		}
+@@ -325,7 +287,7 @@
+ 		if (!fChildren[i] || (fChildren[i]-&gt;Type() &amp; USB_OBJECT_HUB) == 0)
+ 			continue;
+ 
+-		((Hub *)fChildren[i])-&gt;Explore();
++		((Hub *)fChildren[i])-&gt;Explore(changeList);
+ 	}
+ }
+ 
+@@ -357,28 +319,26 @@
+ status_t
+ Hub::ReportDevice(usb_support_descriptor *supportDescriptors,
+ 	uint32 supportDescriptorCount, const usb_notify_hooks *hooks,
+-	usb_driver_cookie **cookies, bool added)
++	usb_driver_cookie **cookies, bool added, bool recursive)
+ {
+ 	TRACE((&quot;USB Hub %d: reporting hub\n&quot;, DeviceAddress()));
+ 
+ 	// Report ourselfs first
+ 	status_t result = Device::ReportDevice(supportDescriptors,
+-		supportDescriptorCount, hooks, cookies, added);
++		supportDescriptorCount, hooks, cookies, added, recursive);
+ 
+-	// Then report all of our children
+-	if (!Lock())
+-		return B_ERROR;
++	if (!recursive)
++		return result;
+ 
+ 	for (int32 i = 0; i &lt; fHubDescriptor.num_ports; i++) {
+ 		if (!fChildren[i])
+ 			continue;
+ 
+ 		if (fChildren[i]-&gt;ReportDevice(supportDescriptors,
+-				supportDescriptorCount, hooks, cookies, added) == B_OK)
++				supportDescriptorCount, hooks, cookies, added, true) == B_OK)
+ 			result = B_OK;
+ 	}
+ 
+-	Unlock();
+ 	return result;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -26,7 +26,7 @@
+ 
+ Pipe::~Pipe()
+ {
+-	CancelQueuedTransfers();
++	CancelQueuedTransfers(true);
+ 	GetBusManager()-&gt;NotifyPipeChange(this, USB_CHANGE_DESTROYED);
+ }
+ 
+@@ -40,9 +40,9 @@
+ 
+ 
+ status_t
+-Pipe::CancelQueuedTransfers()
++Pipe::CancelQueuedTransfers(bool force)
+ {
+-	return GetBusManager()-&gt;CancelQueuedTransfers(this);
++	return GetBusManager()-&gt;CancelQueuedTransfers(this, force);
+ }
+ 
+ 
+@@ -309,7 +309,7 @@
+ 		if (actualLength)
+ 			*actualLength = 0;
+ 
+-		CancelQueuedTransfers();
++		CancelQueuedTransfers(false);
+ 		return B_TIMED_OUT;
+ 	}
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -28,11 +28,16 @@
+ {
+ 	TRACE((&quot;USB Stack: stack init\n&quot;));
+ 
+-	if (benaphore_init(&amp;fLock, &quot;usb stack lock&quot;) &lt; B_OK) {
+-		TRACE_ERROR((&quot;USB Stack: failed to create benaphore lock\n&quot;));
++	if (benaphore_init(&amp;fStackLock, &quot;usb stack lock&quot;) &lt; B_OK) {
++		TRACE_ERROR((&quot;USB Stack: failed to create stack lock\n&quot;));
+ 		return;
+ 	}
+ 
++	if (benaphore_init(&amp;fExploreLock, &quot;usb explore lock&quot;) &lt; B_OK) {
++		TRACE_ERROR((&quot;USB Stack: failed to create explore lock\n&quot;));
++		return;
++	}
++
+ 	size_t objectArraySize = fObjectMaxCount * sizeof(Object *);
+ 	fObjectArray = (Object **)malloc(objectArraySize);
+ 	memset(fObjectArray, 0, objectArraySize);
+@@ -85,8 +90,10 @@
+ 	fStopThreads = true;
+ 	wait_for_thread(fExploreThread, &amp;result);
+ 
+-	Lock();
+-	benaphore_destroy(&amp;fLock);
++	benaphore_lock(&amp;fStackLock);
++	benaphore_destroy(&amp;fStackLock);
++	benaphore_lock(&amp;fExploreLock);
++	benaphore_destroy(&amp;fExploreLock);
+ 
+ 	//Release the bus modules
+ 	for (Vector&lt;BusManager *&gt;::Iterator i = fBusManagers.Begin();
+@@ -111,14 +118,14 @@
+ bool
+ Stack::Lock()
+ {
+-	return (benaphore_lock(&amp;fLock) == B_OK);
++	return (benaphore_lock(&amp;fStackLock) == B_OK);
+ }
+ 
+ 
+ void
+ Stack::Unlock()
+ {
+-	benaphore_unlock(&amp;fLock);
++	benaphore_unlock(&amp;fStackLock);
+ }
+ 
+ 
+@@ -189,13 +196,33 @@
+ 	Stack *stack = (Stack *)data;
+ 
+ 	while (!stack-&gt;fStopThreads) {
++		if (benaphore_lock(&amp;stack-&gt;fExploreLock) != B_OK)
++			break;
++
++		rescan_item *rescanList = NULL;
++		change_item *changeItem = NULL;
+ 		for (int32 i = 0; i &lt; stack-&gt;fBusManagers.Count(); i++) {
+ 			Hub *rootHub = stack-&gt;fBusManagers.ElementAt(i)-&gt;GetRootHub();
+ 			if (rootHub)
+-				rootHub-&gt;Explore();
++				rootHub-&gt;Explore(&amp;changeItem);
+ 		}
+ 
++		while (changeItem) {
++			stack-&gt;NotifyDeviceChange(changeItem-&gt;device, &amp;rescanList, changeItem-&gt;added);
++			if (!changeItem-&gt;added) {
++				// everyone possibly holding a reference is now notified so we
++				// can delete the device
++				changeItem-&gt;device-&gt;GetBusManager()-&gt;FreeDevice(changeItem-&gt;device);
++			}
++
++			change_item *next = changeItem-&gt;link;
++			delete changeItem;
++			changeItem = next;
++		}
++
+ 		stack-&gt;fFirstExploreDone = true;
++		benaphore_unlock(&amp;stack-&gt;fExploreLock);
++		stack-&gt;RescanDrivers(rescanList);
+ 		snooze(USB_DELAY_HUB_EXPLORE);
+ 	}
+ 
+@@ -277,19 +304,33 @@
+ 	while (element) {
+ 		status_t result = device-&gt;ReportDevice(element-&gt;support_descriptors,
+ 			element-&gt;support_descriptor_count, &amp;element-&gt;notify_hooks,
+-			&amp;element-&gt;cookies, added);
++			&amp;element-&gt;cookies, added, false);
+ 
+ 		if (result &gt;= B_OK) {
+-			rescan_item *item = new(std::nothrow) rescan_item;
+-			if (!item)
+-				return;
+-
+-			item-&gt;name = element-&gt;driver_name;
++			const char *driverName = element-&gt;driver_name;
+ 			if (element-&gt;republish_driver_name)
+-				item-&gt;name = element-&gt;republish_driver_name;
++				driverName = element-&gt;republish_driver_name;
+ 
+-			item-&gt;link = *rescanList;
+-			*rescanList = item;
++			bool already = false;
++			rescan_item *rescanItem = *rescanList;
++			while (rescanItem) {
++				if (strcmp(rescanItem-&gt;name, driverName) == 0) {
++					// this driver is going to be rescanned already
++					already = true;
++					break;
++				}
++				rescanItem = rescanItem-&gt;link;
++			}
++
++			if (!already) {
++				rescanItem = new(std::nothrow) rescan_item;
++				if (!rescanItem)
++					return;
++
++				rescanItem-&gt;name = driverName;
++				rescanItem-&gt;link = *rescanList;
++				*rescanList = rescanItem;
++			}
+ 		}
+ 
+ 		element = element-&gt;link;
+@@ -403,6 +444,9 @@
+ 	usb_driver_info *element = fDriverList;
+ 	while (element) {
+ 		if (strcmp(element-&gt;driver_name, driverName) == 0) {
++			if (benaphore_lock(&amp;fExploreLock) != B_OK)
++				return B_ERROR;
++
+ 			// inform driver about any already present devices
+ 			for (int32 i = 0; i &lt; fBusManagers.Count(); i++) {
+ 				Hub *rootHub = fBusManagers.ElementAt(i)-&gt;GetRootHub();
+@@ -410,12 +454,13 @@
+ 					// Report device will recurse down the whole tree
+ 					rootHub-&gt;ReportDevice(element-&gt;support_descriptors,
+ 						element-&gt;support_descriptor_count, hooks,
+-						&amp;element-&gt;cookies, true);
++						&amp;element-&gt;cookies, true, true);
+ 				}
+ 			}
+ 
+ 			element-&gt;notify_hooks.device_added = hooks-&gt;device_added;
+ 			element-&gt;notify_hooks.device_removed = hooks-&gt;device_removed;
++			benaphore_unlock(&amp;fExploreLock);
+ 			return B_OK;
+ 		}
+ 
+@@ -434,17 +479,21 @@
+ 	usb_driver_info *element = fDriverList;
+ 	while (element) {
+ 		if (strcmp(element-&gt;driver_name, driverName) == 0) {
++			if (benaphore_lock(&amp;fExploreLock) != B_OK)
++				return B_ERROR;
++
+ 			// trigger the device removed hook
+ 			for (int32 i = 0; i &lt; fBusManagers.Count(); i++) {
+ 				Hub *rootHub = fBusManagers.ElementAt(i)-&gt;GetRootHub();
+ 				if (rootHub)
+ 					rootHub-&gt;ReportDevice(element-&gt;support_descriptors,
+ 						element-&gt;support_descriptor_count,
+-						&amp;element-&gt;notify_hooks, &amp;element-&gt;cookies, false);
++						&amp;element-&gt;notify_hooks, &amp;element-&gt;cookies, false, true);
+ 			}
+ 
+ 			element-&gt;notify_hooks.device_added = NULL;
+ 			element-&gt;notify_hooks.device_removed = NULL;
++			benaphore_unlock(&amp;fExploreLock);
+ 			return B_OK;
+ 		}
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb.cpp	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb.cpp	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -318,7 +318,7 @@
+ 	if (!object || (object-&gt;Type() &amp; USB_OBJECT_PIPE) == 0)
+ 		return B_DEV_INVALID_PIPE;
+ 
+-	return ((Pipe *)object)-&gt;CancelQueuedTransfers();
++	return ((Pipe *)object)-&gt;CancelQueuedTransfers(false);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -60,6 +60,13 @@
+ };
+ 
+ 
++struct change_item {
++	bool							added;
++	Device 							*device;
++	change_item						*link;
++};
++
++
+ struct rescan_item {
+ 	const char						*name;
+ 	rescan_item						*link;
+@@ -141,7 +148,8 @@
+ 		bool							fFirstExploreDone;
+ 		bool							fStopThreads;
+ 
+-		benaphore						fLock;
++		benaphore						fStackLock;
++		benaphore						fExploreLock;
+ 		PhysicalMemoryAllocator			*fAllocator;
+ 
+ 		uint32							fObjectIndex;
+@@ -178,7 +186,8 @@
+ virtual	status_t						Stop();
+ 
+ virtual	status_t						SubmitTransfer(Transfer *transfer);
+-virtual	status_t						CancelQueuedTransfers(Pipe *pipe);
++virtual	status_t						CancelQueuedTransfers(Pipe *pipe,
++											bool force);
+ 
+ virtual	status_t						NotifyPipeChange(Pipe *pipe,
+ 											usb_change change);
+@@ -260,7 +269,7 @@
+ virtual	void							SetDataToggle(bool toggle) { fDataToggle = toggle; };
+ 
+ 		status_t						SubmitTransfer(Transfer *transfer);
+-		status_t						CancelQueuedTransfers();
++		status_t						CancelQueuedTransfers(bool force);
+ 
+ 		// Convenience functions for standard requests
+ virtual	status_t						SetFeature(uint16 selector);
+@@ -414,6 +423,9 @@
+ 
+ 		status_t						InitCheck();
+ 
++virtual	status_t						Changed(change_item **changeList,
++											bool added);
++
+ virtual	uint32							Type() { return USB_OBJECT_DEVICE; };
+ 
+ 		ControlPipe						*DefaultPipe() { return fDefaultPipe; };
+@@ -437,7 +449,7 @@
+ 											uint32 supportDescriptorCount,
+ 											const usb_notify_hooks *hooks,
+ 											usb_driver_cookie **cookies,
+-											bool added);
++											bool added, bool recursive);
+ virtual	status_t						BuildDeviceName(char *string,
+ 											uint32 *index, size_t bufferSize,
+ 											Device *device);
+@@ -452,6 +464,7 @@
+ 		bool							fInitOK;
+ 
+ private:
++		bool							fAvailable;
+ 		usb_configuration_info			*fConfigurations;
+ 		usb_configuration_info			*fCurrentConfiguration;
+ 		usb_speed						fSpeed;
+@@ -468,8 +481,8 @@
+ 											usb_speed speed);
+ virtual									~Hub();
+ 
+-		bool							Lock();
+-		void							Unlock();
++virtual	status_t						Changed(change_item **changeList,
++											bool added);
+ 
+ virtual	uint32							Type() { return USB_OBJECT_DEVICE | USB_OBJECT_HUB; };
+ 
+@@ -480,7 +493,7 @@
+ 
+ 		status_t						UpdatePortStatus(uint8 index);
+ 		status_t						ResetPort(uint8 index);
+-		void							Explore();
++		void							Explore(change_item **changeList);
+ static	void							InterruptCallback(void *cookie,
+ 											status_t status, void *data,
+ 											size_t actualLength);
+@@ -490,14 +503,12 @@
+ 											uint32 supportDescriptorCount,
+ 											const usb_notify_hooks *hooks,
+ 											usb_driver_cookie **cookies,
+-											bool added);
++											bool added, bool recursive);
+ virtual	status_t						BuildDeviceName(char *string,
+ 											uint32 *index, size_t bufferSize,
+ 											Device *device);
+ 
+ private:
+-		benaphore						fLock;
+-
+ 		InterruptPipe					*fInterruptPipe;
+ 		usb_hub_descriptor				fHubDescriptor;
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ehci.cpp	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -864,7 +864,7 @@
+ 
+ 
+ status_t
+-EHCI::CancelQueuedTransfers(Pipe *pipe)
++EHCI::CancelQueuedTransfers(Pipe *pipe, bool force)
+ {
+ 	if (!Lock())
+ 		return B_ERROR;
+@@ -879,7 +879,13 @@
+ 				descriptor = (ehci_qtd *)descriptor-&gt;next_log;
+ 			}
+ 
+-			current-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++			if (!force) {
++				// if the transfer is canceled by force, the one causing the
++				// cancel is probably not the one who initiated the transfer
++				// and the callback is likely not safe anymore
++				current-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++			}
++
+ 			current-&gt;canceled = true;
+ 		}
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ehci.h	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -37,7 +37,7 @@
+ virtual	status_t					SubmitTransfer(Transfer *transfer);
+ 		status_t					SubmitPeriodicTransfer(Transfer *transfer);
+ 		status_t					SubmitAsyncTransfer(Transfer *transfer);
+-virtual	status_t					CancelQueuedTransfers(Pipe *pipe);
++virtual	status_t					CancelQueuedTransfers(Pipe *pipe, bool force);
+ 
+ virtual	status_t					NotifyPipeChange(Pipe *pipe,
+ 										usb_change change);
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -791,7 +791,7 @@
+ 
+ 
+ status_t
+-OHCI::CancelQueuedTransfers(Pipe *pipe)
++OHCI::CancelQueuedTransfers(Pipe *pipe, bool force)
+ {
+ 	return B_ERROR;
+ }
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -57,7 +57,8 @@
+ 
+ 		status_t					Start();
+ virtual	status_t 					SubmitTransfer(Transfer *transfer);
+-virtual status_t					CancelQueuedTransfers(Pipe *pipe);
++virtual status_t					CancelQueuedTransfers(Pipe *pipe,
++										bool force);
+ 		status_t					SubmitRequest(Transfer *transfer);
+ 
+ virtual	status_t					NotifyPipeChange(Pipe *pipe,
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -603,7 +603,7 @@
+ 
+ 
+ status_t
+-UHCI::CancelQueuedTransfers(Pipe *pipe)
++UHCI::CancelQueuedTransfers(Pipe *pipe, bool force)
+ {
+ 	if (pipe-&gt;Type() &amp; USB_OBJECT_ISO_PIPE)
+ 		return CancelQueuedIsochronousTransfers(pipe);
+@@ -621,7 +621,13 @@
+ 				descriptor = (uhci_td *)descriptor-&gt;link_log;
+ 			}
+ 
+-			current-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++			if (!force) {
++				// if the transfer is canceled by force, the one causing the
++				// cancel is probably not the one who initiated the transfer
++				// and the callback is likely not safe anymore
++				current-&gt;transfer-&gt;Finished(B_CANCELED, 0);
++			}
++
+ 			current-&gt;canceled = true;
+ 		}
+ 		current = current-&gt;link;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2007-11-14 18:08:15 UTC (rev 22928)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2007-11-14 22:11:05 UTC (rev 22929)
+@@ -91,7 +91,7 @@
+ 
+ 		status_t					Start();
+ virtual	status_t					SubmitTransfer(Transfer *transfer);
+-virtual status_t					CancelQueuedTransfers(Pipe *pipe);
++virtual status_t					CancelQueuedTransfers(Pipe *pipe, bool force);
+ 		status_t					CancelQueuedIsochronousTransfers(Pipe *pipe);
+ 		status_t					SubmitRequest(Transfer *transfer);
+ 		status_t					SubmitIsochronous(Transfer *transfer);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004756.html">[Haiku-commits] r22928 -	haiku/trunk/src/add-ons/media/plugins/avcodec
+</A></li>
+	<LI>Next message: <A HREF="004759.html">[Haiku-commits] r22930 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4757">[ date ]</a>
+              <a href="thread.html#4757">[ thread ]</a>
+              <a href="subject.html#4757">[ subject ]</a>
+              <a href="author.html#4757">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

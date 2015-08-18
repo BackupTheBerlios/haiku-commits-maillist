@@ -1,0 +1,230 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23681 - haiku/trunk/src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23681%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200801211156.m0LBuOAv022828%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005689.html">
+   <LINK REL="Next"  HREF="005688.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23681 - haiku/trunk/src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23681%20-%20haiku/trunk/src/system/kernel/debug&In-Reply-To=%3C200801211156.m0LBuOAv022828%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23681 - haiku/trunk/src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Jan 21 12:56:24 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005689.html">[Haiku-commits] r23680 - in haiku/trunk/src: kits/interface	preferences/backgrounds
+</A></li>
+        <LI>Next message: <A HREF="005688.html">[Haiku-commits] r23682 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5683">[ date ]</a>
+              <a href="thread.html#5683">[ thread ]</a>
+              <a href="subject.html#5683">[ subject ]</a>
+              <a href="author.html#5683">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-01-21 12:56:24 +0100 (Mon, 21 Jan 2008)
+New Revision: 23681
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23681&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23681&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/debug/tracing.cpp
+Log:
+Some &quot;traced&quot; command optimizations:
+* Made the iterator static, so that it's possible to move from the
+  iteration position of the previous invocation to the current start,
+  instead of always having to start from the beginning or the end.
+* Filtered backward iteration:
+  - Restrict the range to dump to the entries between the first and the
+    last filter match.
+  - Use new FILTER_MATCH entry flag to avoid applying the filter a
+    second time in the print loop.
+
+
+Modified: haiku/trunk/src/system/kernel/debug/tracing.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/tracing.cpp	2008-01-21 11:54:53 UTC (rev 23680)
++++ haiku/trunk/src/system/kernel/debug/tracing.cpp	2008-01-21 11:56:24 UTC (rev 23681)
+@@ -28,7 +28,8 @@
+ enum {
+ 	WRAP_ENTRY			= 0x01,
+ 	ENTRY_INITIALIZED	= 0x02,
+-	BUFFER_ENTRY		= 0x04
++	BUFFER_ENTRY		= 0x04,
++	FILTER_MATCH		= 0x08
+ };
+ 
+ static const size_t kBufferSize = MAX_TRACE_SIZE / 4;
+@@ -510,13 +511,19 @@
+ 
+ class TraceEntryIterator {
+ public:
+-	TraceEntryIterator(bool startFront)
++	TraceEntryIterator()
+ 		:
+-		fEntry(NULL),
+-		fIndex(startFront ? 0 : sEntries + 1)
++ 		fEntry(NULL),
++		fIndex(0)
+ 	{
+ 	}
+ 
++	void Reset()
++	{
++		fEntry = NULL;
++		fIndex = 0;
++	}
++
+ 	int32 Index() const
+ 	{
+ 		return fIndex;
+@@ -629,7 +636,10 @@
+ 	static int32 _previousFirstChecked = 1;
+ 	static int32 _previousLastChecked = -1;
+ 	static uint32 _previousWritten = 0;
++	static uint32 _previousEntries = 0;
++	static TraceEntryIterator iterator;
+ 
++
+ 	// Note: start and index are Pascal-like indices (i.e. in [1, sEntries]).
+ 	int32 start = 0;	// special index: print the last count entries
+ 	int32 count = 0;
+@@ -653,7 +663,8 @@
+ 			print_debugger_command_usage(argv[0]);
+ 			return 0;
+ 		}
+-		if (sWritten == 0 || sWritten != _previousWritten) {
++		if (sWritten == 0 || sWritten != _previousWritten
++			|| sEntries != _previousEntries) {
+ 			kprintf(&quot;Can't continue iteration. \&quot;%s\&quot; has not been invoked &quot;
+ 				&quot;before, or there were new entries written since the last &quot;
+ 				&quot;invocation.\n&quot;, argv[0]);
+@@ -737,13 +748,22 @@
+ 		lastToCheck = min_c((int32)sEntries, start + maxToCheck - 1);
+ 	}
+ 
+-	TraceEntryIterator iterator(true);
++	// reset the iterator, if something changed in the meantime
++	if (sWritten == 0 || sWritten != _previousWritten
++		|| sEntries != _previousEntries) {
++		iterator.Reset();
++	}
+ 
+ 	char buffer[256];
+ 	LazyTraceOutput out(buffer, sizeof(buffer));
+ 
++	bool markedMatching = false;
++	int32 firstToDump = firstToCheck;
++	int32 lastToDump = lastToCheck;
++
+ 	if (direction &lt; 0 &amp;&amp; hasFilter &amp;&amp; lastToCheck - firstToCheck &gt;= count) {
+ 		// iteration direction is backwards
++		markedMatching = true;
+ 
+ 		// From the last entry to check iterate backwards to check filter
+ 		// matches.
+@@ -753,15 +773,23 @@
+ 		iterator.MoveTo(lastToCheck + 1);
+ 
+ 		// iterate backwards
++		firstToDump = -1;
++		lastToDump = -1;
+ 		while (iterator.Index() &gt; firstToCheck) {
+ 			TraceEntry* entry = iterator.Previous();
+ 			if ((entry-&gt;flags &amp; ENTRY_INITIALIZED) != 0) {
+ 				out.Clear();
+ 				if (TraceFilterParser::Default()-&gt;Filter(entry, out)) {
++					entry-&gt;flags |= FILTER_MATCH;
++					if (lastToDump == -1)
++						lastToDump = iterator.Index();
++					firstToDump = iterator.Index();
++
+ 					matching++;
+ 					if (matching &gt;= count)
+ 						break;
+-				}
++				} else
++					entry-&gt;flags &amp;= ~FILTER_MATCH;
+ 			}
+ 		}
+ 
+@@ -772,13 +800,18 @@
+ 		iterator.Previous();
+ 	}
+ 
++	// set the iterator to the entry before the first one to dump
++	iterator.MoveTo(firstToDump - 1);
++
++	// dump the entries matching the filter in the range
++	// [firstToDump, lastToDump]
+ 	int32 dumped = 0;
+ 
+ 	while (TraceEntry* entry = iterator.Next()) {
+ 		int32 index = iterator.Index();
+-		if (index &lt; firstToCheck)
++		if (index &lt; firstToDump)
+ 			continue;
+-		if (index &gt; lastToCheck || dumped &gt;= count) {
++		if (index &gt; lastToDump || dumped &gt;= count) {
+ 			if (direction &gt; 0)
+ 				lastToCheck = index - 1;
+ 			break;
+@@ -786,8 +819,11 @@
+ 
+ 		if ((entry-&gt;flags &amp; ENTRY_INITIALIZED) != 0) {
+ 			out.Clear();
+-			if (hasFilter &amp;&amp; !TraceFilterParser::Default()-&gt;Filter(entry, out))
++			if (hasFilter &amp;&amp;  (markedMatching
++					? (entry-&gt;flags &amp; FILTER_MATCH) == 0
++					: !TraceFilterParser::Default()-&gt;Filter(entry, out))) {
+ 				continue;
++			}
+ 
+ 			kprintf(&quot;%5ld. %s\n&quot;, index, out.DumpEntry(entry));
+ 		} else if (!hasFilter)
+@@ -807,6 +843,7 @@
+ 	_previousFirstChecked = firstToCheck;
+ 	_previousLastChecked = lastToCheck;
+ 	_previousWritten = sWritten;
++	_previousEntries = sEntries;
+ 
+ 	return cont != 0 ? B_KDEBUG_CONT : 0;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005689.html">[Haiku-commits] r23680 - in haiku/trunk/src: kits/interface	preferences/backgrounds
+</A></li>
+	<LI>Next message: <A HREF="005688.html">[Haiku-commits] r23682 - haiku/trunk/src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5683">[ date ]</a>
+              <a href="thread.html#5683">[ thread ]</a>
+              <a href="subject.html#5683">[ subject ]</a>
+              <a href="author.html#5683">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

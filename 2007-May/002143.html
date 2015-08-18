@@ -1,0 +1,658 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21041 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat/net compat/sys
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21041%20-%20in%0A%09haiku/trunk/src/libs/compat/freebsd_network%3A%20.%20compat/net%20compat/sys&In-Reply-To=%3C200705061508.l46F8SKk000873%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002153.html">
+   <LINK REL="Next"  HREF="002145.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21041 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat/net compat/sys</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21041%20-%20in%0A%09haiku/trunk/src/libs/compat/freebsd_network%3A%20.%20compat/net%20compat/sys&In-Reply-To=%3C200705061508.l46F8SKk000873%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21041 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat/net compat/sys">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Sun May  6 17:08:28 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002153.html">[Haiku-commits] r21040 - in haiku/trunk: headers/os/drivers	src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="002145.html">[Haiku-commits] r21042 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2143">[ date ]</a>
+              <a href="thread.html#2143">[ thread ]</a>
+              <a href="subject.html#2143">[ subject ]</a>
+              <a href="author.html#2143">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-05-06 17:08:08 +0200 (Sun, 06 May 2007)
+New Revision: 21041
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21041&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21041&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/libs/compat/freebsd_network/bus.c
+   haiku/trunk/src/libs/compat/freebsd_network/compat.c
+   haiku/trunk/src/libs/compat/freebsd_network/compat/net/if.h
+   haiku/trunk/src/libs/compat/freebsd_network/compat/sys/bus.h
+   haiku/trunk/src/libs/compat/freebsd_network/device.c
+   haiku/trunk/src/libs/compat/freebsd_network/device.h
+   haiku/trunk/src/libs/compat/freebsd_network/if.c
+Log:
+freebsd compat. layer: use a thread for deferred interrupt handling. fixed a issue with bus_space_write_N. init the receive queue on device creation.
+
+
+Modified: haiku/trunk/src/libs/compat/freebsd_network/bus.c
+===================================================================
+--- haiku/trunk/src/libs/compat/freebsd_network/bus.c	2007-05-06 15:07:56 UTC (rev 21040)
++++ haiku/trunk/src/libs/compat/freebsd_network/bus.c	2007-05-06 15:08:08 UTC (rev 21041)
+@@ -8,10 +8,10 @@
+  * Some of this code is based on previous work by Marcus Overhagen.
+  */
+ 
++#include &quot;device.h&quot;
++
+ #include &lt;malloc.h&gt;
+ 
+-#include &lt;drivers/PCI.h&gt;
+-
+ #include &lt;compat/dev/pci/pcivar.h&gt;
+ #include &lt;compat/machine/resource.h&gt;
+ #include &lt;compat/sys/bus.h&gt;
+@@ -34,9 +34,17 @@
+ 	driver_intr_t handler;
+ 	void *arg;
+ 	int irq;
++
++	void *context;
++
++	thread_id thread;
++	sem_id sem;
+ };
+ 
+ 
++static int32 intr_wrapper(void *data);
++
++
+ static area_id
+ map_mem(void **virtualAddr, void *_phy, size_t size, uint32 protection,
+ 	const char *name)
+@@ -111,6 +119,9 @@
+ 		&amp;&amp; type != SYS_RES_IOPORT)
+ 		return NULL;
+ 
++	device_printf(dev, &quot;bus_alloc_resource(%i, [%i], 0x%lx, 0x%lx, 0x%lx, 0x%lx)\n&quot;,
++		type, *rid, start, end, count, flags);
++
+ 	// maybe a local array of resources is enough
+ 	res = malloc(sizeof(struct resource));
+ 	if (res == NULL)
+@@ -165,19 +176,66 @@
+ intr_wrapper(void *data)
+ {
+ 	struct internal_intr *intr = data;
+-	intr-&gt;handler(intr-&gt;arg);
++	driver_printf(&quot;in interrupt handler.\n&quot;);
++
++	disable_io_interrupt_handler(intr-&gt;context, B_IN_INTERRUPT_CONTEXT);
++	release_sem_etc(intr-&gt;sem, 1, B_DO_NOT_RESCHEDULE);
++
++	return B_INVOKE_SCHEDULER;
++}
++
++
++static int32
++intr_handler(void *data)
++{
++	struct internal_intr *intr = data;
++	status_t status;
++
++	while (1) {
++		enable_io_interrupt_handler(intr-&gt;context);
++
++		status = acquire_sem(intr-&gt;sem);
++		if (status &lt; B_OK)
++			break;
++
++		driver_printf(&quot;in soft interrupt handler.\n&quot;);
++
++		intr-&gt;handler(intr-&gt;arg);
++	}
++
++	disable_io_interrupt_handler(intr-&gt;context, 0);
++
+ 	return 0;
+ }
+ 
+ 
++static void
++free_internal_intr(struct internal_intr *intr)
++{
++	status_t status;
++	delete_sem(intr-&gt;sem);
++	wait_for_thread(intr-&gt;thread, &amp;status);
++
++	if (intr-&gt;context)
++		delete_io_interrupt_handler(intr-&gt;context);
++
++	free(intr);
++}
++
++
+ int
+ bus_setup_intr(device_t dev, struct resource *res, int flags,
+ 	driver_intr_t handler, void *arg, void **cookiep)
+ {
++	/* TODO check MPSAFE etc */
++
+ 	struct internal_intr *intr = (struct internal_intr *)malloc(
+ 		sizeof(struct internal_intr));
++	char semName[64];
+ 	status_t status;
+ 
++	/* status_t status; */
++
+ 	if (intr == NULL)
+ 		return B_NO_MEMORY;
+ 
+@@ -185,12 +243,34 @@
+ 	intr-&gt;arg = arg;
+ 	intr-&gt;irq = res-&gt;handle;
+ 
+-	status = install_io_interrupt_handler(intr-&gt;irq, intr_wrapper, intr, 0);
++	snprintf(semName, sizeof(semName), &quot;%s intr&quot;, dev-&gt;dev_name);
++
++	intr-&gt;sem = create_sem(0, semName);
++	if (intr-&gt;sem &lt; B_OK) {
++		free(intr);
++		return B_NO_MEMORY;
++	}
++
++	snprintf(semName, sizeof(semName), &quot;%s intr handler&quot;, dev-&gt;dev_name);
++
++	intr-&gt;thread = spawn_kernel_thread(intr_handler, semName,
++		B_REAL_TIME_DISPLAY_PRIORITY, intr);
++	if (intr-&gt;thread &lt; B_OK) {
++		delete_sem(intr-&gt;sem);
++		free(intr);
++		return B_NO_MEMORY;
++	}
++
++	intr-&gt;context = NULL;
++	status = create_io_interrupt_handler(intr-&gt;irq, intr_wrapper, intr,
++		&amp;intr-&gt;context);
+ 	if (status &lt; B_OK) {
+-		free(intr);
++		free_internal_intr(intr);
+ 		return status;
+ 	}
+ 
++	resume_thread(intr-&gt;thread);
++
+ 	*cookiep = intr;
+ 
+ 	return 0;
+@@ -201,8 +281,8 @@
+ bus_teardown_intr(device_t dev, struct resource *res, void *arg)
+ {
+ 	struct internal_intr *intr = arg;
+-	remove_io_interrupt_handler(intr-&gt;irq, intr_wrapper, intr);
+-	free(intr);
++	/* remove_io_interrupt_handler(intr-&gt;irq, intr_wrapper, intr); */
++	free_internal_intr(intr);
+ 	return 0;
+ }
+ 
+@@ -215,3 +295,33 @@
+ 	return B_ERROR;
+ }
+ 
++
++#define BUS_SPACE_READ(size, type, fun) \
++	type bus_space_read_##size(bus_space_tag_t tag, \
++		bus_space_handle_t handle, bus_size_t offset) \
++	{ \
++		type value; \
++		if (tag == I386_BUS_SPACE_IO) \
++			value = fun(handle + offset); \
++		else \
++			value = *(volatile type *)(handle + offset); \
++		return value; \
++	}
++
++#define BUS_SPACE_WRITE(size, type, fun) \
++	void bus_space_write_##size(bus_space_tag_t tag, \
++		bus_space_handle_t handle, bus_size_t offset, type value) \
++	{ \
++		if (tag == I386_BUS_SPACE_IO) \
++			fun(value, handle + offset); \
++		else \
++			*(volatile type *)(handle + offset) = value; \
++	}
++
++BUS_SPACE_READ(1, uint8_t, in8)
++BUS_SPACE_READ(2, uint16_t, in16)
++BUS_SPACE_READ(4, uint32_t, in32)
++
++BUS_SPACE_WRITE(1, uint8_t, out8)
++BUS_SPACE_WRITE(2, uint16_t, out16)
++BUS_SPACE_WRITE(4, uint32_t, out32)
+
+Modified: haiku/trunk/src/libs/compat/freebsd_network/compat/net/if.h
+===================================================================
+--- haiku/trunk/src/libs/compat/freebsd_network/compat/net/if.h	2007-05-06 15:07:56 UTC (rev 21040)
++++ haiku/trunk/src/libs/compat/freebsd_network/compat/net/if.h	2007-05-06 15:08:08 UTC (rev 21041)
+@@ -26,6 +26,7 @@
+ #define IFF_DRV_RUNNING		0x10000
+ #define IFF_DRV_OACTIVE		0x20000
+ #define IFF_LINK0			0x40000
++#define IFF_DEBUG			0x80000
+ 
+ 
+ #define LINK_STATE_UNKNOWN	0
+
+Modified: haiku/trunk/src/libs/compat/freebsd_network/compat/sys/bus.h
+===================================================================
+--- haiku/trunk/src/libs/compat/freebsd_network/compat/sys/bus.h	2007-05-06 15:07:56 UTC (rev 21040)
++++ haiku/trunk/src/libs/compat/freebsd_network/compat/sys/bus.h	2007-05-06 15:08:08 UTC (rev 21041)
+@@ -24,69 +24,20 @@
+ #define BUS_SPACE_MAXSIZE_32BIT		0xffffffff
+ #define BUS_SPACE_MAXSIZE			0xffffffff
+ 
+-static inline uint8_t
+-bus_space_read_1(bus_space_tag_t tag, bus_space_handle_t handle,
+-	bus_size_t offset)
+-{
+-	if (tag == I386_BUS_SPACE_IO)
+-		return in8(handle + offset);
+-	return *(volatile uint8_t *)(handle + offset);
+-}
++uint8_t bus_space_read_1(bus_space_tag_t tag, bus_space_handle_t handle,
++	bus_size_t offset);
++void bus_space_write_1(bus_space_tag_t tag, bus_space_handle_t handle,
++	bus_size_t offset, uint8_t value);
++uint16_t bus_space_read_2(bus_space_tag_t tag, bus_space_handle_t handle,
++	bus_size_t offset);
++void bus_space_write_2(bus_space_tag_t tag, bus_space_handle_t handle,
++	bus_size_t offset, uint16_t value);
++uint32_t bus_space_read_4(bus_space_tag_t tag, bus_space_handle_t handle,
++	bus_size_t offset);
++void bus_space_write_4(bus_space_tag_t tag, bus_space_handle_t handle,
++	bus_size_t offset, uint32_t value);
+ 
+ 
+-static inline void
+-bus_space_write_1(bus_space_tag_t tag, bus_space_handle_t handle,
+-	bus_size_t offset, uint8_t value)
+-{
+-	if (tag == I386_BUS_SPACE_IO)
+-		out8(handle + offset, value);
+-	else
+-		*(volatile uint8_t *)(handle + offset) = value;
+-}
+-
+-
+-static inline uint16_t
+-bus_space_read_2(bus_space_tag_t tag, bus_space_handle_t handle,
+-	bus_size_t offset)
+-{
+-	if (tag == I386_BUS_SPACE_IO)
+-		return in16(handle + offset);
+-	return *(volatile uint16_t *)(handle + offset);
+-}
+-
+-
+-static inline void
+-bus_space_write_2(bus_space_tag_t tag, bus_space_handle_t handle,
+-	bus_size_t offset, uint16_t value)
+-{
+-	if (tag == I386_BUS_SPACE_IO)
+-		out16(handle + offset, value);
+-	else
+-		*(volatile uint16_t *)(handle + offset) = value;
+-}
+-
+-
+-static inline uint32_t
+-bus_space_read_4(bus_space_tag_t tag, bus_space_handle_t handle,
+-	bus_size_t offset)
+-{
+-	if (tag == I386_BUS_SPACE_IO)
+-		return in32(handle + offset);
+-	return *(volatile uint32_t *)(handle + offset);
+-}
+-
+-
+-static inline void
+-bus_space_write_4(bus_space_tag_t tag, bus_space_handle_t handle,
+-	bus_size_t offset, uint32_t value)
+-{
+-	if (tag == I386_BUS_SPACE_IO)
+-		out32(handle + offset, value);
+-	else
+-		*(volatile uint32_t *)(handle + offset) = value;
+-}
+-
+-
+ #define BUS_SPACE_BARRIER_READ		1
+ #define BUS_SPACE_BARRIER_WRITE		2
+ 
+
+Modified: haiku/trunk/src/libs/compat/freebsd_network/compat.c
+===================================================================
+--- haiku/trunk/src/libs/compat/freebsd_network/compat.c	2007-05-06 15:07:56 UTC (rev 21040)
++++ haiku/trunk/src/libs/compat/freebsd_network/compat.c	2007-05-06 15:08:08 UTC (rev 21041)
+@@ -20,6 +20,14 @@
+ 
+ // TODO a lot.
+ 
++#define DEBUG_PCI
++
++#ifdef DEBUG_PCI
++#define TRACE_PCI(dev, format, args...) device_printf(dev, format , ##args)
++#else
++#define TRACE_PCI(dev, format, args...) do { } while (0)
++#endif
++
+ status_t init_compat_layer(void);
+ 
+ struct net_stack_module_info *gStack;
+@@ -28,14 +36,18 @@
+ uint32_t
+ pci_read_config(device_t dev, int offset, int size)
+ {
+-	return gPci-&gt;read_pci_config(dev-&gt;pci_info.bus, dev-&gt;pci_info.device,
+-		dev-&gt;pci_info.function, offset, size);
++	uint32_t value = gPci-&gt;read_pci_config(dev-&gt;pci_info.bus,
++		dev-&gt;pci_info.device, dev-&gt;pci_info.function, offset, size);
++	TRACE_PCI(dev, &quot;pci_read_config(%i, %i) = 0x%lx\n&quot;, offset, size, value);
++	return value;
+ }
+ 
+ 
+ void
+ pci_write_config(device_t dev, int offset, uint32_t value, int size)
+ {
++	TRACE_PCI(dev, &quot;pci_write_config(%i, 0x%lx, %i)\n&quot;, offset, value, size);
++
+ 	gPci-&gt;write_pci_config(dev-&gt;pci_info.bus, dev-&gt;pci_info.device,
+ 		dev-&gt;pci_info.function, offset, size, value);
+ }
+@@ -119,16 +131,48 @@
+ }
+ 
+ 
++void
++driver_printf(const char *format, ...)
++{
++	va_list vl;
++	va_start(vl, format);
++	driver_vprintf(format, vl);
++	va_end(vl);
++}
++
++
++static void
++driver_vprintf_etc(const char *extra, const char *format, va_list vl)
++{
++	char buf[256];
++	vsnprintf(buf, sizeof(buf), format, vl);
++
++	if (extra)
++		dprintf(&quot;[%s] (%s) %s&quot;, gDriverName, extra, buf);
++	else
++		dprintf(&quot;[%s] %s&quot;, gDriverName, buf);
++}
++
++
++void
++driver_vprintf(const char *format, va_list vl)
++{
++	driver_vprintf_etc(NULL, format, vl);
++}
++
++
+ int
+ device_printf(device_t dev, const char *format, ...)
+ {
+-	char buf[256];
++	char devDesc[32];
+ 	va_list vl;
++
++	snprintf(devDesc, sizeof(devDesc), &quot;%i:%i:%i&quot;, (int)dev-&gt;pci_info.bus,
++		(int)dev-&gt;pci_info.device, (int)dev-&gt;pci_info.function);
++
+ 	va_start(vl, format);
+-	vsnprintf(buf, sizeof(buf), format, vl);
++	driver_vprintf_etc(devDesc, format, vl);
+ 	va_end(vl);
+-
+-	dprintf(&quot;[%s...] %s&quot;, gDriverName, buf);
+ 	return 0;
+ }
+ 
+@@ -180,13 +224,11 @@
+ int
+ printf(const char *format, ...)
+ {
+-	char buf[256];
+ 	va_list vl;
+ 	va_start(vl, format);
+-	vsnprintf(buf, sizeof(buf), format, vl);
++	driver_vprintf(format, vl);
+ 	va_end(vl);
+ 
+-	dprintf(buf);
+ 	return 0;
+ }
+ 
+
+Modified: haiku/trunk/src/libs/compat/freebsd_network/device.c
+===================================================================
+--- haiku/trunk/src/libs/compat/freebsd_network/device.c	2007-05-06 15:07:56 UTC (rev 21040)
++++ haiku/trunk/src/libs/compat/freebsd_network/device.c	2007-05-06 15:08:08 UTC (rev 21041)
+@@ -58,6 +58,8 @@
+ 		return NULL;
+ 	}
+ 
++	ifq_init(&amp;dev-&gt;receive_queue, semName);
++
+ 	return dev;
+ }
+ 
+@@ -66,6 +68,7 @@
+ free_device(device_t dev)
+ {
+ 	delete_sem(dev-&gt;receive_sem);
++	ifq_uninit(&amp;dev-&gt;receive_queue);
+ 	free(dev-&gt;softc);
+ 	free(dev);
+ }
+@@ -93,7 +96,7 @@
+ 	device_t dev;
+ 	int i;
+ 
+-	dprintf(&quot;%s, compat_open(%s, 0x%lx)\n&quot;, gDriverName, name, flags);
++	driver_printf(&quot;compat_open(%s, 0x%lx)\n&quot;, name, flags);
+ 
+ 	for (i = 0; gDevNameList[i] != NULL; i++) {
+ 		if (strcmp(gDevNameList[i], name) == 0)
+@@ -112,6 +115,8 @@
+ 	if (status != 0)
+ 		dev-&gt;flags = 0;
+ 
++	driver_printf(&quot; ... status = 0x%ld\n&quot;, status);
++
+ 	*cookie = dev;
+ 
+ 	return status;
+@@ -123,7 +128,7 @@
+ {
+ 	device_t dev = cookie;
+ 
+-	dprintf(&quot;%s, compat_close(%p)\n&quot;, gDriverName, dev);
++	device_printf(dev, &quot;compat_close()\n&quot;);
+ 
+ 	return B_ERROR;
+ }
+@@ -134,7 +139,7 @@
+ {
+ 	device_t dev = cookie;
+ 
+-	dprintf(&quot;%s, compat_free(%p)\n&quot;, gDriverName, dev);
++	device_printf(dev, &quot;compat_free()\n&quot;);
+ 
+ 	free_device(dev);
+ 	return B_ERROR;
+@@ -150,6 +155,9 @@
+ 	struct mbuf *mb;
+ 	size_t len;
+ 
++	driver_printf(&quot;compat_read(%p, %lld, %p, [%lu])\n&quot;, cookie, position, buf,
++		*numBytes);
++
+ 	if (dev-&gt;flags &amp; DEVICE_CLOSED)
+ 		return B_INTERRUPTED;
+ 
+@@ -193,6 +201,9 @@
+ 	device_t dev = cookie;
+ 	struct mbuf *mb;
+ 
++	driver_printf(&quot;compat_write(%p, %lld, %p, [%lu])\n&quot;, cookie, position,
++		buffer, *numBytes);
++
+ 	mb = m_getcl(0, MT_DATA, 0);
+ 	if (mb == NULL)
+ 		return ENOBUFS;
+
+Modified: haiku/trunk/src/libs/compat/freebsd_network/device.h
+===================================================================
+--- haiku/trunk/src/libs/compat/freebsd_network/device.h	2007-05-06 15:07:56 UTC (rev 21040)
++++ haiku/trunk/src/libs/compat/freebsd_network/device.h	2007-05-06 15:08:08 UTC (rev 21041)
+@@ -58,6 +58,12 @@
+ void init_bounce_pages(void);
+ void uninit_bounce_pages(void);
+ 
++void driver_printf(const char *format, ...) __attribute__ ((format (__printf__, 1, 2)));
++void driver_vprintf(const char *format, va_list vl);
++
++void ifq_init(struct ifqueue *ifq, const char *name);
++void ifq_uninit(struct ifqueue *ifq);
++
+ extern struct net_stack_module_info *gStack;
+ extern pci_module_info *gPci;
+ 
+
+Modified: haiku/trunk/src/libs/compat/freebsd_network/if.c
+===================================================================
+--- haiku/trunk/src/libs/compat/freebsd_network/if.c	2007-05-06 15:07:56 UTC (rev 21040)
++++ haiku/trunk/src/libs/compat/freebsd_network/if.c	2007-05-06 15:08:08 UTC (rev 21041)
+@@ -73,20 +73,40 @@
+ 
+ 
+ void
++ifq_init(struct ifqueue *ifq, const char *name)
++{
++	ifq-&gt;ifq_head = NULL;
++	ifq-&gt;ifq_tail = NULL;
++	ifq-&gt;ifq_len = 0;
++	ifq-&gt;ifq_maxlen = IFQ_MAXLEN;
++	ifq-&gt;ifq_drops = 0;
++
++	mtx_init(&amp;ifq-&gt;ifq_mtx, name, NULL, MTX_DEF);
++}
++
++
++void
++ifq_uninit(struct ifqueue *ifq)
++{
++	mtx_destroy(&amp;ifq-&gt;ifq_mtx);
++}
++
++
++void
+ if_attach(struct ifnet *ifp)
+ {
+ 	TAILQ_INIT(&amp;ifp-&gt;if_addrhead);
+ 	TAILQ_INIT(&amp;ifp-&gt;if_prefixhead);
+ 	TAILQ_INIT(&amp;ifp-&gt;if_multiaddrs);
+ 
+-	mtx_init(&amp;ifp-&gt;if_snd.ifq_mtx, ifp-&gt;if_xname, NULL, MTX_DEF);
++	ifq_init((struct ifqueue *)&amp;ifp-&gt;if_snd, ifp-&gt;if_xname);
+ }
+ 
+ 
+ void
+ if_detach(struct ifnet *ifp)
+ {
+-	mtx_destroy(&amp;ifp-&gt;if_snd.ifq_mtx);
++	ifq_uninit((struct ifqueue *)&amp;ifp-&gt;if_snd);
+ }
+ 
+ 
+@@ -97,7 +117,6 @@
+ 	if (ifp-&gt;if_flags &amp; IFF_NEEDSGIANT)
+ 		panic(&quot;freebsd compat.: unsupported giant requirement&quot;);
+ #endif
+-
+ 	ifp-&gt;if_start(ifp);
+ }
+ 
+@@ -133,7 +152,7 @@
+ ether_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *dst,
+ 	struct rtentry *rt0)
+ {
+-	int error;
++	int error = 0;
+ 	IFQ_HANDOFF(ifp, m, error);
+ 	return error;
+ }
+@@ -270,3 +289,13 @@
+ 	return 0;
+ }
+ 
++
++char *
++ether_sprintf(const u_char *ap)
++{
++	static char etherbuf[18];
++	snprintf(etherbuf, sizeof (etherbuf),
++		&quot;%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx&quot;,
++		ap[0], ap[1], ap[2], ap[3], ap[4], ap[5]);
++	return (etherbuf);
++}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002153.html">[Haiku-commits] r21040 - in haiku/trunk: headers/os/drivers	src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="002145.html">[Haiku-commits] r21042 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2143">[ date ]</a>
+              <a href="thread.html#2143">[ thread ]</a>
+              <a href="subject.html#2143">[ subject ]</a>
+              <a href="author.html#2143">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

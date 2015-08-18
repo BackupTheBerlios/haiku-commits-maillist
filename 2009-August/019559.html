@@ -1,0 +1,372 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32503 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/scheduler
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32503%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel%20src/system/kernel/scheduler&In-Reply-To=%3C200908190319.n7J3JKbK029081%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019558.html">
+   <LINK REL="Next"  HREF="019564.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32503 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/scheduler</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32503%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel%20src/system/kernel/scheduler&In-Reply-To=%3C200908190319.n7J3JKbK029081%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32503 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/scheduler">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Wed Aug 19 05:19:20 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019558.html">[Haiku-commits] r32502 - haiku/trunk/src/apps/showimage
+</A></li>
+        <LI>Next message: <A HREF="019564.html">[Haiku-commits] r32503 - in haiku/trunk: headers/private/kernel src/system/kernel  src/system/kernel/scheduler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19559">[ date ]</a>
+              <a href="thread.html#19559">[ thread ]</a>
+              <a href="subject.html#19559">[ subject ]</a>
+              <a href="author.html#19559">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-08-19 05:19:17 +0200 (Wed, 19 Aug 2009)
+New Revision: 32503
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32503&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32503&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/smp.h
+   haiku/trunk/src/system/kernel/scheduler/scheduler_affine.cpp
+   haiku/trunk/src/system/kernel/smp.cpp
+Log:
+mmlr+anevilyak:
+* Keep track of the currently running threads.
+* Make use of that info to decide if a thread that becomes ready should preempt
+  the running thread.
+* If we should preempt we send the target CPU a reschedule message.
+* This preemption strategy makes keeping track of idle CPUs by means of a bitmap
+  superflous and it is therefore removed.
+* Right now only other CPUs are preempted though, not the current one.
+* Add missing initialization of the quantum tracking code.
+* Do not extend the quantum of the idle thread based quantum tracking as we want
+  it to not run longer than necessary. Once the preemption works completely
+  adding a quantum timer for the idle thread will become unnecessary though.
+* Fix thread stealing code, it did missed the last thread in the run queue.
+* When stealing, try to steal the highest priority thread that is currently
+  waiting by taking priorities into account when finding the target run queue.
+* Simplify stealing code a bit as well.
+* Minor cleanups.
+
+
+Modified: haiku/trunk/headers/private/kernel/smp.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/smp.h	2009-08-19 02:20:10 UTC (rev 32502)
++++ haiku/trunk/headers/private/kernel/smp.h	2009-08-19 03:19:17 UTC (rev 32503)
+@@ -22,6 +22,7 @@
+ 	SMP_MSG_GLOBAL_INVALIDATE_PAGES,
+ 	SMP_MSG_CPU_HALT,
+ 	SMP_MSG_CALL_FUNCTION,
++	SMP_MSG_RESCHEDULE,
+ 	SMP_MSG_RESCHEDULE_IF_IDLE
+ };
+ 
+
+Modified: haiku/trunk/src/system/kernel/scheduler/scheduler_affine.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/scheduler/scheduler_affine.cpp	2009-08-19 02:20:10 UTC (rev 32502)
++++ haiku/trunk/src/system/kernel/scheduler/scheduler_affine.cpp	2009-08-19 03:19:17 UTC (rev 32503)
+@@ -40,10 +40,10 @@
+ // TODO: consolidate this such that HT/SMT entities on the same physical core
+ // share a queue, once we have the necessary API for retrieving the topology
+ // information
++static struct thread* sRunningThreads[B_MAX_CPU_COUNT];
+ static struct thread* sRunQueue[B_MAX_CPU_COUNT];
+ static int32 sRunQueueSize[B_MAX_CPU_COUNT];
+ static struct thread* sIdleThreads;
+-static cpu_mask_t sIdleCPUs = 0;
+ 
+ const int32 kMaxTrackingQuantums = 5;
+ const bigtime_t kMinThreadQuantum = 3000;
+@@ -61,6 +61,7 @@
+ 		fQuantumAverage = 0;
+ 		fLastQuantumSlot = 0;
+ 		fLastQueue = -1;
++		memset(fLastThreadQuantums, 0, sizeof(fLastThreadQuantums));
+ 	}
+ 	
+ 	inline void SetQuantum(int32 quantum)
+@@ -141,19 +142,6 @@
+ }
+ 
+ 
+-static inline int32
+-affine_get_next_idle_cpu(void)
+-{
+-	for (int32 i = 0; i &lt; smp_get_num_cpus(); i++) {
+-		if (gCPU[i].disabled)
+-			continue;
+-		if (sIdleCPUs &amp; (1 &lt;&lt; i))
+-			return i;
+-	}
+-
+-	return -1;
+-}
+-
+ /*!	Enqueues the thread into the run queue.
+ 	Note: thread lock must be held when entering this function
+ */
+@@ -191,28 +179,27 @@
+ 			prev-&gt;queue_next = thread;
+ 		else
+ 			sRunQueue[targetCPU] = thread;
++
+ 		thread-&gt;scheduler_data-&gt;fLastQueue = targetCPU;
+ 	}
+ 
+ 	thread-&gt;next_priority = thread-&gt;priority;
+ 
+-	if (thread-&gt;priority != B_IDLE_PRIORITY &amp;&amp; targetCPU != smp_get_current_cpu()) {
+-		int32 idleCPU = targetCPU;
+-		if ((sIdleCPUs &amp; (1 &lt;&lt; targetCPU)) == 0) {
+-			idleCPU = affine_get_next_idle_cpu();
+-			// no idle CPUs are available
+-			// to try and grab this task
+-			if (idleCPU &lt; 0)
+-				return;
+-		}
+-		sIdleCPUs &amp;= ~(1 &lt;&lt; idleCPU);
+-		smp_send_ici(idleCPU, SMP_MSG_RESCHEDULE_IF_IDLE, 0, 0,
+-			0, NULL, SMP_MSG_FLAG_ASYNC);
+-	}
+-
+ 	// notify listeners
+ 	NotifySchedulerListeners(&amp;SchedulerListener::ThreadEnqueuedInRunQueue,
+ 		thread);
++
++	if (sRunningThreads[targetCPU] != NULL
++		&amp;&amp; thread-&gt;priority &gt; sRunningThreads[targetCPU]-&gt;priority) {
++		int32 currentCPU = smp_get_current_cpu();
++		if (targetCPU == currentCPU) {
++			// TODO: we want to inform the caller somehow that it should
++			// trigger a reschedule
++		} else {
++			smp_send_ici(targetCPU, SMP_MSG_RESCHEDULE, 0, 0, 0, NULL,
++				SMP_MSG_FLAG_ASYNC);
++		}
++	}
+ }
+ 
+ static inline struct thread *
+@@ -235,12 +222,9 @@
+ /*!	Looks for a possible thread to grab/run from another CPU.
+ 	Note: thread lock must be held when entering this function
+ */
+-static struct thread *steal_thread_from_other_cpus(int32 currentCPU)
++static struct thread *
++steal_thread_from_other_cpus(int32 currentCPU)
+ {
+-	int32 targetCPU = -1;
+-	struct thread* nextThread = NULL;
+-	struct thread* prevThread = NULL;
+-
+ 	// look through the active CPUs - find the one
+ 	// that has a) threads available to steal, and
+ 	// b) out of those, the one that's the most CPU-bound
+@@ -248,43 +232,40 @@
+ 	// - we need to try and maintain a reasonable balance
+ 	// in run queue sizes across CPUs, and also try to maintain
+ 	// an even distribution of cpu bound / interactive threads
++	int32 targetCPU = -1;
+ 	for (int32 i = 0; i &lt; smp_get_num_cpus(); i++) {
+ 		// skip CPUs that have either no or only one thread
+-		if (sRunQueueSize[i] &lt; 2)
++		if (i == currentCPU || sRunQueueSize[i] &lt; 2)
+ 			continue;
+-		if (i == currentCPU)
+-			continue;
++
+ 		// out of the CPUs with threads available to steal,
+ 		// pick whichever one is generally the most CPU bound.
+-		if (targetCPU &lt; 0)
++		if (targetCPU &lt; 0
++			|| sRunQueue[i]-&gt;priority &gt; sRunQueue[targetCPU]-&gt;priority
++			|| (sRunQueue[i]-&gt;priority == sRunQueue[targetCPU]-&gt;priority
++				&amp;&amp; sRunQueueSize[i] &gt; sRunQueueSize[targetCPU]))
+ 			targetCPU = i;
+-		else if (sRunQueueSize[i] &gt; sRunQueueSize[targetCPU])
+-			targetCPU = i;
+ 	}
+ 
+-	if (targetCPU &gt;= 0) {
+-		nextThread = sRunQueue[targetCPU];
+-		do {
+-			// grab the highest priority non-pinned thread
+-			// out of this CPU's queue, if any.
+-			if (nextThread-&gt;pinned_to_cpu &gt; 0) {
+-				prevThread = nextThread;
+-				nextThread = prevThread-&gt;queue_next;
+-			} else
+-				break;
+-		} while (nextThread-&gt;queue_next != NULL);
++	if (targetCPU &lt; 0)
++		return NULL;
+ 
+-		// we reached the end of the queue without finding an
+-		// eligible thread.
+-		if (nextThread-&gt;pinned_to_cpu &gt; 0)
+-			nextThread = NULL;
++	struct thread* nextThread = sRunQueue[targetCPU];
++	struct thread* prevThread = NULL;
+ 
+-		// dequeue the thread we're going to steal
+-		if (nextThread != NULL)
++	while (nextThread != NULL) {
++		// grab the highest priority non-pinned thread
++		// out of this CPU's queue, dequeue and return it
++		if (nextThread-&gt;pinned_to_cpu &lt;= 0) {
+ 			dequeue_from_run_queue(prevThread, targetCPU);
++			return nextThread;
++		}
++
++		prevThread = nextThread;
++		nextThread = nextThread-&gt;queue_next;
+ 	}
+ 
+-	return nextThread;
++	return NULL;
+ }
+ 
+ 
+@@ -319,10 +300,10 @@
+ 
+ 	for (item = sRunQueue[targetCPU], prev = NULL; item &amp;&amp; item != thread;
+ 			item = item-&gt;queue_next) {
+-			if (prev)
+-				prev = prev-&gt;queue_next;
+-			else
+-				prev = item;
++		if (prev)
++			prev = prev-&gt;queue_next;
++		else
++			prev = item;
+ 	}
+ 
+ 	ASSERT(item == thread);
+@@ -405,7 +386,7 @@
+ 	prevThread = NULL;
+ 
+ 	if (sRunQueue[currentCPU] != NULL) {
+-		TRACE((&quot;Dequeueing next thread from CPU %ld\n&quot;, currentCPU));
++		TRACE((&quot;dequeueing next thread from cpu %ld\n&quot;, currentCPU));
+ 		// select next thread from the run queue
+ 		while (nextThread-&gt;queue_next) {
+ 			// always extract real time threads
+@@ -424,6 +405,9 @@
+ 			} while (nextThread-&gt;queue_next != NULL
+ 				&amp;&amp; priority == nextThread-&gt;queue_next-&gt;priority);
+ 		}
++
++		TRACE((&quot;dequeuing thread %ld from cpu %ld\n&quot;, nextThread-&gt;id,
++			currentCPU));
+ 		// extract selected thread from the run queue
+ 		dequeue_from_run_queue(prevThread, currentCPU);
+ 	} else {
+@@ -432,6 +416,7 @@
+ 			nextThread = steal_thread_from_other_cpus(currentCPU);
+ 		} else
+ 			nextThread = NULL;
++
+ 		if (nextThread == NULL) {
+ 			TRACE((&quot;No threads to steal, grabbing from idle pool\n&quot;));
+ 			// no other CPU had anything for us to take,
+@@ -476,30 +461,31 @@
+ 	}
+ 
+ 	if (nextThread != oldThread || oldThread-&gt;cpu-&gt;preempted) {
++		timer *quantumTimer = &amp;oldThread-&gt;cpu-&gt;quantum_timer;
++		if (!oldThread-&gt;cpu-&gt;preempted)
++			cancel_timer(quantumTimer);
++		oldThread-&gt;cpu-&gt;preempted = 0;
++
++		// we do not adjust the quantum for the idle thread as it is going to be
++		// preempted most of the time and would likely get the longer quantum
++		// over time, indeed we use a smaller quantum to avoid running idle too
++		// long
+ 		bigtime_t quantum = kMinThreadQuantum;
+ 		// give CPU-bound background threads a larger quantum size
+ 		// to minimize unnecessary context switches if the system is idle
+-		if (nextThread-&gt;scheduler_data-&gt;GetAverageQuantumUsage()
++		if (nextThread-&gt;priority != B_IDLE_PRIORITY
++			&amp;&amp; nextThread-&gt;scheduler_data-&gt;GetAverageQuantumUsage()
+ 			&gt; (kMinThreadQuantum &gt;&gt; 1)
+ 			&amp;&amp; nextThread-&gt;priority &lt; B_NORMAL_PRIORITY)
+ 			quantum = kMaxThreadQuantum;
+-		timer *quantumTimer = &amp;oldThread-&gt;cpu-&gt;quantum_timer;
+ 
+-		if (!oldThread-&gt;cpu-&gt;preempted)
+-			cancel_timer(quantumTimer);
+-
+-		oldThread-&gt;cpu-&gt;preempted = 0;
+ 		add_timer(quantumTimer, &amp;reschedule_event, quantum,
+ 			B_ONE_SHOT_RELATIVE_TIMER | B_TIMER_ACQUIRE_THREAD_LOCK);
+ 
+-		// update the idle bit for this CPU in the CPU mask
+-		if (nextThread-&gt;priority == B_IDLE_PRIORITY)
+-			sIdleCPUs = SET_BIT(sIdleCPUs, currentCPU);
+-		else
+-			sIdleCPUs = CLEAR_BIT(sIdleCPUs, currentCPU);
+-
+-		if (nextThread != oldThread)
++		if (nextThread != oldThread) {
++			sRunningThreads[currentCPU] = nextThread;
+ 			context_switch(oldThread, nextThread);
++		}
+ 	}
+ }
+ 
+
+Modified: haiku/trunk/src/system/kernel/smp.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/smp.cpp	2009-08-19 02:20:10 UTC (rev 32502)
++++ haiku/trunk/src/system/kernel/smp.cpp	2009-08-19 03:19:17 UTC (rev 32503)
+@@ -631,6 +631,9 @@
+ 			func(msg-&gt;data, currentCPU, msg-&gt;data2, msg-&gt;data3);
+ 			break;
+ 		}
++		case SMP_MSG_RESCHEDULE:
++			thread_get_current_thread()-&gt;cpu-&gt;invoke_scheduler = true;
++			break;
+ 		case SMP_MSG_RESCHEDULE_IF_IDLE:
+ 		{
+ 			// TODO: We must not dereference the thread when entering the kernel
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019558.html">[Haiku-commits] r32502 - haiku/trunk/src/apps/showimage
+</A></li>
+	<LI>Next message: <A HREF="019564.html">[Haiku-commits] r32503 - in haiku/trunk: headers/private/kernel src/system/kernel  src/system/kernel/scheduler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19559">[ date ]</a>
+              <a href="thread.html#19559">[ thread ]</a>
+              <a href="subject.html#19559">[ subject ]</a>
+              <a href="author.html#19559">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

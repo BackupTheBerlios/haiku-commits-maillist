@@ -1,0 +1,364 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29914 - in haiku/trunk/src/system/kernel: .	scheduler
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29914%20-%20in%20haiku/trunk/src/system/kernel%3A%20.%0A%09scheduler&In-Reply-To=%3C200904042354.n34Ns4nh008913%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015436.html">
+   <LINK REL="Next"  HREF="015438.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29914 - in haiku/trunk/src/system/kernel: .	scheduler</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29914%20-%20in%20haiku/trunk/src/system/kernel%3A%20.%0A%09scheduler&In-Reply-To=%3C200904042354.n34Ns4nh008913%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29914 - in haiku/trunk/src/system/kernel: .	scheduler">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Apr  5 01:54:04 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015436.html">[Haiku-commits] r29913 - haiku/trunk/src/apps/mail
+</A></li>
+        <LI>Next message: <A HREF="015438.html">[Haiku-commits] r29915 - in	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server:	. beos
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15437">[ date ]</a>
+              <a href="thread.html#15437">[ thread ]</a>
+              <a href="subject.html#15437">[ subject ]</a>
+              <a href="author.html#15437">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-04-05 01:54:01 +0200 (Sun, 05 Apr 2009)
+New Revision: 29914
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29914&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29914&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/main.cpp
+   haiku/trunk/src/system/kernel/scheduler/scheduler_affine.cpp
+   haiku/trunk/src/system/kernel/scheduler/scheduler_simple.cpp
+Log:
+bonefish + mmlr:
+* We started the &quot;main2&quot; thread too late. Since the scheduler was already
+  started on all CPUs, the idle thread could wait (for a mutex) while
+  spawing the &quot;main2&quot; thread. This violated the assumption in the scheduler
+  that all idle threads would always be ready or running. We now create the
+  thread while the kernel runs still single-threaded.
+* scheduler_start() is now invoked with interrupts still disabled. We enable
+  them after the function returns. This prevents scheduler_reschedule() from
+  potentially being invoked before scheduler_start().
+
+
+Modified: haiku/trunk/src/system/kernel/main.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/main.cpp	2009-04-04 23:05:55 UTC (rev 29913)
++++ haiku/trunk/src/system/kernel/main.cpp	2009-04-04 23:54:01 UTC (rev 29914)
+@@ -189,6 +189,13 @@
+ 		swap_init();
+ #endif
+ 
++		// Start a thread to finish initializing the rest of the system. Note,
++		// it won't be scheduled before calling scheduler_start() (on any CPU).
++		TRACE(&quot;spawning main2 thread\n&quot;);
++		thread_id thread = spawn_kernel_thread(&amp;main2, &quot;main2&quot;,
++			B_NORMAL_PRIORITY, NULL);
++		send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
++
+ 		// bring up the AP cpus in a lock step fashion
+ 		TRACE(&quot;waking up AP cpus\n&quot;);
+ 		sCpuRendezvous = sCpuRendezvous2 = 0;
+@@ -202,16 +209,9 @@
+ 		smp_cpu_rendezvous(&amp;sCpuRendezvous2, 0);
+ 			// release the AP cpus to go enter the scheduler
+ 
+-		TRACE(&quot;enabling interrupts and starting scheduler on cpu 0\n&quot;);
++		TRACE(&quot;starting scheduler on cpu 0 and enabling interrupts\n&quot;);
++		scheduler_start();
+ 		enable_interrupts();
+-		scheduler_start();
+-
+-		// start a thread to finish initializing the rest of the system
+-		TRACE(&quot;starting main2 thread\n&quot;);
+-		thread_id thread = spawn_kernel_thread(&amp;main2, &quot;main2&quot;,
+-			B_NORMAL_PRIORITY, NULL);
+-		TRACE(&quot;resuming main2 thread...\n&quot;);
+-		resume_thread(thread);
+ 	} else {
+ 		// lets make sure we're in sync with the main cpu
+ 		// the boot processor has probably been sending us
+@@ -228,8 +228,8 @@
+ 		smp_cpu_rendezvous(&amp;sCpuRendezvous2, currentCPU);
+ 
+ 		// welcome to the machine
++		scheduler_start();
+ 		enable_interrupts();
+-		scheduler_start();
+ 	}
+ 
+ 	TRACE(&quot;main: done... begin idle loop on cpu %d\n&quot;, currentCPU);
+
+Modified: haiku/trunk/src/system/kernel/scheduler/scheduler_affine.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/scheduler/scheduler_affine.cpp	2009-04-04 23:05:55 UTC (rev 29913)
++++ haiku/trunk/src/system/kernel/scheduler/scheduler_affine.cpp	2009-04-04 23:54:01 UTC (rev 29914)
+@@ -49,13 +49,13 @@
+ const bigtime_t kMaxThreadQuantum = 10000;
+ 
+ struct scheduler_thread_data {
+-	scheduler_thread_data(void) 
++	scheduler_thread_data(void)
+ 	{
+ 		Init();
+ 	}
+-	
+-	
+-	void Init() 
++
++
++	void Init()
+ 	{
+ 		memset(fLastThreadQuantums, 0, sizeof(fLastThreadQuantums));
+ 		fLastQuantumSlot = 0;
+@@ -69,7 +69,7 @@
+ 			quantumAverage += fLastThreadQuantums[i];
+ 		return quantumAverage / kMaxTrackingQuantums;
+ 	}
+-	
++
+ 	int32 fLastThreadQuantums[kMaxTrackingQuantums];
+ 	int16 fLastQuantumSlot;
+ 	int32 fLastQueue;
+@@ -96,13 +96,13 @@
+ 
+ 	for (int32 i = 0; i &lt; smp_get_num_cpus(); i++) {
+ 		thread = sRunQueue[i];
+-		kprintf(&quot;Run queue for cpu %ld (%ld threads)\n&quot;, i, 
++		kprintf(&quot;Run queue for cpu %ld (%ld threads)\n&quot;, i,
+ 			sRunQueueSize[i]);
+ 		if (sRunQueueSize[i] &gt; 0) {
+ 			kprintf(&quot;thread      id      priority  avg. quantum  name\n&quot;);
+ 			while (thread) {
+ 				kprintf(&quot;%p  %-7ld %-8ld  %-12ld  %s\n&quot;, thread, thread-&gt;id,
+-					thread-&gt;priority, 
++					thread-&gt;priority,
+ 					thread-&gt;scheduler_data-&gt;GetAverageQuantumUsage(),
+ 					thread-&gt;name);
+ 				thread = thread-&gt;queue_next;
+@@ -126,7 +126,7 @@
+ 		if (targetCPU &lt; 0 || sRunQueueSize[i] &lt; sRunQueueSize[targetCPU])
+ 			targetCPU = i;
+ 	}
+-	
++
+ 	return targetCPU;
+ }
+ 
+@@ -151,7 +151,7 @@
+ affine_enqueue_in_run_queue(struct thread *thread)
+ {
+ 	int32 targetCPU = -1;
+-	if (thread-&gt;pinned_to_cpu &gt; 0) 
++	if (thread-&gt;pinned_to_cpu &gt; 0)
+ 		targetCPU = thread-&gt;previous_cpu-&gt;cpu_num;
+ 	else if (thread-&gt;previous_cpu == NULL || thread-&gt;previous_cpu-&gt;disabled)
+ 		targetCPU = affine_get_most_idle_cpu();
+@@ -183,14 +183,14 @@
+ 			sRunQueue[targetCPU] = thread;
+ 		thread-&gt;scheduler_data-&gt;fLastQueue = targetCPU;
+ 	}
+-	
++
+ 	thread-&gt;next_priority = thread-&gt;priority;
+ 
+ 	if (thread-&gt;priority != B_IDLE_PRIORITY &amp;&amp; targetCPU != smp_get_current_cpu()) {
+ 		int32 idleCPU = targetCPU;
+ 		if ((sIdleCPUs &amp; (1 &lt;&lt; targetCPU)) == 0) {
+ 			idleCPU = affine_get_next_idle_cpu();
+-			// no idle CPUs are available 
++			// no idle CPUs are available
+ 			// to try and grab this task
+ 			if (idleCPU &lt; 0)
+ 				return;
+@@ -214,7 +214,7 @@
+ 	}
+ 	sRunQueueSize[currentCPU]--;
+ 	resultThread-&gt;scheduler_data-&gt;fLastQueue = -1;
+-	
++
+ 	return resultThread;
+ }
+ 
+@@ -256,17 +256,17 @@
+ 			if (nextThread-&gt;pinned_to_cpu &gt; 0) {
+ 				prevThread = nextThread;
+ 				nextThread = prevThread-&gt;queue_next;
+-			} else 
++			} else
+ 				break;
+ 		} while (nextThread-&gt;queue_next != NULL);
+-		
++
+ 		// we reached the end of the queue without finding an
+ 		// eligible thread.
+ 		if (nextThread-&gt;pinned_to_cpu &gt; 0)
+ 			nextThread = NULL;
+-		
+-		// dequeue the thread we're going to steal	
+-		if (nextThread != NULL) 
++
++		// dequeue the thread we're going to steal
++		if (nextThread != NULL)
+ 			dequeue_from_run_queue(prevThread, targetCPU);
+ 	}
+ 
+@@ -297,11 +297,11 @@
+ 
+ 	// search run queues for the thread
+ 	// TODO: keep track of the queue a thread is in (perhaps in a
+-	// data pointer on the thread struct) so we only have to walk 
++	// data pointer on the thread struct) so we only have to walk
+ 	// that exact queue to find it.
+ 	struct thread *item = NULL, *prev = NULL;
+ 	targetCPU = thread-&gt;scheduler_data-&gt;fLastQueue;
+-	
++
+ 	for (item = sRunQueue[targetCPU], prev = NULL; item &amp;&amp; item != thread;
+ 			item = item-&gt;queue_next) {
+ 			if (prev)
+@@ -404,7 +404,7 @@
+ 			// skip normal threads sometimes (roughly 20%)
+ 			if (_rand() &gt; 0x1a00)
+ 				break;
+-			
++
+ 			// skip until next lower priority
+ 			int32 priority = nextThread-&gt;priority;
+ 			do {
+@@ -412,7 +412,7 @@
+ 				nextThread = nextThread-&gt;queue_next;
+ 			} while (nextThread-&gt;queue_next != NULL
+ 				&amp;&amp; priority == nextThread-&gt;queue_next-&gt;priority);
+-		} 
++		}
+ 		// extract selected thread from the run queue
+ 		dequeue_from_run_queue(prevThread, currentCPU);
+ 	} else {
+@@ -423,7 +423,7 @@
+ 			nextThread = NULL;
+ 		if (nextThread == NULL) {
+ 			TRACE((&quot;No threads to steal, grabbing from idle pool\n&quot;));
+-			// no other CPU had anything for us to take, 
++			// no other CPU had anything for us to take,
+ 			// grab one from the kernel's idle pool
+ 			nextThread = sIdleThreads;
+ 			if (nextThread)
+@@ -447,7 +447,7 @@
+ 
+ 	// track CPU activity
+ 	if (!thread_is_idle_thread(oldThread)) {
+-		bigtime_t activeTime = 
++		bigtime_t activeTime =
+ 			(oldThread-&gt;kernel_time - oldThread-&gt;cpu-&gt;last_kernel_time)
+ 			+ (oldThread-&gt;user_time - oldThread-&gt;cpu-&gt;last_user_time);
+ 		oldThread-&gt;cpu-&gt;active_time += activeTime;
+@@ -468,8 +468,8 @@
+ 		bigtime_t quantum = kMinThreadQuantum;
+ 		// give CPU-bound background threads a larger quantum size
+ 		// to minimize unnecessary context switches if the system is idle
+-		if (nextThread-&gt;scheduler_data-&gt;GetAverageQuantumUsage() 
+-			&gt; (kMinThreadQuantum &gt;&gt; 1) 
++		if (nextThread-&gt;scheduler_data-&gt;GetAverageQuantumUsage()
++			&gt; (kMinThreadQuantum &gt;&gt; 1)
+ 			&amp;&amp; nextThread-&gt;priority &lt; B_NORMAL_PRIORITY)
+ 			quantum = kMaxThreadQuantum;
+ 		timer *quantumTimer = &amp;oldThread-&gt;cpu-&gt;quantum_timer;
+@@ -516,19 +516,17 @@
+ }
+ 
+ 
+-/*!	This starts the scheduler. Must be run under the context of
+-	the initial idle thread.
++/*!	This starts the scheduler. Must be run in the context of the initial idle
++	thread. Interrupts must be disabled and will be disabled when returning.
+ */
+ static void
+ affine_start(void)
+ {
+-	cpu_status state = disable_interrupts();
+ 	GRAB_THREAD_LOCK();
+ 
+ 	affine_reschedule();
+ 
+ 	RELEASE_THREAD_LOCK();
+-	restore_interrupts(state);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/system/kernel/scheduler/scheduler_simple.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/scheduler/scheduler_simple.cpp	2009-04-04 23:05:55 UTC (rev 29913)
++++ haiku/trunk/src/system/kernel/scheduler/scheduler_simple.cpp	2009-04-04 23:54:01 UTC (rev 29914)
+@@ -261,7 +261,7 @@
+ 		// CPU is disabled - service any threads we may have that are pinned,
+ 		// otherwise just select the idle thread
+ 		while (nextThread &amp;&amp; nextThread-&gt;priority &gt; B_IDLE_PRIORITY) {
+-			if (nextThread-&gt;pinned_to_cpu &gt; 0 &amp;&amp; 
++			if (nextThread-&gt;pinned_to_cpu &gt; 0 &amp;&amp;
+ 				nextThread-&gt;previous_cpu == oldThread-&gt;cpu)
+ 					break;
+ 			prevThread = nextThread;
+@@ -401,19 +401,17 @@
+ }
+ 
+ 
+-/*!	This starts the scheduler. Must be run under the context of
+-	the initial idle thread.
++/*!	This starts the scheduler. Must be run in the context of the initial idle
++	thread. Interrupts must be disabled and will be disabled when returning.
+ */
+ static void
+ simple_start(void)
+ {
+-	cpu_status state = disable_interrupts();
+ 	GRAB_THREAD_LOCK();
+ 
+ 	simple_reschedule();
+ 
+ 	RELEASE_THREAD_LOCK();
+-	restore_interrupts(state);
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015436.html">[Haiku-commits] r29913 - haiku/trunk/src/apps/mail
+</A></li>
+	<LI>Next message: <A HREF="015438.html">[Haiku-commits] r29915 - in	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server:	. beos
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15437">[ date ]</a>
+              <a href="thread.html#15437">[ thread ]</a>
+              <a href="subject.html#15437">[ subject ]</a>
+              <a href="author.html#15437">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

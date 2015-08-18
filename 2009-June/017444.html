@@ -1,0 +1,1090 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31214 - in haiku/trunk: headers/os/kernel	headers/private/kernel headers/private/kernel/arch	headers/private/kernel/arch/x86 src/system/kernel/arch/x86	src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31214%20-%20in%20haiku/trunk%3A%20headers/os/kernel%0A%09headers/private/kernel%20headers/private/kernel/arch%0A%09headers/private/kernel/arch/x86%20src/system/kernel/arch/x86%0A%09src/system/kernel/debug&In-Reply-To=%3C200906232104.n5NL41nU031409%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017498.html">
+   <LINK REL="Next"  HREF="017445.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31214 - in haiku/trunk: headers/os/kernel	headers/private/kernel headers/private/kernel/arch	headers/private/kernel/arch/x86 src/system/kernel/arch/x86	src/system/kernel/debug</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31214%20-%20in%20haiku/trunk%3A%20headers/os/kernel%0A%09headers/private/kernel%20headers/private/kernel/arch%0A%09headers/private/kernel/arch/x86%20src/system/kernel/arch/x86%0A%09src/system/kernel/debug&In-Reply-To=%3C200906232104.n5NL41nU031409%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31214 - in haiku/trunk: headers/os/kernel	headers/private/kernel headers/private/kernel/arch	headers/private/kernel/arch/x86 src/system/kernel/arch/x86	src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Jun 23 23:04:01 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017498.html">[Haiku-commits] r31213 - in haiku/trunk/src/add-ons:	accelerants/nvidia accelerants/nvidia/engine	kernel/drivers/graphics/nvidia
+</A></li>
+        <LI>Next message: <A HREF="017445.html">[Haiku-commits] r31215 -	haiku/trunk/src/add-ons/kernel/drivers/power/acpi_embedded_controller
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17444">[ date ]</a>
+              <a href="thread.html#17444">[ thread ]</a>
+              <a href="subject.html#17444">[ subject ]</a>
+              <a href="author.html#17444">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-06-23 23:03:57 +0200 (Tue, 23 Jun 2009)
+New Revision: 31214
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31214&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31214&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/debug/BreakpointManager.cpp
+   haiku/trunk/src/system/kernel/debug/BreakpointManager.h
+Modified:
+   haiku/trunk/headers/os/kernel/debugger.h
+   haiku/trunk/headers/private/kernel/arch/user_debugger.h
+   haiku/trunk/headers/private/kernel/arch/x86/arch_user_debugger.h
+   haiku/trunk/headers/private/kernel/user_debugger.h
+   haiku/trunk/src/system/kernel/arch/x86/arch_user_debugger.cpp
+   haiku/trunk/src/system/kernel/debug/Jamfile
+   haiku/trunk/src/system/kernel/debug/user_debugger.cpp
+Log:
+Added transparent software breakpoint support for user debuggers:
+* The bulk of the work -- i.e. juggling the software and hardware breakpoints,
+  watchpoints, and memory reads/writes -- is done in the new class
+  BreakpointManager.
+* For the architectures a few capability macros have to be defined, one
+  pointing to the software breakpoint instruction opcode. Done for x86.
+* Some more simplifications in the user debugger code, made possible by the
+  recently introduced debugger_changed_condition attribute.
+
+
+Modified: haiku/trunk/headers/os/kernel/debugger.h
+===================================================================
+--- haiku/trunk/headers/os/kernel/debugger.h	2009-06-23 20:52:30 UTC (rev 31213)
++++ haiku/trunk/headers/os/kernel/debugger.h	2009-06-23 21:03:57 UTC (rev 31214)
+@@ -455,9 +455,6 @@
+ typedef struct {
+ 	debug_origin		origin;
+ 	debug_cpu_state		cpu_state;	// cpu state
+-	bool				software;	// true, if the is a software breakpoint
+-									// (i.e. caused by a respective trap
+-									// instruction)
+ } debug_breakpoint_hit;
+ 
+ // B_DEBUGGER_MESSAGE_WATCHPOINT_HIT
+
+Modified: haiku/trunk/headers/private/kernel/arch/user_debugger.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/arch/user_debugger.h	2009-06-23 20:52:30 UTC (rev 31213)
++++ haiku/trunk/headers/private/kernel/arch/user_debugger.h	2009-06-23 21:03:57 UTC (rev 31214)
+@@ -50,6 +50,34 @@
+ 
+ #include &lt;arch_user_debugger.h&gt;
+ 
++// Defaults for macros defined by the architecture specific header:
++
++// maximum number of instruction breakpoints
++#ifndef DEBUG_MAX_BREAKPOINTS
++#	define DEBUG_MAX_BREAKPOINTS 0
++#endif
++
++// maximum number of data watchpoints
++#ifndef DEBUG_MAX_WATCHPOINTS
++#	define DEBUG_MAX_WATCHPOINTS 0
++#endif
++
++// the software breakpoint instruction
++#if !defined(DEBUG_SOFTWARE_BREAKPOINT)	\
++	|| !defined(DEBUG_SOFTWARE_BREAKPOINT_SIZE)
++#	undef DEBUG_SOFTWARE_BREAKPOINT
++#	undef DEBUG_SOFTWARE_BREAKPOINT_SIZE
++#	define DEBUG_SOFTWARE_BREAKPOINT		NULL
++#	define DEBUG_SOFTWARE_BREAKPOINT_SIZE	0
++#endif
++
++// Boolean whether break- and watchpoints use the same registers. If != 0, then
++// DEBUG_MAX_BREAKPOINTS == DEBUG_MAX_WATCHPOINTS and either specifies the
++// total count of break- plus watchpoints.
++#ifndef DEBUG_SHARED_BREAK_AND_WATCHPOINTS
++#	define DEBUG_SHARED_BREAK_AND_WATCHPOINTS 0
++#endif
++
+ #endif	// _ASSEMBLER
+ 
+ #endif	// KERNEL_ARCH_USER_DEBUGGER_H
+
+Modified: haiku/trunk/headers/private/kernel/arch/x86/arch_user_debugger.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/arch/x86/arch_user_debugger.h	2009-06-23 20:52:30 UTC (rev 31213)
++++ haiku/trunk/headers/private/kernel/arch/x86/arch_user_debugger.h	2009-06-23 21:03:57 UTC (rev 31214)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2005, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at users.sf.net.</A>
++ * Copyright 2005-2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at users.sf.net.</A>
+  * Distributed under the terms of the MIT License.
+  */
+ #ifndef _KERNEL_ARCH_X86_USER_DEBUGGER_H
+@@ -9,9 +9,7 @@
+ 
+ // number of breakpoints the CPU supports
+ // Actually it supports 4, but DR3 is used to hold the struct thread*.
+-enum {
+-	X86_BREAKPOINT_COUNT = 3,
+-};
++#define X86_BREAKPOINT_COUNT	3
+ 
+ // debug status register DR6
+ enum {
+@@ -110,6 +108,9 @@
+ 	uint32	flags;
+ };
+ 
++// The software breakpoint instruction (int3).
++extern const uint8 kX86SoftwareBreakpoint[1];
++
+ #ifdef __cplusplus
+ extern &quot;C&quot; {
+ #endif
+@@ -129,4 +130,11 @@
+ }
+ #endif
+ 
++// Feature macros we're supposed to define.
++#define DEBUG_MAX_BREAKPOINTS				X86_BREAKPOINT_COUNT
++#define DEBUG_MAX_WATCHPOINTS				X86_BREAKPOINT_COUNT
++#define DEBUG_SOFTWARE_BREAKPOINT			kX86SoftwareBreakpoint
++#define DEBUG_SOFTWARE_BREAKPOINT_SIZE		1
++#define DEBUG_SHARED_BREAK_AND_WATCHPOINTS	1
++
+ #endif	// _KERNEL_ARCH_X86_USER_DEBUGGER_H
+
+Modified: haiku/trunk/headers/private/kernel/user_debugger.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/user_debugger.h	2009-06-23 20:52:30 UTC (rev 31213)
++++ haiku/trunk/headers/private/kernel/user_debugger.h	2009-06-23 21:03:57 UTC (rev 31214)
+@@ -20,6 +20,7 @@
+ #define	B_DEBUG_PROFILE_BUFFER_FLUSH_THRESHOLD	70			/* in % */
+ 
+ 
++struct BreakpointManager;
+ struct ConditionVariable;
+ struct function_profile_info;
+ struct thread;
+@@ -70,6 +71,9 @@
+ 		// variable the thread won't be deleted (until unsetting it) -- it might
+ 		// be removed from the team hash table, though.
+ 
++	struct BreakpointManager* breakpoint_manager;
++		// manages hard- and software breakpoints
++
+ 	struct arch_team_debug_info	arch_info;
+ };
+ 
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_user_debugger.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_user_debugger.cpp	2009-06-23 20:52:30 UTC (rev 31213)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_user_debugger.cpp	2009-06-23 21:03:57 UTC (rev 31214)
+@@ -30,6 +30,9 @@
+ #define B_WATCHPOINT_NOT_FOUND				B_NAME_NOT_FOUND
+ 	// ToDo: Make those real error codes.
+ 
++// The software breakpoint instruction (int3).
++const uint8 kX86SoftwareBreakpoint[1] = { 0xcc };
++
+ // maps breakpoint slot index to LEN_i LSB number
+ static const uint32 sDR7Len[4] = {
+ 	X86_DR7_LEN0_LSB, X86_DR7_LEN1_LSB, X86_DR7_LEN2_LSB, X86_DR7_LEN3_LSB
+@@ -902,6 +905,9 @@
+ {
+ 	TRACE((&quot;i386_handle_breakpoint_exception()\n&quot;));
+ 
++	// reset eip to the int3 instruction
++	frame-&gt;eip--;
++
+ 	if (!IFRAME_IS_USER(frame)) {
+ 		panic(&quot;breakpoint exception in kernel mode&quot;);
+ 		return;
+
+Added: haiku/trunk/src/system/kernel/debug/BreakpointManager.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/BreakpointManager.cpp	2009-06-23 20:52:30 UTC (rev 31213)
++++ haiku/trunk/src/system/kernel/debug/BreakpointManager.cpp	2009-06-23 21:03:57 UTC (rev 31214)
+@@ -0,0 +1,783 @@
++/*
++ * Copyright 2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++
++#include &quot;BreakpointManager.h&quot;
++
++#include &lt;algorithm&gt;
++
++#include &lt;AutoDeleter.h&gt;
++
++#include &lt;commpage_defs.h&gt;
++#include &lt;kernel.h&gt;
++#include &lt;util/AutoLock.h&gt;
++#include &lt;vm.h&gt;
++
++
++//#define TRACE_BREAKPOINT_MANAGER
++#ifdef TRACE_BREAKPOINT_MANAGER
++#	define TRACE(x...) dprintf(x)
++#else
++#	define TRACE(x...) do {} while (false)
++#endif
++
++
++// soft limit for the number of breakpoints
++const int32 kMaxBreakpointCount = 10240;
++
++
++BreakpointManager::InstalledBreakpoint::InstalledBreakpoint(addr_t address)
++	:
++	breakpoint(NULL),
++	address(address)
++{
++}
++
++
++// #pragma mark -
++
++
++BreakpointManager::BreakpointManager()
++	:
++	fBreakpointCount(0),
++	fWatchpointCount(0)
++{
++	rw_lock_init(&amp;fLock, &quot;breakpoint manager&quot;);
++}
++
++
++BreakpointManager::~BreakpointManager()
++{
++	WriteLocker locker(fLock);
++
++	// delete the installed breakpoint objects
++	BreakpointTree::Iterator it = fBreakpoints.GetIterator();
++	while (InstalledBreakpoint* installedBreakpoint = it.Next()) {
++		it.Remove();
++
++		// delete underlying software breakpoint
++		if (installedBreakpoint-&gt;breakpoint-&gt;software)
++			delete installedBreakpoint-&gt;breakpoint;
++
++		delete installedBreakpoint;
++	}
++
++	// delete the watchpoints
++	while (InstalledWatchpoint* watchpoint = fWatchpoints.RemoveHead())
++		delete watchpoint;
++
++	// delete the hardware breakpoint objects
++	while (Breakpoint* breakpoint = fHardwareBreakpoints.RemoveHead())
++		delete breakpoint;
++
++	rw_lock_destroy(&amp;fLock);
++}
++
++
++status_t
++BreakpointManager::Init()
++{
++	// create objects for the hardware breakpoints
++	for (int32 i = 0; i &lt; DEBUG_MAX_BREAKPOINTS; i++) {
++		Breakpoint* breakpoint = new(std::nothrow) Breakpoint;
++		if (breakpoint == NULL)
++			return B_NO_MEMORY;
++
++		breakpoint-&gt;address = 0;
++		breakpoint-&gt;installedBreakpoint = NULL;
++		breakpoint-&gt;used = false;
++		breakpoint-&gt;software = false;
++
++		fHardwareBreakpoints.Add(breakpoint);
++	}
++
++	return B_OK;
++}
++
++
++status_t
++BreakpointManager::InstallBreakpoint(void* _address)
++{
++	const addr_t address = (addr_t)_address;
++
++	WriteLocker locker(fLock);
++
++	if (fBreakpointCount &gt;= kMaxBreakpointCount)
++		return B_BUSY;
++
++	// check whether there's already a breakpoint at the address
++	InstalledBreakpoint* installed = fBreakpoints.Lookup(address);
++	if (installed != NULL)
++		return B_BAD_VALUE;
++
++	// create the breakpoint object
++	installed = new(std::nothrow) InstalledBreakpoint(address);
++	if (installed == NULL)
++		return B_NO_MEMORY;
++	ObjectDeleter&lt;InstalledBreakpoint&gt; installedDeleter(installed);
++
++	// If we still have enough hardware breakpoints left, install a hardware
++	// breakpoint.
++	Breakpoint* breakpoint = _GetUnusedHardwareBreakpoint(false);
++	if (breakpoint != NULL) {
++		status_t error = _InstallHardwareBreakpoint(breakpoint, address);
++		if (error != B_OK)
++			return error;
++
++		breakpoint-&gt;installedBreakpoint = installed;
++		installed-&gt;breakpoint = breakpoint;
++	} else {
++		// install a software breakpoint
++		status_t error = _InstallSoftwareBreakpoint(installed, address);
++		if (error != B_OK)
++			return error;
++	}
++
++	fBreakpoints.Insert(installed);
++	installedDeleter.Detach();
++	fBreakpointCount++;
++
++	return B_OK;
++}
++
++
++status_t
++BreakpointManager::UninstallBreakpoint(void* _address)
++{
++	const addr_t address = (addr_t)_address;
++
++	WriteLocker locker(fLock);
++
++	InstalledBreakpoint* installed = fBreakpoints.Lookup(address);
++	if (installed == NULL)
++		return B_BAD_VALUE;
++
++	if (installed-&gt;breakpoint-&gt;software)
++		_UninstallSoftwareBreakpoint(installed-&gt;breakpoint);
++	else
++		_UninstallHardwareBreakpoint(installed-&gt;breakpoint);
++
++	fBreakpoints.Remove(installed);
++	delete installed;
++	fBreakpointCount--;
++
++	return B_OK;
++}
++
++
++status_t
++BreakpointManager::InstallWatchpoint(void* _address, uint32 type, int32 length)
++{
++	const addr_t address = (addr_t)_address;
++
++	WriteLocker locker(fLock);
++
++	InstalledWatchpoint* watchpoint = _FindWatchpoint(address);
++	if (watchpoint != NULL)
++		return B_BAD_VALUE;
++
++#if DEBUG_SHARED_BREAK_AND_WATCHPOINTS
++	// We need at least one hardware breakpoint for our breakpoint management.
++	if (fWatchpointCount + 1 &gt;= DEBUG_MAX_WATCHPOINTS)
++		return B_BUSY;
++#else
++	if (fWatchpointCount &gt;= DEBUG_MAX_WATCHPOINTS)
++		return B_BUSY;
++#endif
++
++	watchpoint = new(std::nothrow) InstalledWatchpoint;
++	if (watchpoint == NULL)
++		return B_NO_MEMORY;
++	ObjectDeleter&lt;InstalledWatchpoint&gt; watchpointDeleter(watchpoint);
++
++	status_t error = _InstallWatchpoint(watchpoint, address, type, length);
++	if (error != B_OK)
++		return error;
++
++	fWatchpoints.Add(watchpointDeleter.Detach());
++	fWatchpointCount++;
++	return B_OK;
++}
++
++
++status_t
++BreakpointManager::UninstallWatchpoint(void* address)
++{
++	WriteLocker locker(fLock);
++
++	InstalledWatchpoint* watchpoint = _FindWatchpoint((addr_t)address);
++	if (watchpoint == NULL)
++		return B_BAD_VALUE;
++
++	ObjectDeleter&lt;InstalledWatchpoint&gt; deleter(watchpoint);
++	fWatchpoints.Remove(watchpoint);
++	fWatchpointCount--;
++
++	return _UninstallWatchpoint(watchpoint);
++}
++
++
++void
++BreakpointManager::RemoveAllBreakpoints()
++{
++	WriteLocker locker(fLock);
++
++	// remove the breakpoints
++	BreakpointTree::Iterator it = fBreakpoints.GetIterator();
++	while (InstalledBreakpoint* installedBreakpoint = it.Next()) {
++		it.Remove();
++
++		// uninstall underlying hard/software breakpoint
++		if (installedBreakpoint-&gt;breakpoint-&gt;software)
++			_UninstallSoftwareBreakpoint(installedBreakpoint-&gt;breakpoint);
++		else
++			_UninstallHardwareBreakpoint(installedBreakpoint-&gt;breakpoint);
++
++		delete installedBreakpoint;
++	}
++
++	// remove the watchpoints
++	while (InstalledWatchpoint* watchpoint = fWatchpoints.RemoveHead()) {
++		_UninstallWatchpoint(watchpoint);
++		delete watchpoint;
++	}
++}
++
++
++/*!	\brief Returns whether the given address can be accessed in principle.
++	No check whether there's an actually accessible area is performed, though.
++*/
++/*static*/ bool
++BreakpointManager::CanAccessAddress(const void* _address, bool write)
++{
++	const addr_t address = (addr_t)_address;
++
++	// user addresses are always fine
++	if (IS_USER_ADDRESS(address))
++		return true;
++
++	// a commpage address can at least be read
++	if (address &gt;= USER_COMMPAGE_ADDR
++		&amp;&amp; address &lt; USER_COMMPAGE_ADDR + COMMPAGE_SIZE) {
++		return !write;
++	}
++
++	return false;
++}
++
++
++/*!	\brief Reads data from user memory.
++
++	Tries to read \a size bytes of data from user memory address \a address
++	into the supplied buffer \a buffer. If only a part could be read the
++	function won't fail. The number of bytes actually read is return through
++	\a bytesRead.
++
++	\param address The user memory address from which to read.
++	\param buffer The buffer into which to write.
++	\param size The number of bytes to read.
++	\param bytesRead Will be set to the number of bytes actually read.
++	\return \c B_OK, if reading went fine. Then \a bytesRead will be set to
++			the amount of data actually read. An error indicates that nothing
++			has been read.
++*/
++status_t
++BreakpointManager::ReadMemory(const void* _address, void* buffer, size_t size,
++	size_t&amp; bytesRead)
++{
++	const addr_t address = (addr_t)_address;
++
++	ReadLocker locker(fLock);
++
++	status_t error = _ReadMemory(address, buffer, size, bytesRead);
++	if (error != B_OK)
++		return error;
++
++	// If we have software breakpoints installed, fix the buffer not to contain
++	// any of them.
++
++	// address of the first possibly intersecting software breakpoint
++	const addr_t startAddress
++		= std::max(address, (addr_t)DEBUG_SOFTWARE_BREAKPOINT_SIZE - 1)
++			- (DEBUG_SOFTWARE_BREAKPOINT_SIZE - 1);
++
++	BreakpointTree::Iterator it = fBreakpoints.GetIterator(startAddress, true,
++		true);
++	while (InstalledBreakpoint* installed = it.Next()) {
++		Breakpoint* breakpoint = installed-&gt;breakpoint;
++		if (breakpoint-&gt;address &gt;= address + size)
++			break;
++
++		if (breakpoint-&gt;software) {
++			// Software breakpoint intersects -- replace the read data with
++			// the data saved in the breakpoint object.
++			addr_t minAddress = std::max(breakpoint-&gt;address, address);
++			size_t toCopy = std::min(address + size,
++					breakpoint-&gt;address + DEBUG_SOFTWARE_BREAKPOINT_SIZE)
++				- minAddress;
++			memcpy((uint8*)buffer + (minAddress - address),
++				breakpoint-&gt;softwareData + (minAddress - breakpoint-&gt;address),
++				toCopy);
++		}
++	}
++
++	return B_OK;
++}
++
++
++status_t
++BreakpointManager::WriteMemory(void* _address, const void* _buffer, size_t size,
++	size_t&amp; bytesWritten)
++{
++	bytesWritten = 0;
++
++	if (size == 0)
++		return B_OK;
++
++	addr_t address = (addr_t)_address;
++	const uint8* buffer = (uint8*)_buffer;
++
++	WriteLocker locker(fLock);
++
++	// We don't want to overwrite software breakpoints, so things are a bit more
++	// complicated. We iterate through the intersecting software breakpoints,
++	// writing the memory between them normally, but skipping the breakpoints
++	// itself. We write into their softwareData instead.
++
++	// Get the first breakpoint -- if it starts before the address, we'll
++	// handle it separately to make things in the main loop simpler.
++	const addr_t startAddress
++		= std::max(address, (addr_t)DEBUG_SOFTWARE_BREAKPOINT_SIZE - 1)
++			- (DEBUG_SOFTWARE_BREAKPOINT_SIZE - 1);
++
++	BreakpointTree::Iterator it = fBreakpoints.GetIterator(startAddress, true,
++		true);
++	InstalledBreakpoint* installed = it.Next();
++	while (installed != NULL) {
++		Breakpoint* breakpoint = installed-&gt;breakpoint;
++		if (breakpoint-&gt;address &gt;= address)
++			break;
++
++		if (breakpoint-&gt;software) {
++			// We've got a breakpoint that is partially intersecting with the
++			// beginning of the address range to write.
++			size_t toCopy = std::min(address + size,
++					breakpoint-&gt;address + DEBUG_SOFTWARE_BREAKPOINT_SIZE)
++				- address;
++			memcpy(breakpoint-&gt;softwareData + (address - breakpoint-&gt;address),
++				buffer, toCopy);
++
++			address += toCopy;
++			size -= toCopy;
++			bytesWritten += toCopy;
++			buffer += toCopy;
++		}
++
++		installed = it.Next();
++	}
++
++	// loop through the breakpoints intersecting with the range
++	while (installed != NULL) {
++		Breakpoint* breakpoint = installed-&gt;breakpoint;
++		if (breakpoint-&gt;address &gt;= address + size)
++			break;
++
++		if (breakpoint-&gt;software) {
++			// write the data up to the breakpoint (if any)
++			size_t toCopy = breakpoint-&gt;address - address;
++			if (toCopy &gt; 0) {
++				size_t chunkWritten;
++				status_t error = _WriteMemory(address, buffer, toCopy,
++					chunkWritten);
++				if (error != B_OK)
++					return bytesWritten &gt; 0 ? B_OK : error;
++
++				address += chunkWritten;
++				size -= chunkWritten;
++				bytesWritten += chunkWritten;
++				buffer += chunkWritten;
++
++				if (chunkWritten &lt; toCopy)
++					return B_OK;
++			}
++
++			// write to the breakpoint data
++			toCopy = std::min(size, (size_t)DEBUG_SOFTWARE_BREAKPOINT_SIZE);
++			memcpy(breakpoint-&gt;softwareData, buffer, toCopy);
++
++			address += toCopy;
++			size -= toCopy;
++			bytesWritten += toCopy;
++			buffer += toCopy;
++		}
++
++		installed = it.Next();
++	}
++
++	// write remaining data
++	if (size &gt; 0) {
++		size_t chunkWritten;
++		status_t error = _WriteMemory(address, buffer, size, chunkWritten);
++		if (error != B_OK)
++			return bytesWritten &gt; 0 ? B_OK : error;
++
++		bytesWritten += chunkWritten;
++	}
++
++	return B_OK;
++}
++
++
++void
++BreakpointManager::PrepareToContinue(void* _address)
++{
++	const addr_t address = (addr_t)_address;
++
++	WriteLocker locker(fLock);
++
++	// Check whether there's a software breakpoint at the continuation address.
++	InstalledBreakpoint* installed = fBreakpoints.Lookup(address);
++	if (installed == NULL || !installed-&gt;breakpoint-&gt;software)
++		return;
++
++	// We need to replace the software breakpoint by a hardware one, or
++	// we can't continue the thread.
++	Breakpoint* breakpoint = _GetUnusedHardwareBreakpoint(true);
++	if (breakpoint == NULL) {
++		dprintf(&quot;Failed to allocate a hardware breakpoint.\n&quot;);
++		return;
++	}
++
++	status_t error = _InstallHardwareBreakpoint(breakpoint, address);
++	if (error != B_OK)
++		return;
++
++	_UninstallSoftwareBreakpoint(installed-&gt;breakpoint);
++
++	breakpoint-&gt;installedBreakpoint = installed;
++	installed-&gt;breakpoint = breakpoint;
++}
++
++
++BreakpointManager::Breakpoint*
++BreakpointManager::_GetUnusedHardwareBreakpoint(bool force)
++{
++	// try to find a free one first
++	for (BreakpointList::Iterator it = fHardwareBreakpoints.GetIterator();
++			Breakpoint* breakpoint = it.Next();) {
++		if (!breakpoint-&gt;used)
++			return breakpoint;
++	}
++
++	if (!force)
++		return NULL;
++
++	// replace one by a software breakpoint
++	for (BreakpointList::Iterator it = fHardwareBreakpoints.GetIterator();
++			Breakpoint* breakpoint = it.Next();) {
++		if (breakpoint-&gt;installedBreakpoint == NULL)
++			continue;
++
++		status_t error = _InstallSoftwareBreakpoint(
++			breakpoint-&gt;installedBreakpoint, breakpoint-&gt;address);
++		if (error != B_OK)
++			continue;
++
++		if (_UninstallHardwareBreakpoint(breakpoint) == B_OK)
++			return breakpoint;
++	}
++
++	return NULL;
++}
++
++
++status_t
++BreakpointManager::_InstallSoftwareBreakpoint(InstalledBreakpoint* installed,
++	addr_t address)
++{
++	Breakpoint* breakpoint = new(std::nothrow) Breakpoint;
++	if (breakpoint == NULL)
++		return B_NO_MEMORY;
++	ObjectDeleter&lt;Breakpoint&gt; breakpointDeleter(breakpoint);
++
++	breakpoint-&gt;address = address;
++	breakpoint-&gt;installedBreakpoint = installed;
++	breakpoint-&gt;used = true;
++	breakpoint-&gt;software = true;
++
++	// save the memory where the software breakpoint shall be installed
++	size_t bytesTransferred;
++	status_t error = _ReadMemory(address, breakpoint-&gt;softwareData,
++		DEBUG_SOFTWARE_BREAKPOINT_SIZE, bytesTransferred);
++	if (error != B_OK)
++		return error;
++	if (bytesTransferred != DEBUG_SOFTWARE_BREAKPOINT_SIZE)
++		return B_BAD_ADDRESS;
++
++	// write the breakpoint code
++	error = _WriteMemory(address, DEBUG_SOFTWARE_BREAKPOINT,
++		DEBUG_SOFTWARE_BREAKPOINT_SIZE, bytesTransferred);
++	if (error != B_OK)
++		return error;
++
++	if (bytesTransferred &lt; DEBUG_SOFTWARE_BREAKPOINT_SIZE) {
++		// breakpoint written partially only -- undo the written part
++		if (bytesTransferred &gt; 0) {
++			size_t dummy;
++			_WriteMemory(address, breakpoint-&gt;softwareData, bytesTransferred,
++				dummy);
++		}
++		return B_BAD_ADDRESS;
++	}
++
++	installed-&gt;breakpoint = breakpoint;
++	breakpointDeleter.Detach();
++
++	TRACE(&quot;installed software breakpoint at %#lx\n&quot;, address);
++
++	return B_OK;
++}
++
++
++status_t
++BreakpointManager::_UninstallSoftwareBreakpoint(Breakpoint* breakpoint)
++{
++	size_t bytesWritten;
++	_WriteMemory(breakpoint-&gt;address, breakpoint-&gt;softwareData,
++		DEBUG_SOFTWARE_BREAKPOINT_SIZE, bytesWritten);
++
++	TRACE(&quot;uninstalled software breakpoint at %#lx\n&quot;, breakpoint-&gt;address);
++
++	delete breakpoint;
++	return B_OK;
++}
++
++
++status_t
++BreakpointManager::_InstallHardwareBreakpoint(Breakpoint* breakpoint,
++	addr_t address)
++{
++	status_t error = arch_set_breakpoint((void*)address);
++	if (error != B_OK)
++		return error;
++
++	// move to the tail of the list
++	fHardwareBreakpoints.Remove(breakpoint);
++	fHardwareBreakpoints.Add(breakpoint);
++
++	TRACE(&quot;installed hardware breakpoint at %#lx\n&quot;, address);
++
++	breakpoint-&gt;address = address;
++	breakpoint-&gt;used = true;
++	return B_OK;
++}
++
++
++status_t
++BreakpointManager::_UninstallHardwareBreakpoint(Breakpoint* breakpoint)
++{
++	status_t error = arch_clear_breakpoint((void*)breakpoint-&gt;address);
++	if (error != B_OK)
++		return error;
++
++	TRACE(&quot;uninstalled hardware breakpoint at %#lx\n&quot;, breakpoint-&gt;address);
++
++	breakpoint-&gt;used = false;
++	breakpoint-&gt;installedBreakpoint = NULL;
++	return B_OK;
++}
++
++
++BreakpointManager::InstalledWatchpoint*
++BreakpointManager::_FindWatchpoint(addr_t address) const
++{
++	for (InstalledWatchpointList::ConstIterator it = fWatchpoints.GetIterator();
++		InstalledWatchpoint* watchpoint = it.Next();) {
++		if (address == watchpoint-&gt;address)
++			return watchpoint;
++	}
++
++	return NULL;
++}
++
++
++status_t
++BreakpointManager::_InstallWatchpoint(InstalledWatchpoint* watchpoint,
++	addr_t address, uint32 type, int32 length)
++{
++#if DEBUG_SHARED_BREAK_AND_WATCHPOINTS
++	// We need a hardware breakpoint.
++	watchpoint-&gt;breakpoint = _GetUnusedHardwareBreakpoint(true);
++	if (watchpoint-&gt;breakpoint == NULL) {
++		dprintf(&quot;Failed to allocate a hardware breakpoint for watchpoint.\n&quot;);
++		return B_BUSY;
++	}
++#endif
++
++	status_t error = arch_set_watchpoint((void*)address, type, length);
++	if (error != B_OK)
++		return error;
++
++	watchpoint-&gt;address = address;
++
++#if DEBUG_SHARED_BREAK_AND_WATCHPOINTS
++	watchpoint-&gt;breakpoint-&gt;used = true;
++#endif
++
++	return B_OK;
++}
++
++
++status_t
++BreakpointManager::_UninstallWatchpoint(InstalledWatchpoint* watchpoint)
++{
++#if DEBUG_SHARED_BREAK_AND_WATCHPOINTS
++	watchpoint-&gt;breakpoint-&gt;used = false;
++#endif
++
++	return arch_clear_watchpoint((void*)watchpoint-&gt;address);
++}
++
++
++status_t
++BreakpointManager::_ReadMemory(const addr_t _address, void* _buffer,
++	size_t size, size_t&amp; bytesRead)
++{
++	const uint8* address = (const uint8*)_address;
++	uint8* buffer = (uint8*)_buffer;
++
++	// check the parameters
++	if (!CanAccessAddress(address, false))
++		return B_BAD_ADDRESS;
++	if (size &lt;= 0)
++		return B_BAD_VALUE;
++
++	// If the region to be read crosses page boundaries, we split it up into
++	// smaller chunks.
++	status_t error = B_OK;
++	bytesRead = 0;
++	while (size &gt; 0) {
++		// check whether we're still in user address space
++		if (!CanAccessAddress(address, false)) {
++			error = B_BAD_ADDRESS;
++			break;
++		}
++
++		// don't cross page boundaries in a single read
++		int32 toRead = size;
++		int32 maxRead = B_PAGE_SIZE - (addr_t)address % B_PAGE_SIZE;
++		if (toRead &gt; maxRead)
++			toRead = maxRead;
++
++		error = user_memcpy(buffer, address, toRead);
++		if (error != B_OK)
++			break;
++
++		bytesRead += toRead;
++		address += toRead;
++		buffer += toRead;
++		size -= toRead;
++	}
++
++	// If reading fails, we only fail, if we haven't read anything yet.
++	if (error != B_OK) {
++		if (bytesRead &gt; 0)
++			return B_OK;
++		return error;
++	}
++
++	return B_OK;
++}
++
++
++status_t
++BreakpointManager::_WriteMemory(addr_t _address, const void* _buffer,
++	size_t size, size_t&amp; bytesWritten)
++{
++	uint8* address = (uint8*)_address;
++	const uint8* buffer = (const uint8*)_buffer;
++
++	// check the parameters
++	if (!CanAccessAddress(address, true))
++		return B_BAD_ADDRESS;
++	if (size &lt;= 0)
++		return B_BAD_VALUE;
++
++	// If the region to be written crosses area boundaries, we split it up into
++	// smaller chunks.
++	status_t error = B_OK;
++	bytesWritten = 0;
++	while (size &gt; 0) {
++		// check whether we're still in user address space
++		if (!CanAccessAddress(address, true)) {
++			error = B_BAD_ADDRESS;
++			break;
++		}
++
++		// get the area for the address (we need to use _user_area_for(), since
++		// we're looking for a user area)
++		area_id area = _user_area_for(address);
++		if (area &lt; 0) {
++			TRACE(&quot;BreakpointManager::_WriteMemory(): area not found for &quot;
++				&quot;address: %#lx: %lx\n&quot;, address, area);
++			error = area;
++			break;
++		}
++
++		area_info areaInfo;
++		status_t error = get_area_info(area, &amp;areaInfo);
++		if (error != B_OK) {
++			TRACE(&quot;BreakpointManager::_WriteMemory(): failed to get info for &quot;
++				&quot;area %ld: %lx\n&quot;, area, error);
++			error = B_BAD_ADDRESS;
++			break;
++		}
++
++		// restrict this round of writing to the found area
++		int32 toWrite = size;
++		int32 maxWrite = (uint8*)areaInfo.address + areaInfo.size - address;
++		if (toWrite &gt; maxWrite)
++			toWrite = maxWrite;
++
++		// if the area is read-only, we temporarily need to make it writable
++		bool protectionChanged = false;
++		if (!(areaInfo.protection &amp; (B_WRITE_AREA | B_KERNEL_WRITE_AREA))) {
++			error = set_area_protection(area,
++				areaInfo.protection | B_WRITE_AREA);
++			if (error != B_OK) {
++				TRACE(&quot;BreakpointManager::_WriteMemory(): failed to set new &quot;
++					&quot;protection for area %ld: %lx\n&quot;, area, error);
++				break;
++			}
++			protectionChanged = true;
++		}
++
++		// copy the memory
++		error = user_memcpy(address, buffer, toWrite);
++
++		// reset the area protection
++		if (protectionChanged)
++			set_area_protection(area, areaInfo.protection);
++
++		if (error != B_OK) {
++			TRACE(&quot;BreakpointManager::_WriteMemory(): user_memcpy() failed: &quot;
++				&quot;%lx\n&quot;, error);
++			break;
++		}
++
++		bytesWritten += toWrite;
++		address += toWrite;
++		buffer += toWrite;
++		size -= toWrite;
++	}
++
++	// If writing fails, we only fail, if we haven't written anything yet.
++	if (error != B_OK) {
++		if (bytesWritten &gt; 0)
++			return B_OK;
++		return error;
++	}
++
++	return B_OK;
++}
+
+Added: haiku/trunk/src/system/kernel/debug/BreakpointManager.h
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/BreakpointManager.h	2009-06-23 20:52:30 UTC (rev 31213)
++++ haiku/trunk/src/system/kernel/debug/BreakpointManager.h	2009-06-23 21:03:57 UTC (rev 31214)
+@@ -0,0 +1,144 @@
++/*
++ * Copyright 2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef BREAKPOINT_MANAGER_H
++#define BREAKPOINT_MANAGER_H
++
++#include &lt;util/DoublyLinkedList.h&gt;
++#include &lt;util/SplayTree.h&gt;
++
++#include &lt;arch/user_debugger.h&gt;
++#include &lt;lock.h&gt;
++
++
++struct BreakpointManager {
++public:
++								BreakpointManager();
++								~BreakpointManager();
++
++			status_t			Init();
++
++			status_t			InstallBreakpoint(void* address);
++			status_t			UninstallBreakpoint(void* address);
++
++			status_t			InstallWatchpoint(void* address, uint32 type,
++									int32 length);
++			status_t			UninstallWatchpoint(void* address);
++
++			void				RemoveAllBreakpoints();
++									// break- and watchpoints
++
++	static	bool				CanAccessAddress(const void* address,
++									bool write);
++			status_t			ReadMemory(const void* _address, void* _buffer,
++									size_t size, size_t&amp; bytesRead);
++			status_t			WriteMemory(void* _address, const void* _buffer,
++									size_t size, size_t&amp; bytesWritten);
++
++			void				PrepareToContinue(void* address);
++
++private:
++			struct InstalledBreakpoint;
++
++			struct Breakpoint : DoublyLinkedListLinkImpl&lt;Breakpoint&gt; {
++				addr_t					address;
++				InstalledBreakpoint*	installedBreakpoint;
++				bool					used;
++				bool					software;
++				uint8					softwareData[
++											DEBUG_SOFTWARE_BREAKPOINT_SIZE];
++			};
++
++			typedef DoublyLinkedList&lt;Breakpoint&gt; BreakpointList;
++
++			struct InstalledBreakpoint : SplayTreeLink&lt;InstalledBreakpoint&gt; {
++				InstalledBreakpoint*	splayNext;
++				Breakpoint*				breakpoint;
++				addr_t					address;
+
+[... truncated: 681 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017498.html">[Haiku-commits] r31213 - in haiku/trunk/src/add-ons:	accelerants/nvidia accelerants/nvidia/engine	kernel/drivers/graphics/nvidia
+</A></li>
+	<LI>Next message: <A HREF="017445.html">[Haiku-commits] r31215 -	haiku/trunk/src/add-ons/kernel/drivers/power/acpi_embedded_controller
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17444">[ date ]</a>
+              <a href="thread.html#17444">[ thread ]</a>
+              <a href="subject.html#17444">[ subject ]</a>
+              <a href="author.html#17444">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,183 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31767 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31767%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200907261328.n6QDSijr002524%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018264.html">
+   <LINK REL="Next"  HREF="018266.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31767 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31767%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200907261328.n6QDSijr002524%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31767 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sun Jul 26 15:28:44 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018264.html">[Haiku-commits] r31766 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+        <LI>Next message: <A HREF="018266.html">[Haiku-commits] r31768 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18265">[ date ]</a>
+              <a href="thread.html#18265">[ thread ]</a>
+              <a href="subject.html#18265">[ subject ]</a>
+              <a href="author.html#18265">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-07-26 15:28:43 +0200 (Sun, 26 Jul 2009)
+New Revision: 31767
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31767&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31767&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+Log:
+Fixed a number of issues with double indirect blocks:
+* The &quot;index&quot; was not correctly updated when the next indirect block was about
+  to be used, which lead the code to write the runs to a wrong block, causing
+  slight corruption, as well as the known invalid block_run(0,0,0) problem.
+* blocksRequested is now always a multiple of &quot;minimum&quot; as well.
+* When the file size grew beyond the max_double_indirect_range, the minimum was
+  not adjusted, leading to too many extra allocations that had to be reverted
+  afterwards again.
+* If an allocation was not a multiple of NUM_ARRAY_BLOCKS, but also smaller than
+  this limit (could happen due to the bug above), an endless loop could be
+  entered. This was actually a regression introduced in r974.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2009-07-26 13:15:26 UTC (rev 31766)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2009-07-26 13:28:43 UTC (rev 31767)
+@@ -1633,8 +1633,12 @@
+ 		bytes = size - data-&gt;MaxIndirectRange();
+ 	else if (data-&gt;Size() &lt; data-&gt;MaxDirectRange())
+ 		bytes = size - data-&gt;MaxDirectRange();
+-	else
++	else {
++		// no preallocation left to be used
+ 		bytes = size - data-&gt;Size();
++		if (data-&gt;MaxDoubleIndirectRange() &gt; 0)
++			minimum = NUM_ARRAY_BLOCKS;
++	}
+ 
+ 	// do we have enough free blocks on the disk?
+ 	off_t blocksNeeded = (bytes + fVolume-&gt;BlockSize() - 1)
+@@ -1687,10 +1691,15 @@
+ 		// the requested blocks do not need to be returned with a
+ 		// single allocation, so we need to iterate until we have
+ 		// enough blocks allocated
++		if (minimum &gt; 1) {
++			// make sure that &quot;blocks&quot; is a multiple of minimum
++			blocksRequested = round_up(blocksRequested, minimum);
++		}
++
+ 		block_run run;
+ 		status_t status = fVolume-&gt;Allocate(transaction, this, blocksRequested,
+ 			run, minimum);
+-		if (status &lt; B_OK)
++		if (status != B_OK)
+ 			return status;
+ 
+ 		// okay, we have the needed blocks, so just distribute them to the
+@@ -1702,10 +1711,6 @@
+ 		blocksNeeded -= run.Length();
+ 		// don't preallocate if the first allocation was already too small
+ 		blocksRequested = blocksNeeded;
+-		if (minimum &gt; 1) {
+-			// make sure that &quot;blocks&quot; is a multiple of minimum
+-			blocksRequested = round_up(blocksRequested, minimum);
+-		}
+ 
+ 		// Direct block range
+ 
+@@ -1746,7 +1751,7 @@
+ 			// if there is no indirect block yet, create one
+ 			if (data-&gt;indirect.IsZero()) {
+ 				status = _AllocateBlockArray(transaction, data-&gt;indirect);
+-				if (status &lt; B_OK)
++				if (status != B_OK)
+ 					return status;
+ 
+ 				data-&gt;max_indirect_range = HOST_ENDIAN_TO_BFS_INT64(
+@@ -1800,7 +1805,7 @@
+ 
+ 		if (data-&gt;Size() &lt;= data-&gt;MaxDoubleIndirectRange()
+ 			|| !data-&gt;max_double_indirect_range) {
+-			while ((run.Length() % NUM_ARRAY_BLOCKS) != 0) {
++			if ((run.Length() % NUM_ARRAY_BLOCKS) != 0) {
+ 				// The number of allocated blocks isn't a multiple of
+ 				// NUM_ARRAY_BLOCKS, so we have to change this. This can happen
+ 				// the first time the stream grows into the double
+@@ -1813,7 +1818,7 @@
+ 				status = fVolume-&gt;Free(transaction,
+ 					block_run::Run(run.AllocationGroup(),
+ 					run.Start() + run.Length(), rest));
+-				if (status &lt; B_OK)
++				if (status != B_OK)
+ 					return status;
+ 
+ 				blocksNeeded += rest;
+@@ -1833,7 +1838,7 @@
+ 			if (data-&gt;double_indirect.IsZero()) {
+ 				status = _AllocateBlockArray(transaction,
+ 					data-&gt;double_indirect);
+-				if (status &lt; B_OK)
++				if (status != B_OK)
+ 					return status;
+ 
+ 				data-&gt;max_double_indirect_range = data-&gt;max_indirect_range;
+@@ -1876,7 +1881,7 @@
+ 
+ 						status = _AllocateBlockArray(transaction,
+ 							array[indirectIndex % runsPerBlock]);
+-						if (status &lt; B_OK)
++						if (status != B_OK)
+ 							return status;
+ 					}
+ 
+@@ -1900,6 +1905,8 @@
+ 					} while ((++index % runsPerBlock) != 0 &amp;&amp; run.length);
+ 				} while ((index % runsPerArray) != 0 &amp;&amp; run.length);
+ 
++				if (index == runsPerArray)
++					index = 0;
+ 				if (++indirectIndex % runsPerBlock == 0) {
+ 					array = NULL;
+ 					index = 0;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018264.html">[Haiku-commits] r31766 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+	<LI>Next message: <A HREF="018266.html">[Haiku-commits] r31768 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18265">[ date ]</a>
+              <a href="thread.html#18265">[ thread ]</a>
+              <a href="subject.html#18265">[ subject ]</a>
+              <a href="author.html#18265">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

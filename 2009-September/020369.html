@@ -1,0 +1,1087 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32937 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32937%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay&In-Reply-To=%3C200909050154.n851sglU032083%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020368.html">
+   <LINK REL="Next"  HREF="020370.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32937 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32937%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay&In-Reply-To=%3C200909050154.n851sglU032083%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32937 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sat Sep  5 03:54:42 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020368.html">[Haiku-commits] r32936 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+        <LI>Next message: <A HREF="020370.html">[Haiku-commits] r32938 -	haiku/branches/releases/r1alpha1/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20369">[ date ]</a>
+              <a href="thread.html#20369">[ thread ]</a>
+              <a href="subject.html#20369">[ subject ]</a>
+              <a href="author.html#20369">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-09-05 03:54:40 +0200 (Sat, 05 Sep 2009)
+New Revision: 32937
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32937&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32937&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp
+Log:
+* Implement attribute support in write_overlay. It mostly uses the same backends
+  as the other node operations.
+* Differentiate between data and metadata modification, so that changes to
+  attributes or stat fields (other than size) dont't prevent direct IO relay.
+* Suppress child finish notifications when sending subrequests to the
+  underlaying filesystem. Otherwise the request can be gone by the time we
+  try to complete it.
+* Fix offsets used for IORequest::CopyData().
+* Some refactoring.
+* Added locking.
+
+With that a write_overlay can be put on attribute enabled filesystems to either
+make them writeable or snapshot them. This allows for example for a working
+BFS based LiveCD.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp	2009-09-05 01:16:56 UTC (rev 32936)
++++ haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp	2009-09-05 01:54:40 UTC (rev 32937)
+@@ -13,6 +13,7 @@
+ #include &lt;dirent.h&gt;
+ 
+ #include &lt;util/kernel_cpp.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ 
+ #include &lt;fs_cache.h&gt;
+ #include &lt;fs_info.h&gt;
+@@ -46,6 +47,7 @@
+ class OverlayInode;
+ 
+ struct open_cookie {
++	OverlayInode *	node;
+ 	int				open_mode;
+ 	void *			super_cookie;
+ };
+@@ -59,6 +61,7 @@
+ struct overlay_dirent {
+ 	ino_t			inode_number;
+ 	char *			name;
++	OverlayInode *	node; // only for attributes
+ 
+ 	void			remove_and_dispose(fs_volume *volume, ino_t directoryInode)
+ 					{
+@@ -68,6 +71,14 @@
+ 						free(name);
+ 						free(this);
+ 					}
++
++	void			dispose_attribute(fs_volume *volume, ino_t fileInode)
++					{
++						notify_attribute_changed(volume-&gt;id, fileInode, name,
++							B_ATTR_REMOVED);
++						free(name);
++						free(this);
++					}
+ };
+ 
+ 
+@@ -100,20 +111,32 @@
+ 							OverlayInode(OverlayVolume *volume,
+ 								fs_vnode *superVnode, ino_t inodeNumber,
+ 								OverlayInode *parentDir = NULL,
+-								const char *name = NULL, mode_t mode = 0);
++								const char *name = NULL, mode_t mode = 0,
++								bool attribute = false,
++								type_code attributeType = 0);
+ 							~OverlayInode();
+ 
+ 		status_t			InitCheck();
+ 
++		bool				Lock() { return recursive_lock_lock(&amp;fLock) == B_OK; }
++		void				Unlock() { recursive_lock_unlock(&amp;fLock); }
++
+ 		bool				IsVirtual() { return fIsVirtual; }
+ 		bool				IsModified() { return fIsModified; }
++		bool				IsDataModified() { return fIsDataModified; }
++		bool				IsAttribute() { return fIsAttribute; }
+ 
+ 		fs_volume *			Volume() { return fVolume-&gt;Volume(); }
+ 		fs_volume *			SuperVolume() { return fVolume-&gt;SuperVolume(); }
++
++		void				SetSuperVnode(fs_vnode *superVnode);
+ 		fs_vnode *			SuperVnode() { return &fSuperVnode; }
++
++		void				SetInodeNumber(ino_t inodeNumber);
+ 		ino_t				InodeNumber() { return fInodeNumber; }
+ 
+ 		void				SetModified();
++		void				SetDataModified();
+ 		void				CreateCache();
+ 
+ 		void				SetParentDir(OverlayInode *parentDir);
+@@ -122,6 +145,9 @@
+ 		bool				IsNonEmptyDirectory();
+ 
+ 		status_t			Lookup(const char *name, ino_t *inodeNumber);
++		status_t			LookupAttribute(const char *name,
++								OverlayInode **node);
++
+ 		void				SetName(const char *name);
+ 		status_t			GetName(char *buffer, size_t bufferSize);
+ 
+@@ -129,7 +155,9 @@
+ 		status_t			WriteStat(const struct stat *stat, uint32 statMask);
+ 
+ 		status_t			Create(const char *name, int openMode, int perms,
+-								void **cookie, ino_t *newInodeNumber);
++								void **cookie, ino_t *newInodeNumber,
++								bool attribute = false,
++								type_code attributeType = 0);
+ 		status_t			Open(int openMode, void **cookie);
+ 		status_t			Close(void *cookie);
+ 		status_t			FreeCookie(void *cookie);
+@@ -146,28 +174,34 @@
+ 
+ 		status_t			CreateDir(const char *name, int perms);
+ 		status_t			RemoveDir(const char *name);
+-		status_t			OpenDir(void **cookie);
++		status_t			OpenDir(void **cookie, bool attribute = false);
+ 		status_t			CloseDir(void *cookie);
+ 		status_t			FreeDirCookie(void *cookie);
+ 		status_t			ReadDir(void *cookie, struct dirent *buffer,
+-								size_t bufferSize, uint32 *num);
++								size_t bufferSize, uint32 *num,
++								bool attribute = false);
+ 		status_t			RewindDir(void *cookie);
+ 
+ 		status_t			CreateSymlink(const char *name, const char *path,
+ 								int mode);
+ 		status_t			ReadSymlink(char *buffer, size_t *bufferSize);
+ 
+-		status_t			AddEntry(overlay_dirent *entry);
++		status_t			AddEntry(overlay_dirent *entry,
++								bool attribute = false);
+ 		status_t			RemoveEntry(const char *name,
+-								overlay_dirent **entry);
++								overlay_dirent **entry, bool attribute = false);
+ 
+ private:
+ 		void				_TrimBuffers();
+ 
++		status_t			_PopulateStat();
+ 		status_t			_PopulateDirents();
++		status_t			_PopulateAttributeDirents();
+ 		status_t			_CreateCommon(const char *name, int type, int perms,
+-								ino_t *newInodeNumber, OverlayInode **node);
++								ino_t *newInodeNumber, OverlayInode **node,
++								bool attribute, type_code attributeType);
+ 
++		recursive_lock		fLock;
+ 		OverlayVolume *		fVolume;
+ 		OverlayInode *		fParentDir;
+ 		const char *		fName;
+@@ -177,11 +211,16 @@
+ 		off_t				fOriginalNodeLength;
+ 		overlay_dirent **	fDirents;
+ 		uint32				fDirentCount;
++		overlay_dirent **	fAttributeDirents;
++		uint32				fAttributeDirentCount;
+ 		struct stat			fStat;
+ 		bool				fHasStat;
+ 		bool				fHasDirents;
++		bool				fHasAttributeDirents;
+ 		bool				fIsVirtual;
++		bool				fIsAttribute;
+ 		bool				fIsModified;
++		bool				fIsDataModified;
+ 		void *				fFileCache;
+ };
+ 
+@@ -205,7 +244,8 @@
+ 
+ 
+ OverlayInode::OverlayInode(OverlayVolume *volume, fs_vnode *superVnode,
+-	ino_t inodeNumber, OverlayInode *parentDir, const char *name, mode_t mode)
++	ino_t inodeNumber, OverlayInode *parentDir, const char *name, mode_t mode,
++	bool attribute, type_code attributeType)
+ 	:	fVolume(volume),
+ 		fParentDir(parentDir),
+ 		fName(name),
+@@ -214,14 +254,20 @@
+ 		fOriginalNodeLength(-1),
+ 		fDirents(NULL),
+ 		fDirentCount(0),
++		fAttributeDirents(NULL),
++		fAttributeDirentCount(0),
+ 		fHasStat(false),
+ 		fHasDirents(false),
++		fHasAttributeDirents(false),
+ 		fIsVirtual(superVnode == NULL),
++		fIsAttribute(attribute),
+ 		fIsModified(false),
++		fIsDataModified(false),
+ 		fFileCache(NULL)
+ {
+ 	TRACE(&quot;inode created %lld\n&quot;, fInodeNumber);
+ 
++	recursive_lock_init(&amp;fLock, &quot;write overlay inode lock&quot;);
+ 	if (superVnode != NULL)
+ 		fSuperVnode = *superVnode;
+ 	else {
+@@ -236,7 +282,7 @@
+ 		fStat.st_blksize = 1024;
+ 		fStat.st_atime = fStat.st_mtime = fStat.st_ctime = fStat.st_crtime
+ 			= time(NULL);
+-		fStat.st_type = 0;
++		fStat.st_type = attributeType;
+ 		fHasStat = true;
+ 	}
+ }
+@@ -255,9 +301,19 @@
+ 		element = next;
+ 	}
+ 
+-	for (uint32 i = 0; i &lt; fDirentCount; i++)
++	for (uint32 i = 0; i &lt; fDirentCount; i++) {
++		free(fDirents[i]-&gt;name);
+ 		free(fDirents[i]);
++	}
+ 	free(fDirents);
++
++	for (uint32 i = 0; i &lt; fAttributeDirentCount; i++) {
++		free(fAttributeDirents[i]-&gt;name);
++		free(fAttributeDirents[i]);
++	}
++	free(fAttributeDirents);
++
++	recursive_lock_destroy(&amp;fLock);
+ }
+ 
+ 
+@@ -269,8 +325,29 @@
+ 
+ 
+ void
++OverlayInode::SetSuperVnode(fs_vnode *superVnode)
++{
++	RecursiveLocker locker(fLock);
++	fSuperVnode = *superVnode;
++}
++
++
++void
++OverlayInode::SetInodeNumber(ino_t inodeNumber)
++{
++	RecursiveLocker locker(fLock);
++	fInodeNumber = inodeNumber;
++}
++
++
++void
+ OverlayInode::SetModified()
+ {
++	if (fIsAttribute) {
++		fIsModified = true;
++		return;
++	}
++
+ 	// we must ensure that a modified node never get's put, as we cannot get it
+ 	// from the underlying filesystem, so we get an additional reference here
+ 	// and deliberately leak it
+@@ -282,6 +359,15 @@
+ 
+ 
+ void
++OverlayInode::SetDataModified()
++{
++	fIsDataModified = true;
++	if (!fIsModified)
++		SetModified();
++}
++
++
++void
+ OverlayInode::CreateCache()
+ {
+ 	if (!S_ISDIR(fStat.st_mode) &amp;&amp; !S_ISLNK(fStat.st_mode)) {
+@@ -295,6 +381,7 @@
+ void
+ OverlayInode::SetParentDir(OverlayInode *parentDir)
+ {
++	RecursiveLocker locker(fLock);
+ 	fParentDir = parentDir;
+ 	if (fHasDirents &amp;&amp; fDirentCount &gt;= 2)
+ 		fDirents[1]-&gt;inode_number = parentDir-&gt;InodeNumber();
+@@ -304,8 +391,9 @@
+ bool
+ OverlayInode::IsNonEmptyDirectory()
+ {
++	RecursiveLocker locker(fLock);
+ 	if (!fHasStat)
+-		ReadStat(NULL);
++		_PopulateStat();
+ 
+ 	if (!S_ISDIR(fStat.st_mode))
+ 		return false;
+@@ -320,12 +408,14 @@
+ status_t
+ OverlayInode::Lookup(const char *name, ino_t *inodeNumber)
+ {
++	RecursiveLocker locker(fLock);
+ 	if (!fHasDirents)
+ 		_PopulateDirents();
+ 
+ 	for (uint32 i = 0; i &lt; fDirentCount; i++) {
+ 		if (strcmp(fDirents[i]-&gt;name, name) == 0) {
+ 			*inodeNumber = fDirents[i]-&gt;inode_number;
++			locker.Unlock();
+ 
+ 			OverlayInode *node = NULL;
+ 			status_t result = get_vnode(Volume(), *inodeNumber,
+@@ -340,9 +430,44 @@
+ }
+ 
+ 
++status_t
++OverlayInode::LookupAttribute(const char *name, OverlayInode **node)
++{
++	RecursiveLocker locker(fLock);
++	if (!fHasAttributeDirents)
++		_PopulateAttributeDirents();
++
++	for (uint32 i = 0; i &lt; fAttributeDirentCount; i++) {
++		overlay_dirent *dirent = fAttributeDirents[i];
++		if (strcmp(dirent-&gt;name, name) == 0) {
++			if (dirent-&gt;node == NULL) {
++				OverlayInode *newNode = new(std::nothrow) OverlayInode(fVolume,
++					SuperVnode(), fInodeNumber, NULL, dirent-&gt;name, 0, true, 0);
++				if (newNode == NULL)
++					return B_NO_MEMORY;
++
++				status_t result = newNode-&gt;InitCheck();
++				if (result != B_OK) {
++					delete newNode;
++					return result;
++				}
++
++				dirent-&gt;node = newNode;
++			}
++
++			*node = dirent-&gt;node;
++			return B_OK;
++		}
++	}
++
++	return B_ENTRY_NOT_FOUND;
++}
++
++
+ void
+ OverlayInode::SetName(const char *name)
+ {
++	RecursiveLocker locker(fLock);
+ 	fName = name;
+ 	if (!fIsModified)
+ 		SetModified();
+@@ -352,12 +477,13 @@
+ status_t
+ OverlayInode::GetName(char *buffer, size_t bufferSize)
+ {
++	RecursiveLocker locker(fLock);
+ 	if (fName != NULL) {
+ 		strlcpy(buffer, fName, bufferSize);
+ 		return B_OK;
+ 	}
+ 
+-	if (fIsVirtual)
++	if (fIsVirtual || fIsAttribute)
+ 		return B_UNSUPPORTED;
+ 
+ 	if (fSuperVnode.ops-&gt;get_vnode_name == NULL)
+@@ -371,21 +497,10 @@
+ status_t
+ OverlayInode::ReadStat(struct stat *stat)
+ {
+-	if (!fHasStat) {
+-		if (fSuperVnode.ops-&gt;read_stat == NULL)
+-			return B_UNSUPPORTED;
++	RecursiveLocker locker(fLock);
++	if (!fHasStat)
++		_PopulateStat();
+ 
+-		status_t result = fSuperVnode.ops-&gt;read_stat(SuperVolume(),
+-			&amp;fSuperVnode, &amp;fStat);
+-		if (result != B_OK)
+-			return result;
+-
+-		fHasStat = true;
+-	}
+-
+-	if (stat == NULL)
+-		return B_OK;
+-
+ 	memcpy(stat, &amp;fStat, sizeof(struct stat));
+ 	stat-&gt;st_blocks = (stat-&gt;st_size + stat-&gt;st_blksize - 1) / stat-&gt;st_blksize;
+ 	return B_OK;
+@@ -395,12 +510,20 @@
+ status_t
+ OverlayInode::WriteStat(const struct stat *stat, uint32 statMask)
+ {
++	if (fIsAttribute)
++		return B_UNSUPPORTED;
++
++	RecursiveLocker locker(fLock);
+ 	if (!fHasStat)
+-		ReadStat(NULL);
++		_PopulateStat();
+ 
+ 	if (statMask &amp; B_STAT_SIZE) {
+-		fStat.st_size = stat-&gt;st_size;
+-		_TrimBuffers();
++		if (fStat.st_size != stat-&gt;st_size) {
++			fStat.st_size = stat-&gt;st_size;
++			if (!fIsDataModified)
++				SetDataModified();
++			_TrimBuffers();
++		}
+ 	}
+ 
+ 	if (statMask &amp; B_STAT_MODE)
+@@ -431,11 +554,11 @@
+ 
+ status_t
+ OverlayInode::Create(const char *name, int openMode, int perms, void **cookie,
+-	ino_t *newInodeNumber)
++	ino_t *newInodeNumber, bool attribute, type_code attributeType)
+ {
+ 	OverlayInode *newNode = NULL;
+-	status_t result = _CreateCommon(name, S_IFREG, perms, newInodeNumber,
+-		&amp;newNode);
++	status_t result = _CreateCommon(name, attribute ? S_ATTR : S_IFREG, perms,
++		newInodeNumber, &amp;newNode, attribute, attributeType);
+ 	if (result != B_OK)
+ 		return result;
+ 
+@@ -446,14 +569,16 @@
+ status_t
+ OverlayInode::Open(int openMode, void **_cookie)
+ {
++	RecursiveLocker locker(fLock);
+ 	if (!fHasStat)
+-		ReadStat(NULL);
++		_PopulateStat();
+ 
+ 	open_cookie *cookie = (open_cookie *)malloc(sizeof(open_cookie));
+ 	if (cookie == NULL)
+ 		return B_NO_MEMORY;
+ 
+ 	cookie-&gt;open_mode = openMode;
++	cookie-&gt;node = this;
+ 	*_cookie = cookie;
+ 
+ 	if (fIsVirtual) {
+@@ -465,34 +590,50 @@
+ 		return B_OK;
+ 	}
+ 
+-	if (fSuperVnode.ops-&gt;open == NULL)
++	if ((fIsAttribute &amp;&amp; fSuperVnode.ops-&gt;open_attr == NULL)
++		|| (!fIsAttribute &amp;&amp; fSuperVnode.ops-&gt;open == NULL))
+ 		return B_UNSUPPORTED;
+ 
+-	if (fOriginalNodeLength &lt; 0) {
+-		struct stat stat;
+-		status_t result = fSuperVnode.ops-&gt;read_stat(SuperVolume(),
+-			&amp;fSuperVnode, &amp;stat);
+-		if (result != B_OK)
+-			return result;
+-
+-		fOriginalNodeLength = stat.st_size;
++	if (openMode &amp; O_TRUNC) {
++		if (fStat.st_size != 0) {
++			fStat.st_size = 0;
++			_TrimBuffers();
++			if (!fIsDataModified)
++				SetDataModified();
++		}
+ 	}
+ 
+-	if (openMode &amp; O_TRUNC) {
+-		fStat.st_size = 0;
+-		_TrimBuffers();
+-		if (!fIsModified)
+-			SetModified();
++	openMode &amp;= ~(O_RDWR | O_WRONLY | O_TRUNC | O_CREAT);
++	status_t result;
++	if (fIsAttribute) {
++		result = fSuperVnode.ops-&gt;open_attr(SuperVolume(), &amp;fSuperVnode,
++			fName, openMode, &amp;cookie-&gt;super_cookie);
++	} else {
++		result = fSuperVnode.ops-&gt;open(SuperVolume(), &amp;fSuperVnode,
++			openMode, &amp;cookie-&gt;super_cookie);
+ 	}
+ 
+-	openMode &amp;= ~(O_RDWR | O_WRONLY | O_TRUNC | O_CREAT);
+-	status_t result = fSuperVnode.ops-&gt;open(SuperVolume(), &amp;fSuperVnode,
+-		openMode, &amp;cookie-&gt;super_cookie);
+ 	if (result != B_OK) {
+ 		free(cookie);
+ 		return result;
+ 	}
+ 
++	if (fOriginalNodeLength &lt; 0) {
++		struct stat stat;
++		if (fIsAttribute) {
++			result = fSuperVnode.ops-&gt;read_attr_stat(SuperVolume(),
++				&amp;fSuperVnode, cookie-&gt;super_cookie, &amp;stat);
++		} else {
++			result = fSuperVnode.ops-&gt;read_stat(SuperVolume(),
++				&amp;fSuperVnode, &amp;stat);
++		}
++
++		if (result != B_OK)
++			return result;
++
++		fOriginalNodeLength = stat.st_size;
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -504,6 +645,11 @@
+ 		return B_OK;
+ 
+ 	open_cookie *cookie = (open_cookie *)_cookie;
++	if (fIsAttribute) {
++		return fSuperVnode.ops-&gt;close_attr(SuperVolume(), &amp;fSuperVnode,
++			cookie-&gt;super_cookie);
++	}
++
+ 	return fSuperVnode.ops-&gt;close(SuperVolume(), &amp;fSuperVnode,
+ 		cookie-&gt;super_cookie);
+ }
+@@ -515,8 +661,13 @@
+ 	status_t result = B_OK;
+ 	open_cookie *cookie = (open_cookie *)_cookie;
+ 	if (!fIsVirtual) {
+-		result = fSuperVnode.ops-&gt;free_cookie(SuperVolume(),
+-			&amp;fSuperVnode, cookie-&gt;super_cookie);
++		if (fIsAttribute) {
++			result = fSuperVnode.ops-&gt;free_attr_cookie(SuperVolume(),
++				&amp;fSuperVnode, cookie-&gt;super_cookie);
++		} else {
++			result = fSuperVnode.ops-&gt;free_cookie(SuperVolume(),
++				&amp;fSuperVnode, cookie-&gt;super_cookie);
++		}
+ 	}
+ 
+ 	free(cookie);
+@@ -528,6 +679,7 @@
+ OverlayInode::Read(void *_cookie, off_t position, void *buffer, size_t *length,
+ 	bool readPages, IORequest *ioRequest)
+ {
++	RecursiveLocker locker(fLock);
+ 	if (position &gt;= fStat.st_size) {
+ 		*length = 0;
+ 		return B_OK;
+@@ -569,6 +721,8 @@
+ 				if (result != B_OK)
+ 					return result;
+ 
++				bool wereSuppressed = ioRequest-&gt;SuppressChildNotifications();
++				ioRequest-&gt;SetSuppressChildNotifications(true);
+ 				result = fSuperVnode.ops-&gt;io(SuperVolume(), &amp;fSuperVnode,
+ 					superCookie, subRequest);
+ 				if (result != B_OK)
+@@ -576,6 +730,10 @@
+ 
+ 				result = subRequest-&gt;Wait(0, 0);
+ 				readLength = subRequest-&gt;TransferredBytes();
++				ioRequest-&gt;SetSuppressChildNotifications(wereSuppressed);
++			} else if (fIsAttribute) {
++				result = fSuperVnode.ops-&gt;read_attr(SuperVolume(), &amp;fSuperVnode,
++					superCookie, position, pointer, &amp;readLength);
+ 			} else {
+ 				result = fSuperVnode.ops-&gt;read(SuperVolume(), &amp;fSuperVnode,
+ 					superCookie, position, pointer, &amp;readLength);
+@@ -614,8 +772,8 @@
+ 			const void *source = element-&gt;buffer + (position
+ 				- element-&gt;position);
+ 			if (ioRequest != NULL) {
+-				ioRequest-&gt;CopyData(source, (addr_t)pointer - (addr_t)buffer,
+-					copyLength);
++				ioRequest-&gt;CopyData(source, ioRequest-&gt;Offset()
++					+ ((addr_t)pointer - (addr_t)buffer), copyLength);
+ 			} else
+ 				memcpy(pointer, source, copyLength);
+ 
+@@ -635,14 +793,15 @@
+ OverlayInode::Write(void *_cookie, off_t position, const void *buffer,
+ 	size_t length, IORequest *ioRequest)
+ {
++	RecursiveLocker locker(fLock);
+ 	if (_cookie != NULL) {
+ 		open_cookie *cookie = (open_cookie *)_cookie;
+ 		if (cookie-&gt;open_mode &amp; O_APPEND)
+ 			position = fStat.st_size;
+ 	}
+ 
+-	if (!fIsModified)
+-		SetModified();
++	if (!fIsDataModified)
++		SetDataModified();
+ 
+ 	// find insertion point
+ 	write_buffer **link = &fWriteBuffers;
+@@ -676,13 +835,18 @@
+ 				// other chunk completely covers us, just copy
+ 				void *target = other-&gt;buffer + (newPosition - other-&gt;position);
+ 				if (ioRequest != NULL)
+-					ioRequest-&gt;CopyData(0, target, length);
++					ioRequest-&gt;CopyData(ioRequest-&gt;Offset(), target, length);
+ 				else
+ 					memcpy(target, buffer, length);
+ 
+ 				fStat.st_mtime = time(NULL);
+-				notify_stat_changed(SuperVolume()-&gt;id, fInodeNumber,
+-					B_STAT_MODIFICATION_TIME);
++				if (fIsAttribute) {
++					notify_attribute_changed(SuperVolume()-&gt;id, fInodeNumber,
++						fName, B_ATTR_CHANGED);
++				} else {
++					notify_stat_changed(SuperVolume()-&gt;id, fInodeNumber,
++						B_STAT_MODIFICATION_TIME);
++				}
+ 				return B_OK;
+ 			}
+ 
+@@ -735,8 +899,15 @@
+ 		memcpy(target, buffer, length);
+ 
+ 	fStat.st_mtime = time(NULL);
+-	notify_stat_changed(SuperVolume()-&gt;id, fInodeNumber,
+-		B_STAT_MODIFICATION_TIME | (sizeChanged ? B_STAT_SIZE : 0));
++
++	if (fIsAttribute) {
++		notify_attribute_changed(SuperVolume()-&gt;id, fInodeNumber, fName,
++			B_ATTR_CHANGED);
++	} else {
++		notify_stat_changed(SuperVolume()-&gt;id, fInodeNumber,
++			B_STAT_MODIFICATION_TIME | (sizeChanged ? B_STAT_SIZE : 0));
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -772,7 +943,7 @@
+ status_t
+ OverlayInode::CreateDir(const char *name, int perms)
+ {
+-	return _CreateCommon(name, S_IFDIR, perms, NULL, NULL);
++	return _CreateCommon(name, S_IFDIR, perms, NULL, NULL, false, 0);
+ }
+ 
+ 
+@@ -784,10 +955,13 @@
+ 
+ 
+ status_t
+-OverlayInode::OpenDir(void **cookie)
++OverlayInode::OpenDir(void **cookie, bool attribute)
+ {
+-	if (!fHasDirents)
++	RecursiveLocker locker(fLock);
++	if (!attribute &amp;&amp; !fHasDirents)
+ 		_PopulateDirents();
++	else if (attribute &amp;&amp; !fHasAttributeDirents)
++		_PopulateAttributeDirents();
+ 
+ 	open_dir_cookie *dirCookie = (open_dir_cookie *)malloc(
+ 		sizeof(open_dir_cookie));
+@@ -817,15 +991,19 @@
+ 
+ status_t
+ OverlayInode::ReadDir(void *cookie, struct dirent *buffer, size_t bufferSize,
+-	uint32 *num)
++	uint32 *num, bool attribute)
+ {
++	RecursiveLocker locker(fLock);
++	uint32 direntCount = attribute ? fAttributeDirentCount : fDirentCount;
++	overlay_dirent **dirents = attribute ? fAttributeDirents : fDirents;
++
+ 	open_dir_cookie *dirCookie = (open_dir_cookie *)cookie;
+-	if (dirCookie-&gt;index &gt;= fDirentCount) {
++	if (dirCookie-&gt;index &gt;= direntCount) {
+ 		*num = 0;
+ 		return B_OK;
+ 	}
+ 
+-	overlay_dirent *dirent = fDirents[dirCookie-&gt;index++];
++	overlay_dirent *dirent = dirents[dirCookie-&gt;index++];
+ 	size_t nameLength = MIN(strlen(dirent-&gt;name),
+ 		bufferSize - sizeof(struct dirent)) + 1;
+ 
+@@ -855,7 +1033,8 @@
+ {
+ 	OverlayInode *newNode = NULL;
+ 	// TODO: find out why mode is ignored
+-	status_t result = _CreateCommon(name, S_IFLNK, 0777, NULL, &amp;newNode);
++	status_t result = _CreateCommon(name, S_IFLNK, 0777, NULL, &amp;newNode,
++		false, 0);
+ 	if (result != B_OK)
+ 		return result;
+ 
+@@ -882,22 +1061,32 @@
+ 
+ 
+ status_t
+-OverlayInode::AddEntry(overlay_dirent *entry)
++OverlayInode::AddEntry(overlay_dirent *entry, bool attribute)
+ {
+-	if (!fHasDirents)
++	RecursiveLocker locker(fLock);
++	if (!attribute &amp;&amp; !fHasDirents)
+ 		_PopulateDirents();
++	else if (attribute &amp;&amp; !fHasAttributeDirents)
++		_PopulateAttributeDirents();
+ 
+-	status_t result = RemoveEntry(entry-&gt;name, NULL);
++	status_t result = RemoveEntry(entry-&gt;name, NULL, attribute);
+ 	if (result != B_OK &amp;&amp; result != B_ENTRY_NOT_FOUND)
+ 		return B_FILE_EXISTS;
+ 
+-	overlay_dirent **newDirents = (overlay_dirent **)realloc(fDirents,
+-		sizeof(overlay_dirent *) * (fDirentCount + 1));
++	overlay_dirent **newDirents = (overlay_dirent **)realloc(
++		attribute ? fAttributeDirents : fDirents,
++		sizeof(overlay_dirent *)
++			* ((attribute ? fAttributeDirentCount : fDirentCount) + 1));
+ 	if (newDirents == NULL)
+ 		return B_NO_MEMORY;
+ 
+-	fDirents = newDirents;
+-	fDirents[fDirentCount++] = entry;
++	if (attribute) {
++		fAttributeDirents = newDirents;
++		fAttributeDirents[fAttributeDirentCount++] = entry;
++	} else {
++		fDirents = newDirents;
++		fDirents[fDirentCount++] = entry;
++	}
+ 
+ 	if (!fIsModified)
+ 		SetModified();
+@@ -907,15 +1096,21 @@
+ 
+ 
+ status_t
+-OverlayInode::RemoveEntry(const char *name, overlay_dirent **_entry)
++OverlayInode::RemoveEntry(const char *name, overlay_dirent **_entry,
++	bool attribute)
+ {
+-	if (!fHasDirents)
++	RecursiveLocker locker(fLock);
++	if (!attribute &amp;&amp; !fHasDirents)
+ 		_PopulateDirents();
++	else if (attribute &amp;&amp; !fHasAttributeDirents)
++		_PopulateAttributeDirents();
+ 
+-	for (uint32 i = 0; i &lt; fDirentCount; i++) {
+-		overlay_dirent *entry = fDirents[i];
++	uint32 direntCount = attribute ? fAttributeDirentCount : fDirentCount;
++	overlay_dirent **dirents = attribute ? fAttributeDirents : fDirents;
++	for (uint32 i = 0; i &lt; direntCount; i++) {
++		overlay_dirent *entry = dirents[i];
+ 		if (strcmp(entry-&gt;name, name) == 0) {
+-			if (_entry == NULL) {
++			if (_entry == NULL &amp;&amp; !attribute) {
+ 				// check for non-empty directories when trying
+ 				// to dispose the entry
+ 				OverlayInode *node = NULL;
+@@ -932,12 +1127,18 @@
+ 					return result;
+ 			}
+ 
+-			for (uint32 j = i + 1; j &lt; fDirentCount; j++)
+-				fDirents[j - 1] = fDirents[j];
+-			fDirentCount--;
++			for (uint32 j = i + 1; j &lt; direntCount; j++)
++				dirents[j - 1] = dirents[j];
+ 
++			if (attribute)
++				fAttributeDirentCount--;
++			else
++				fDirentCount--;
++
+ 			if (_entry != NULL)
+ 				*_entry = entry;
++			else if (attribute)
++				entry-&gt;dispose_attribute(Volume(), fInodeNumber);
+ 			else
+ 				entry-&gt;remove_and_dispose(Volume(), fInodeNumber);
+ 
+@@ -1004,6 +1205,45 @@
+ 
+ 
+ status_t
++OverlayInode::_PopulateStat()
++{
++	if (fHasStat)
++		return B_OK;
++ 
++ 	fHasStat = true;
++	if (fIsAttribute) {
++		if (fName == NULL || fSuperVnode.ops-&gt;open_attr == NULL
++			|| fSuperVnode.ops-&gt;read_attr_stat == NULL)
++			return B_UNSUPPORTED;
++
++		void *cookie = NULL;
++		status_t result = fSuperVnode.ops-&gt;open_attr(SuperVolume(),
++			&amp;fSuperVnode, fName, O_RDONLY, &amp;cookie);
++		if (result != B_OK)
++			return result;
++
++		result = fSuperVnode.ops-&gt;read_attr_stat(SuperVolume(), &amp;fSuperVnode,
++			cookie, &amp;fStat);
++
++		if (fSuperVnode.ops-&gt;close_attr != NULL)
++			fSuperVnode.ops-&gt;close_attr(SuperVolume(), &amp;fSuperVnode, cookie);
++
++		if (fSuperVnode.ops-&gt;free_attr_cookie != NULL) {
++			fSuperVnode.ops-&gt;free_attr_cookie(SuperVolume(), &amp;fSuperVnode,
++				cookie);
++		}
++
++		return B_OK;
++	}
++
++	if (fSuperVnode.ops-&gt;read_stat == NULL)
++		return B_UNSUPPORTED;
++
++	return fSuperVnode.ops-&gt;read_stat(SuperVolume(), &amp;fSuperVnode, &amp;fStat);
++}
++
++
++status_t
+ OverlayInode::_PopulateDirents()
+ {
+ 	if (fHasDirents)
+@@ -1105,36 +1345,124 @@
+ 
+ 
+ status_t
++OverlayInode::_PopulateAttributeDirents()
++{
++	if (fHasAttributeDirents)
++		return B_OK;
++
++	fHasAttributeDirents = true;
++	if (fIsVirtual || fSuperVnode.ops-&gt;open_attr_dir == NULL
++		|| fSuperVnode.ops-&gt;read_attr_dir == NULL)
++		return B_OK;
++
++	// we don't really care about errors from here on
++	void *superCookie = NULL;
++	status_t result = fSuperVnode.ops-&gt;open_attr_dir(SuperVolume(),
++		&amp;fSuperVnode, &amp;superCookie);
++	if (result != B_OK)
++		return B_OK;
++
++	size_t bufferSize = sizeof(struct dirent) + B_FILE_NAME_LENGTH;
++	struct dirent *buffer = (struct dirent *)malloc(bufferSize);
++	if (buffer == NULL)
++		goto close_attr_dir;
++
++	while (true) {
++		uint32 num = 1;
++		result = fSuperVnode.ops-&gt;read_attr_dir(SuperVolume(),
++			&amp;fSuperVnode, superCookie, buffer, bufferSize, &amp;num);
++		if (result != B_OK || num == 0)
++			break;
++
++		overlay_dirent **newDirents = (overlay_dirent **)realloc(
++			fAttributeDirents, sizeof(overlay_dirent *)
++				* (fAttributeDirentCount + num));
++		if (newDirents == NULL) {
++			TRACE_ALWAYS(&quot;failed to allocate storage for attribute dirents\n&quot;);
++			break;
++		}
++
++		fAttributeDirents = newDirents;
++		struct dirent *dirent = buffer;
++		for (uint32 i = 0; i &lt; num; i++) {
++			overlay_dirent *entry = (overlay_dirent *)malloc(
++				sizeof(overlay_dirent));
++			if (entry == NULL) {
++				TRACE_ALWAYS(&quot;failed to allocate storage for attr dirent\n&quot;);
++				break;
++			}
++
++			entry-&gt;node = NULL;
++			entry-&gt;inode_number = fInodeNumber;
++			entry-&gt;name = strdup(dirent-&gt;d_name);
++			if (entry-&gt;name == NULL) {
++				TRACE_ALWAYS(&quot;failed to duplicate dirent entry name\n&quot;);
++				free(entry);
++				break;
++			}
++
++			fAttributeDirents[fAttributeDirentCount++] = entry;
++			dirent = (struct dirent *)((uint8 *)dirent + dirent-&gt;d_reclen);
++		}
++	}
++
++	free(buffer);
++
++close_attr_dir:
++	if (fSuperVnode.ops-&gt;close_attr_dir != NULL) {
++		fSuperVnode.ops-&gt;close_attr_dir(SuperVolume(), &amp;fSuperVnode,
++			superCookie);
++	}
++
++	if (fSuperVnode.ops-&gt;free_attr_dir_cookie != NULL) {
++		fSuperVnode.ops-&gt;free_attr_dir_cookie(SuperVolume(), &amp;fSuperVnode,
++			superCookie);
++	}
++
++	return B_OK;
++}
++
++
++status_t
+ OverlayInode::_CreateCommon(const char *name, int type, int perms,
+-	ino_t *newInodeNumber, OverlayInode **_node)
++	ino_t *newInodeNumber, OverlayInode **_node, bool attribute,
++	type_code attributeType)
+ {
++	RecursiveLocker locker(fLock);
+ 	if (!fHasStat)
+-		ReadStat(NULL);
++		_PopulateStat();
+ 
+-	if (!S_ISDIR(fStat.st_mode))
++	if (!attribute &amp;&amp; !S_ISDIR(fStat.st_mode))
+ 		return B_NOT_A_DIRECTORY;
+ 
++	locker.Unlock();
++
+ 	overlay_dirent *entry = (overlay_dirent *)malloc(sizeof(overlay_dirent));
+ 	if (entry == NULL)
+ 		return B_NO_MEMORY;
+ 
++	entry-&gt;node = NULL;
+ 	entry-&gt;name = strdup(name);
+ 	if (entry-&gt;name == NULL) {
+ 		free(entry);
+ 		return B_NO_MEMORY;
+ 	}
+ 
+-	entry-&gt;inode_number = fVolume-&gt;BuildInodeNumber();
++	if (attribute)
++		entry-&gt;inode_number = fInodeNumber;
++	else
++		entry-&gt;inode_number = fVolume-&gt;BuildInodeNumber();
+ 
+ 	OverlayInode *node = new(std::nothrow) OverlayInode(fVolume, NULL,
+-		entry-&gt;inode_number, this, entry-&gt;name, (perms &amp; S_IUMSK) | type);
++		entry-&gt;inode_number, this, entry-&gt;name, (perms &amp; S_IUMSK) | type
++			| (attribute ? S_ATTR : 0), attribute, attributeType);
+ 	if (node == NULL) {
+ 		free(entry-&gt;name);
+ 		free(entry);
+ 		return B_NO_MEMORY;
+ 	}
+ 
+-	status_t result = AddEntry(entry);
++	status_t result = AddEntry(entry, attribute);
+ 	if (result != B_OK) {
+ 		free(entry-&gt;name);
+ 		free(entry);
+@@ -1142,24 +1470,35 @@
+ 		return result;
+ 	}
+ 
+-	result = publish_overlay_vnode(fVolume-&gt;Volume(), entry-&gt;inode_number,
+-		node, type);
+-	if (result != B_OK) {
+-		RemoveEntry(entry-&gt;name, NULL);
+-		delete node;
+-		return result;
+-	}
++	if (!attribute) {
++		result = publish_overlay_vnode(fVolume-&gt;Volume(), entry-&gt;inode_number,
++			node, type);
++		if (result != B_OK) {
++			RemoveEntry(entry-&gt;name, NULL);
++			delete node;
++			return result;
++		}
++	} else
++		entry-&gt;node = node;
+ 
+-	node-&gt;SetModified();
+-	node-&gt;CreateCache();
++	node-&gt;Lock();
++	node-&gt;SetDataModified();
++	if (!attribute)
++		node-&gt;CreateCache();
++	node-&gt;Unlock();
+ 
+ 	if (newInodeNumber != NULL)
+ 		*newInodeNumber = entry-&gt;inode_number;
+ 	if (_node != NULL)
+ 		*_node = node;
+ 
+-	notify_entry_created(SuperVolume()-&gt;id, fInodeNumber, entry-&gt;name,
+-		entry-&gt;inode_number);
++	if (attribute) {
++		notify_attribute_changed(SuperVolume()-&gt;id, fInodeNumber, entry-&gt;name,
++			B_ATTR_CREATED);
++	} else {
++		notify_entry_created(SuperVolume()-&gt;id, fInodeNumber, entry-&gt;name,
++			entry-&gt;inode_number);
++	}
+ 
+
+[... truncated: 218 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020368.html">[Haiku-commits] r32936 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+	<LI>Next message: <A HREF="020370.html">[Haiku-commits] r32938 -	haiku/branches/releases/r1alpha1/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20369">[ date ]</a>
+              <a href="thread.html#20369">[ thread ]</a>
+              <a href="subject.html#20369">[ subject ]</a>
+              <a href="author.html#20369">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

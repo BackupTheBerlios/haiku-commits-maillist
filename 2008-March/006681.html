@@ -1,0 +1,555 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24321 - in haiku/trunk: headers/os/app	headers/private/app src/kits/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24321%20-%20in%20haiku/trunk%3A%20headers/os/app%0A%09headers/private/app%20src/kits/app&In-Reply-To=%3C200803091335.m29DZgX8027069%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006678.html">
+   <LINK REL="Next"  HREF="006682.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24321 - in haiku/trunk: headers/os/app	headers/private/app src/kits/app</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24321%20-%20in%20haiku/trunk%3A%20headers/os/app%0A%09headers/private/app%20src/kits/app&In-Reply-To=%3C200803091335.m29DZgX8027069%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24321 - in haiku/trunk: headers/os/app	headers/private/app src/kits/app">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun Mar  9 14:35:42 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006678.html">[Haiku-commits] r24320 - in haiku/trunk:	headers/build/private/kernel headers/private/kernel	src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="006682.html">[Haiku-commits] r24322 - in haiku/trunk: headers/private/fs_shell	src/system/kernel/fs src/tools/fs_shell
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6681">[ date ]</a>
+              <a href="thread.html#6681">[ thread ]</a>
+              <a href="subject.html#6681">[ subject ]</a>
+              <a href="author.html#6681">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-03-09 14:35:41 +0100 (Sun, 09 Mar 2008)
+New Revision: 24321
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24321&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24321&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/os/app/Message.h
+   haiku/trunk/headers/private/app/MessagePrivate.h
+   haiku/trunk/src/kits/app/Message.cpp
+Log:
+Rewrite and activate message passing by area. Passing by area works now with
+the new sematic of transfer_area so a message area is transfered into the right
+teams' address space and it does not need to be cloned there anymore. Passing
+by area is only used for messages bigger than a certain size (currently
+hardcoded to 40KB) which should be somehow bound to the max port message size.
+This makes passing large messages (i.e. &gt; the port limit) possible, so for
+example copy&amp;paste of long text, image data, etc. should now work.
+Got rid of the fClonedArea member as it is not necessary with the new design,
+renamed shared_area to message_area in the private message_header, avoid
+an unnecessary allocation of the header for the copy constructors, check
+allocations in a few more places and some minor cleanup.
+
+Modified: haiku/trunk/headers/os/app/Message.h
+===================================================================
+--- haiku/trunk/headers/os/app/Message.h	2008-03-09 12:56:59 UTC (rev 24320)
++++ haiku/trunk/headers/os/app/Message.h	2008-03-09 13:35:41 UTC (rev 24321)
+@@ -257,7 +257,7 @@
+ 		friend class Private;
+ 		friend class BMessageQueue;
+ 
+-		status_t		_InitCommon();
++		status_t		_InitCommon(bool initHeader);
+ 		status_t		_InitHeader();
+ 		status_t		_Clear();
+ 
+@@ -284,14 +284,13 @@
+ 		message_header*	fHeader;
+ 		field_header*	fFields;
+ 		uint8*			fData;
+-		area_id			fClonedArea;
+ 
+ 		mutable	BMessage* fOriginal;
+ 
+ 		BMessage*		fQueueLink;
+ 			// fQueueLink is used by BMessageQueue to build a linked list
+ 
+-		uint32			fReserved[10];
++		uint32			fReserved[11];
+ 
+ 						// deprecated
+ 						BMessage(BMessage *message);
+
+Modified: haiku/trunk/headers/private/app/MessagePrivate.h
+===================================================================
+--- haiku/trunk/headers/private/app/MessagePrivate.h	2008-03-09 12:56:59 UTC (rev 24320)
++++ haiku/trunk/headers/private/app/MessagePrivate.h	2008-03-09 13:35:41 UTC (rev 24321)
+@@ -68,7 +68,7 @@
+ 
+ 	int32		target;
+ 	int32		current_specifier;
+-	area_id		shared_area;
++	area_id		message_area;
+ 
+ 	// reply info
+ 	port_id		reply_port;
+
+Modified: haiku/trunk/src/kits/app/Message.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/Message.cpp	2008-03-09 12:56:59 UTC (rev 24320)
++++ haiku/trunk/src/kits/app/Message.cpp	2008-03-09 13:35:41 UTC (rev 24321)
+@@ -100,6 +100,9 @@
+ 
+ 	status_t result;
+ 	char *buffer = (char *)malloc(size);
++	if (buffer == NULL)
++		return B_NO_MEMORY;
++
+ 	do {
+ 		result = read_port(replyPort, _code, buffer, size);
+ 	} while (result == B_INTERRUPTED);
+@@ -121,14 +124,14 @@
+ BMessage::BMessage()
+ {
+ 	DEBUG_FUNCTION_ENTER;
+-	_InitCommon();
++	_InitCommon(true);
+ }
+ 
+ 
+ BMessage::BMessage(BMessage *other)
+ {
+ 	DEBUG_FUNCTION_ENTER;
+-	_InitCommon();
++	_InitCommon(false);
+ 	*this = *other;
+ }
+ 
+@@ -136,7 +139,7 @@
+ BMessage::BMessage(uint32 _what)
+ {
+ 	DEBUG_FUNCTION_ENTER;
+-	_InitCommon();
++	_InitCommon(true);
+ 	fHeader-&gt;what = what = _what;
+ }
+ 
+@@ -144,7 +147,7 @@
+ BMessage::BMessage(const BMessage &amp;other)
+ {
+ 	DEBUG_FUNCTION_ENTER;
+-	_InitCommon();
++	_InitCommon(false);
+ 	*this = other;
+ }
+ 
+@@ -152,7 +155,6 @@
+ BMessage::~BMessage()
+ {
+ 	DEBUG_FUNCTION_ENTER;
+-
+ 	_Clear();
+ }
+ 
+@@ -184,7 +186,7 @@
+ 		memcpy(fData, other.fData, fHeader-&gt;data_size);
+ 	}
+ 
+-	fHeader-&gt;shared_area = -1;
++	fHeader-&gt;message_area = -1;
+ 	fHeader-&gt;fields_available = 0;
+ 	fHeader-&gt;data_available = 0;
+ 	fHeader-&gt;what = what = other.what;
+@@ -219,7 +221,7 @@
+ 
+ 
+ status_t
+-BMessage::_InitCommon()
++BMessage::_InitCommon(bool initHeader)
+ {
+ 	DEBUG_FUNCTION_ENTER;
+ 	what = 0;
+@@ -228,12 +230,14 @@
+ 	fFields = NULL;
+ 	fData = NULL;
+ 
+-	fClonedArea = -1;
+-
+ 	fOriginal = NULL;
+ 	fQueueLink = NULL;
+ 
+-	return _InitHeader();
++	if (initHeader)
++		return _InitHeader();
++
++	fHeader = NULL;
++	return B_OK;
+ }
+ 
+ 
+@@ -248,7 +252,7 @@
+ 	fHeader-&gt;flags = MESSAGE_FLAG_VALID;
+ 	fHeader-&gt;what = what;
+ 	fHeader-&gt;current_specifier = -1;
+-	fHeader-&gt;shared_area = -1;
++	fHeader-&gt;message_area = -1;
+ 
+ 	fHeader-&gt;target = B_NULL_TOKEN;
+ 	fHeader-&gt;reply_target = B_NULL_TOKEN;
+@@ -266,17 +270,20 @@
+ BMessage::_Clear()
+ {
+ 	DEBUG_FUNCTION_ENTER;
+-	// We're going to destroy all information of this message. If there's
+-	// still someone waiting for a reply to this message, we have to send
+-	// one now.
+-	if (IsSourceWaiting())
+-		SendReply(B_NO_REPLY);
++	if (fHeader) {
++		// We're going to destroy all information of this message. If there's
++		// still someone waiting for a reply to this message, we have to send
++		// one now.
++		if (IsSourceWaiting())
++			SendReply(B_NO_REPLY);
+ 
+-	if (fClonedArea &gt;= B_OK)
+-		_Dereference();
++		if (fHeader-&gt;message_area &gt;= 0)
++			_Dereference();
+ 
+-	free(fHeader);
+-	fHeader = NULL;
++		free(fHeader);
++		fHeader = NULL;
++	}
++
+ 	free(fFields);
+ 	fFields = NULL;
+ 	free(fData);
+@@ -561,7 +568,7 @@
+ 	if (!oldEntry || !newEntry)
+ 		return B_BAD_VALUE;
+ 
+-	if (fClonedArea &gt;= B_OK)
++	if (fHeader-&gt;message_area &gt;= 0)
+ 		_CopyForWrite();
+ 
+ 	uint32 hash = _HashName(oldEntry) % fHeader-&gt;hash_table_size;
+@@ -926,6 +933,9 @@
+ {
+ 	DEBUG_FUNCTION_ENTER;
+ 	message_header *header = (message_header *)malloc(sizeof(message_header));
++	if (header == NULL)
++		return B_NO_MEMORY;
++
+ 	memcpy(header, fHeader, sizeof(message_header));
+ 
+ 	header-&gt;what = what;
+@@ -934,7 +944,7 @@
+ 	header-&gt;flags |= MESSAGE_FLAG_PASS_BY_AREA;
+ 	*_header = header;
+ 
+-	if (header-&gt;shared_area &gt;= B_OK)
++	if (header-&gt;message_area &gt;= 0)
+ 		return B_OK;
+ 
+ 	if (header-&gt;fields_size == 0 &amp;&amp; header-&gt;data_size == 0)
+@@ -943,7 +953,7 @@
+ 	uint8 *address = NULL;
+ 	ssize_t size = header-&gt;fields_size + header-&gt;data_size;
+ 	size = (size + B_PAGE_SIZE) &amp; ~(B_PAGE_SIZE - 1);
+-	area_id area = create_area(&quot;Shared BMessage data&quot;, (void **)&amp;address,
++	area_id area = create_area(&quot;BMessage data&quot;, (void **)&amp;address,
+ 		B_ANY_ADDRESS, size, B_NO_LOCK, B_READ_AREA | B_WRITE_AREA);
+ 
+ 	if (area &lt; B_OK) {
+@@ -963,7 +973,7 @@
+ 		header-&gt;data_checksum = BPrivate::CalculateChecksum((uint8 *)address, header-&gt;data_size);
+ 	}
+ 
+-	header-&gt;shared_area = area;
++	header-&gt;message_area = area;
+ 	return B_OK;
+ }
+ 
+@@ -979,25 +989,37 @@
+ 	if (fHeader-&gt;fields_size == 0 &amp;&amp; header-&gt;data_size == 0)
+ 		return B_OK;
+ 
++	area_info areaInfo;
++	status_t result = get_area_info(fHeader-&gt;message_area, &amp;areaInfo);
++	if (result &lt; B_OK)
++		return result;
++
+ 	uint8 *address = NULL;
+-	area_id clone = clone_area(&quot;Cloned BMessage data&quot;, (void **)&amp;address,
+-		B_ANY_ADDRESS, B_READ_AREA, fHeader-&gt;shared_area);
++	thread_info threadInfo;
++	get_thread_info(find_thread(NULL), &amp;threadInfo);
++	if (areaInfo.team != threadInfo.team) {
++#ifndef HAIKU_TARGET_PLATFORM_LIBBE_TEST
++		// we are accessing a message from a port not owned by us
++		area_id transfered = _kern_transfer_area(fHeader-&gt;message_area,
++			(void **)&amp;address, B_ANY_ADDRESS, threadInfo.team);
++		if (transfered &lt; 0) {
++			debug_printf(&quot;BMessage: failed to transfer area into current team\n&quot;);
++			return transfered;
++		}
+ 
+-	if (clone &lt; B_OK) {
+-		free(fHeader);
+-		fHeader = NULL;
+-		_InitHeader();
+-		return clone;
+-	}
++		fHeader-&gt;message_area = transfered;
++#endif
++	} else
++		address = (uint8 *)areaInfo.address;
+ 
+-	fClonedArea = clone;
+ 	fFields = (field_header *)address;
+ 	address += fHeader-&gt;fields_size;
+ 	fData = address;
+ 
++	// ToDo: once we fully trust this mechanism we might want to remove this
+ 	if (fHeader-&gt;fields_checksum != BPrivate::CalculateChecksum((uint8 *)fFields, fHeader-&gt;fields_size)
+ 		|| fHeader-&gt;data_checksum != BPrivate::CalculateChecksum((uint8 *)fData, fHeader-&gt;data_size)) {
+-		debug_printf(&quot;checksum mismatch\n&quot;);
++		debug_printf(&quot;BMessage: checksum mismatch in message passed by area!\n&quot;);
+ 		_Clear();
+ 		_InitHeader();
+ 		return B_BAD_VALUE;
+@@ -1011,8 +1033,8 @@
+ BMessage::_Dereference()
+ {
+ 	DEBUG_FUNCTION_ENTER;
+-	delete_area(fClonedArea);
+-	fClonedArea = -1;
++	delete_area(fHeader-&gt;message_area);
++	fHeader-&gt;message_area = -1;
+ 	fFields = NULL;
+ 	fData = NULL;
+ 	return B_OK;
+@@ -1023,19 +1045,25 @@
+ BMessage::_CopyForWrite()
+ {
+ 	DEBUG_FUNCTION_ENTER;
+-	if (fClonedArea &lt; B_OK)
+-		return B_OK;
+ 
+ 	field_header *newFields = NULL;
+ 	uint8 *newData = NULL;
+ 
+ 	if (fHeader-&gt;fields_size &gt; 0) {
+ 		newFields = (field_header *)malloc(fHeader-&gt;fields_size);
++		if (newFields == NULL)
++			return B_NO_MEMORY;
++
+ 		memcpy(newFields, fFields, fHeader-&gt;fields_size);
+ 	}
+ 
+ 	if (fHeader-&gt;data_size &gt; 0) {
+ 		newData = (uint8 *)malloc(fHeader-&gt;data_size);
++		if (newData == NULL) {
++			free(newFields);
++			return B_NO_MEMORY;
++		}
++
+ 		memcpy(newData, fData, fHeader-&gt;data_size);
+ 	}
+ 
+@@ -1089,7 +1117,7 @@
+ 		if (result &lt; B_OK)
+ 			return result;
+ 	} else {
+-		fHeader-&gt;shared_area = -1;
++		fHeader-&gt;message_area = -1;
+ 
+ 		if (fHeader-&gt;fields_size &gt; 0) {
+ 			fFields = (field_header *)malloc(fHeader-&gt;fields_size);
+@@ -1102,8 +1130,11 @@
+ 
+ 		if (fHeader-&gt;data_size &gt; 0) {
+ 			fData = (uint8 *)malloc(fHeader-&gt;data_size);
+-			if (!fData)
++			if (!fData) {
++				free(fFields);
++				fFields = NULL;
+ 				return B_NO_MEMORY;
++			}
+ 
+ 			memcpy(fData, flatBuffer, fHeader-&gt;data_size);
+ 		}
+@@ -1156,7 +1187,7 @@
+ 		if (result &lt; B_OK)
+ 			return result;
+ 	} else {
+-		fHeader-&gt;shared_area = -1;
++		fHeader-&gt;message_area = -1;
+ 
+ 		if (result == B_OK &amp;&amp; fHeader-&gt;fields_size &gt; 0) {
+ 			fFields = (field_header *)malloc(fHeader-&gt;fields_size);
+@@ -1571,7 +1602,7 @@
+ 	if (numBytes &lt;= 0 || !data)
+ 		return B_BAD_VALUE;
+ 
+-	if (fClonedArea &gt;= B_OK)
++	if (fHeader-&gt;message_area &gt;= 0)
+ 		_CopyForWrite();
+ 
+ 	field_header *field = NULL;
+@@ -1628,7 +1659,7 @@
+ 	if (index &lt; 0)
+ 		return B_BAD_VALUE;
+ 
+-	if (fClonedArea &gt;= B_OK)
++	if (fHeader-&gt;message_area &gt;= 0)
+ 		_CopyForWrite();
+ 
+ 	field_header *field = NULL;
+@@ -1679,7 +1710,7 @@
+ BMessage::RemoveName(const char *name)
+ {
+ 	DEBUG_FUNCTION_ENTER;
+-	if (fClonedArea &gt;= B_OK)
++	if (fHeader-&gt;message_area &gt;= 0)
+ 		_CopyForWrite();
+ 
+ 	field_header *field = NULL;
+@@ -1751,9 +1782,6 @@
+ 	if (numBytes &lt;= 0 || !data)
+ 		return B_BAD_VALUE;
+ 
+-	if (fClonedArea &gt;= B_OK)
+-		_CopyForWrite();
+-
+ 	field_header *field = NULL;
+ 	status_t result = _FindField(name, type, &amp;field);
+ 
+@@ -1766,6 +1794,9 @@
+ 	if (index &gt;= field-&gt;count)
+ 		return B_BAD_INDEX;
+ 
++	if (fHeader-&gt;message_area &gt;= 0)
++		_CopyForWrite();
++
+ 	if (field-&gt;flags &amp; FIELD_FLAG_FIXED_SIZE) {
+ 		ssize_t size = field-&gt;data_size / field-&gt;count;
+ 		if (size != numBytes)
+@@ -1885,7 +1916,7 @@
+ 	ssize_t size = 0;
+ 	char *buffer = NULL;
+ 	message_header *header = NULL;
+-	status_t result;
++	status_t result = B_OK;
+ 
+ 	BPrivate::BDirectMessageTarget* direct = NULL;
+ 	BMessage* copy = NULL;
+@@ -1900,38 +1931,56 @@
+ 		if (copy != NULL) {
+ 			header = copy-&gt;fHeader;
+ 			header-&gt;flags = fHeader-&gt;flags;
+-			result = B_OK;
+ 		} else {
+ 			direct-&gt;Release();
+-			result = B_NO_MEMORY;
++			return B_NO_MEMORY;
+ 		}
+-	} else if (/*fHeader-&gt;fields_size + fHeader-&gt;data_size &gt; B_PAGE_SIZE*/false) {
++#ifndef HAIKU_TARGET_PLATFORM_LIBBE_TEST
++	} else if (fHeader-&gt;fields_size + fHeader-&gt;data_size &gt; B_PAGE_SIZE * 10) {
++		// ToDo: bind the above size to the max port message size
++		// use message passing by area for such a large message
+ 		result = _FlattenToArea(&amp;header);
++		if (result &lt; B_OK)
++			return result;
++
+ 		buffer = (char *)header;
+ 		size = sizeof(message_header);
+ 
+-#ifndef HAIKU_TARGET_PLATFORM_LIBBE_TEST
+-		// TODO: this is not yet finished - the target needs to get the
+-		// address (and ID) of the area
+-		port_info info;
+-		get_port_info(port, &amp;info);
++		team_id target = portOwner;
++		if (target &lt; 0) {
++			port_info info;
++			result = get_port_info(port, &amp;info);
++			if (result &lt; B_OK)
++				return result;
++			target = info.team;
++		}
++
+ 		void *address = NULL;
+-		_kern_transfer_area(header-&gt;shared_area, &amp;address, B_ANY_ADDRESS,
+-			info.team);
++		area_id transfered = _kern_transfer_area(header-&gt;message_area,
++			&amp;address, B_ANY_ADDRESS, target);
++		if (transfered &lt; B_OK) {
++			delete_area(header-&gt;message_area);
++			free(header);
++			return transfered;
++		}
++
++		header-&gt;message_area = transfered;
+ #endif
+ 	} else {
+ 		size = _NativeFlattenedSize();
+ 		buffer = (char *)malloc(size);
+-		if (buffer != NULL) {
+-			result = _NativeFlatten(buffer, size);
+-			header = (message_header *)buffer;
+-		} else
+-			result = B_NO_MEMORY;
++		if (buffer == NULL)
++			return B_NO_MEMORY;
++
++		result = _NativeFlatten(buffer, size);
++		if (result &lt; B_OK) {
++			free(buffer);
++			return result;
++		}
++
++		header = (message_header *)buffer;
+ 	}
+ 
+-	if (result &lt; B_OK)
+-		return result;
+-
+ 	if (!replyTo.IsValid()) {
+ 		BMessenger::Private(replyTo).SetTo(fHeader-&gt;reply_team,
+ 			fHeader-&gt;reply_port, fHeader-&gt;reply_target);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006678.html">[Haiku-commits] r24320 - in haiku/trunk:	headers/build/private/kernel headers/private/kernel	src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="006682.html">[Haiku-commits] r24322 - in haiku/trunk: headers/private/fs_shell	src/system/kernel/fs src/tools/fs_shell
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6681">[ date ]</a>
+              <a href="thread.html#6681">[ thread ]</a>
+              <a href="subject.html#6681">[ subject ]</a>
+              <a href="author.html#6681">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,205 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22857 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22857%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200711080930.lA89UwfX022571%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004658.html">
+   <LINK REL="Next"  HREF="004660.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22857 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22857%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200711080930.lA89UwfX022571%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22857 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Nov  8 10:30:58 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004658.html">[Haiku-commits] r22856 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="004660.html">[Haiku-commits] r22857 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4659">[ date ]</a>
+              <a href="thread.html#4659">[ thread ]</a>
+              <a href="subject.html#4659">[ subject ]</a>
+              <a href="author.html#4659">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-11-08 10:30:58 +0100 (Thu, 08 Nov 2007)
+New Revision: 22857
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22857&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22857&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+Log:
+The file cache now completely bypasses the cache for writes equal or larger
+than 64KB. Reads should probably get a similar logic, at least if memory is
+tight.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-11-07 22:26:55 UTC (rev 22856)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-11-08 09:30:58 UTC (rev 22857)
+@@ -78,7 +78,11 @@
+ 	bool			last_access_was_write;
+ };
+ 
++typedef status_t (*cache_func)(file_cache_ref *ref, off_t offset,
++	size_t numBytes, int32 pageOffset, addr_t buffer, size_t bufferSize,
++	size_t lastReservedPages, size_t reservePages);
+ 
++
+ static struct cache_module_info *sCacheModule;
+ 
+ 
+@@ -853,10 +857,32 @@
+ 
+ 
+ static status_t
+-satisfy_cache_io(file_cache_ref *ref, off_t offset, addr_t buffer,
+-	int32 &amp;pageOffset, size_t bytesLeft, size_t &amp;reservePages,
++write_to_file(file_cache_ref *ref, off_t offset, size_t numBytes,
++	int32 pageOffset, addr_t buffer, size_t bufferSize,
++	size_t lastReservedPages, size_t reservePages)
++{
++	iovec vec;
++	vec.iov_base = (void *)buffer;
++	vec.iov_len = bufferSize;
++
++	mutex_unlock(&amp;ref-&gt;cache-&gt;lock);
++	vm_page_unreserve_pages(lastReservedPages);
++
++	status_t status = pages_io(ref, offset, &amp;vec, 1, &amp;numBytes, true);
++	if (status == B_OK)
++		reserve_pages(ref, reservePages, true);
++
++	mutex_lock(&amp;ref-&gt;cache-&gt;lock);
++
++	return status;
++}
++
++
++static inline status_t
++satisfy_cache_io(file_cache_ref *ref, cache_func function, off_t offset,
++	addr_t buffer, int32 &amp;pageOffset, size_t bytesLeft, size_t &amp;reservePages,
+ 	off_t &amp;lastOffset, addr_t &amp;lastBuffer, int32 &amp;lastPageOffset,
+-	size_t &amp;lastLeft, size_t &amp;lastReservedPages, bool doWrite)
++	size_t &amp;lastLeft, size_t &amp;lastReservedPages)
+ {
+ 	if (lastBuffer == buffer)
+ 		return B_OK;
+@@ -865,14 +891,8 @@
+ 	reservePages = min_c(MAX_IO_VECS,
+ 		(lastLeft - requestSize + B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT);
+ 
+-	status_t status;
+-	if (doWrite) {
+-		status = write_to_cache(ref, lastOffset, requestSize, lastPageOffset,
+-			lastBuffer, requestSize, lastReservedPages, reservePages);
+-	} else {
+-		status = read_into_cache(ref, lastOffset, requestSize, lastPageOffset,
+-			lastBuffer, requestSize, lastReservedPages, reservePages);
+-	}
++	status_t status = function(ref, lastOffset, requestSize, lastPageOffset,
++		lastBuffer, requestSize, lastReservedPages, reservePages);
+ 	if (status == B_OK) {
+ 		lastReservedPages = reservePages;
+ 		lastBuffer = buffer;
+@@ -917,6 +937,15 @@
+ 	if (size == 0)
+ 		return B_OK;
+ 
++	cache_func function;
++	if (doWrite) {
++		if (size &gt;= 65536)
++			function = write_to_file;
++		else
++			function = write_to_cache;
++	} else
++		function = read_into_cache;
++
+ 	// &quot;offset&quot; and &quot;lastOffset&quot; are always aligned to B_PAGE_SIZE,
+ 	// the &quot;last*&quot; variables always point to the end of the last
+ 	// satisfied request part
+@@ -941,9 +970,9 @@
+ 			// in the near future, we need to satisfy the request of the pages
+ 			// we didn't get yet (to make sure no one else interferes in the
+ 			// mean time).
+-			status_t status = satisfy_cache_io(ref, offset, buffer, pageOffset,
+-				bytesLeft, reservePages, lastOffset, lastBuffer, lastPageOffset,
+-				lastLeft, lastReservedPages, doWrite);
++			status_t status = satisfy_cache_io(ref, function, offset, buffer,
++				pageOffset, bytesLeft, reservePages, lastOffset, lastBuffer,
++				lastPageOffset, lastLeft, lastReservedPages);
+ 			if (status != B_OK)
+ 				return status;
+ 
+@@ -1009,9 +1038,9 @@
+ 		offset += B_PAGE_SIZE;
+ 
+ 		if (buffer - lastBuffer + lastPageOffset &gt;= kMaxChunkSize) {
+-			status_t status = satisfy_cache_io(ref, offset, buffer, pageOffset,
+-				bytesLeft, reservePages, lastOffset, lastBuffer, lastPageOffset,
+-				lastLeft, lastReservedPages, doWrite);
++			status_t status = satisfy_cache_io(ref, function, offset, buffer,
++				pageOffset, bytesLeft, reservePages, lastOffset, lastBuffer,
++				lastPageOffset, lastLeft, lastReservedPages);
+ 			if (status != B_OK)
+ 				return status;
+ 		}
+@@ -1019,16 +1048,8 @@
+ 
+ 	// fill the last remaining bytes of the request (either write or read)
+ 
+-	status_t status;
+-	if (doWrite) {
+-		status = write_to_cache(ref, lastOffset, lastLeft, lastPageOffset,
+-			lastBuffer, lastLeft, lastReservedPages, 0);
+-	} else {
+-		status = read_into_cache(ref, lastOffset, lastLeft, lastPageOffset,
+-			lastBuffer, lastLeft, lastReservedPages, 0);
+-	}
+-
+-	return status;
++	return function(ref, lastOffset, lastLeft, lastPageOffset,
++		lastBuffer, lastLeft, lastReservedPages, 0);
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004658.html">[Haiku-commits] r22856 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="004660.html">[Haiku-commits] r22857 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4659">[ date ]</a>
+              <a href="thread.html#4659">[ thread ]</a>
+              <a href="subject.html#4659">[ subject ]</a>
+              <a href="author.html#4659">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

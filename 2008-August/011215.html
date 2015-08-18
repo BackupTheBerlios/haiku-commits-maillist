@@ -1,0 +1,295 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27140 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27140%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200808221019.m7MAJTjm021446%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011214.html">
+   <LINK REL="Next"  HREF="011218.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27140 - haiku/trunk/src/system/kernel</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27140%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200808221019.m7MAJTjm021446%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27140 - haiku/trunk/src/system/kernel">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Aug 22 12:19:29 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011214.html">[Haiku-commits] r27139 -	haiku/trunk/src/add-ons/kernel/file_systems/udf
+</A></li>
+        <LI>Next message: <A HREF="011218.html">[Haiku-commits] r27141 - haiku/trunk/src/kits/tracker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11215">[ date ]</a>
+              <a href="thread.html#11215">[ thread ]</a>
+              <a href="subject.html#11215">[ subject ]</a>
+              <a href="author.html#11215">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-08-22 12:19:29 +0200 (Fri, 22 Aug 2008)
+New Revision: 27140
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27140&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27140&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/module.cpp
+Log:
+* unload_module_image() was never called with image == NULL, so I just removed
+  that possibility.
+* It now has a &quot;remove&quot; argument instead, that decides whether or not the
+  image has to be removed from the hash still.
+* Moved locking to put_module_image(), ie. both, {load|unload}_module_image()
+  need to be called with the sModulesLock held now.
+* module_init_post_boot_device() needs to remove the image from the hash itself,
+  or else it messes up its hash iterator.
+* check_module_image() could call unload_module_image() under certain
+  conditions - but this was completely wrong, and could have caused crashes.
+* search_module()/check_module_image() now keep a reference to the module
+  image on success, thus a caller doesn't need to call get_module_image()
+  again afterwards - this also fixes another round of potential module
+  unloading to happen.
+* That reference is leaked for built-in modules in get_module(), but it doesn't
+  matter for them, anyway.
+
+
+Modified: haiku/trunk/src/system/kernel/module.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/module.cpp	2008-08-22 10:15:35 UTC (rev 27139)
++++ haiku/trunk/src/system/kernel/module.cpp	2008-08-22 10:19:29 UTC (rev 27140)
+@@ -373,9 +373,10 @@
+ }
+ 
+ 
+-/*!	Try to load the module image at the specified location.
+-	If it could be loaded, it returns B_OK, and stores a pointer
+-	to the module_image object in &quot;_moduleImage&quot;.
++/*!	Try to load the module image at the specified \a path.
++	If it could be loaded, it returns \c B_OK, and stores a pointer
++	to the module_image object in \a _moduleImage.
++	Needs to be called with the sModulesLock held.
+ */
+ static status_t
+ load_module_image(const char* path, module_image** _moduleImage)
+@@ -385,6 +386,7 @@
+ 	image_id image;
+ 
+ 	TRACE((&quot;load_module_image(path = \&quot;%s\&quot;, _image = %p)\n&quot;, path, _moduleImage));
++	ASSERT_LOCKED_RECURSIVE(&amp;sModulesLock);
+ 	ASSERT(_moduleImage != NULL);
+ 
+ 	image = load_kernel_add_on(path);
+@@ -437,28 +439,23 @@
+ }
+ 
+ 
++/*!	Unloads the module's kernel add-on. The \a image will be freed.
++	Needs to be called with the sModulesLock held.
++*/
+ static status_t
+-unload_module_image(module_image* moduleImage, const char* path)
++unload_module_image(module_image* moduleImage, bool remove)
+ {
+-	TRACE((&quot;unload_module_image(image = %p, path = %s)\n&quot;, moduleImage, path));
++	TRACE((&quot;unload_module_image(image %p, remove %d)\n&quot;, moduleImage, remove));
++	ASSERT_LOCKED_RECURSIVE(&amp;sModulesLock);
+ 
+-	RecursiveLocker locker(sModulesLock);
+-
+-	if (moduleImage == NULL) {
+-		// if no image was specified, lookup it up in the hash table
+-		moduleImage = (module_image*)hash_lookup(sModuleImagesHash, path);
+-		if (moduleImage == NULL)
+-			return B_ENTRY_NOT_FOUND;
+-	}
+-
+ 	if (moduleImage-&gt;ref_count != 0) {
+ 		FATAL((&quot;Can't unload %s due to ref_cnt = %ld\n&quot;, moduleImage-&gt;path,
+ 			moduleImage-&gt;ref_count));
+ 		return B_ERROR;
+ 	}
+ 
+-	hash_remove(sModuleImagesHash, moduleImage);
+-	locker.Unlock();
++	if (remove)
++		hash_remove(sModuleImagesHash, moduleImage);
+ 
+ 	unload_kernel_add_on(moduleImage-&gt;image);
+ 	free(moduleImage-&gt;path);
+@@ -471,6 +468,8 @@
+ static void
+ put_module_image(module_image* image)
+ {
++	RecursiveLocker locker(sModulesLock);
++
+ 	int32 refCount = atomic_add(&amp;image-&gt;ref_count, -1);
+ 	ASSERT(refCount &gt; 0);
+ 
+@@ -478,7 +477,7 @@
+ 	// (because chances are that we will never be able to access it again)
+ 
+ 	if (refCount == 1 &amp;&amp; !image-&gt;keep_loaded &amp;&amp; gBootDevice &gt; 0)
+-		unload_module_image(image, NULL);
++		unload_module_image(image, true);
+ }
+ 
+ 
+@@ -562,18 +561,22 @@
+ }
+ 
+ 
+-/*!	Loads the file at &quot;path&quot; and scans all modules contained therein.
+-	Returns B_OK if &quot;searchedName&quot; could be found under those modules,
+-	B_ENTRY_NOT_FOUND if not.
++/*!	Loads the file at \a path and scans all modules contained therein.
++	Returns \c B_OK if \a searchedName could be found under those modules,
++	and will return the referenced image in \a _moduleImage.
++	Returns \c B_ENTRY_NOT_FOUND if the module could not be found.
++
+ 	Must only be called for files that haven't been scanned yet.
+-	&quot;searchedName&quot; is allowed to be NULL (if all modules should be scanned)
++	\a searchedName is allowed to be \c NULL (if all modules should be scanned)
+ */
+ static status_t
+-check_module_image(const char* path, const char* searchedName)
++check_module_image(const char* path, const char* searchedName,
++	module_image** _moduleImage)
+ {
++	status_t status = B_ENTRY_NOT_FOUND;
+ 	module_image* image;
+ 	module_info** info;
+-	int index = 0, match = B_ENTRY_NOT_FOUND;
++	int index = 0;
+ 
+ 	TRACE((&quot;check_module_image(path = \&quot;%s\&quot;, searchedName = \&quot;%s\&quot;)\n&quot;, path,
+ 		searchedName));
+@@ -586,22 +589,18 @@
+ 		// name matches if it was a new entry
+ 		if (create_module(*info, path, index++, NULL) == B_OK) {
+ 			if (searchedName &amp;&amp; !strcmp((*info)-&gt;name, searchedName))
+-				match = B_OK;
++				status = B_OK;
+ 		}
+ 	}
+ 
+-	// The module we looked for couldn't be found, so we can unload the
+-	// loaded module at this point
+-	if (match != B_OK) {
+-		TRACE((&quot;check_module_file: unloading module file \&quot;%s\&quot; (not used yet)\n&quot;,
+-			path));
+-		unload_module_image(image, path);
++	if (status != B_OK) {
++		// decrement the ref we got in get_module_image
++		put_module_image(image);
++		return status;
+ 	}
+ 
+-	// decrement the ref we got in get_module_image
+-	put_module_image(image);
+-
+-	return match;
++	*_moduleImage = image;
++	return B_OK;
+ }
+ 
+ 
+@@ -609,7 +608,7 @@
+ 	saves us some extra checking here :)
+ */
+ static module*
+-search_module(const char* name)
++search_module(const char* name, module_image** _moduleImage)
+ {
+ 	status_t status = B_ENTRY_NOT_FOUND;
+ 	uint32 i;
+@@ -635,7 +634,7 @@
+ 			path.BufferSize());
+ 		if (status == B_OK) {
+ 			path.UnlockBuffer();
+-			status = check_module_image(path.Path(), name);
++			status = check_module_image(path.Path(), name, _moduleImage);
+ 			if (status == B_OK)
+ 				break;
+ 		}
+@@ -1850,8 +1849,10 @@
+ 		if (image == NULL)
+ 			break;
+ 
+-		if (image-&gt;ref_count == 0 &amp;&amp; !image-&gt;keep_loaded)
+-			unload_module_image(image, NULL);
++		if (image-&gt;ref_count == 0 &amp;&amp; !image-&gt;keep_loaded) {
++			hash_remove_current(sModuleImagesHash, &amp;iterator);
++			unload_module_image(image, false);
++		}
+ 	}
+ 
+ 	return B_OK;
+@@ -2076,7 +2077,7 @@
+ status_t
+ get_module(const char* path, module_info** _info)
+ {
+-	module_image* moduleImage;
++	module_image* moduleImage = NULL;
+ 	module* module;
+ 	status_t status;
+ 
+@@ -2091,7 +2092,7 @@
+ 
+ 	// if we don't have it cached yet, search for it
+ 	if (module == NULL) {
+-		module = search_module(path);
++		module = search_module(path, &amp;moduleImage);
+ 		if (module == NULL) {
+ 			FATAL((&quot;module: Search for %s failed.\n&quot;, path));
+ 			return B_ENTRY_NOT_FOUND;
+@@ -2099,14 +2100,15 @@
+ 	}
+ 
+ 	if ((module-&gt;flags &amp; B_BUILT_IN_MODULE) == 0) {
+-		/* We now need to find the module_image for the module. This should
++		/* We now need to find the module_image for the module. This will
+ 		 * be in memory if we have just run search_module(), but may not be
+ 		 * if we are using cached information.
+ 		 * We can't use the module-&gt;module_image pointer, because it is not
+ 		 * reliable at this point (it won't be set to NULL when the module_image
+ 		 * is unloaded).
+ 		 */
+-		if (get_module_image(module-&gt;file, &amp;moduleImage) &lt; B_OK)
++		if (moduleImage == NULL
++			&amp;&amp; get_module_image(module-&gt;file, &amp;moduleImage) &lt; B_OK)
+ 			return B_ENTRY_NOT_FOUND;
+ 
+ 		// (re)set in-memory data for the loaded module
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011214.html">[Haiku-commits] r27139 -	haiku/trunk/src/add-ons/kernel/file_systems/udf
+</A></li>
+	<LI>Next message: <A HREF="011218.html">[Haiku-commits] r27141 - haiku/trunk/src/kits/tracker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11215">[ date ]</a>
+              <a href="thread.html#11215">[ thread ]</a>
+              <a href="subject.html#11215">[ subject ]</a>
+              <a href="author.html#11215">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

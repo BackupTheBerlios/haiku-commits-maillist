@@ -1,0 +1,595 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20889 - in haiku/trunk:	headers/private/kernel/slab src/system/kernel/slab
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20889%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/slab%20src/system/kernel/slab&In-Reply-To=%3C200704282135.l3SLZdkV019788%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001901.html">
+   <LINK REL="Next"  HREF="001903.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20889 - in haiku/trunk:	headers/private/kernel/slab src/system/kernel/slab</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20889%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/slab%20src/system/kernel/slab&In-Reply-To=%3C200704282135.l3SLZdkV019788%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20889 - in haiku/trunk:	headers/private/kernel/slab src/system/kernel/slab">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Sat Apr 28 23:35:39 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001901.html">[Haiku-commits] r20888 - haiku/trunk/src/tools/fs_shell
+</A></li>
+        <LI>Next message: <A HREF="001903.html">[Haiku-commits] r20890 - in haiku/trunk: headers/build/os/support	headers/private/fs_shell src/build/libroot src/tools/fs_shell
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1902">[ date ]</a>
+              <a href="thread.html#1902">[ thread ]</a>
+              <a href="subject.html#1902">[ subject ]</a>
+              <a href="author.html#1902">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-28 23:35:23 +0200 (Sat, 28 Apr 2007)
+New Revision: 20889
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20889&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20889&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/slab/Base.h
+   haiku/trunk/headers/private/kernel/slab/Depot.h
+   haiku/trunk/src/system/kernel/slab/Slab.cpp
+Log:
+some object cache / slab improvements.
+
+ - call the reclaimer callback when low on memory.
+ - use the depot when on multi-cpu setups (for scalability).
+ - fixed the amount of memory spent on slabs for very large objects.
+
+
+Modified: haiku/trunk/headers/private/kernel/slab/Base.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/slab/Base.h	2007-04-28 21:34:54 UTC (rev 20888)
++++ haiku/trunk/headers/private/kernel/slab/Base.h	2007-04-28 21:35:23 UTC (rev 20889)
+@@ -30,7 +30,7 @@
+ 
+ typedef status_t (*object_cache_constructor)(void *cookie, void *object);
+ typedef void (*object_cache_destructor)(void *cookie, void *object);
+-typedef void (*object_cache_reclaimer)(void *cookie, void *object);
++typedef void (*object_cache_reclaimer)(void *cookie, int32 level);
+ 
+ object_cache *create_object_cache(const char *name, size_t object_size,
+ 	size_t alignment, void *cookie, object_cache_constructor constructor,
+
+Modified: haiku/trunk/headers/private/kernel/slab/Depot.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/slab/Depot.h	2007-04-28 21:34:54 UTC (rev 20888)
++++ haiku/trunk/headers/private/kernel/slab/Depot.h	2007-04-28 21:35:23 UTC (rev 20889)
+@@ -9,46 +9,32 @@
+ #ifndef _SLAB_DEPOT_H_
+ #define _SLAB_DEPOT_H_
+ 
+-#include &lt;stdint.h&gt;
+-
+ #include &lt;lock.h&gt;
+-#include &lt;smp.h&gt;
++#include &lt;KernelExport.h&gt;
+ 
+ #ifdef __cplusplus
+ extern &quot;C&quot; {
+ #endif
+ 
+-typedef struct base_depot {
++typedef struct object_depot {
+ 	benaphore lock;
+ 	struct depot_magazine *full, *empty;
+ 	size_t full_count, empty_count;
+ 	struct depot_cpu_store *stores;
+ 
+-	void (*return_object)(struct base_depot *depot, void *object);
+-} base_depot;
++	void (*return_object)(struct object_depot *depot, void *object);
++} object_depot;
+ 
+ 
+-typedef struct depot_cpu_store {
+-	benaphore lock;
+-	struct depot_magazine *loaded, *previous;
+-} depot_cpu_store;
++status_t object_depot_init(object_depot *depot,
++	void (*return_object)(object_depot *, void *));
++void object_depot_destroy(object_depot *depot);
+ 
++void *object_depot_obtain(object_depot *depot);
++int object_depot_store(object_depot *depot, void *object);
+ 
+-static inline depot_cpu_store *
+-base_depot_cpu(base_depot *depot)
+-{
+-	return &amp;depot-&gt;stores[smp_get_current_cpu()];
+-}
++void object_depot_make_empty(object_depot *depot);
+ 
+-
+-status_t base_depot_init(base_depot *depot,
+-	void (*return_object)(base_depot *, void *));
+-void base_depot_destroy(base_depot *depot);
+-void *base_depot_obtain_from_store(base_depot *depot, depot_cpu_store *store);
+-int base_depot_return_to_store(base_depot *depot, depot_cpu_store *store,
+-	void *object);
+-void base_depot_make_empty(base_depot *depot);
+-
+ #ifdef __cplusplus
+ }
+ #endif
+
+Modified: haiku/trunk/src/system/kernel/slab/Slab.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/slab/Slab.cpp	2007-04-28 21:34:54 UTC (rev 20888)
++++ haiku/trunk/src/system/kernel/slab/Slab.cpp	2007-04-28 21:35:23 UTC (rev 20889)
+@@ -15,6 +15,7 @@
+ #include &lt;util/DoublyLinkedList.h&gt;
+ #include &lt;util/OpenHashTable.h&gt;
+ 
++#include &lt;smp.h&gt;
+ #include &lt;vm_low_memory.h&gt;
+ 
+ #include &lt;algorithm&gt; // swap
+@@ -63,7 +64,7 @@
+ 	size_t object_size;
+ 	size_t cache_color_cycle;
+ 	SlabList empty, partial, full;
+-	size_t empty_count, pressure;
++	size_t used_count, empty_count, pressure;
+ 
+ 	size_t slab_size;
+ 	size_t usage, maximum;
+@@ -74,7 +75,7 @@
+ 	object_cache_destructor destructor;
+ 	object_cache_reclaimer reclaimer;
+ 
+-	base_depot depot;
++	object_depot depot;
+ 
+ 	virtual slab *CreateSlab(uint32 flags) = 0;
+ 	virtual void ReturnSlab(slab *slab) = 0;
+@@ -143,11 +144,17 @@
+ 
+ struct depot_magazine {
+ 	struct depot_magazine *next;
+-	uint16_t current_round, round_count;
++	uint16 current_round, round_count;
+ 	void *rounds[0];
+ };
+ 
+ 
++struct depot_cpu_store {
++	benaphore lock;
++	struct depot_magazine *loaded, *previous;
++};
++
++
+ static object_cache *sSlabCache, *sLinkCache;
+ static ObjectCacheList sObjectCaches;
+ static benaphore sObjectCacheListLock;
+@@ -176,18 +183,25 @@
+ static inline void *
+ link_to_object(object_link *link, size_t objectSize)
+ {
+-	return ((uint8_t *)link) - (objectSize - sizeof(object_link));
++	return ((uint8 *)link) - (objectSize - sizeof(object_link));
+ }
+ 
+ 
+ static inline object_link *
+ object_to_link(void *object, size_t objectSize)
+ {
+-	return (object_link *)(((uint8_t *)object)
++	return (object_link *)(((uint8 *)object)
+ 		+ (objectSize - sizeof(object_link)));
+ }
+ 
+ 
++static inline depot_cpu_store *
++object_depot_cpu(object_depot *depot)
++{
++	return &amp;depot-&gt;stores[smp_get_current_cpu()];
++}
++
++
+ static inline int
+ __fls0(size_t value)
+ {
+@@ -243,12 +257,18 @@
+ 
+ 	object_cache *cache = (object_cache *)_self;
+ 
++	// we are calling the reclaimer without the object cache lock
++	// to give the owner a chance to return objects to the slabs.
++	// As we only register the low memory handler after we complete
++	// the init of the object cache, unless there are some funky
++	// memory re-order business going on, we should be ok.
++
++	if (cache-&gt;reclaimer)
++		cache-&gt;reclaimer(cache-&gt;cookie, level);
++
+ 	BenaphoreLocker _(cache-&gt;lock);
+-
+ 	size_t minimumAllowed;
+ 
+-	// TODO: call reclaim
+-
+ 	switch (level) {
+ 	case B_LOW_MEMORY_NOTE:
+ 		minimumAllowed = cache-&gt;pressure / 2 + 1;
+@@ -278,6 +298,16 @@
+ }
+ 
+ 
++static void
++object_cache_return_object_wrapper(object_depot *depot, void *object)
++{
++	object_cache *cache = (object_cache *)(((uint8 *)depot)
++		- offsetof(object_cache, depot));
++
++	object_cache_free(cache, object);
++}
++
++
+ static status_t
+ object_cache_init(object_cache *cache, const char *name, size_t objectSize,
+ 	size_t alignment, size_t maximum, uint32 flags, void *cookie,
+@@ -303,6 +333,7 @@
+ 		cache-&gt;object_size);
+ 
+ 	cache-&gt;cache_color_cycle = 0;
++	cache-&gt;used_count = 0;
+ 	cache-&gt;empty_count = 0;
+ 	cache-&gt;pressure = 0;
+ 
+@@ -311,8 +342,17 @@
+ 
+ 	cache-&gt;flags = flags;
+ 
+-	if (!(flags &amp; CACHE_NO_DEPOT)) {
+-		// TODO init depot
++	// no gain in using the depot in single cpu setups
++	if (smp_get_num_cpus() == 1)
++		cache-&gt;flags |= CACHE_NO_DEPOT;
++
++	if (!(cache-&gt;flags &amp; CACHE_NO_DEPOT)) {
++		status_t status = object_depot_init(&amp;cache-&gt;depot,
++			object_cache_return_object_wrapper);
++		if (status &lt; B_OK) {
++			benaphore_destroy(&amp;cache-&gt;lock);
++			return status;
++		}
+ 	}
+ 
+ 	cache-&gt;cookie = cookie;
+@@ -367,7 +407,7 @@
+ 		return NULL;
+ 	}
+ 
+-	cache-&gt;slab_size = 16 * B_PAGE_SIZE;
++	cache-&gt;slab_size = max_c(16 * B_PAGE_SIZE, 8 * object_size);
+ 	cache-&gt;lower_boundary = __fls0(cache-&gt;object_size);
+ 
+ 	return cache;
+@@ -411,6 +451,9 @@
+ 
+ 	benaphore_lock(&amp;cache-&gt;lock);
+ 
++	if (!(cache-&gt;flags &amp; CACHE_NO_DEPOT))
++		object_depot_destroy(&amp;cache-&gt;depot);
++
+ 	unregister_low_memory_handler(object_cache_low_memory, cache);
+ 
+ 	if (!cache-&gt;full.IsEmpty())
+@@ -422,8 +465,6 @@
+ 	while (!cache-&gt;empty.IsEmpty())
+ 		cache-&gt;ReturnSlab(cache-&gt;empty.RemoveHead());
+ 
+-	cache-&gt;empty_count = 0;
+-
+ 	benaphore_destroy(&amp;cache-&gt;lock);
+ 	delete cache;
+ }
+@@ -432,10 +473,16 @@
+ void *
+ object_cache_alloc(object_cache *cache, uint32 flags)
+ {
++	// flags are read only.
++	if (!(cache-&gt;flags &amp; CACHE_NO_DEPOT)) {
++		void *object = object_depot_obtain(&amp;cache-&gt;depot);
++		if (object)
++			return object;
++	}
++
+ 	BenaphoreLocker _(cache-&gt;lock);
++	slab *source;
+ 
+-	slab *source = NULL;
+-
+ 	if (cache-&gt;partial.IsEmpty()) {
+ 		if (cache-&gt;empty.IsEmpty()) {
+ 			source = cache-&gt;CreateSlab(flags);
+@@ -444,8 +491,8 @@
+ 
+ 			cache-&gt;pressure++;
+ 		} else {
++			source = cache-&gt;empty.RemoveHead();
+ 			cache-&gt;empty_count--;
+-			source = cache-&gt;empty.RemoveHead();
+ 		}
+ 
+ 		cache-&gt;partial.Add(source);
+@@ -455,6 +502,7 @@
+ 
+ 	object_link *link = _pop(source-&gt;free);
+ 	source-&gt;count--;
++	cache-&gt;used_count++;
+ 
+ 	TRACE_CACHE(cache, &quot;allocate %p from %p, %lu remaining.&quot;, link, source,
+ 		source-&gt;count);
+@@ -481,6 +529,8 @@
+ 
+ 	_push(source-&gt;free, link);
+ 	source-&gt;count++;
++	cache-&gt;used_count--;
++
+ 	if (source-&gt;count == source-&gt;size) {
+ 		cache-&gt;partial.Remove(source);
+ 
+@@ -500,6 +550,12 @@
+ void
+ object_cache_free(object_cache *cache, void *object)
+ {
++	// flags are read only.
++	if (!(cache-&gt;flags &amp; CACHE_NO_DEPOT)) {
++		if (object_depot_store(&amp;cache-&gt;depot, object))
++			return;
++	}
++
+ 	BenaphoreLocker _(cache-&gt;lock);
+ 	object_cache_return_to_slab(cache, cache-&gt;ObjectSlab(object), object);
+ }
+@@ -525,7 +581,7 @@
+ 	TRACE_CACHE(this, &quot;  %lu objects, %lu spare bytes, offset %lu&quot;,
+ 		slab-&gt;size, spareBytes, slab-&gt;offset);
+ 
+-	uint8_t *data = ((uint8_t *)pages) + slab-&gt;offset;
++	uint8 *data = ((uint8 *)pages) + slab-&gt;offset;
+ 
+ 	for (size_t i = 0; i &lt; slab-&gt;size; i++) {
+ 		bool failedOnFirst = false;
+@@ -540,7 +596,7 @@
+ 			if (!failedOnFirst)
+ 				UnprepareObject(slab, data);
+ 
+-			data = ((uint8_t *)pages) + slab-&gt;offset;
++			data = ((uint8 *)pages) + slab-&gt;offset;
+ 			for (size_t j = 0; j &lt; i; j++) {
+ 				if (destructor)
+ 					destructor(cookie, data);
+@@ -567,7 +623,7 @@
+ 	if (slab-&gt;count != slab-&gt;size)
+ 		panic(&quot;cache: destroying a slab which isn't empty.&quot;);
+ 
+-	uint8_t *data = ((uint8_t *)slab-&gt;pages) + slab-&gt;offset;
++	uint8 *data = ((uint8 *)slab-&gt;pages) + slab-&gt;offset;
+ 
+ 	for (size_t i = 0; i &lt; slab-&gt;size; i++) {
+ 		if (destructor)
+@@ -581,15 +637,15 @@
+ static inline slab *
+ slab_in_pages(const void *pages, size_t slab_size)
+ {
+-	return (slab *)(((uint8_t *)pages) + slab_size - sizeof(slab));
++	return (slab *)(((uint8 *)pages) + slab_size - sizeof(slab));
+ }
+ 
+ 
+ static inline const void *
+ lower_boundary(void *object, size_t byteCount)
+ {
+-	const uint8_t *null = (uint8_t *)NULL;
+-	return null + ((((uint8_t *)object) - null) &amp; ~(byteCount - 1));
++	const uint8 *null = (uint8 *)NULL;
++	return null + ((((uint8 *)object) - null) &amp; ~(byteCount - 1));
+ }
+ 
+ 
+@@ -673,18 +729,16 @@
+ 		return NULL;
+ 
+ 	void *pages;
+-	if (allocate_pages(this, &amp;pages, flags) &lt; B_OK) {
+-		free_slab(slab);
+-		return NULL;
+-	}
+ 
+-	if (InitSlab(slab, pages, slab_size) == NULL) {
++	if (allocate_pages(this, &amp;pages, flags) == B_OK) {
++		if (InitSlab(slab, pages, slab_size))
++			return slab;
++
+ 		free_pages(this, pages);
+-		free_slab(slab);
+-		return NULL;
+ 	}
+ 
+-	return slab;
++	free_slab(slab);
++	return NULL;
+ }
+ 
+ 
+@@ -767,7 +821,7 @@
+ 
+ 
+ static bool
+-exchange_with_full(base_depot *depot, depot_magazine* &amp;magazine)
++exchange_with_full(object_depot *depot, depot_magazine* &amp;magazine)
+ {
+ 	BenaphoreLocker _(depot-&gt;lock);
+ 
+@@ -784,7 +838,7 @@
+ 
+ 
+ static bool
+-exchange_with_empty(base_depot *depot, depot_magazine* &amp;magazine)
++exchange_with_empty(object_depot *depot, depot_magazine* &amp;magazine)
+ {
+ 	BenaphoreLocker _(depot-&gt;lock);
+ 
+@@ -829,17 +883,17 @@
+ 
+ 
+ static void
+-empty_magazine(base_depot *depot, depot_magazine *magazine)
++empty_magazine(object_depot *depot, depot_magazine *magazine)
+ {
+-	for (uint16_t i = 0; i &lt; magazine-&gt;current_round; i++)
++	for (uint16 i = 0; i &lt; magazine-&gt;current_round; i++)
+ 		depot-&gt;return_object(depot, magazine-&gt;rounds[i]);
+ 	free_magazine(magazine);
+ }
+ 
+ 
+ status_t
+-base_depot_init(base_depot *depot,
+-	void (*return_object)(base_depot *depot, void *object))
++object_depot_init(object_depot *depot,
++	void (*return_object)(object_depot *depot, void *object))
+ {
+ 	depot-&gt;full = NULL;
+ 	depot-&gt;empty = NULL;
+@@ -867,9 +921,9 @@
+ 
+ 
+ void
+-base_depot_destroy(base_depot *depot)
++object_depot_destroy(object_depot *depot)
+ {
+-	base_depot_make_empty(depot);
++	object_depot_make_empty(depot);
+ 
+ 	for (int i = 0; i &lt; smp_get_num_cpus(); i++) {
+ 		benaphore_destroy(&amp;depot-&gt;stores[i].lock);
+@@ -881,8 +935,8 @@
+ }
+ 
+ 
+-void *
+-base_depot_obtain_from_store(base_depot *depot, depot_cpu_store *store)
++static void *
++object_depot_obtain_from_store(object_depot *depot, depot_cpu_store *store)
+ {
+ 	BenaphoreLocker _(store-&gt;lock);
+ 
+@@ -909,8 +963,8 @@
+ }
+ 
+ 
+-int
+-base_depot_return_to_store(base_depot *depot, depot_cpu_store *store,
++static int
++object_depot_return_to_store(object_depot *depot, depot_cpu_store *store,
+ 	void *object)
+ {
+ 	BenaphoreLocker _(store-&gt;lock);
+@@ -933,12 +987,29 @@
+ }
+ 
+ 
++void *
++object_depot_obtain(object_depot *depot)
++{
++	return object_depot_obtain_from_store(depot, object_depot_cpu(depot));
++}
++
++
++int
++object_depot_store(object_depot *depot, void *object)
++{
++	return object_depot_return_to_store(depot, object_depot_cpu(depot),
++		object);
++}
++
++
+ void
+-base_depot_make_empty(base_depot *depot)
++object_depot_make_empty(object_depot *depot)
+ {
+-	// TODO locking
++	for (int i = 0; i &lt; smp_get_num_cpus(); i++) {
++		depot_cpu_store *store = &amp;depot-&gt;stores[i];
+ 
+-	for (int i = 0; i &lt; smp_get_num_cpus(); i++) {
++		BenaphoreLocker _(store-&gt;lock);
++
+ 		if (depot-&gt;stores[i].loaded)
+ 			empty_magazine(depot, depot-&gt;stores[i].loaded);
+ 		if (depot-&gt;stores[i].previous)
+@@ -946,6 +1017,8 @@
+ 		depot-&gt;stores[i].loaded = depot-&gt;stores[i].previous = NULL;
+ 	}
+ 
++	BenaphoreLocker _(depot-&gt;lock);
++
+ 	while (depot-&gt;full)
+ 		empty_magazine(depot, _pop(depot-&gt;full));
+ 
+@@ -957,16 +1030,17 @@
+ static int
+ dump_slabs(int argc, char *argv[])
+ {
+-	kprintf(&quot;%10s %32s %8s %8s %6s\n&quot;, &quot;address&quot;, &quot;name&quot;, &quot;objsize&quot;, &quot;usage&quot;,
+-		&quot;empty&quot;);
++	kprintf(&quot;%10s %32s %8s %8s %6s %8s %6s\n&quot;, &quot;address&quot;, &quot;name&quot;, &quot;objsize&quot;, &quot;usage&quot;,
++		&quot;empty&quot;, &quot;usedobj&quot;, &quot;flags&quot;);
+ 
+ 	ObjectCacheList::Iterator it = sObjectCaches.GetIterator();
+ 
+ 	while (it.HasNext()) {
+ 		object_cache *cache = it.Next();
+ 
+-		kprintf(&quot;%p %32s %8lu %8lu %6lu\n&quot;, cache, cache-&gt;name,
+-			cache-&gt;object_size, cache-&gt;usage, cache-&gt;empty_count);
++		kprintf(&quot;%p %32s %8lu %8lu %6lu %8lu %6lx\n&quot;, cache, cache-&gt;name,
++			cache-&gt;object_size, cache-&gt;usage, cache-&gt;empty_count,
++			cache-&gt;used_count, cache-&gt;flags);
+ 	}
+ 
+ 	return 0;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001901.html">[Haiku-commits] r20888 - haiku/trunk/src/tools/fs_shell
+</A></li>
+	<LI>Next message: <A HREF="001903.html">[Haiku-commits] r20890 - in haiku/trunk: headers/build/os/support	headers/private/fs_shell src/build/libroot src/tools/fs_shell
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1902">[ date ]</a>
+              <a href="thread.html#1902">[ thread ]</a>
+              <a href="subject.html#1902">[ subject ]</a>
+              <a href="author.html#1902">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

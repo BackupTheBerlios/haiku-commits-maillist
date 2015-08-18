@@ -1,0 +1,350 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24920 -	haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24920%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial&In-Reply-To=%3C200804112152.m3BLqdDp025971%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007677.html">
+   <LINK REL="Next"  HREF="007679.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24920 -	haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24920%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial&In-Reply-To=%3C200804112152.m3BLqdDp025971%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24920 -	haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Fri Apr 11 23:52:39 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007677.html">[Haiku-commits] r24919 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix
+</A></li>
+        <LI>Next message: <A HREF="007679.html">[Haiku-commits] r24921 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7678">[ date ]</a>
+              <a href="thread.html#7678">[ thread ]</a>
+              <a href="subject.html#7678">[ subject ]</a>
+              <a href="author.html#7678">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-04-11 23:52:39 +0200 (Fri, 11 Apr 2008)
+New Revision: 24920
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24920&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24920&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/Driver.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/SerialDevice.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/SerialDevice.h
+Log:
+Correct the way serial devices are deleted. They are either deleted on removal
+when they are not open or they are deleted on free when they are already
+removed. This should fix the sudden crashes when you unplugged a device that
+might not have been fully closed yet.
+Also handle the case of removal correctly and don't use the usb_device anymore
+after releasing it by returning from the device removed hook. Calls to the
+device just return B_DEV_NOT_READY in that case.
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/Driver.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/Driver.cpp	2008-04-11 20:43:40 UTC (rev 24919)
++++ haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/Driver.cpp	2008-04-11 21:52:39 UTC (rev 24920)
+@@ -87,8 +87,13 @@
+ 	SerialDevice *device = (SerialDevice *)cookie;
+ 	for (int32 i = 0; i &lt; DEVICES_COUNT; i++) {
+ 		if (gSerialDevices[i] == device) {
+-			delete device;
+-			gSerialDevices[i] = NULL;
++			if (device-&gt;IsOpen()) {
++				// the device will be deleted upon being freed
++				device-&gt;Removed();
++			} else {
++				delete device;
++				gSerialDevices[i] = NULL;
++			}
+ 			break;
+ 		}
+ 	}
+@@ -131,7 +136,7 @@
+ 	}
+ 
+ 	for (int32 i = 0; i &lt; DEVICES_COUNT; i++)
+-		gSerialDevices[i] = 0;
++		gSerialDevices[i] = NULL;
+ 
+ 	gDeviceNames[0] = NULL;
+ 
+@@ -293,7 +298,22 @@
+ {
+ 	TRACE_FUNCALLS(&quot;&gt; usb_serial_free(0x%08x)\n&quot;, cookie);
+ 	SerialDevice *device = (SerialDevice *)cookie;
+-	return device-&gt;Free();
++	acquire_sem(gDriverLock);
++	status_t status = device-&gt;Free();
++	if (device-&gt;IsRemoved()) {
++		for (int32 i = 0; i &lt; DEVICES_COUNT; i++) {
++			if (gSerialDevices[i] == device) {
++				// the device is removed already but as it was open the
++				// removed hook has not deleted the object
++				delete device;
++				gSerialDevices[i] = NULL;
++				break;
++			}
++		}
++	}
++
++	release_sem(gDriverLock);
++	return status;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/SerialDevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/SerialDevice.cpp	2008-04-11 20:43:40 UTC (rev 24919)
++++ haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/SerialDevice.cpp	2008-04-11 21:52:39 UTC (rev 24920)
+@@ -19,6 +19,8 @@
+ 		fVendorID(vendorID),
+ 		fProductID(productID),
+ 		fDescription(description),
++		fDeviceOpen(false),
++		fDeviceRemoved(false),
+ 		fControlPipe(0),
+ 		fReadPipe(0),
+ 		fWritePipe(0),
+@@ -43,19 +45,13 @@
+ 
+ SerialDevice::~SerialDevice()
+ {
+-	fStopDeviceThread = true;
+-	gUSBModule-&gt;cancel_queued_transfers(fReadPipe);
+-	gUSBModule-&gt;cancel_queued_transfers(fWritePipe);
+-	gUSBModule-&gt;cancel_queued_transfers(fControlPipe);
++	Removed();
+ 
+ 	if (fDoneRead &gt;= B_OK)
+ 		delete_sem(fDoneRead);
+ 	if (fDoneWrite &gt;= B_OK)
+ 		delete_sem(fDoneWrite);
+ 
+-	int32 result = B_OK;
+-	wait_for_thread(fDeviceThread, &amp;result);
+-
+ 	if (fBufferArea &gt;= B_OK)
+ 		delete_area(fBufferArea);
+ 
+@@ -250,6 +246,12 @@
+ status_t
+ SerialDevice::Open(uint32 flags)
+ {
++	if (fDeviceOpen)
++		return B_BUSY;
++
++	if (fDeviceRemoved)
++		return B_DEV_NOT_READY;
++
+ 	gTTYModule-&gt;ttyinit(&amp;fTTY, true);
+ 	fTTYFile.tty = &fTTY;
+ 	fTTYFile.flags = flags;
+@@ -285,17 +287,18 @@
+ 		fInterruptBufferSize, InterruptCallbackFunction, this);
+ 	if (status &lt; B_OK)
+ 		TRACE_ALWAYS(&quot;failed to queue initial interrupt\n&quot;);
+-	return status;
++
++	fDeviceOpen = true;
++	return B_OK;
+ }
+ 
+ 
+ status_t
+ SerialDevice::Read(char *buffer, size_t *numBytes)
+ {
+-	struct ddrover *ddr = gTTYModule-&gt;ddrstart(NULL);
+-	if (!ddr) {
++	if (fDeviceRemoved) {
+ 		*numBytes = 0;
+-		return B_NO_MEMORY;
++		return B_DEV_NOT_READY;
+ 	}
+ 
+ 	status_t status = benaphore_lock(&amp;fReadLock);
+@@ -305,6 +308,13 @@
+ 		return status;
+ 	}
+ 
++	struct ddrover *ddr = gTTYModule-&gt;ddrstart(NULL);
++	if (!ddr) {
++		*numBytes = 0;
++		benaphore_unlock(&amp;fReadLock);
++		return B_NO_MEMORY;
++	}
++
+ 	status = gTTYModule-&gt;ttyread(&amp;fTTYFile, ddr, buffer, numBytes);
+ 	gTTYModule-&gt;ddrdone(ddr);
+ 
+@@ -325,6 +335,11 @@
+ 		return status;
+ 	}
+ 
++	if (fDeviceRemoved) {
++		benaphore_unlock(&amp;fWriteLock);
++		return B_DEV_NOT_READY;
++	}
++
+ 	while (bytesLeft &gt; 0) {
+ 		size_t length = MIN(bytesLeft, fWriteBufferSize);
+ 		OnWrite(buffer, &amp;length);
+@@ -367,6 +382,9 @@
+ status_t
+ SerialDevice::Control(uint32 op, void *arg, size_t length)
+ {
++	if (fDeviceRemoved)
++		return B_DEV_NOT_READY;
++
+ 	struct ddrover *ddr = gTTYModule-&gt;ddrstart(NULL);
+ 	if (!ddr)
+ 		return B_NO_MEMORY;
+@@ -380,6 +398,9 @@
+ status_t
+ SerialDevice::Select(uint8 event, uint32 ref, selectsync *sync)
+ {
++	if (fDeviceRemoved)
++		return B_DEV_NOT_READY;
++
+ 	struct ddrover *ddr = gTTYModule-&gt;ddrstart(NULL);
+ 	if (!ddr)
+ 		return B_NO_MEMORY;
+@@ -393,6 +414,9 @@
+ status_t
+ SerialDevice::DeSelect(uint8 event, selectsync *sync)
+ {
++	if (fDeviceRemoved)
++		return B_DEV_NOT_READY;
++
+ 	struct ddrover *ddr = gTTYModule-&gt;ddrstart(NULL);
+ 	if (!ddr)
+ 		return B_NO_MEMORY;
+@@ -408,9 +432,11 @@
+ {
+ 	OnClose();
+ 
+-	gUSBModule-&gt;cancel_queued_transfers(fReadPipe);
+-	gUSBModule-&gt;cancel_queued_transfers(fWritePipe);
+-	gUSBModule-&gt;cancel_queued_transfers(fControlPipe);
++	if (!fDeviceRemoved) {
++		gUSBModule-&gt;cancel_queued_transfers(fReadPipe);
++		gUSBModule-&gt;cancel_queued_transfers(fWritePipe);
++		gUSBModule-&gt;cancel_queued_transfers(fControlPipe);
++	}
+ 
+ 	struct ddrover *ddr = gTTYModule-&gt;ddrstart(NULL);
+ 	if (!ddr)
+@@ -418,6 +444,8 @@
+ 
+ 	status_t status = gTTYModule-&gt;ttyclose(&amp;fTTYFile, ddr);
+ 	gTTYModule-&gt;ddrdone(ddr);
++
++	fDeviceOpen = false;
+ 	return status;
+ }
+ 
+@@ -435,6 +463,31 @@
+ }
+ 
+ 
++void
++SerialDevice::Removed()
++{
++	if (fDeviceRemoved)
++		return;
++
++	// notifies us that the device was removed
++	fDeviceRemoved = true;
++
++	// we need to ensure that we do not use the device anymore
++	fStopDeviceThread = true;
++	fInputStopped = false;
++	gUSBModule-&gt;cancel_queued_transfers(fReadPipe);
++	gUSBModule-&gt;cancel_queued_transfers(fWritePipe);
++	gUSBModule-&gt;cancel_queued_transfers(fControlPipe);
++
++	int32 result = B_OK;
++	wait_for_thread(fDeviceThread, &amp;result);
++	fDeviceThread = -1;
++
++	benaphore_lock(&amp;fWriteLock);
++	benaphore_unlock(&amp;fWriteLock);
++}
++
++
+ status_t
+ SerialDevice::AddDevice(const usb_configuration_info *config)
+ {
+@@ -586,7 +639,7 @@
+ 
+ 	// ToDo: maybe handle those somehow?
+ 
+-	if (status == B_OK) {
++	if (status == B_OK &amp;&amp; !device-&gt;fDeviceRemoved) {
+ 		status = gUSBModule-&gt;queue_interrupt(device-&gt;fControlPipe,
+ 			device-&gt;fInterruptBuffer, device-&gt;fInterruptBufferSize,
+ 			device-&gt;InterruptCallbackFunction, device);
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/SerialDevice.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/SerialDevice.h	2008-04-11 20:43:40 UTC (rev 24919)
++++ haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial/SerialDevice.h	2008-04-11 21:52:39 UTC (rev 24920)
+@@ -55,6 +55,10 @@
+ 		status_t				Close();
+ 		status_t				Free();
+ 
++		bool					IsOpen() { return fDeviceOpen; };
++		void					Removed();
++		bool					IsRemoved() { return fDeviceRemoved; };
++
+ 		/* virtual interface to be overriden as necessary */
+ virtual	status_t				AddDevice(const usb_configuration_info *config);
+ 
+@@ -84,6 +88,8 @@
+ 		uint16					fVendorID;
+ 		uint16					fProductID;
+ 		const char *			fDescription;	// informational description
++		bool					fDeviceOpen;
++		bool					fDeviceRemoved;
+ 
+ 		/* communication pipes */
+ 		usb_pipe				fControlPipe;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007677.html">[Haiku-commits] r24919 -	haiku/trunk/src/add-ons/kernel/network/protocols/unix
+</A></li>
+	<LI>Next message: <A HREF="007679.html">[Haiku-commits] r24921 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7678">[ date ]</a>
+              <a href="thread.html#7678">[ thread ]</a>
+              <a href="subject.html#7678">[ subject ]</a>
+              <a href="author.html#7678">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,244 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27391 - haiku/trunk/src/system/kernel/posix
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27391%20-%20haiku/trunk/src/system/kernel/posix&In-Reply-To=%3C200809091757.m89HvbkU029983%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011741.html">
+   <LINK REL="Next"  HREF="011660.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27391 - haiku/trunk/src/system/kernel/posix</H1>
+    <B>sbenedetto at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27391%20-%20haiku/trunk/src/system/kernel/posix&In-Reply-To=%3C200809091757.m89HvbkU029983%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27391 - haiku/trunk/src/system/kernel/posix">sbenedetto at mail.berlios.de
+       </A><BR>
+    <I>Tue Sep  9 19:57:37 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011741.html">[Haiku-commits] r27390 - haiku/trunk/src/system/boot/platform/bios_ia32
+</A></li>
+        <LI>Next message: <A HREF="011660.html">[Haiku-commits] r27392 -	haiku/trunk/src/system/boot/platform/bios_ia32
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11654">[ date ]</a>
+              <a href="thread.html#11654">[ thread ]</a>
+              <a href="subject.html#11654">[ subject ]</a>
+              <a href="author.html#11654">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: sbenedetto
+Date: 2008-09-09 19:57:36 +0200 (Tue, 09 Sep 2008)
+New Revision: 27391
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27391&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27391&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp
+Log:
+* Wake up waiting threads when a new message is sent or received
+* Removed sXsiMessageCountLock in favor of atomic_* function utility
+* free up any remaining messages when a queue gets destroyed
+
+
+Modified: haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp	2008-09-09 15:18:51 UTC (rev 27390)
++++ haiku/trunk/src/system/kernel/posix/xsi_message_queue.cpp	2008-09-09 17:57:36 UTC (rev 27391)
+@@ -113,12 +113,8 @@
+ 		fMessageQueue.msg_qbytes = MAX_BYTES_PER_QUEUE;
+ 	}
+ 
+-	~XsiMessageQueue()
+-	{
+-		mutex_destroy(&amp;fLock);
+-		// TODO: free up all messages
+-		// TODO: Wake up any thread still waiting
+-	}
++	// Implemented after sXsiMessageCount is declared
++	~XsiMessageQueue();
+ 
+ 	status_t BlockAndUnlock(struct thread *thread, MutexLocker *queueLocker)
+ 	{
+@@ -199,7 +195,7 @@
+ 		return fID;
+ 	}
+ 
+-	// Implemented after sXsiMessageCountLock is declared
++	// Implemented after sXsiMessageCount is declared
+ 	bool Insert(queued_message *message);
+ 
+ 	key_t IpcKey() const
+@@ -217,7 +213,7 @@
+ 		return fMessageQueue.msg_qbytes;
+ 	}
+ 
+-	// Implemented after sXsiMessageCountLock is declared
++	// Implemented after sXsiMessageCount is declared
+ 	queued_message *Remove(long typeRequested);
+ 
+ 	uint32 SequenceNumber() const
+@@ -240,6 +236,27 @@
+ 		fMessageQueue.msg_perm.mode = (flags &amp; 0x01ff);
+ 	}
+ 
++	void WakeUpThread(bool waitForMessage)
++	{
++		InterruptsSpinLocker _(gThreadSpinlock);
++		if (waitForMessage) {
++			// Wake up all waiting thread for a message
++			// TODO: this can cause starvation for any
++			// very-unlucky-and-slow thread
++			while (queued_thread *entry = fWaitingToReceive.RemoveHead()) {
++				entry-&gt;queued = false;
++				fThreadsWaitingToReceive--;
++				thread_unblock_locked(entry-&gt;thread, 0);
++			}
++		} else {
++			while (queued_thread *entry = fWaitingToSend.RemoveHead()) {
++				entry-&gt;queued = false;
++				fThreadsWaitingToSend--;
++				thread_unblock_locked(entry-&gt;thread, 0);
++			}
++		}
++	}
++
+ 	HashTableLink&lt;XsiMessageQueue&gt;* Link()
+ 	{
+ 		return &fLink;
+@@ -358,7 +375,6 @@
+ 
+ static mutex sIpcLock;
+ static mutex sXsiMessageQueueLock;
+-static mutex sXsiMessageCountLock;
+ 
+ static uint32 sGlobalSequenceNumber = 1;
+ static vint32 sXsiMessageCount = 0;
+@@ -368,24 +384,59 @@
+ //	#pragma mark -
+ 
+ 
++XsiMessageQueue::~XsiMessageQueue()
++{
++	mutex_destroy(&amp;fLock);
++
++	// Wake up any threads still waiting
++	if (fThreadsWaitingToSend || fThreadsWaitingToReceive) {
++		InterruptsSpinLocker _(gThreadSpinlock);
++		while (queued_thread *entry = fWaitingToReceive.RemoveHead()) {
++			entry-&gt;queued = false;
++			thread_unblock_locked(entry-&gt;thread, EIDRM);
++		}
++		while (queued_thread *entry = fWaitingToSend.RemoveHead()) {
++			entry-&gt;queued = false;
++			thread_unblock_locked(entry-&gt;thread, EIDRM);
++		}
++	}
++
++	// Free up any remaining messages
++	if (fMessageQueue.msg_qnum) {
++		while (queued_message *message = fMessage.RemoveHead()) {
++			atomic_add(&amp;sXsiMessageCount, -1);
++			delete message;
++		}
++	}
++}
++
++
+ bool
+ XsiMessageQueue::Insert(queued_message *message)
+ {
+ 	// The only situation that would make us (potentially) wait
+ 	// is that we exceed with bytes or with the total number of messages
+-	MutexLocker _(sXsiMessageCountLock);
+-	if (fBytesInQueue == fMessageQueue.msg_qbytes
+-		|| fBytesInQueue + message-&gt;length &gt; fMessageQueue.msg_qbytes
+-		|| sXsiMessageCount &gt;= MAX_XSI_MESSAGE)
++	if (fBytesInQueue + message-&gt;length &gt; fMessageQueue.msg_qbytes)
+ 		return true;
+ 
++	while (true) {
++		int32 oldCount = atomic_get(&amp;sXsiMessageCount);
++		if (oldCount &gt;= MAX_XSI_MESSAGE)
++			return true;
++		// If another thread updates the counter we keep 
++		// iterating
++		if (atomic_test_and_set(&amp;sXsiMessageCount, oldCount + 1, oldCount)
++			== oldCount)
++			break;
++	}
++
+ 	fMessage.Add(message);
+ 	fMessageQueue.msg_qnum++;
+ 	fMessageQueue.msg_lspid = getpid();
+ 	fMessageQueue.msg_stime = real_time_clock();
+ 	fBytesInQueue += message-&gt;length;
+-	sXsiMessageCount++;
+-	// TODO: Wake up any thread waiting on receive
++	if (fThreadsWaitingToReceive)
++		WakeUpThread(true /* WaitForMessage */);
+ 	return false;
+ }
+ 
+@@ -428,9 +479,9 @@
+ 	fMessageQueue.msg_lrpid = getpid();
+ 	fMessageQueue.msg_rtime = real_time_clock();
+ 	fBytesInQueue -= message-&gt;length;
+-	MutexLocker _(sXsiMessageCountLock);
+-	sXsiMessageCount--;
+-	// TODO: Wake up any thread waiting on send
++	atomic_add(&amp;sXsiMessageCount, -1);
++	if (fThreadsWaitingToSend)
++		WakeUpThread(false /* WaitForMessage */);
+ 	return message;
+ }
+ 
+@@ -466,7 +517,6 @@
+ 
+ 	mutex_init(&amp;sIpcLock, &quot;global POSIX message queue IPC table&quot;);
+ 	mutex_init(&amp;sXsiMessageQueueLock, &quot;global POSIX xsi message queue table&quot;);
+-	mutex_init(&amp;sXsiMessageCountLock, &quot;global POSIX xsi message count&quot;);
+ }
+ 
+ 
+@@ -754,7 +804,7 @@
+ 		}
+ 	}
+ 
+-	return B_ERROR;
++	return B_OK;
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011741.html">[Haiku-commits] r27390 - haiku/trunk/src/system/boot/platform/bios_ia32
+</A></li>
+	<LI>Next message: <A HREF="011660.html">[Haiku-commits] r27392 -	haiku/trunk/src/system/boot/platform/bios_ia32
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11654">[ date ]</a>
+              <a href="thread.html#11654">[ thread ]</a>
+              <a href="subject.html#11654">[ subject ]</a>
+              <a href="author.html#11654">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

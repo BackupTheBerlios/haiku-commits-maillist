@@ -1,0 +1,336 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25205 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25205%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/debug&In-Reply-To=%3C200804270302.m3R322xa003934%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008242.html">
+   <LINK REL="Next"  HREF="008244.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25205 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25205%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/debug&In-Reply-To=%3C200804270302.m3R322xa003934%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25205 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Apr 27 05:02:02 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008242.html">[Haiku-commits] r25204 - in haiku/trunk:	headers/private/kernel/arch src/system/kernel/arch/x86
+</A></li>
+        <LI>Next message: <A HREF="008244.html">[Haiku-commits] r25206 - haiku/trunk/build/config_headers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8243">[ date ]</a>
+              <a href="thread.html#8243">[ thread ]</a>
+              <a href="subject.html#8243">[ subject ]</a>
+              <a href="author.html#8243">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-04-27 05:02:01 +0200 (Sun, 27 Apr 2008)
+New Revision: 25205
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25205&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25205&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/tracing.h
+   haiku/trunk/src/system/kernel/debug/tracing.cpp
+Log:
+Support for stack traces in tracing entries:
+* Added capture_tracing_stack_trace() which allocates space in the
+  tracing buffer and captures the stack trace according to the given
+  parameters.
+* Added TraceOutput::PrintStackTrace() to print a stack trace thus
+  created.
+* Added TraceEntry::DumpStackTrace() callback which is supposed to print
+  a stack trace for the entry, if it can do that.
+* Added &quot;--stacktrace&quot; switch to the &quot;traced&quot; command, which causes the
+  stack traces for all entries that have one to be printed as well.
+
+
+Modified: haiku/trunk/headers/private/kernel/tracing.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/tracing.h	2008-04-27 02:54:27 UTC (rev 25204)
++++ haiku/trunk/headers/private/kernel/tracing.h	2008-04-27 03:02:01 UTC (rev 25205)
+@@ -16,6 +16,8 @@
+ 	uint32	flags			: 4;
+ };
+ 
++struct tracing_stack_trace;
++
+ #ifdef __cplusplus
+ 
+ #include &lt;new&gt;
+@@ -35,6 +37,7 @@
+ 
+ 		void Clear();
+ 		void Print(const char* format,...);
++		void PrintStackTrace(tracing_stack_trace* stackTrace);
+ 		bool IsFull() const	{ return fSize &gt;= fCapacity; }
+ 
+ 		char* Buffer() const	{ return fBuffer; }
+@@ -60,6 +63,7 @@
+ 		virtual ~TraceEntry();
+ 
+ 		virtual void Dump(TraceOutput&amp; out);
++		virtual void DumpStackTrace(TraceOutput&amp; out);
+ 
+ 		size_t Size() const { return size; }
+ 		uint16 Flags() const { return flags; }
+@@ -140,6 +144,8 @@
+ uint8* alloc_tracing_buffer_memcpy(const void* source, size_t size, bool user);
+ char* alloc_tracing_buffer_strcpy(const char* source, size_t maxSize,
+ 			bool user);
++tracing_stack_trace* capture_tracing_stack_trace(int32 maxCount,
++			int32 skipFrames, bool userOnly);
+ int dump_tracing(int argc, char** argv, WrapperTraceFilter* wrapperFilter);
+ status_t tracing_init(void);
+ 
+
+Modified: haiku/trunk/src/system/kernel/debug/tracing.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/tracing.cpp	2008-04-27 02:54:27 UTC (rev 25204)
++++ haiku/trunk/src/system/kernel/debug/tracing.cpp	2008-04-27 03:02:01 UTC (rev 25205)
+@@ -10,7 +10,10 @@
+ #include &lt;stdarg.h&gt;
+ #include &lt;stdlib.h&gt;
+ 
++#include &lt;arch/debug.h&gt;
+ #include &lt;debug.h&gt;
++#include &lt;elf.h&gt;
++#include &lt;int.h&gt;
+ #include &lt;kernel.h&gt;
+ #include &lt;team.h&gt;
+ #include &lt;thread.h&gt;
+@@ -34,6 +37,13 @@
+ 	FILTER_MATCH		= 0x08
+ };
+ 
++struct tracing_stack_trace {
++	int32	depth;
++	addr_t	return_addresses[0];
++};
++
++
++static const size_t kTraceOutputBufferSize = 10240;
+ static const size_t kBufferSize = MAX_TRACE_SIZE / 4;
+ 
+ static trace_entry* sBuffer;
+@@ -42,6 +52,7 @@
+ static uint32 sEntries;
+ static uint32 sWritten;
+ static spinlock sLock;
++static char* sTraceOutputBuffer;
+ 
+ 
+ static trace_entry*
+@@ -239,6 +250,31 @@
+ 
+ 
+ void
++TraceOutput::PrintStackTrace(tracing_stack_trace* stackTrace)
++{
++	if (stackTrace == NULL || stackTrace-&gt;depth &lt;= 0)
++		return;
++
++	for (int32 i = 0; i &lt; stackTrace-&gt;depth; i++) {
++		addr_t address = stackTrace-&gt;return_addresses[i];
++
++		const char* symbol;
++		const char* imageName;
++		bool exactMatch;
++		addr_t baseAddress;
++
++		if (elf_debug_lookup_symbol_address(address, &amp;baseAddress, &amp;symbol,
++				&amp;imageName, &amp;exactMatch) == B_OK) {
++			Print(&quot;  %p  %s + 0x%lx (%s)%s\n&quot;, (void*)address, symbol,
++				address - baseAddress, imageName,
++				exactMatch ? &quot;&quot; : &quot; (nearest)&quot;);
++		} else
++			Print(&quot;  %p\n&quot;, (void*)address);
++	}
++}
++
++
++void
+ TraceOutput::SetLastEntryTime(bigtime_t time)
+ {
+ 	fLastEntryTime = time;
+@@ -276,6 +312,12 @@
+ 
+ 
+ void
++TraceEntry::DumpStackTrace(TraceOutput&amp; out)
++{
++}
++
++
++void
+ TraceEntry::Initialized()
+ {
+ #if ENABLE_TRACING
+@@ -758,6 +800,7 @@
+ 	// variables in which we store our state to be continuable
+ 	static int32 _previousCount = 0;
+ 	static bool _previousHasFilter = false;
++	static bool _previousPrintStackTrace = false;
+ 	static int32 _previousMaxToCheck = 0;
+ 	static int32 _previousFirstChecked = 1;
+ 	static int32 _previousLastChecked = -1;
+@@ -775,14 +818,18 @@
+ 	int32 cont = 0;
+ 
+ 	bool hasFilter = false;
++	bool printStackTrace = false;
+ 
+ 	uint32 outputFlags = 0;
+ 	while (argi &lt; argc) {
+-		if (strcmp(argv[argi], &quot;--printteam&quot;) == 0) {
++		if (strcmp(argv[argi], &quot;--difftime&quot;) == 0) {
++			outputFlags |= TRACE_OUTPUT_DIFF_TIME;
++			argi++;
++		} else if (strcmp(argv[argi], &quot;--printteam&quot;) == 0) {
+ 			outputFlags |= TRACE_OUTPUT_TEAM_ID;
+ 			argi++;
+-		} else if (strcmp(argv[argi], &quot;--difftime&quot;) == 0) {
+-			outputFlags |= TRACE_OUTPUT_DIFF_TIME;
++		} else if (strcmp(argv[argi], &quot;--stacktrace&quot;) == 0) {
++			printStackTrace = true;
+ 			argi++;
+ 		} else
+ 			break;
+@@ -850,6 +897,7 @@
+ 		maxToCheck = _previousMaxToCheck;
+ 		hasFilter = _previousHasFilter;
+ 		outputFlags = _previousOutputFlags;
++		printStackTrace = _previousPrintStackTrace;
+ 
+ 		if (direction &lt; 0)
+ 			start = _previousFirstChecked - 1;
+@@ -896,8 +944,8 @@
+ 		iterator.Reset();
+ 	}
+ 
+-	char buffer[256];
+-	LazyTraceOutput out(buffer, sizeof(buffer), outputFlags);
++	LazyTraceOutput out(sTraceOutputBuffer, kTraceOutputBufferSize,
++		outputFlags);
+ 
+ 	bool markedMatching = false;
+ 	int32 firstToDump = firstToCheck;
+@@ -985,6 +1033,13 @@
+ 				len--;
+ 
+ 			kprintf(&quot;%5ld. %.*s\n&quot;, index, len, dump);
++
++			if (printStackTrace) {
++				out.Clear();
++				entry-&gt;DumpStackTrace(out);
++				if (out.Size() &gt; 0)
++					kputs(out.Buffer());
++			}
+ 		} else if (!filter)
+ 			kprintf(&quot;%5ld. ** uninitialized entry **\n&quot;, index);
+ 
+@@ -999,6 +1054,7 @@
+ 	_previousCount = count;
+ 	_previousMaxToCheck = maxToCheck;
+ 	_previousHasFilter = hasFilter;
++	_previousPrintStackTrace = printStackTrace;
+ 	_previousFirstChecked = firstToCheck;
+ 	_previousLastChecked = lastToCheck;
+ 	_previousDirection = direction;
+@@ -1089,6 +1145,31 @@
+ }
+ 
+ 
++tracing_stack_trace*
++capture_tracing_stack_trace(int32 maxCount, int32 skipFrames, bool userOnly)
++{
++#if	ENABLE_TRACING
++	// TODO: page_fault_exception() doesn't allow us to gracefully handle
++	// a bad address in the stack trace, if interrupts are disabled.
++	if (!are_interrupts_enabled())
++		return NULL;
++
++	tracing_stack_trace* stackTrace
++		= (tracing_stack_trace*)alloc_tracing_buffer(
++			sizeof(tracing_stack_trace) + maxCount * sizeof(addr_t));
++
++	if (stackTrace != NULL) {
++		stackTrace-&gt;depth = arch_debug_get_stack_trace(
++			stackTrace-&gt;return_addresses, maxCount, skipFrames + 1, userOnly);
++	}
++
++	return stackTrace;
++#else
++	return NULL;
++#endif
++}
++
++
+ int
+ dump_tracing(int argc, char** argv, WrapperTraceFilter* wrapperFilter)
+ {
+@@ -1104,12 +1185,13 @@
+ tracing_init(void)
+ {
+ #if	ENABLE_TRACING
+-	area_id area = create_area(&quot;tracing log&quot;, (void**)&amp;sBuffer,
+-		B_ANY_KERNEL_ADDRESS, MAX_TRACE_SIZE, B_FULL_LOCK,
+-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	area_id area = create_area(&quot;tracing log&quot;, (void**)&amp;sTraceOutputBuffer,
++		B_ANY_KERNEL_ADDRESS, MAX_TRACE_SIZE + kTraceOutputBufferSize,
++		B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+ 	if (area &lt; B_OK)
+ 		return area;
+ 
++	sBuffer = (trace_entry*)(sTraceOutputBuffer + kTraceOutputBufferSize);
+ 	sFirstEntry = sBuffer;
+ 	sAfterLastEntry = sBuffer;
+ 
+@@ -1125,8 +1207,9 @@
+ 		&quot;afterwards entering an empty line in the debugger will reinvoke it.\n&quot;
+ 		&quot;If no arguments are given, the command continues in the direction\n&quot;
+ 		&quot;of the last invocation.\n&quot;
+-		&quot;\&quot;--printteam\&quot; enables printing the entries' team IDs.\n&quot;
+-		&quot;\&quot;--difftime\&quot;  print difference times for all but the first entry.\n&quot;
++		&quot;\&quot;--printteam\&quot;  enables printing the entries' team IDs.\n&quot;
++		&quot;\&quot;--difftime\&quot;   print difference times for all but the first entry.\n&quot;
++		&quot;\&quot;--stacktrace\&quot; print stack traces for entries that captured one.\n&quot;
+ 		&quot;  &lt;start&gt;    - The base index of the entries to print. Depending on\n&quot;
+ 		&quot;               whether the iteration direction is forward or\n&quot;
+ 		&quot;               backward this will be the first or last entry printed\n&quot;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008242.html">[Haiku-commits] r25204 - in haiku/trunk:	headers/private/kernel/arch src/system/kernel/arch/x86
+</A></li>
+	<LI>Next message: <A HREF="008244.html">[Haiku-commits] r25206 - haiku/trunk/build/config_headers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8243">[ date ]</a>
+              <a href="thread.html#8243">[ thread ]</a>
+              <a href="subject.html#8243">[ subject ]</a>
+              <a href="author.html#8243">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

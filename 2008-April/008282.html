@@ -1,0 +1,453 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25225 - haiku/trunk/src/tests/kits/net/tcp_shell
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25225%20-%20haiku/trunk/src/tests/kits/net/tcp_shell&In-Reply-To=%3C200804281548.m3SFmnuu000629%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008281.html">
+   <LINK REL="Next"  HREF="008283.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25225 - haiku/trunk/src/tests/kits/net/tcp_shell</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25225%20-%20haiku/trunk/src/tests/kits/net/tcp_shell&In-Reply-To=%3C200804281548.m3SFmnuu000629%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25225 - haiku/trunk/src/tests/kits/net/tcp_shell">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Apr 28 17:48:49 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008281.html">[Haiku-commits] r25224 - haiku/trunk/src/apps/pairs
+</A></li>
+        <LI>Next message: <A HREF="008283.html">[Haiku-commits] r25226 - haiku/trunk/src/tests/add-ons/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8282">[ date ]</a>
+              <a href="thread.html#8282">[ thread ]</a>
+              <a href="subject.html#8282">[ subject ]</a>
+              <a href="author.html#8282">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-04-28 17:48:49 +0200 (Mon, 28 Apr 2008)
+New Revision: 25225
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25225&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25225&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/tests/kits/net/tcp_shell/tcp_shell.cpp
+Log:
+* Made it work and build again after recent network stack changes.
+* Implement &quot;close&quot; command that actively closes the server socket, or does
+  an simultaneous close. Even though this triggers an &quot;endless conversation&quot;
+  between two time-wait endpoints on Haiku, it works fine in the shell.
+
+
+Modified: haiku/trunk/src/tests/kits/net/tcp_shell/tcp_shell.cpp
+===================================================================
+--- haiku/trunk/src/tests/kits/net/tcp_shell/tcp_shell.cpp	2008-04-28 10:54:38 UTC (rev 25224)
++++ haiku/trunk/src/tests/kits/net/tcp_shell/tcp_shell.cpp	2008-04-28 15:48:49 UTC (rev 25225)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2006-2007, Haiku, Inc. All Rights Reserved.
++ * Copyright 2006-2008, Haiku, Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -7,6 +7,9 @@
+  */
+ 
+ 
++#define _KERNEL_DEBUG_H
++	// avoid including the private kernel debug.h header
++
+ #include &quot;argv.h&quot;
+ #include &quot;tcp.h&quot;
+ #include &quot;utility.h&quot;
+@@ -93,6 +96,8 @@
+ static double sRandomReorder = 0.0;
+ static set&lt;uint32&gt; sReorderList;
+ static bool sSimultaneousConnect = false;
++static bool sSimultaneousClose = false;
++static bool sServerActiveClose = false;
+ 
+ static struct net_domain sDomain = {
+ 	&quot;ipv4&quot;,
+@@ -103,26 +108,39 @@
+ };
+ 
+ 
+-bool
++static bool
+ is_server(const sockaddr* addr)
+ {
+ 	return ((sockaddr_in*)addr)-&gt;sin_port == htons(1024);
+ }
+ 
+ 
+-bool
+-is_syn(net_buffer* buffer)
++static uint8
++tcp_segment_flags(net_buffer* buffer)
+ {
+ 	NetBufferHeaderReader&lt;tcp_header&gt; bufferHeader(buffer);
+ 	if (bufferHeader.Status() &lt; B_OK)
+ 		return bufferHeader.Status();
+ 
+ 	tcp_header &amp;header = bufferHeader.Data();
++	return header.flags;
++}
+ 
+-	return (header.flags &amp; TCP_FLAG_SYNCHRONIZE) != 0;
++
++static bool
++is_syn(net_buffer* buffer)
++{
++	return (tcp_segment_flags(buffer) &amp; TCP_FLAG_SYNCHRONIZE) != 0;
+ }
+ 
+ 
++static bool
++is_fin(net_buffer* buffer)
++{
++	return (tcp_segment_flags(buffer) &amp; TCP_FLAG_FINISH) != 0;
++}
++
++
+ //	#pragma mark - misc kernel
+ 
+ 
+@@ -155,6 +173,12 @@
+ }
+ 
+ 
++extern &quot;C&quot; void
++scheduler_enqueue_in_run_queue(struct thread *thread)
++{
++}
++
++
+ //	#pragma mark - stack
+ 
+ 
+@@ -193,33 +217,53 @@
+ }
+ 
+ 
++static bool
++dummy_is_syscall(void)
++{
++	return false;
++}
++
++
++static bool
++dummy_is_restarted_syscall(void)
++{
++	return false;
++}
++
++
++static void
++dummy_store_syscall_restart_timeout(bigtime_t timeout)
++{
++}
++
++
+ static net_stack_module_info gNetStackModule = {
+ 	{
+ 		NET_STACK_MODULE_NAME,
+ 		0,
+ 		std_ops
+ 	},
+-	NULL, //register_domain,
+-	NULL, //unregister_domain,
++	NULL, // register_domain,
++	NULL, // unregister_domain,
+ 	get_domain,
+ 
+ 	register_domain_protocols,
+ 	register_domain_datalink_protocols,
+ 	register_domain_receiving_protocol,
+ 
+-	NULL, //get_domain_receiving_protocol,
+-	NULL, //put_domain_receiving_protocol,
++	NULL, // get_domain_receiving_protocol,
++	NULL, // put_domain_receiving_protocol,
+ 
+-	NULL, //register_device_deframer,
+-	NULL, //unregister_device_deframer,
+-	NULL, //register_domain_device_handler,
+-	NULL, //register_device_handler,
+-	NULL, //unregister_device_handler,
+-	NULL, //register_device_monitor,
+-	NULL, //unregister_device_monitor,
+-	NULL, //device_link_changed,
+-	NULL, //device_removed,
+-	NULL, //device_enqueue_buffer,
++	NULL, // register_device_deframer,
++	NULL, // unregister_device_deframer,
++	NULL, // register_domain_device_handler,
++	NULL, // register_device_handler,
++	NULL, // unregister_device_handler,
++	NULL, // register_device_monitor,
++	NULL, // unregister_device_monitor,
++	NULL, // device_link_changed,
++	NULL, // device_removed,
++	NULL, // device_enqueue_buffer,
+ 
+ 	notify_socket,
+ 
+@@ -236,6 +280,11 @@
+ 	set_timer,
+ 	cancel_timer,
+ 	is_timer_active,
++
++	dummy_is_syscall,
++	dummy_is_restarted_syscall,
++	dummy_store_syscall_restart_timeout,
++	NULL, // restore_syscall_restart_timeout
+ };
+ 
+ 
+@@ -621,23 +670,23 @@
+ 		0,
+ 		std_ops
+ 	},
+-	NULL, //socket_open,
+-	NULL, //socket_close,
+-	NULL, //socket_free,
++	NULL, // open,
++	NULL, // close,
++	NULL, // free,
+ 
+-	NULL, //socket_readv,
+-	NULL, //socket_writev,
+-	NULL, //socket_control,
++	NULL, // readv,
++	NULL, // writev,
++	NULL, // control,
+ 
+-	NULL, //socket_read_avail,
+-	NULL, //socket_send_avail,
++	NULL, // read_avail,
++	NULL, // send_avail,
+ 
+-	NULL, //socket_send_data,
+-	NULL, //socket_receive_data,
++	NULL, // send_data,
++	NULL, // receive_data,
+ 
+-	NULL, //get_option,
+-	NULL, //set_option,
+-	NULL, //socket_get_next_stat,
++	NULL, // get_option,
++	NULL, // set_option,
++	NULL, // get_next_stat,
+ 
+ 	// connections
+ 	socket_spawn_pending,
+@@ -648,22 +697,23 @@
+ 	socket_connected,
+ 
+ 	// notifications
+-	NULL, //socket_request_notification,
+-	NULL, //socket_cancel_notification,
++	NULL, // request_notification,
++	NULL, // cancel_notification,
+ 	socket_notify,
+ 
+ 	// standard socket API
+-	NULL, //socket_accept,
+-	NULL, //socket_bind,
+-	NULL, //socket_connect,
+-	NULL, //socket_getpeername,
+-	NULL, //socket_getsockname,
+-	NULL, //socket_getsockopt,
+-	NULL, //socket_listen,
+-	NULL, //socket_recv,
+-	NULL, //socket_send,
+-	NULL, //socket_setsockopt,
+-	NULL, //socket_shutdown,
++	NULL, // accept,
++	NULL, // bind,
++	NULL, // connect,
++	NULL, // getpeername,
++	NULL, // getsockname,
++	NULL, // getsockopt,
++	NULL, // listen,
++	NULL, // receive,
++	NULL, // send,
++	NULL, // setsockopt,
++	NULL, // shutdown,
++	NULL, // socketpair
+ };
+ 
+ 
+@@ -1046,6 +1096,8 @@
+ 		0,
+ 		std_ops
+ 	},
++	NET_PROTOCOL_ATOMIC_MESSAGES,
++
+ 	NULL, // init
+ 	NULL, // uninit
+ 	domain_open,
+@@ -1071,6 +1123,8 @@
+ 	NULL, // deliver_data
+ 	domain_error,
+ 	domain_error_reply,
++	NULL, // attach_ancillary_data
++	NULL, // process_ancillary_data
+ };
+ 
+ 
+@@ -1094,7 +1148,8 @@
+ 
+ 		while (true) {
+ 			context-&gt;lock.Lock();
+-			net_buffer* buffer = (net_buffer*)list_remove_head_item(&amp;context-&gt;list);
++			net_buffer* buffer = (net_buffer*)list_remove_head_item(
++				&amp;context-&gt;list);
+ 			context-&gt;lock.Unlock();
+ 
+ 			if (buffer == NULL)
+@@ -1108,13 +1163,17 @@
+ 				address.sin_port = htons(1023);
+ 				address.sin_addr.s_addr = htonl(0xc0a80001);
+ 
+-				status_t status = socket_connect(gServerSocket, (struct sockaddr *)&amp;address,
+-					sizeof(struct sockaddr));
++				status_t status = socket_connect(gServerSocket,
++					(struct sockaddr *)&amp;address, sizeof(struct sockaddr));
+ 				if (status &lt; B_OK)
+ 					fprintf(stderr, &quot;tcp_tester: simultaneous connect failed: %s\n&quot;, strerror(status));
+ 
+ 				sSimultaneousConnect = false;
+ 			}
++			if (sSimultaneousClose &amp;&amp; !context-&gt;server &amp;&amp; is_fin(buffer)) {
++				close_protocol(gClientSocket-&gt;first_protocol);
++				sSimultaneousClose = false;
++			}
+ 			if ((sRandomReorder &gt; 0.0
+ 					|| sReorderList.find(sPacketNumber) != sReorderList.end())
+ 				&amp;&amp; reorderBuffer == NULL
+@@ -1159,6 +1218,12 @@
+ 		while ((bytesRead = socket_recv(connectionSocket, buffer,
+ 				sizeof(buffer), 0)) &gt; 0) {
+ 			printf(&quot;server: received %ld bytes\n&quot;, bytesRead);
++
++			if (sServerActiveClose) {
++				printf(&quot;server: active close\n&quot;);
++				close_protocol(connectionSocket-&gt;first_protocol);
++				return 0;
++			}
+ 		}
+ 		if (bytesRead &lt; 0)
+ 			printf(&quot;server: receiving failed: %s\n&quot;, strerror(bytesRead));
+@@ -1183,7 +1248,7 @@
+ 	address.sin_port = htons(1024);
+ 	address.sin_addr.s_addr = INADDR_ANY;
+ 
+-	status_t status = socket_bind(gServerSocket, (struct sockaddr *)&amp;address,
++	status_t status = socket_bind(gServerSocket, (struct sockaddr*)&amp;address,
+ 		sizeof(struct sockaddr));
+ 	if (status &lt; B_OK) {
+ 		fprintf(stderr, &quot;tcp_tester: cannot bind server: %s\n&quot;, strerror(status));
+@@ -1338,6 +1403,32 @@
+ 
+ 
+ static void
++do_close(int argc, char** argv)
++{
++	sSimultaneousClose = false;
++	sServerActiveClose = true;
++
++	if (argc &gt; 1) {
++		if (!strcmp(argv[1], &quot;-s&quot;))
++			sSimultaneousClose = true;
++		else {
++			fprintf(stderr, &quot;usage: close [-s]\n&quot;);
++			return;
++		}
++	}
++
++	gClientSocket-&gt;send.timeout = 0;
++
++	char buffer[32767] = {'q'};
++	ssize_t bytesWritten = socket_send(gClientSocket, buffer, sizeof(buffer), 0);
++	if (bytesWritten &lt; B_OK) {
++		fprintf(stderr, &quot;failed sending buffer: %s\n&quot;, strerror(bytesWritten));
++		return;
++	}
++}
++
++
++static void
+ do_drop(int argc, char** argv)
+ {
+ 	if (argc == 1) {
+@@ -1493,6 +1584,7 @@
+ static cmd_entry sBuiltinCommands[] = {
+ 	{&quot;connect&quot;, do_connect, &quot;Connects the client&quot;},
+ 	{&quot;send&quot;, do_send, &quot;Sends data from the client to the server&quot;},
++	{&quot;close&quot;, do_close, &quot;Performs an active or simultaneous close&quot;},
+ 	{&quot;dprintf&quot;, do_dprintf, &quot;Toggles debug output&quot;},
+ 	{&quot;drop&quot;, do_drop, &quot;Lets you drop packets during transfer&quot;},
+ 	{&quot;reorder&quot;, do_reorder, &quot;Lets you reorder packets during transfer&quot;},
+@@ -1514,6 +1606,9 @@
+ }
+ 
+ 
++//	#pragma mark -
++
++
+ int
+ main(int argc, char** argv)
+ {
+@@ -1524,10 +1619,10 @@
+ 		return 1;
+ 	}
+ 
+-	_add_builtin_module((module_info *)&amp;gNetStackModule);
+-	_add_builtin_module((module_info *)&amp;gNetBufferModule);
+-	_add_builtin_module((module_info *)&amp;gNetSocketModule);
+-	_add_builtin_module((module_info *)&amp;gNetDatalinkModule);
++	_add_builtin_module((module_info*)&amp;gNetStackModule);
++	_add_builtin_module((module_info*)&amp;gNetBufferModule);
++	_add_builtin_module((module_info*)&amp;gNetSocketModule);
++	_add_builtin_module((module_info*)&amp;gNetDatalinkModule);
+ 	_add_builtin_module(modules[0]);
+ 	if (_get_builtin_dependencies() &lt; B_OK) {
+ 		fprintf(stderr, &quot;tcp_tester: Could not initialize modules: %s\n&quot;,
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008281.html">[Haiku-commits] r25224 - haiku/trunk/src/apps/pairs
+</A></li>
+	<LI>Next message: <A HREF="008283.html">[Haiku-commits] r25226 - haiku/trunk/src/tests/add-ons/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8282">[ date ]</a>
+              <a href="thread.html#8282">[ thread ]</a>
+              <a href="subject.html#8282">[ subject ]</a>
+              <a href="author.html#8282">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

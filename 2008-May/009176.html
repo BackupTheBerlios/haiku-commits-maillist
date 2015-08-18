@@ -1,0 +1,170 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25707 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25707%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/usb&In-Reply-To=%3C200805291748.m4THmf6k021389%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009177.html">
+   <LINK REL="Next"  HREF="009178.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25707 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25707%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/usb&In-Reply-To=%3C200805291748.m4THmf6k021389%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25707 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Thu May 29 19:48:41 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009177.html">[Haiku-commits] r25706 - haiku/trunk/src/data/beos_mime/audio
+</A></li>
+        <LI>Next message: <A HREF="009178.html">[Haiku-commits] r25708 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9176">[ date ]</a>
+              <a href="thread.html#9176">[ thread ]</a>
+              <a href="subject.html#9176">[ subject ]</a>
+              <a href="author.html#9176">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-05-29 19:48:41 +0200 (Thu, 29 May 2008)
+New Revision: 25707
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25707&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25707&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/BeOSCompatibility.h
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h
+Log:
+* For multi function devices it is not so unlikely to try to do multiple
+  concurent SendRequest() calls. Therefore it's probably a good idea to
+  protect that, now that the request data is not dynamically allocated anymore.
+* Fix warning about not returning a result in the compatibility version of
+  init_mutex_etc() (which wouldn't make a difference as the Haiku version
+  does not return anything).
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/BeOSCompatibility.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/BeOSCompatibility.h	2008-05-29 17:27:28 UTC (rev 25706)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/BeOSCompatibility.h	2008-05-29 17:48:41 UTC (rev 25707)
+@@ -55,7 +55,7 @@
+ inline status_t
+ mutex_init_etc(mutex *ben, const char *name, int32 flags)
+ {
+-	mutex_init(ben, name);
++	return mutex_init(ben, name);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp	2008-05-29 17:27:28 UTC (rev 25706)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp	2008-05-29 17:48:41 UTC (rev 25707)
+@@ -293,6 +293,7 @@
+ 	:	Pipe(parent),
+ 		fNotifySem(-1)
+ {
++	mutex_init(&amp;fSendRequestLock, &quot;control pipe send request&quot;);
+ }
+ 
+ 
+@@ -300,6 +301,7 @@
+ {
+ 	if (fNotifySem &gt;= 0)
+ 		delete_sem(fNotifySem);
++	mutex_destroy(&amp;fSendRequestLock);
+ }
+ 
+ 
+@@ -308,16 +310,24 @@
+ 	uint16 index, uint16 length, void *data, size_t dataLength,
+ 	size_t *actualLength)
+ {
++	status_t result = mutex_lock(&amp;fSendRequestLock);
++	if (result != B_OK)
++		return result;
++
+ 	if (fNotifySem &lt; 0) {
+ 		fNotifySem = create_sem(0, &quot;usb send request notify&quot;);
+-		if (fNotifySem &lt; 0)
++		if (fNotifySem &lt; 0) {
++			mutex_unlock(&amp;fSendRequestLock);
+ 			return B_NO_MORE_SEMS;
++		}
+ 	}
+ 
+-	status_t result = QueueRequest(requestType, request, value, index, length,
+-		data, dataLength, SendRequestCallback, this);
+-	if (result &lt; B_OK)
++	result = QueueRequest(requestType, request, value, index, length, data,
++		dataLength, SendRequestCallback, this);
++	if (result &lt; B_OK) {
++		mutex_unlock(&amp;fSendRequestLock);
+ 		return result;
++	}
+ 
+ 	// The sem will be released unconditionally in the callback after the
+ 	// result data was filled in. Use a 1 second timeout for control transfers.
+@@ -334,12 +344,14 @@
+ 		if (actualLength)
+ 			*actualLength = 0;
+ 
++		mutex_unlock(&amp;fSendRequestLock);
+ 		return B_TIMED_OUT;
+ 	}
+ 
+ 	if (actualLength)
+ 		*actualLength = fActualLength;
+ 
++	mutex_unlock(&amp;fSendRequestLock);
+ 	return fTransferStatus;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h	2008-05-29 17:27:28 UTC (rev 25706)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h	2008-05-29 17:48:41 UTC (rev 25707)
+@@ -334,6 +334,7 @@
+ 											void *callbackCookie);
+ 
+ private:
++		mutex							fSendRequestLock;
+ 		sem_id							fNotifySem;
+ 		status_t						fTransferStatus;
+ 		size_t							fActualLength;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009177.html">[Haiku-commits] r25706 - haiku/trunk/src/data/beos_mime/audio
+</A></li>
+	<LI>Next message: <A HREF="009178.html">[Haiku-commits] r25708 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9176">[ date ]</a>
+              <a href="thread.html#9176">[ thread ]</a>
+              <a href="subject.html#9176">[ subject ]</a>
+              <a href="author.html#9176">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,138 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24947 -	haiku/trunk/src/add-ons/kernel/drivers/bus/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24947%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/bus/usb&In-Reply-To=%3C200804121420.m3CEKsh0028301%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007735.html">
+   <LINK REL="Next"  HREF="007690.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24947 -	haiku/trunk/src/add-ons/kernel/drivers/bus/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24947%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/bus/usb&In-Reply-To=%3C200804121420.m3CEKsh0028301%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24947 -	haiku/trunk/src/add-ons/kernel/drivers/bus/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sat Apr 12 16:20:54 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007735.html">[Haiku-commits] r24946 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+        <LI>Next message: <A HREF="007690.html">[Haiku-commits] r24918 - haiku/trunk/headers/private/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7732">[ date ]</a>
+              <a href="thread.html#7732">[ thread ]</a>
+              <a href="subject.html#7732">[ subject ]</a>
+              <a href="author.html#7732">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-04-12 16:20:53 +0200 (Sat, 12 Apr 2008)
+New Revision: 24947
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24947&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24947&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+Log:
+Make a local copy of the passed in isochronous packet descriptors before
+handing them over to the USB stack. Otherwise the finisher (kernel) thread
+would have no way to fill those packets when they came from a user space
+address range. Completely untested though.
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp	2008-04-12 13:36:33 UTC (rev 24946)
++++ haiku/trunk/src/add-ons/kernel/drivers/bus/usb/usb_raw.cpp	2008-04-12 14:20:53 UTC (rev 24947)
+@@ -591,9 +591,25 @@
+ 				return B_OK;
+ 			}
+ 
+-			benaphore_lock(&amp;device-&gt;lock);
++			size_t descriptorsSize = 0;
++			usb_iso_packet_descriptor *packetDescriptors = NULL;
++			if (op == B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER) {
++				descriptorsSize = sizeof(usb_iso_packet_descriptor)
++					* command-&gt;isochronous.packet_count;
++				packetDescriptors
++					= (usb_iso_packet_descriptor *)malloc(descriptorsSize);
++				if (!packetDescriptors) {
++					command-&gt;transfer.status = B_USB_RAW_STATUS_NO_MEMORY;
++					command-&gt;transfer.length = 0;
++					return B_OK;
++				}
+ 
++				memcpy(packetDescriptors,
++					command-&gt;isochronous.packet_descriptors, descriptorsSize);
++			}
++
+ 			status_t status;
++			benaphore_lock(&amp;device-&gt;lock);
+ 			if (op == B_USB_RAW_COMMAND_INTERRUPT_TRANSFER) {
+ 				status = gUSBModule-&gt;queue_interrupt(endpointInfo-&gt;handle,
+ 					command-&gt;transfer.data, command-&gt;transfer.length,
+@@ -605,14 +621,14 @@
+ 			} else {
+ 				status = gUSBModule-&gt;queue_isochronous(endpointInfo-&gt;handle,
+ 					command-&gt;isochronous.data, command-&gt;isochronous.length,
+-					command-&gt;isochronous.packet_descriptors,
+-					command-&gt;isochronous.packet_count, NULL, 0,
+-					usb_raw_callback, device);
++					packetDescriptors, command-&gt;isochronous.packet_count, NULL,
++					0, usb_raw_callback, device);
+ 			}
+ 
+ 			if (status &lt; B_OK) {
+ 				command-&gt;transfer.status = B_USB_RAW_STATUS_FAILED;
+ 				command-&gt;transfer.length = 0;
++				free(packetDescriptors);
+ 				benaphore_unlock(&amp;device-&gt;lock);
+ 				return B_OK;
+ 			}
+@@ -621,6 +637,13 @@
+ 			command-&gt;transfer.status = device-&gt;status;
+ 			command-&gt;transfer.length = device-&gt;actual_length;
+ 			benaphore_unlock(&amp;device-&gt;lock);
++
++			if (op == B_USB_RAW_COMMAND_ISOCHRONOUS_TRANSFER) {
++				memcpy(command-&gt;isochronous.packet_descriptors,
++					packetDescriptors, descriptorsSize);
++				free(packetDescriptors);
++			}
++
+ 			return B_OK;
+ 		}
+ 	}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007735.html">[Haiku-commits] r24946 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+	<LI>Next message: <A HREF="007690.html">[Haiku-commits] r24918 - haiku/trunk/headers/private/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7732">[ date ]</a>
+              <a href="thread.html#7732">[ thread ]</a>
+              <a href="subject.html#7732">[ subject ]</a>
+              <a href="author.html#7732">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

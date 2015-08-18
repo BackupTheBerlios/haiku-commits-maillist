@@ -1,0 +1,404 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23568 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23568%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/debug&In-Reply-To=%3C200801162151.m0GLp0Ki026656%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005552.html">
+   <LINK REL="Next"  HREF="005558.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23568 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23568%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/debug&In-Reply-To=%3C200801162151.m0GLp0Ki026656%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23568 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Jan 16 22:51:00 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005552.html">[Haiku-commits] r23567 - haiku/trunk/src/system/kernel/cache
+</A></li>
+        <LI>Next message: <A HREF="005558.html">[Haiku-commits] r23569 - in haiku/trunk/3rdparty/mmu_man/themes: .	addons
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5557">[ date ]</a>
+              <a href="thread.html#5557">[ thread ]</a>
+              <a href="subject.html#5557">[ subject ]</a>
+              <a href="author.html#5557">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-01-16 22:50:59 +0100 (Wed, 16 Jan 2008)
+New Revision: 23568
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23568&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23568&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/debug.h
+   haiku/trunk/src/system/kernel/debug/debug_commands.cpp
+   haiku/trunk/src/system/kernel/debug/debug_variables.cpp
+   haiku/trunk/src/system/kernel/debug/debug_variables.h
+Log:
+* Changed the way temporary variables work. They won't be unset before
+  a command is executed anymore. Instead the least recently used
+  temporary variable is overwritten, if there's no free slot for a new
+  temporary variable.
+* Removed the special handling for the command result variable (&quot;_&quot;). It
+  just works like any other temporary variable, now.
+* Individual temporary variables can be removed (e.g. using the &quot;unset&quot;
+  command).
+* Added unset_all_debug_variables() and &quot;unset_all&quot; command to unset
+  all persistent and temporary variables.
+* Removed remove_all_temporary_debug_variables and renamed
+  remove_debug_variable() to unset_debug_variable().
+
+
+Modified: haiku/trunk/headers/private/kernel/debug.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/debug.h	2008-01-16 20:43:12 UTC (rev 23567)
++++ haiku/trunk/headers/private/kernel/debug.h	2008-01-16 21:50:59 UTC (rev 23568)
+@@ -63,8 +63,8 @@
+ extern bool		set_debug_variable(const char* variableName, uint64 value);
+ extern uint64	get_debug_variable(const char* variableName,
+ 					uint64 defaultValue);
+-extern bool		remove_debug_variable(const char* variableName);
+-extern void		remove_all_temporary_debug_variables();
++extern bool		unset_debug_variable(const char* variableName);
++extern void		unset_all_debug_variables();
+ 
+ extern bool		evaluate_debug_expression(const char* expression,
+ 					uint64* result, bool silent);
+
+Modified: haiku/trunk/src/system/kernel/debug/debug_commands.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/debug_commands.cpp	2008-01-16 20:43:12 UTC (rev 23567)
++++ haiku/trunk/src/system/kernel/debug/debug_commands.cpp	2008-01-16 21:50:59 UTC (rev 23568)
+@@ -94,10 +94,6 @@
+ int
+ invoke_debugger_command(struct debugger_command *command, int argc, char** argv)
+ {
+-	// remove the temporary variables of the previously executed command, if
+-	// this command sets a temporary variable
+-	mark_temporary_debug_variables_obsolete();
+-
+ 	struct thread* thread = thread_get_current_thread();
+ 	addr_t oldFaultHandler = thread-&gt;fault_handler;
+ 
+
+Modified: haiku/trunk/src/system/kernel/debug/debug_variables.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/debug_variables.cpp	2008-01-16 20:43:12 UTC (rev 23567)
++++ haiku/trunk/src/system/kernel/debug/debug_variables.cpp	2008-01-16 21:50:59 UTC (rev 23568)
+@@ -10,6 +10,7 @@
+ #include &lt;KernelExport.h&gt;
+ 
+ #include &lt;debug.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
+ 
+ 
+ static const int kVariableCount				= 64;
+@@ -42,10 +43,14 @@
+ 	}
+ };
+ 
++struct TemporaryVariable : Variable,
++		DoublyLinkedListLinkImpl&lt;TemporaryVariable&gt; {
++};
++
+ static Variable sVariables[kVariableCount];
+-static Variable sTemporaryVariables[kTemporaryVariableCount];
++static TemporaryVariable sTemporaryVariables[kTemporaryVariableCount];
+ 
+-static bool sTemporaryVariablesObsolete = false;
++static DoublyLinkedList&lt;TemporaryVariable&gt; sTemporaryVariablesLRUQueue;
+ 
+ 
+ static inline bool
+@@ -55,33 +60,90 @@
+ }
+ 
+ 
++static void
++dequeue_temporary_variable(TemporaryVariable* variable)
++{
++	// dequeue if queued
++	if (variable-&gt;GetDoublyLinkedListLink()-&gt;previous != NULL
++		|| sTemporaryVariablesLRUQueue.Head() == variable) {
++		sTemporaryVariablesLRUQueue.Remove(variable);
++	}
++}
++
++
++static void
++unset_variable(Variable* variable)
++{
++	if (is_temporary_variable(variable-&gt;name))
++		dequeue_temporary_variable(static_cast&lt;TemporaryVariable*&gt;(variable));
++
++	variable-&gt;Uninit();
++}
++
++
++static void
++touch_variable(Variable* _variable)
++{
++	if (!is_temporary_variable(_variable-&gt;name))
++		return;
++
++	TemporaryVariable* variable = static_cast&lt;TemporaryVariable*&gt;(_variable);
++
++	// move to the end of the queue
++	dequeue_temporary_variable(variable);
++	sTemporaryVariablesLRUQueue.Add(variable);
++}
++
++
+ static Variable*
++free_temporary_variable_slot()
++{
++	TemporaryVariable* variable = sTemporaryVariablesLRUQueue.RemoveHead();
++	if (variable)
++		variable-&gt;Uninit();
++
++	return variable;
++}
++
++
++static Variable*
+ get_variable(const char* variableName, bool create)
+ {
+ 	Variable* variables;
+ 	int variableCount;
+ 
+-	// get the variable domain (persistent or temporary)
++	// find the variable in the respective array and a free slot, we can
++	// use, if it doesn't exist yet
++	Variable* freeSlot = NULL;
++
+ 	if (is_temporary_variable(variableName)) {
+-		variables = sTemporaryVariables;
+-		variableCount = kTemporaryVariableCount;
++		// temporary variable
++		for (int i = 0; i &lt; kTemporaryVariableCount; i++) {
++			TemporaryVariable* variable = sTemporaryVariables + i;
++	
++			if (!variable-&gt;IsUsed()) {
++				if (freeSlot == NULL)
++					freeSlot = variable;
++			} else if (variable-&gt;HasName(variableName))
++				return variable;
++		}
++
++		if (create &amp;&amp; freeSlot == NULL)
++			freeSlot = free_temporary_variable_slot();
+ 	} else {
+-		variables = sVariables;
+-		variableCount = kVariableCount;
++		// persistent variable
++		for (int i = 0; i &lt; kVariableCount; i++) {
++			Variable* variable = sVariables + i;
++	
++			if (!variable-&gt;IsUsed()) {
++				if (freeSlot == NULL)
++					freeSlot = variable;
++			} else if (variable-&gt;HasName(variableName))
++				return variable;
++		}
+ 	}
+ 
+-	Variable* freeSlot = NULL;
+ 
+-	for (int i = 0; i &lt; variableCount; i++) {
+-		Variable* variable = variables + i;
+-
+-		if (!variable-&gt;IsUsed()) {
+-			if (freeSlot == NULL)
+-				freeSlot = variable;
+-		} else if (variable-&gt;HasName(variableName))
+-			return variable;
+-	}
+-
+ 	if (create &amp;&amp; freeSlot != NULL) {
+ 		freeSlot-&gt;Init(variableName);
+ 		return freeSlot;
+@@ -106,9 +168,7 @@
+ 
+ 	const char* variable = argv[1];
+ 
+-	if (is_temporary_variable(variable))
+-		kprintf(&quot;You cannot remove temporary variables.\n&quot;);
+-	else if (!remove_debug_variable(variable))
++	if (!unset_debug_variable(variable))
+ 		kprintf(&quot;Did not find variable %s.\n&quot;, variable);
+ 
+ 	return 0;
+@@ -116,6 +176,22 @@
+ 
+ 
+ static int
++cmd_unset_all_variables(int argc, char **argv)
++{
++	static const char* usage = &quot;usage: %s\n&quot;
++		&quot;Unsets all variables.\n&quot;;
++	if (argc == 2 &amp;&amp; strcmp(argv[1], &quot;--help&quot;) == 0) {
++		kprintf(usage, argv[0]);
++		return 0;
++	}
++
++	unset_all_debug_variables();
++
++	return 0;
++}
++
++
++static int
+ cmd_variables(int argc, char **argv)
+ {
+ 	static const char* usage = &quot;usage: vars\n&quot;
+@@ -160,14 +236,9 @@
+ bool
+ set_debug_variable(const char* variableName, uint64 value)
+ {
+-	if (sTemporaryVariablesObsolete &amp;&amp; is_temporary_variable(variableName)
+-		&amp;&amp; strcmp(variableName, kCommandReturnValueVariable) != 0) {
+-		remove_all_temporary_debug_variables();
+-	}
+-
+-
+ 	if (Variable* variable = get_variable(variableName, true)) {
+ 		variable-&gt;value = value;
++		touch_variable(variable);
+ 		return true;
+ 	}
+ 
+@@ -178,23 +249,20 @@
+ uint64
+ get_debug_variable(const char* variableName, uint64 defaultValue)
+ {
+-	if (Variable* variable = get_variable(variableName, false))
++	if (Variable* variable = get_variable(variableName, false)) {
++		touch_variable(variable);
+ 		return variable-&gt;value;
++	}
+ 
+ 	return defaultValue;
+ }
+ 
+ 
+ bool
+-remove_debug_variable(const char* variableName)
++unset_debug_variable(const char* variableName)
+ {
+-	// We don't allow explicit removal of inidividual temporary variables.
+-	// This speeds up removing them all.
+-	if (is_temporary_variable(variableName))
+-		return false;
+-
+ 	if (Variable* variable = get_variable(variableName, false)) {
+-		variable-&gt;Uninit();
++		unset_variable(variable);
+ 		return true;
+ 	}
+ 
+@@ -203,42 +271,31 @@
+ 
+ 
+ void
+-remove_all_temporary_debug_variables()
++unset_all_debug_variables()
+ {
++	// persistent variables
++	for (int i = 0; i &lt; kVariableCount; i++) {
++		Variable&amp; variable = sVariables[i];
++		if (variable.IsUsed())
++			unset_variable(&amp;variable);
++	}
++
++	// temporary variables
+ 	for (int i = 0; i &lt; kTemporaryVariableCount; i++) {
+ 		Variable&amp; variable = sTemporaryVariables[i];
+-		if (!variable.IsUsed())
+-			break;
+-
+-		variable.Uninit();
++		if (variable.IsUsed())
++			unset_variable(&amp;variable);
+ 	}
+-
+-	// always keep the return value variable defined
+-	set_debug_variable(kCommandReturnValueVariable, 0);
+-
+-	sTemporaryVariablesObsolete = false;
+ }
+ 
+ 
+-/*!	Schedules all temporary variables for removal.
+-	They will be removed, the next time set_debug_variable() is invoked
+-	for a temporary variable other than the command return value variable.
+-*/
+ void
+-mark_temporary_debug_variables_obsolete()
+-{
+-	sTemporaryVariablesObsolete = true;
+-}
+-
+-
+-void
+ debug_variables_init()
+ {
+-	// always keep the return value variable defined
+-	set_debug_variable(kCommandReturnValueVariable, 0);
+-
+ 	add_debugger_command(&quot;unset&quot;, &amp;cmd_unset_variable,
+ 		&quot;Unsets the given variable&quot;);
++	add_debugger_command(&quot;unset_all&quot;, &amp;cmd_unset_all_variables,
++		&quot;Unsets all variables&quot;);
+ 	add_debugger_command(&quot;vars&quot;, &amp;cmd_variables,
+ 		&quot;Lists all defined variables with their values&quot;);
+ }
+
+Modified: haiku/trunk/src/system/kernel/debug/debug_variables.h
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/debug_variables.h	2008-01-16 20:43:12 UTC (rev 23567)
++++ haiku/trunk/src/system/kernel/debug/debug_variables.h	2008-01-16 21:50:59 UTC (rev 23568)
+@@ -14,8 +14,6 @@
+ extern &quot;C&quot; {
+ #endif
+ 
+-void	mark_temporary_debug_variables_obsolete();
+-
+ void	debug_variables_init();
+ 
+ #ifdef __cplusplus
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005552.html">[Haiku-commits] r23567 - haiku/trunk/src/system/kernel/cache
+</A></li>
+	<LI>Next message: <A HREF="005558.html">[Haiku-commits] r23569 - in haiku/trunk/3rdparty/mmu_man/themes: .	addons
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5557">[ date ]</a>
+              <a href="thread.html#5557">[ thread ]</a>
+              <a href="subject.html#5557">[ subject ]</a>
+              <a href="author.html#5557">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

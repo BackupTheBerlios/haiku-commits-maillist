@@ -1,0 +1,615 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21462 - haiku/trunk/src/kits/tracker
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21462%20-%20haiku/trunk/src/kits/tracker&In-Reply-To=%3C200706190933.l5J9XU9Q017791%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002814.html">
+   <LINK REL="Next"  HREF="002816.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21462 - haiku/trunk/src/kits/tracker</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21462%20-%20haiku/trunk/src/kits/tracker&In-Reply-To=%3C200706190933.l5J9XU9Q017791%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21462 - haiku/trunk/src/kits/tracker">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Tue Jun 19 11:33:30 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002814.html">[Haiku-commits] r21461 - haiku/trunk/src/system/kernel/cache
+</A></li>
+        <LI>Next message: <A HREF="002816.html">[Haiku-commits] r21463 - in haiku/trunk: headers/private/shared	src/kits/shared
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2815">[ date ]</a>
+              <a href="thread.html#2815">[ thread ]</a>
+              <a href="subject.html#2815">[ subject ]</a>
+              <a href="author.html#2815">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2007-06-19 11:33:29 +0200 (Tue, 19 Jun 2007)
+New Revision: 21462
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21462&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21462&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/kits/tracker/Pose.cpp
+   haiku/trunk/src/kits/tracker/Pose.h
+   haiku/trunk/src/kits/tracker/PoseList.cpp
+   haiku/trunk/src/kits/tracker/PoseList.h
+   haiku/trunk/src/kits/tracker/PoseView.cpp
+   haiku/trunk/src/kits/tracker/PoseView.h
+   haiku/trunk/src/kits/tracker/SettingsViews.cpp
+   haiku/trunk/src/kits/tracker/Tracker.cpp
+   haiku/trunk/src/kits/tracker/Utilities.cpp
+   haiku/trunk/src/kits/tracker/Utilities.h
+Log:
+Reworked the handling of periodically updated poses (currently only ones with a volume space bar):
+
+* Addad global list where poses that need periodic updates can be registered with a callback
+* Use this mechanism for poses with a volume space bar
+* Create only one BVolume when the BPose is created for a volume, instead of every time the free space is calculated
+* On Pulse() the global list is used to update all of the registered periodic update poses
+* As the poses know their volume, it is no longer necessary to use a BVolumeRoster to loop through each volume on each Pulse()
+* Removed the now superfluous SendNotices() mechanism
+* Removed corresponding watching / handling of these notices in BPoseView
+
+The BPoseView did a linear search for each volume pose on each Pulse() before. What's more it did this once for each mounted volume as it did get one individual notice for each of them. To get these volumes a BVolumeRoster was used to loop through the volumes, but then the BPose did still create a new BVolume to actually calculate the free space! I'm surprised that it did not suck away more performance with this method...
+
+Anyway, this should bring down BVolume construction and update overhead down to a minimum and hopefully fix ticket #1247.
+
+Modified: haiku/trunk/src/kits/tracker/Pose.cpp
+===================================================================
+--- haiku/trunk/src/kits/tracker/Pose.cpp	2007-06-18 23:58:15 UTC (rev 21461)
++++ haiku/trunk/src/kits/tracker/Pose.cpp	2007-06-19 09:33:29 UTC (rev 21462)
+@@ -49,32 +49,15 @@
+ 
+ 
+ int32
+-CalcFreeSpace(dev_t device)
++CalcFreeSpace(BVolume *volume)
+ {
+-	BVolume volume(device);
+-	fs_info info;
+-	if (volume.InitCheck() == B_OK &amp;&amp; fs_stat_dev(device,&amp;info) == B_OK) {
+-		// Philosophy here:
+-		// Bars go on all drives with read/write capabilities
+-		// Exceptions: Not on CDDA, but on NTFS/Ext2
+-		// Also note that some volumes may return 0 when
+-		// BVolume::Capacity() is called (believe-me... That *DOES*
+-		// happen) so we also check for that.
+-		off_t capacity = volume.Capacity();
+-		if (((!volume.IsReadOnly() &amp;&amp; strcmp(info.fsh_name,&quot;cdda&quot;))
+-			|| !strcmp(info.fsh_name,&quot;ntfs&quot;)
+-			|| !strcmp(info.fsh_name,&quot;ext2&quot;))
+-			&amp;&amp; (capacity &gt; 0)) {
+-			int32 percent = static_cast&lt;int32&gt;(volume.FreeBytes() / (capacity / 100));
++	off_t capacity = volume-&gt;Capacity();
++	int32 percent = static_cast&lt;int32&gt;(volume-&gt;FreeBytes() / (capacity / 100));
+ 
+-			// warn below 20 MB of free space (if this is less than 10% of free space)
+-			if (volume.FreeBytes() &lt; 20 * 1024 * 1024 &amp;&amp; percent &lt; 10)
+-				return -2 - percent;
+-
+-			return percent;
+-		}
+-	}
+-	return -1;
++	// warn below 20 MB of free space (if this is less than 10% of free space)
++	if (volume-&gt;FreeBytes() &lt; 20 * 1024 * 1024 &amp;&amp; percent &lt; 10)
++		return -2 - percent;
++	return percent;
+ }
+ 
+ 
+@@ -98,9 +81,32 @@
+ {
+ 	CreateWidgets(view);
+ 
+-	if (model-&gt;IsVolume() &amp;&amp; TrackerSettings().ShowVolumeSpaceBar()) {
++	if (model-&gt;IsVolume()) {
++		fs_info info;
+ 		dev_t device = model-&gt;NodeRef()-&gt;device;
+-		fPercent = CalcFreeSpace(device);
++		BVolume *volume = new BVolume(device);
++		if (volume-&gt;InitCheck() == B_OK
++			&amp;&amp; fs_stat_dev(device, &amp;info) == B_OK) {
++			// Philosophy here:
++			// Bars go on all drives with read/write capabilities
++			// Exceptions: Not on CDDA, but on NTFS/Ext2
++			// Also note that some volumes may return 0 when
++			// BVolume::Capacity() is called (believe-me... That *DOES*
++			// happen) so we also check for that.
++			off_t capacity = volume-&gt;Capacity();
++			if (((!volume-&gt;IsReadOnly() &amp;&amp; strcmp(info.fsh_name,&quot;cdda&quot;))
++				|| !strcmp(info.fsh_name,&quot;ntfs&quot;)
++				|| !strcmp(info.fsh_name,&quot;ext2&quot;))
++				&amp;&amp; capacity &gt; 0) {
++				// The volume is ok and we want space bars on it
++				gPeriodicUpdatePoses.AddPose(this, view,
++					_PeriodicUpdateCallback, volume);
++				if (TrackerSettings().ShowVolumeSpaceBar())
++					fPercent = CalcFreeSpace(volume);
++			} else
++				delete volume;
++		} else
++			delete volume;
+ 	}
+ 
+ 	if ((fClipboardMode = FSClipboardFindNodeMode(model,true)) != 0
+@@ -112,6 +118,13 @@
+ 
+ BPose::~BPose()
+ {
++	if (fModel-&gt;IsVolume()) {
++		// we might be registered for periodic updates
++		BVolume *volume = NULL;
++		if (gPeriodicUpdatePoses.RemovePose(this, (void **)&amp;volume))
++			delete volume;
++	}
++
+ 	delete fModel;
+ }
+ 
+@@ -285,8 +298,16 @@
+ 
+ 
+ bool
+-BPose::UpdateVolumeSpaceBar(bool enabled)
++BPose::_PeriodicUpdateCallback(BPose *pose, void *cookie)
+ {
++	return pose-&gt;UpdateVolumeSpaceBar((BVolume *)cookie);
++}
++
++
++bool
++BPose::UpdateVolumeSpaceBar(BVolume *volume)
++{
++	bool enabled = TrackerSettings().ShowVolumeSpaceBar();
+ 	if (!enabled) {
+ 		if (fPercent == -1)
+ 			return false;
+@@ -295,9 +316,7 @@
+ 		return true;
+ 	}
+ 
+-	dev_t device = TargetModel()-&gt;NodeRef()-&gt;device;
+-	int32 percent = CalcFreeSpace(device);
+-
++	int32 percent = CalcFreeSpace(volume);
+ 	if (fPercent != percent) {
+ 		if (percent &gt; 100)
+ 			fPercent = 100;
+
+Modified: haiku/trunk/src/kits/tracker/Pose.h
+===================================================================
+--- haiku/trunk/src/kits/tracker/Pose.h	2007-06-18 23:58:15 UTC (rev 21461)
++++ haiku/trunk/src/kits/tracker/Pose.h	2007-06-19 09:33:29 UTC (rev 21462)
+@@ -96,7 +96,7 @@
+ 		void UpdateAllWidgets(int32 poseIndex, BPoint poseLoc, BPoseView *);
+ 		void UpdateWidgetAndModel(Model *resolvedModel, const char *attrName,
+ 				uint32 attrType, int32 poseIndex, BPoint poseLoc, BPoseView *view);
+-		bool UpdateVolumeSpaceBar(bool enabled);
++		bool UpdateVolumeSpaceBar(BVolume *volume);
+ 		void UpdateIcon(BPoint poseLoc, BPoseView *);
+ 
+ 		//void UpdateFixedSymlink(BPoint poseLoc, BPoseView *);	
+@@ -126,6 +126,7 @@
+ #endif
+ 
+ 	private:
++		static bool _PeriodicUpdateCallback(BPose *pose, void *cookie);
+ 		void EditPreviousNextWidgetCommon(BPoseView *poseView, bool next);
+ 		void CreateWidgets(BPoseView *);
+ 		bool TestLargeIconPixel(BPoint) const;
+
+Modified: haiku/trunk/src/kits/tracker/PoseList.cpp
+===================================================================
+--- haiku/trunk/src/kits/tracker/PoseList.cpp	2007-06-18 23:58:15 UTC (rev 21461)
++++ haiku/trunk/src/kits/tracker/PoseList.cpp	2007-06-19 09:33:29 UTC (rev 21462)
+@@ -105,20 +105,3 @@
+ 
+ 	return NULL;
+ }
+-
+-BPose *
+-PoseList::FindVolumePose(const dev_t device, int32 *resultingIndex) const
+-{
+-	int32 count = CountItems();
+-	for (int32 index = 0; index &lt; count; index++) {
+-		BPose *pose = ItemAt(index);
+-		Model *model = pose-&gt;TargetModel();
+-		ASSERT(model);
+-		if (model-&gt;IsVolume() &amp;&amp; model-&gt;NodeRef()-&gt;device == device) {
+-			if (resultingIndex)
+-				*resultingIndex = index;
+-			return pose;
+-		}
+-	}
+-	return NULL;
+-}
+
+Modified: haiku/trunk/src/kits/tracker/PoseList.h
+===================================================================
+--- haiku/trunk/src/kits/tracker/PoseList.h	2007-06-18 23:58:15 UTC (rev 21461)
++++ haiku/trunk/src/kits/tracker/PoseList.h	2007-06-19 09:33:29 UTC (rev 21462)
+@@ -64,7 +64,6 @@
+ 	BPose *DeepFindPose(const node_ref *node, int32 *index = NULL) const;
+ 		// same as FindPose, node can be a target of the actual
+ 		// pose if the pose is a symlink
+-	BPose *FindVolumePose(const dev_t device, int32 *index = NULL) const;
+ };
+ 
+ // iteration glue, add permutations as needed
+
+Modified: haiku/trunk/src/kits/tracker/PoseView.cpp
+===================================================================
+--- haiku/trunk/src/kits/tracker/PoseView.cpp	2007-06-18 23:58:15 UTC (rev 21461)
++++ haiku/trunk/src/kits/tracker/PoseView.cpp	2007-06-19 09:33:29 UTC (rev 21462)
+@@ -803,9 +803,6 @@
+ 		app-&gt;StopWatching(this, kShowSelectionWhenInactiveChanged);
+ 		app-&gt;StopWatching(this, kTransparentSelectionChanged);
+ 		app-&gt;StopWatching(this, kSortFolderNamesFirstChanged);
+-		app-&gt;StopWatching(this, kShowVolumeSpaceBar);
+-		app-&gt;StopWatching(this, kSpaceBarColorChanged);
+-		app-&gt;StopWatching(this, kUpdateVolumeSpaceBar);
+ 		app-&gt;Unlock();
+ 	}
+ 
+@@ -890,9 +887,6 @@
+ 		app-&gt;StartWatching(this, kShowSelectionWhenInactiveChanged);
+ 		app-&gt;StartWatching(this, kTransparentSelectionChanged);
+ 		app-&gt;StartWatching(this, kSortFolderNamesFirstChanged);
+-		app-&gt;StartWatching(this, kShowVolumeSpaceBar);
+-		app-&gt;StartWatching(this, kSpaceBarColorChanged);
+-		app-&gt;StartWatching(this, kUpdateVolumeSpaceBar);
+ 		app-&gt;Unlock();
+ 	}
+ 
+@@ -2331,20 +2325,6 @@
+ 							Invalidate();
+ 						}
+ 						break;
+-
+-					case kShowVolumeSpaceBar:
+-						bool enabled;
+-						if (message-&gt;FindBool(&quot;ShowVolumeSpaceBar&quot;, &amp;enabled) == B_OK)
+-							TrackerSettings().SetShowVolumeSpaceBar(enabled);
+-						// supposed to fall through
+-					case kSpaceBarColorChanged:
+-						UpdateVolumeIcons();
+-						break;
+-					case kUpdateVolumeSpaceBar:
+-						dev_t device;
+-						message-&gt;FindInt32(&quot;device&quot;, (int32 *)&amp;device);
+-						UpdateVolumeIcon(device);	
+-						break;
+ 				}
+ 			}
+ 			break;
+@@ -5214,34 +5194,21 @@
+ 
+ 
+ void 
+-BPoseView::UpdateVolumeIcon(dev_t device, bool forceUpdate)
++BPoseView::UpdateIcon(BPose *pose)
+ {
+-	int32 index;
+-	BPose *pose = fPoseList-&gt;FindVolumePose(device,&amp;index);
+-	if (pose == NULL)
+-		return;
+-
+-	if (pose-&gt;UpdateVolumeSpaceBar(TrackerSettings().ShowVolumeSpaceBar()) || forceUpdate) {
+-		BPoint loc(0, index * fListElemHeight);
+-		pose-&gt;UpdateIcon(loc, this);
++	BPoint location;
++	if (ViewMode() == kListMode) {
++		// need to find the index of the pose in the pose list
++		int32 count = fPoseList-&gt;CountItems();
++		for (int32 index = 0; index &lt; count; index++) {
++			if (fPoseList-&gt;ItemAt(index) == pose) {
++				location.Set(0, index * fListElemHeight);
++				break;
++			}
++		}
+ 	}
+-}
+ 
+-
+-void 
+-BPoseView::UpdateVolumeIcons()
+-{
+-	BVolumeRoster roster;
+-
+-	BVolume volume;
+-	while(roster.GetNextVolume(&amp;volume) == B_NO_ERROR) {
+-		BDirectory dir;
+-		volume.GetRootDirectory(&amp;dir);
+-		node_ref nodeRef;
+-		dir.GetNodeRef(&amp;nodeRef);
+-
+-		UpdateVolumeIcon(nodeRef.device, true);
+-	}
++	pose-&gt;UpdateIcon(location, this);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/kits/tracker/PoseView.h
+===================================================================
+--- haiku/trunk/src/kits/tracker/PoseView.h	2007-06-18 23:58:15 UTC (rev 21461)
++++ haiku/trunk/src/kits/tracker/PoseView.h	2007-06-19 09:33:29 UTC (rev 21462)
+@@ -159,8 +159,7 @@
+ 		void SetAutoScroll(bool);
+ 		void SetPoseEditing(bool);
+ 
+-		void UpdateVolumeIcon(dev_t device, bool forceUpdate = false);
+-		void UpdateVolumeIcons();
++		void UpdateIcon(BPose *pose);
+ 
+ 		// file change notification handler
+ 		virtual bool FSNotification(const BMessage *);
+
+Modified: haiku/trunk/src/kits/tracker/SettingsViews.cpp
+===================================================================
+--- haiku/trunk/src/kits/tracker/SettingsViews.cpp	2007-06-18 23:58:15 UTC (rev 21461)
++++ haiku/trunk/src/kits/tracker/SettingsViews.cpp	2007-06-19 09:33:29 UTC (rev 21462)
+@@ -1072,9 +1072,7 @@
+ 		{
+ 			settings.SetShowVolumeSpaceBar(fSpaceBarShowCheckBox-&gt;Value() == 1);
+ 			Window()-&gt;PostMessage(kSettingsContentsModified);
+-			BMessage notificationMessage;
+-			notificationMessage.AddBool(&quot;ShowVolumeSpaceBar&quot;, settings.ShowVolumeSpaceBar());
+-			tracker-&gt;SendNotices(kShowVolumeSpaceBar, &amp;notificationMessage);
++			tracker-&gt;PostMessage(kShowVolumeSpaceBar);
+ 			break;
+ 		}
+ 
+@@ -1094,6 +1092,7 @@
+ 			}
+ 			break;
+ 		}
++
+ 		case kSpaceBarColorChanged:
+ 		{
+ 			switch (fCurrentColor) {
+@@ -1109,8 +1108,7 @@
+ 			}
+ 
+ 			Window()-&gt;PostMessage(kSettingsContentsModified);
+-			BMessage notificationMessage;
+-			tracker-&gt;SendNotices(kSpaceBarColorChanged, &amp;notificationMessage);
++			tracker-&gt;PostMessage(kSpaceBarColorChanged);
+ 			break;
+ 		}
+ 
+
+Modified: haiku/trunk/src/kits/tracker/Tracker.cpp
+===================================================================
+--- haiku/trunk/src/kits/tracker/Tracker.cpp	2007-06-18 23:58:15 UTC (rev 21461)
++++ haiku/trunk/src/kits/tracker/Tracker.cpp	2007-06-19 09:33:29 UTC (rev 21462)
+@@ -483,6 +483,12 @@
+ 			break;
+ 		}
+ 
++		case kShowVolumeSpaceBar:
++		case kSpaceBarColorChanged: {
++			gPeriodicUpdatePoses.DoPeriodicUpdate(true);
++			break;
++		}
++
+ 		default:
+ 			_inherited::MessageReceived(message);
+ 			break;
+@@ -497,20 +503,7 @@
+ 		return;
+ 
+ 	// update the volume icon's free space bars
+-	BVolumeRoster roster;
+-
+- 	BVolume volume;
+-	while (roster.GetNextVolume(&amp;volume) == B_OK) {
+-		BDirectory dir;
+-		volume.GetRootDirectory(&amp;dir);
+-		node_ref nodeRef;
+-		dir.GetNodeRef(&amp;nodeRef);
+-
+-		BMessage notificationMessage;
+-		notificationMessage.AddInt32(&quot;device&quot;, *(int32 *)&amp;nodeRef.device);
+-
+-		SendNotices(kUpdateVolumeSpaceBar, &amp;notificationMessage);
+-	}
++	gPeriodicUpdatePoses.DoPeriodicUpdate(false);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/kits/tracker/Utilities.cpp
+===================================================================
+--- haiku/trunk/src/kits/tracker/Utilities.cpp	2007-06-18 23:58:15 UTC (rev 21461)
++++ haiku/trunk/src/kits/tracker/Utilities.cpp	2007-06-19 09:33:29 UTC (rev 21462)
+@@ -35,6 +35,7 @@
+ #include &quot;Attributes.h&quot;
+ #include &quot;MimeTypes.h&quot;
+ #include &quot;Model.h&quot;
++#include &quot;PoseView.h&quot;
+ #include &quot;Utilities.h&quot;
+ #include &quot;ContainerWindow.h&quot;
+ 
+@@ -158,7 +159,81 @@
+ 	textView-&gt;DisallowChar(B_PAGE_DOWN);
+ 	textView-&gt;DisallowChar(B_FUNCTION_KEY);
+ }
+- 
++
++
++PeriodicUpdatePoses::PeriodicUpdatePoses()
++	:	fPoseList(20, true)
++{
++	fLock = new Benaphore(&quot;PeriodicUpdatePoses&quot;);
++}
++
++
++PeriodicUpdatePoses::~PeriodicUpdatePoses()
++{
++	fLock-&gt;Lock();
++	fPoseList.MakeEmpty();
++	delete fLock;
++}
++
++
++void
++PeriodicUpdatePoses::AddPose(BPose *pose, BPoseView *poseView,
++	PeriodicUpdateCallback callback, void *cookie)
++{
++	periodic_pose *periodic = new periodic_pose;
++	periodic-&gt;pose = pose;
++	periodic-&gt;pose_view = poseView;
++	periodic-&gt;callback = callback;
++	periodic-&gt;cookie = cookie;
++	fPoseList.AddItem(periodic);
++}
++
++
++bool
++PeriodicUpdatePoses::RemovePose(BPose *pose, void **cookie)
++{
++	int32 count = fPoseList.CountItems();
++	for (int32 index = 0; index &lt; count; index++) {
++		if (fPoseList.ItemAt(index)-&gt;pose == pose) {
++			if (!fLock-&gt;Lock())
++				return false;
++
++			periodic_pose *periodic = fPoseList.RemoveItemAt(index);
++			if (cookie)
++				*cookie = periodic-&gt;cookie;
++			delete periodic;
++			fLock-&gt;Unlock();
++			return true;
++		}
++	}
++
++	return false;
++}
++
++
++void
++PeriodicUpdatePoses::DoPeriodicUpdate(bool forceRedraw)
++{
++	if (!fLock-&gt;Lock())
++		return;
++
++	int32 count = fPoseList.CountItems();
++	for (int32 index = 0; index &lt; count; index++) {
++		periodic_pose *periodic = fPoseList.ItemAt(index);
++		if (periodic-&gt;callback(periodic-&gt;pose, periodic-&gt;cookie)
++			|| forceRedraw) {
++			periodic-&gt;pose_view-&gt;LockLooper();
++			periodic-&gt;pose_view-&gt;UpdateIcon(periodic-&gt;pose);
++			periodic-&gt;pose_view-&gt;UnlockLooper();
++		}
++	}
++
++	fLock-&gt;Unlock();
++}
++
++
++static PeriodicUpdatePoses gPeriodicUpdatePoses;
++
+ }	// namespace BPrivate
+ 
+ 
+
+Modified: haiku/trunk/src/kits/tracker/Utilities.h
+===================================================================
+--- haiku/trunk/src/kits/tracker/Utilities.h	2007-06-18 23:58:15 UTC (rev 21461)
++++ haiku/trunk/src/kits/tracker/Utilities.h	2007-06-19 09:33:29 UTC (rev 21462)
+@@ -46,6 +46,7 @@
+ #include &lt;MenuItem.h&gt;
+ #include &lt;MessageFilter.h&gt;
+ #include &lt;Mime.h&gt;
++#include &lt;ObjectList.h&gt;
+ #include &lt;Point.h&gt;
+ #include &lt;Path.h&gt;
+ #include &lt;String.h&gt;
+@@ -62,6 +63,8 @@
+ namespace BPrivate {
+ 
+ class Benaphore;
++class BPose;
++class BPoseView;
+ 
+ // global variables
+ extern const rgb_color kBlack;
+@@ -83,6 +86,38 @@
+ 
+ // misc typedefs, constants and structs
+ 
++// Periodically updated poses (ones with a volume space bar) register
++// themselfs in this global list. This way they can be iterated over instead
++// of sending around update messages.
++
++class PeriodicUpdatePoses {
++	public:
++		PeriodicUpdatePoses();
++		~PeriodicUpdatePoses();
++
++		typedef bool (*PeriodicUpdateCallback)(BPose *pose, void *cookie);
++
++		void AddPose(BPose *pose, BPoseView *poseView,
++			PeriodicUpdateCallback callback, void *cookie);
++		bool RemovePose(BPose *pose, void **cookie);
++
++		void DoPeriodicUpdate(bool forceRedraw);
++
++	private:
++		struct periodic_pose {
++			BPose					*pose;
++			BPoseView				*pose_view;
++			PeriodicUpdateCallback	callback;
++			void					*cookie;
++		};
++
++		Benaphore *fLock;
++		BObjectList&lt;periodic_pose&gt; fPoseList;
++};
++
++extern PeriodicUpdatePoses gPeriodicUpdatePoses;
++
++
+ // PoseInfo is the structure that gets saved as attributes for every node on
+ // disk, defining the node's position and visibility
+ class PoseInfo {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002814.html">[Haiku-commits] r21461 - haiku/trunk/src/system/kernel/cache
+</A></li>
+	<LI>Next message: <A HREF="002816.html">[Haiku-commits] r21463 - in haiku/trunk: headers/private/shared	src/kits/shared
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2815">[ date ]</a>
+              <a href="thread.html#2815">[ thread ]</a>
+              <a href="subject.html#2815">[ subject ]</a>
+              <a href="author.html#2815">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

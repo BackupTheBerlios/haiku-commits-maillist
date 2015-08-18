@@ -1,0 +1,334 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28063 - haiku/trunk/src/apps/deskbar
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28063%20-%20haiku/trunk/src/apps/deskbar&In-Reply-To=%3C200810132331.m9DNVK4P012663%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012667.html">
+   <LINK REL="Next"  HREF="012669.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28063 - haiku/trunk/src/apps/deskbar</H1>
+    <B>stippi at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28063%20-%20haiku/trunk/src/apps/deskbar&In-Reply-To=%3C200810132331.m9DNVK4P012663%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28063 - haiku/trunk/src/apps/deskbar">stippi at mail.berlios.de
+       </A><BR>
+    <I>Tue Oct 14 01:31:20 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012667.html">[Haiku-commits] r28062 -	haiku/trunk/src/tools/makebootable/platform/bios_ia32
+</A></li>
+        <LI>Next message: <A HREF="012669.html">[Haiku-commits] r28064 - in haiku/trunk/src/apps/icon-o-matic: .	import_export import_export/styled_text
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12668">[ date ]</a>
+              <a href="thread.html#12668">[ thread ]</a>
+              <a href="subject.html#12668">[ subject ]</a>
+              <a href="author.html#12668">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2008-10-14 01:31:19 +0200 (Tue, 14 Oct 2008)
+New Revision: 28063
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28063&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28063&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/deskbar/ExpandoMenuBar.cpp
+   haiku/trunk/src/apps/deskbar/ExpandoMenuBar.h
+   haiku/trunk/src/apps/deskbar/TeamMenuItem.cpp
+   haiku/trunk/src/apps/deskbar/TeamMenuItem.h
+Log:
+zooey + stippi:
+Reimplemented the drag message over the team entries dragging. The previous
+implementation used the menu bar tracking by faking a B_MOUSE_DOWN event. The
+problem was that in Haiku menus are always sticky and therefor the tracking
+thread was not exited when the user released the mouse (which was supposed to
+trigger the drop event in the Deskbar). The new implementation follows the
+drag in the asynchronous mouse hooks and uses it's own selection state in
+TTeamMenuItem to highlight the eventual drop targets.
+Fixes #2771.
+
+
+Modified: haiku/trunk/src/apps/deskbar/ExpandoMenuBar.cpp
+===================================================================
+--- haiku/trunk/src/apps/deskbar/ExpandoMenuBar.cpp	2008-10-13 23:27:50 UTC (rev 28062)
++++ haiku/trunk/src/apps/deskbar/ExpandoMenuBar.cpp	2008-10-13 23:31:19 UTC (rev 28063)
+@@ -78,7 +78,8 @@
+ 	fShowTeamExpander(static_cast&lt;TBarApp *&gt;(be_app)-&gt;Settings()-&gt;superExpando),
+ 	fExpandNewTeams(static_cast&lt;TBarApp *&gt;(be_app)-&gt;Settings()-&gt;expandNewTeams),
+ 	fBarView(bar),
+-	fFirstApp(0)
++	fFirstApp(0),
++	fPreviousDragTargetItem(NULL)
+ {
+ #ifdef DOUBLECLICKBRINGSTOFRONT
+ 	fLastClickItem = -1;
+@@ -392,8 +393,8 @@
+ TExpandoMenuBar::MouseMoved(BPoint where, uint32 code, const BMessage *message)
+ {
+ 	if (!message) {
+-		//	force a cleanup
+-		fBarView-&gt;DragStop(true);
++		// force a cleanup
++		_FinishedDrag();
+ 		BMenuBar::MouseMoved(where, code, message);
+ 		return;
+ 	}
+@@ -403,29 +404,61 @@
+ 		|| Window()-&gt;CurrentMessage()-&gt;FindInt32(&quot;buttons&quot;, (int32*)&amp;buttons) &lt; B_OK)
+ 		buttons = 0;
+ 
++	if (buttons == 0)
++		return;
++
+ 	switch (code) {
+ 		case B_ENTERED_VIEW:
+-			if (message &amp;&amp; buttons != 0) {
+-				fBarView-&gt;CacheDragData(message);
+-				MouseDown(where);
+-			}
++			// fPreviousDragTargetItem should always be NULL here anyways.
++			if (fPreviousDragTargetItem)
++				_FinishedDrag();
++
++			fBarView-&gt;CacheDragData(message);
++			fPreviousDragTargetItem = NULL;
+ 			break;
+ 
++		case B_OUTSIDE_VIEW:
++			// NOTE: Should not be here, but for the sake of defensive
++			// programming...
+ 		case B_EXITED_VIEW:
+-			if (fBarView-&gt;Dragging() &amp;&amp; buttons != 0) {
+-				if (!TeamItemAtPoint(where)
+-					&amp;&amp; !InBeMenu(where)
+-					&amp;&amp; (fSeparatorItem &amp;&amp; !fSeparatorItem-&gt;Frame().Contains(where))
+-					&amp;&amp; !Frame().Contains(where)) {
+-					fBarView-&gt;DragStop();
++			_FinishedDrag();
++			break;
++
++		case B_INSIDE_VIEW:
++			if (fBarView-&gt;Dragging()) {
++				TTeamMenuItem* item = NULL;
++				for (int32 i = 0; i &lt; CountItems(); i++) {
++					BMenuItem* _item = ItemAt(i);
++					if (_item-&gt;Frame().Contains(where)) {
++						item = dynamic_cast&lt;TTeamMenuItem*&gt;(_item);
++						break;
++					}
+ 				}
++				if (item == fPreviousDragTargetItem)
++					break;
++				if (fPreviousDragTargetItem != NULL)
++					fPreviousDragTargetItem-&gt;SetOverrideSelected(false);
++				if (item != NULL)
++					item-&gt;SetOverrideSelected(true);
++				fPreviousDragTargetItem = item;
+ 			}
+ 			break;
+ 	}
+-	BMenuBar::MouseMoved(where, code, message);
+ }
+ 
+ 
++void
++TExpandoMenuBar::MouseUp(BPoint where)
++{
++	if (!fBarView-&gt;Dragging()) {
++		BMenuBar::MouseUp(where);
++		return;
++	}
++
++	_FinishedDrag(true);
++}
++
++
+ bool
+ TExpandoMenuBar::InBeMenu(BPoint loc) const
+ {
+@@ -816,3 +849,17 @@
+ 	return B_OK;
+ }
+ 
++
++void
++TExpandoMenuBar::_FinishedDrag(bool invoke)
++{
++	if (fPreviousDragTargetItem != NULL) {
++		if (invoke)
++			fPreviousDragTargetItem-&gt;Invoke();
++		fPreviousDragTargetItem-&gt;SetOverrideSelected(false);
++		fPreviousDragTargetItem = NULL;
++	}
++	if (!invoke &amp;&amp; fBarView-&gt;Dragging())
++		fBarView-&gt;DragStop(true);
++}
++
+
+Modified: haiku/trunk/src/apps/deskbar/ExpandoMenuBar.h
+===================================================================
+--- haiku/trunk/src/apps/deskbar/ExpandoMenuBar.h	2008-10-13 23:27:50 UTC (rev 28062)
++++ haiku/trunk/src/apps/deskbar/ExpandoMenuBar.h	2008-10-13 23:31:19 UTC (rev 28063)
+@@ -66,6 +66,7 @@
+ 		virtual void MessageReceived(BMessage *message);
+ 		virtual void MouseDown(BPoint where);
+ 		virtual void MouseMoved(BPoint where, uint32 code, const BMessage *);
++		virtual void MouseUp(BPoint where);
+ 
+ 		virtual void Draw(BRect update);
+ 		virtual void DrawBackground(BRect update);
+@@ -88,7 +89,7 @@
+ 		void AddTeam(team_id team, const char *signature);
+ 		void RemoveTeam(team_id team, bool partial);
+ 
+-		void Hilite(drag_and_drop_selection which);
++		void _FinishedDrag(bool invoke = false);
+ 
+ 		bool fVertical;
+ 		bool fOverflow;
+@@ -102,6 +103,7 @@
+ 
+ 		TBarMenuTitle *fBeMenuItem;
+ 		TTeamMenuItem *fSeparatorItem;
++		TTeamMenuItem *fPreviousDragTargetItem;
+ 
+ #ifdef DOUBLECLICKBRINGSTOFRONT
+ 		int32 fLastClickItem;
+
+Modified: haiku/trunk/src/apps/deskbar/TeamMenuItem.cpp
+===================================================================
+--- haiku/trunk/src/apps/deskbar/TeamMenuItem.cpp	2008-10-13 23:27:50 UTC (rev 28062)
++++ haiku/trunk/src/apps/deskbar/TeamMenuItem.cpp	2008-10-13 23:31:19 UTC (rev 28063)
+@@ -101,6 +101,7 @@
+ 
+ 	fOverrideWidth = width;
+ 	fOverrideHeight = height;
++	fOverriddenSelected = false;
+ 
+ 	fDrawLabel = drawLabel;
+ 	fVertical = vertical;
+@@ -156,6 +157,14 @@
+ }
+ 
+ 
++void
++TTeamMenuItem::SetOverrideSelected(bool selected)
++{
++	fOverriddenSelected = selected;
++	Highlight(selected);
++}
++
++
+ float
+ TTeamMenuItem::LabelWidth() const
+ {
+@@ -225,14 +234,14 @@
+ 	//	if not selected or being tracked on, fill with gray
+ 	TBarView *barview = (static_cast&lt;TBarApp *&gt;(be_app))-&gt;BarView();
+ 	bool canHandle = !barview-&gt;Dragging() || barview-&gt;AppCanHandleTypes(Signature());
+-	if (!IsSelected() &amp;&amp; !menu-&gt;IsRedrawAfterSticky() || !canHandle || !IsEnabled()) {
++	if (!_IsSelected() &amp;&amp; !menu-&gt;IsRedrawAfterSticky() || !canHandle || !IsEnabled()) {
+ 		frame.InsetBy(1, 1);
+ 		menu-&gt;SetHighColor(menuColor);
+ 		menu-&gt;FillRect(frame);
+ 	}
+ 
+ 	//	draw the gray, unselected item, border
+-	if (!IsSelected() || !IsEnabled()) {
++	if (!_IsSelected() || !IsEnabled()) {
+ 		rgb_color shadow = tint_color(menuColor, B_DARKEN_1_TINT);
+ 		rgb_color light = tint_color(menuColor, B_LIGHTEN_2_TINT);
+ 
+@@ -257,7 +266,7 @@
+ 	}
+ 
+ 	//	if selected or being tracked on, fill with the hilite gray color
+-	if (IsEnabled() &amp;&amp; IsSelected() &amp;&amp; !menu-&gt;IsRedrawAfterSticky() &amp;&amp; canHandle) {
++	if (IsEnabled() &amp;&amp; _IsSelected() &amp;&amp; !menu-&gt;IsRedrawAfterSticky() &amp;&amp; canHandle) {
+ 		// fill
+ 		menu-&gt;SetHighColor(tint_color(menuColor, B_HIGHLIGHT_BACKGROUND_TINT));
+ 		menu-&gt;FillRect(frame);
+@@ -415,7 +424,7 @@
+ 	TBarView *barview = (static_cast&lt;TBarApp *&gt;(be_app))-&gt;BarView();
+ 	bool canHandle = !barview-&gt;Dragging()
+ 		|| barview-&gt;AppCanHandleTypes(Signature());
+-	if (IsSelected() &amp;&amp; IsEnabled() &amp;&amp; canHandle)
++	if (_IsSelected() &amp;&amp; IsEnabled() &amp;&amp; canHandle)
+ 		menu-&gt;SetLowColor(tint_color(menu-&gt;ViewColor(),
+ 			B_HIGHLIGHT_BACKGROUND_TINT));
+ 	else
+@@ -521,3 +530,10 @@
+ 	return bounds;
+ }
+ 
++
++bool
++TTeamMenuItem::_IsSelected() const
++{
++	return IsSelected() || fOverriddenSelected;
++}
++
+
+Modified: haiku/trunk/src/apps/deskbar/TeamMenuItem.h
+===================================================================
+--- haiku/trunk/src/apps/deskbar/TeamMenuItem.h	2008-10-13 23:27:50 UTC (rev 28062)
++++ haiku/trunk/src/apps/deskbar/TeamMenuItem.h	2008-10-13 23:31:19 UTC (rev 28063)
+@@ -59,6 +59,7 @@
+ 
+ 		void SetOverrideWidth(float width);
+ 		void SetOverrideHeight(float height);
++		void SetOverrideSelected(bool selected);
+ 
+ 		bool IsExpanded();
+ 		void ToggleExpandState(bool resizeWindow);
+@@ -82,6 +83,8 @@
+ 			float width = -1.0f, float height = -1.0f,
+ 			bool drawLabel = true,bool vertical=true);
+ 
++		bool _IsSelected() const;
++
+ 		BList *fTeam;
+ 		BBitmap *fIcon;
+ 		char *fName;
+@@ -96,6 +99,7 @@
+ 		bool fVertical;
+ 
+ 		bool fExpanded;
++		bool fOverriddenSelected;
+ };
+ 
+ #endif /* TEAMMENUITEM_H */
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012667.html">[Haiku-commits] r28062 -	haiku/trunk/src/tools/makebootable/platform/bios_ia32
+</A></li>
+	<LI>Next message: <A HREF="012669.html">[Haiku-commits] r28064 - in haiku/trunk/src/apps/icon-o-matic: .	import_export import_export/styled_text
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12668">[ date ]</a>
+              <a href="thread.html#12668">[ thread ]</a>
+              <a href="subject.html#12668">[ subject ]</a>
+              <a href="author.html#12668">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

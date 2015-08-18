@@ -1,0 +1,315 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30714 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30714%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200905120155.n4C1tHOI009966%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016648.html">
+   <LINK REL="Next"  HREF="016651.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30714 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30714%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200905120155.n4C1tHOI009966%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30714 - haiku/trunk/src/add-ons/kernel/busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Tue May 12 03:55:17 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016648.html">[Haiku-commits] r30713 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+        <LI>Next message: <A HREF="016651.html">[Haiku-commits] r30714 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16649">[ date ]</a>
+              <a href="thread.html#16649">[ thread ]</a>
+              <a href="subject.html#16649">[ subject ]</a>
+              <a href="author.html#16649">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-05-12 03:55:15 +0200 (Tue, 12 May 2009)
+New Revision: 30714
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30714&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30714&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+Log:
+Do not free the descriptor chains and transfer queue head directly when
+finishing transfers. The host controller might still be using some of those
+structures. In the (unlikely) case that a freed memory chunk would be
+immediately re-used and filled with new values this would lead the controller
+to either find invalid values and assert a process error or it could follow
+invalid list links leading to host system errors. We have to wait with freeing
+until the controller processing the next frame to make sure this cannot happen.
+The unlikely case should also have been the cause of bug #2481.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2009-05-11 23:56:26 UTC (rev 30713)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2009-05-12 01:55:15 UTC (rev 30714)
+@@ -334,12 +334,15 @@
+ 		fLastTransfer(NULL),
+ 		fFinishTransfersSem(-1),
+ 		fFinishThread(-1),
+-		fStopFinishThread(false),
++		fStopThreads(false),
++		fFreeList(NULL),
++		fCleanupThread(-1),
++		fCleanupSem(-1),
++		fCleanupCount(0),
+ 		fFirstIsochronousTransfer(NULL),
+ 		fLastIsochronousTransfer(NULL),
+ 		fFinishIsochronousTransfersSem(-1),
+ 		fFinishIsochronousThread(-1),
+-		fStopFinishIsochronousThread(false),
+ 		fRootHub(NULL),
+ 		fRootHubAddress(0),
+ 		fPortResetChange(0)
+@@ -456,18 +459,28 @@
+ 		fLastIsochronousDescriptor[i] = NULL;
+ 	}
+ 
+-	// Create semaphore the finisher thread will wait for
++	// Create semaphore the finisher and cleanup threads will wait for
+ 	fFinishTransfersSem = create_sem(0, &quot;UHCI Finish Transfers&quot;);
+ 	if (fFinishTransfersSem &lt; B_OK) {
+ 		TRACE_ERROR(&quot;failed to create finisher semaphore\n&quot;);
+ 		return;
+ 	}
+ 
+-	// Create the finisher service thread
++	fCleanupSem = create_sem(0, &quot;UHCI Cleanup&quot;);
++	if (fCleanupSem &lt; B_OK) {
++		TRACE_ERROR(&quot;failed to create cleanup semaphore\n&quot;);
++		return;
++	}
++
++	// Create the finisher service and cleanup threads
+ 	fFinishThread = spawn_kernel_thread(FinishThread,
+ 		&quot;uhci finish thread&quot;, B_URGENT_DISPLAY_PRIORITY, (void *)this);
+ 	resume_thread(fFinishThread);
+ 
++	fCleanupThread = spawn_kernel_thread(CleanupThread,
++		&quot;uhci cleanup thread&quot;, B_NORMAL_PRIORITY, (void *)this);
++	resume_thread(fCleanupThread);
++
+ 	// Create a lock for the isochronous transfer list
+ 	mutex_init(&amp;fIsochronousLock, &quot;UHCI isochronous lock&quot;);
+ 
+@@ -519,11 +532,12 @@
+ #endif
+ 
+ 	int32 result = 0;
+-	fStopFinishThread = true;
+-	fStopFinishIsochronousThread = true;
++	fStopThreads = true;
+ 	delete_sem(fFinishTransfersSem);
++	delete_sem(fCleanupSem);
+ 	delete_sem(fFinishIsochronousTransfersSem);
+ 	wait_for_thread(fFinishThread, &amp;result);
++	wait_for_thread(fCleanupThread, &amp;result);
+ 	wait_for_thread(fFinishIsochronousThread, &amp;result);
+ 
+ 	LockIsochronous();
+@@ -1217,7 +1231,7 @@
+ void
+ UHCI::FinishTransfers()
+ {
+-	while (!fStopFinishThread) {
++	while (!fStopThreads) {
+ 		if (acquire_sem(fFinishTransfersSem) &lt; B_OK)
+ 			continue;
+ 
+@@ -1364,8 +1378,9 @@
+ 							Transfer *resubmit = transfer-&gt;transfer;
+ 
+ 							// free the used descriptors
+-							transfer-&gt;queue-&gt;RemoveTransfer(transfer-&gt;transfer_queue);
+-							FreeDescriptorChain(transfer-&gt;first_descriptor);
++							transfer-&gt;queue-&gt;RemoveTransfer(
++								transfer-&gt;transfer_queue);
++							AddToFreeList(transfer);
+ 
+ 							// resubmit the advanced transfer so the rest
+ 							// of the buffers are transmitted over the bus
+@@ -1388,18 +1403,85 @@
+ 
+ 			// remove and free the hardware queue and its descriptors
+ 			transfer-&gt;queue-&gt;RemoveTransfer(transfer-&gt;transfer_queue);
+-			FreeDescriptorChain(transfer-&gt;first_descriptor);
+-			FreeTransferQueue(transfer-&gt;transfer_queue);
+-
+ 			delete transfer-&gt;transfer;
+-			delete transfer;
++			AddToFreeList(transfer);
+ 			transfer = next;
+ 		}
+ 	}
+ }
+ 
+ 
++void
++UHCI::AddToFreeList(transfer_data *transfer)
++{
++	transfer-&gt;free_after_frame = ReadReg16(UHCI_FRNUM);
++	if (!Lock())
++		return;
++
++	transfer-&gt;link = fFreeList;
++	fFreeList = transfer;
++	Unlock();
++
++	if (atomic_add(&amp;fCleanupCount, 1) == 0)
++		release_sem(fCleanupSem);
++}
++
++
+ int32
++UHCI::CleanupThread(void *data)
++{
++	((UHCI *)data)-&gt;Cleanup();
++	return B_OK;
++}
++
++
++void
++UHCI::Cleanup()
++{
++	while (!fStopThreads) {
++		if (acquire_sem(fCleanupSem) != B_OK)
++			continue;
++
++		bigtime_t nextTime = system_time() + 1000;
++		while (atomic_get(&amp;fCleanupCount) != 0) {
++			// wait for the frame to pass
++			snooze_until(nextTime, B_SYSTEM_TIMEBASE);
++			nextTime += 1000;
++
++			if (!Lock())
++				continue;
++
++			// find the first entry we may free
++			transfer_data **link = &fFreeList;
++			transfer_data *transfer = fFreeList;
++			uint16 frameNumber = ReadReg16(UHCI_FRNUM);
++			while (transfer) {
++				if (transfer-&gt;free_after_frame != frameNumber) {
++					*link = NULL;
++					break;
++				}
++
++				link = &amp;transfer-&gt;link;
++				transfer = transfer-&gt;link;
++			}
++
++			Unlock();
++
++			// the transfers below this one are all freeable
++			while (transfer) {
++				transfer_data *next = transfer-&gt;link;
++				FreeDescriptorChain(transfer-&gt;first_descriptor);
++				FreeTransferQueue(transfer-&gt;transfer_queue);
++				delete transfer;
++				atomic_add(&amp;fCleanupCount, -1);
++				transfer = next;
++			}
++		}
++	}
++}
++
++
++int32
+ UHCI::FinishIsochronousThread(void *data)
+ {
+        ((UHCI *)data)-&gt;FinishIsochronousTransfers();
+@@ -1415,7 +1497,7 @@
+ 	 * of a transfer, it processes the entire transfer.
+ 	 */
+ 
+-	while (!fStopFinishIsochronousThread) {
++	while (!fStopThreads) {
+ 		// Go to sleep if there are not isochronous transfer to process
+ 		if (acquire_sem(fFinishIsochronousTransfersSem) &lt; B_OK)
+ 			return;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2009-05-11 23:56:26 UTC (rev 30713)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2009-05-12 01:55:15 UTC (rev 30714)
+@@ -69,6 +69,7 @@
+ 	uhci_td *		data_descriptor;
+ 	bool			incoming;
+ 	bool			canceled;
++	uint16			free_after_frame;
+ 	transfer_data *	link;
+ } transfer_data;
+ 
+@@ -137,6 +138,10 @@
+ static	int32						FinishThread(void *data);
+ 		void						FinishTransfers();
+ 
++		void						AddToFreeList(transfer_data *transfer);
++static	int32						CleanupThread(void *data);
++		void						Cleanup();
++
+ 		status_t					CreateFilledTransfer(Transfer *transfer,
+ 										uhci_td **_firstDescriptor,
+ 										uhci_qh **_transferQueue);
+@@ -227,15 +232,19 @@
+ 		transfer_data *				fLastTransfer;
+ 		sem_id						fFinishTransfersSem;
+ 		thread_id					fFinishThread;
+-		bool						fStopFinishThread;
++		bool						fStopThreads;
+ 
++		transfer_data *				fFreeList;
++		thread_id					fCleanupThread;
++		sem_id						fCleanupSem;
++		int32						fCleanupCount;
++
+ 		// Maintain a linked list of isochronous transfers
+ 		isochronous_transfer_data *	fFirstIsochronousTransfer;
+ 		isochronous_transfer_data *	fLastIsochronousTransfer;
+ 		sem_id						fFinishIsochronousTransfersSem;
+ 		thread_id					fFinishIsochronousThread;
+ 		mutex						fIsochronousLock;
+-		bool						fStopFinishIsochronousThread;
+ 
+ 		// Root hub
+ 		UHCIRootHub *				fRootHub;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016648.html">[Haiku-commits] r30713 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+	<LI>Next message: <A HREF="016651.html">[Haiku-commits] r30714 - haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16649">[ date ]</a>
+              <a href="thread.html#16649">[ thread ]</a>
+              <a href="subject.html#16649">[ subject ]</a>
+              <a href="author.html#16649">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

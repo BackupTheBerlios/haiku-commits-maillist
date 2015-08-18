@@ -1,0 +1,484 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30203 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30203%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200904161824.n3GIOuJw017989%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015987.html">
+   <LINK REL="Next"  HREF="015891.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30203 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30203%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200904161824.n3GIOuJw017989%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30203 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 16 20:24:56 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015987.html">[Haiku-commits] r30202 - haiku/trunk/src/apps/mail
+</A></li>
+        <LI>Next message: <A HREF="015891.html">[Haiku-commits] r30204 - in haiku/trunk: headers/os/drivers	src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15890">[ date ]</a>
+              <a href="thread.html#15890">[ thread ]</a>
+              <a href="subject.html#15890">[ subject ]</a>
+              <a href="author.html#15890">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-04-16 20:24:55 +0200 (Thu, 16 Apr 2009)
+New Revision: 30203
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30203&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30203&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.h
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.h
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/bfs.h
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
+Log:
+* There is now a list of removed vnodes in Volume - while asking the VFS for
+  this seemed to be a good idea, there is one race condition that cannot be
+  solved otherwise (the vnode must be added/removed to that list while holding
+  the transaction lock, and we cannot guarantee that in the VFS).
+* We are using an unused area of the in-memory bfs_inode to store the list
+  links (bfs_inode::pad - this will also work on 64 bit platforms).
+* Inode no longer adds a singly linked list link - the transaction list now
+  shares the doubly linked list with the removed vnodes list.
+* Added an in-memory flag INODE_IN_TRANSACTION to avoid searching an inode
+  to be added in the list.
+* Removing an attribute directory did not hold its write lock.
+* If removing an attribute failed for some reason, the INODE_DELETED flag
+  was not removed (the transaction would not have failed because of that).
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp	2009-04-16 16:20:15 UTC (rev 30202)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/BlockAllocator.cpp	2009-04-16 18:24:55 UTC (rev 30203)
+@@ -1147,7 +1147,7 @@
+ 		// Lock the volume's journal
+ 
+ 	status_t status = mutex_lock(&amp;fLock);
+-	if (status &lt; B_OK) {
++	if (status != B_OK) {
+ 		fVolume-&gt;GetJournal(0)-&gt;Unlock(NULL, true);
+ 		return status;
+ 	}
+@@ -1185,16 +1185,12 @@
+ 	fCheckCookie = cookie;
+ 		// to be able to restore nicely if &quot;chkbfs&quot; exited abnormally
+ 
+-#if !BFS_SHELL
+ 	// Put removed vnodes to the stack -- they are not reachable by traversing
+ 	// the file system anymore.
+-	void* inode = NULL;
+-	ino_t nodeID;
+-	while (get_next_removed_vnode(fVolume-&gt;FSVolume(), &amp;nodeID,	 &amp;inode)
+-			== B_OK) {
+-		cookie-&gt;stack.Push(fVolume-&gt;ToBlockRun(nodeID));
++	InodeList::Iterator iterator = fVolume-&gt;RemovedInodes().GetIterator();
++	while (Inode* inode = iterator.Next()) {
++		cookie-&gt;stack.Push(inode-&gt;BlockRun());
+ 	}
+-#endif
+ 
+ 	// TODO: check reserved area in bitmap!
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.cpp	2009-04-16 16:20:15 UTC (rev 30202)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Debug.cpp	2009-04-16 18:24:55 UTC (rev 30203)
+@@ -127,7 +127,6 @@
+ 	dump_block_run(	&quot;  attributes         = &quot;, inode-&gt;attributes);
+ 	Print(&quot;  type               = %u\n&quot;, (unsigned)inode-&gt;Type());
+ 	Print(&quot;  inode_size         = %u\n&quot;, (unsigned)inode-&gt;InodeSize());
+-	Print(&quot;  etc                = %#08x\n&quot;, (int)inode-&gt;etc);
+ 	Print(&quot;  short_symlink      = %s\n&quot;,
+ 		S_ISLNK(inode-&gt;Mode()) &amp;&amp; (inode-&gt;Flags() &amp; INODE_LONG_SYMLINK) == 0
+ 			? inode-&gt;short_symlink : &quot;-&quot;);
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2009-04-16 16:20:15 UTC (rev 30202)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2009-04-16 18:24:55 UTC (rev 30203)
+@@ -335,6 +335,7 @@
+ 
+ 	NodeGetter node(volume, this);
+ 	memcpy(&amp;fNode, node.Node(), sizeof(bfs_inode));
++	fNode.flags &amp;= HOST_ENDIAN_TO_BFS_INT32(INODE_PERMANENT_FLAGS);
+ 
+ 	char lockName[B_OS_NAME_LENGTH];
+ 	snprintf(lockName, sizeof(lockName), &quot;bfs inode %d.%d&quot;,
+@@ -411,6 +412,9 @@
+ 	file_map_delete(Map());
+ 	delete fTree;
+ 
++	if ((Flags() &amp; INODE_DELETED) != 0)
++		fVolume-&gt;RemovedInodes().Remove(this);
++
+ 	rw_lock_destroy(&amp;fLock);
+ }
+ 
+@@ -424,7 +428,7 @@
+ 		if (status == B_BUSY)
+ 			return B_BUSY;
+ 
+-		if (status &lt; B_OK) {
++		if (status != B_OK) {
+ 			FATAL((&quot;inode at block %Ld corrupt!\n&quot;, BlockNumber()));
+ 			RETURN_ERROR(B_BAD_DATA);
+ 		}
+@@ -436,7 +440,7 @@
+ 			RETURN_ERROR(B_NO_MEMORY);
+ 
+ 		status_t status = fTree-&gt;InitCheck();
+-		if (status &lt; B_OK) {
++		if (status != B_OK) {
+ 			FATAL((&quot;inode tree at block %Ld corrupt!\n&quot;, BlockNumber()));
+ 			RETURN_ERROR(B_BAD_DATA);
+ 		}
+@@ -551,7 +555,7 @@
+ 		Inode* attribute;
+ 		status_t status = CreateAttribute(transaction, item-&gt;Name(),
+ 			item-&gt;Type(), &amp;attribute);
+-		if (status &lt; B_OK)
++		if (status != B_OK)
+ 			RETURN_ERROR(status);
+ 
+ 		size_t length = item-&gt;DataSize();
+@@ -559,7 +563,7 @@
+ 
+ 		ReleaseAttribute(attribute);
+ 
+-		if (status &lt; B_OK) {
++		if (status != B_OK) {
+ 			Vnode vnode(fVolume, Attributes());
+ 			Inode* attributes;
+ 			if (vnode.Get(&amp;attributes) &lt; B_OK
+@@ -947,6 +951,8 @@
+ 		return status;
+ 
+ 	if (attributes-&gt;IsEmpty()) {
++		attributes-&gt;WriteLockInTransaction(transaction);
++
+ 		// remove attribute directory (don't fail if that can't be done)
+ 		if (remove_vnode(fVolume-&gt;FSVolume(), attributes-&gt;ID()) == B_OK) {
+ 			// update the inode, so that no one will ever doubt it's deleted :-)
+@@ -954,8 +960,11 @@
+ 			if (attributes-&gt;WriteBack(transaction) == B_OK) {
+ 				Attributes().SetTo(0, 0, 0);
+ 				WriteBack(transaction);
+-			} else
++			} else {
+ 				unremove_vnode(fVolume-&gt;FSVolume(), attributes-&gt;ID());
++				attributes-&gt;Node().flags
++					&amp;= ~HOST_ENDIAN_TO_BFS_INT32(INODE_DELETED);
++			}
+ 		}
+ 	}
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.h	2009-04-16 16:20:15 UTC (rev 30202)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.h	2009-04-16 18:24:55 UTC (rev 30203)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2001-2009, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * This file may be used under the terms of the MIT License.
+  */
+ #ifndef INODE_H
+@@ -24,7 +24,9 @@
+ class Transaction;
+ 
+ 
+-class Inode : public SinglyLinkedListLinkImpl&lt;Inode&gt; {
++class Inode {
++	typedef DoublyLinkedListLink&lt;Inode&gt; Link;
++
+ public:
+ 							Inode(Volume* volume, ino_t id);
+ 							Inode(Volume* volume, Transaction&amp; transaction,
+@@ -174,6 +176,11 @@
+ 								{ ASSERT_WRITE_LOCKED_RW_LOCK(&amp;fLock); }
+ #endif
+ 
++			Link*			GetDoublyLinkedListLink()
++								{ return (Link*)&amp;fNode.pad[0]; }
++			const Link*		GetDoublyLinkedListLink() const
++								{ return (Link*)&amp;fNode.pad[0]; }
++
+ private:
+ 							Inode(const Inode&amp; other);
+ 							Inode&amp; operator=(const Inode&amp; other);
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2009-04-16 16:20:15 UTC (rev 30202)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2009-04-16 18:24:55 UTC (rev 30203)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2001-2009, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * This file may be used under the terms of the MIT License.
+  */
+ 
+@@ -1091,18 +1091,21 @@
+ 	if (fJournal == NULL)
+ 		panic(&quot;Transaction is not running!&quot;);
+ 
+-	InodeList::Iterator iterator = fLockedInodes.GetIterator();
+-	while (iterator.HasNext()) {
+-		if (iterator.Next() == inode) {
+-			//dprintf(&quot;  inode %Ld already in transaction\n&quot;, inode-&gt;ID());
+-			return;
+-		}
+-	}
++	// These flags can only change while holding the transaction lock
++	if ((inode-&gt;Flags() &amp; INODE_IN_TRANSACTION) != 0)
++		return;
+ 
++	// We share the same list link with the removed list, so we have to remove
++	// the inode from that list here (and add it back when we no longer need it)
++	if ((inode-&gt;Flags() &amp; INODE_DELETED) != 0)
++		GetVolume()-&gt;RemovedInodes().Remove(inode);
++
+ 	if (!GetVolume()-&gt;IsInitializing())
+ 		acquire_vnode(GetVolume()-&gt;FSVolume(), inode-&gt;ID());
++
+ 	rw_lock_write_lock(&amp;inode-&gt;fLock);
+ 	fLockedInodes.Add(inode);
++	inode-&gt;Node().flags |= HOST_ENDIAN_TO_BFS_INT32(INODE_IN_TRANSACTION);
+ }
+ 
+ 
+@@ -1112,8 +1115,14 @@
+ 	if (fJournal == NULL)
+ 		panic(&quot;Transaction is not running!&quot;);
+ 
++	inode-&gt;Node().flags &amp;= ~HOST_ENDIAN_TO_BFS_INT32(INODE_IN_TRANSACTION);
+ 	fLockedInodes.Remove(inode);
+ 	rw_lock_write_unlock(&amp;inode-&gt;fLock);
++
++	// See AddInode() why we do this here
++	if ((inode-&gt;Flags() &amp; INODE_DELETED) != 0)
++		GetVolume()-&gt;RemovedInodes().Add(inode);
++
+ 	if (!GetVolume()-&gt;IsInitializing())
+ 		put_vnode(GetVolume()-&gt;FSVolume(), inode-&gt;ID());
+ }
+@@ -1123,7 +1132,13 @@
+ Transaction::_UnlockInodes()
+ {
+ 	while (Inode* inode = fLockedInodes.RemoveHead()) {
++		inode-&gt;Node().flags &amp;= ~HOST_ENDIAN_TO_BFS_INT32(INODE_IN_TRANSACTION);
+ 		rw_lock_write_unlock(&amp;inode-&gt;fLock);
++
++		// See AddInode() why we do this here
++		if ((inode-&gt;Flags() &amp; INODE_DELETED) != 0)
++			GetVolume()-&gt;RemovedInodes().Add(inode);
++
+ 		if (!GetVolume()-&gt;IsInitializing())
+ 			put_vnode(GetVolume()-&gt;FSVolume(), inode-&gt;ID());
+ 	}
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h	2009-04-16 16:20:15 UTC (rev 30202)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.h	2009-04-16 18:24:55 UTC (rev 30203)
+@@ -16,7 +16,6 @@
+ class Inode;
+ class LogEntry;
+ typedef DoublyLinkedList&lt;LogEntry&gt; LogEntryList;
+-typedef SinglyLinkedList&lt;Inode&gt; InodeList;
+ 
+ 
+ class Journal {
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.h	2009-04-16 16:20:15 UTC (rev 30202)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.h	2009-04-16 18:24:55 UTC (rev 30203)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2001-2009, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * This file may be used under the terms of the MIT License.
+  */
+ #ifndef VOLUME_H
+@@ -23,6 +23,8 @@
+ 	VOLUME_NO_INDICES	= 0x0001,
+ };
+ 
++typedef DoublyLinkedList&lt;Inode&gt; InodeList;
++
+ class Volume {
+ public:
+ 							Volume(fs_volume* volume);
+@@ -86,6 +88,9 @@
+ 
+ 			status_t		CreateIndicesRoot(Transaction&amp; transaction);
+ 
++			InodeList&amp;		RemovedInodes() { return fRemovedInodes; }
++				// This list is guarded by the transaction lock
++
+ 			// block bitmap
+ 			BlockAllocator&amp;	Allocator();
+ 			status_t		AllocateForInode(Transaction&amp; transaction,
+@@ -127,7 +132,7 @@
+ 								uint32* _offset = NULL);
+ 	static	status_t		Identify(int fd, disk_super_block* superBlock);
+ 
+-	protected:
++protected:
+ 			fs_volume*		fVolume;
+ 			int				fDevice;
+ 			disk_super_block fSuperBlock;
+@@ -155,6 +160,8 @@
+ 
+ 			void*			fBlockCache;
+ 			thread_id		fCheckingThread;
++
++			InodeList		fRemovedInodes;
+ };
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/bfs.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/bfs.h	2009-04-16 16:20:15 UTC (rev 30202)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/bfs.h	2009-04-16 18:24:55 UTC (rev 30203)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2001-2009, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Parts of this code is based on work previously done by Marcus Overhagen.
+  *
+  * This file may be used under the terms of the MIT License.
+@@ -165,7 +165,8 @@
+ 
+ class Volume;
+ 
+-#define SHORT_SYMLINK_NAME_LENGTH	144 // length incl. terminating '\0'
++#define SHORT_SYMLINK_NAME_LENGTH	144
++	// length incl. terminating '\0'
+ 
+ struct bfs_inode {
+ 	int32		magic1;
+@@ -181,13 +182,14 @@
+ 	uint32		type;				// attribute type
+ 
+ 	int32		inode_size;
+-	uint32		etc;				// a pointer to the Inode object during construction
++	uint32		etc;
+ 
+ 	union {
+ 		data_stream		data;
+ 		char 			short_symlink[SHORT_SYMLINK_NAME_LENGTH];
+ 	};
+ 	int32		pad[4];
++		// we use this member as a doubly linked list link
+ 
+ 	small_data	small_data_start[0];
+ 
+@@ -222,6 +224,8 @@
+ 	INODE_PERMANENT_FLAGS	= 0x0000ffff,
+ 
+ 	INODE_WAS_WRITTEN		= 0x00020000,
++	INODE_IN_TRANSACTION	= 0x00040000,
++
+ 	// The rest is only used by the file system check functionality
+ 	INODE_DONT_FREE_SPACE	= 0x00080000
+ };
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp	2009-04-16 16:20:15 UTC (rev 30202)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/kernel_interface.cpp	2009-04-16 18:24:55 UTC (rev 30203)
+@@ -266,7 +266,7 @@
+ 	}
+ 
+ 	status_t status = node-&gt;InitCheck(volume);
+-	if (status &lt; B_OK) {
++	if (status != B_OK) {
+ 		if ((node-&gt;Flags() &amp; INODE_DELETED) != 0) {
+ 			INFORM((&quot;inode at %Ld is already deleted!\n&quot;, id));
+ 		} else {
+@@ -281,7 +281,7 @@
+ 		return B_NO_MEMORY;
+ 
+ 	status = inode-&gt;InitCheck(false);
+-	if (status &lt; B_OK)
++	if (status != B_OK)
+ 		delete inode;
+ 
+ 	if (status == B_OK) {
+@@ -328,20 +328,20 @@
+ 	Volume* volume = (Volume*)_volume-&gt;private_volume;
+ 	Inode* inode = (Inode*)_node-&gt;private_node;
+ 
++	// If the inode isn't in use anymore, we were called before
++	// bfs_unlink() returns - in this case, we can just use the
++	// transaction which has already deleted the inode.
++	Transaction transaction(volume, volume-&gt;ToBlock(inode-&gt;Parent()));
++
+ 	// The &quot;chkbfs&quot; functionality uses this flag to prevent the space used
+ 	// up by the inode from being freed - this flag is set only in situations
+ 	// where this is a good idea... (the block bitmap will get fixed anyway
+ 	// in this case).
+-	if (inode-&gt;Flags() &amp; INODE_DONT_FREE_SPACE) {
++	if ((inode-&gt;Flags() &amp; INODE_DONT_FREE_SPACE) != 0) {
+ 		delete inode;
+ 		return B_OK;
+ 	}
+ 
+-	// If the inode isn't in use anymore, we were called before
+-	// bfs_unlink() returns - in this case, we can just use the
+-	// transaction which has already deleted the inode.
+-	Transaction transaction(volume, volume-&gt;ToBlock(inode-&gt;Parent()));
+-
+ 	status_t status = inode-&gt;Free(transaction);
+ 	if (status == B_OK) {
+ 		transaction.Done();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015987.html">[Haiku-commits] r30202 - haiku/trunk/src/apps/mail
+</A></li>
+	<LI>Next message: <A HREF="015891.html">[Haiku-commits] r30204 - in haiku/trunk: headers/os/drivers	src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15890">[ date ]</a>
+              <a href="thread.html#15890">[ thread ]</a>
+              <a href="subject.html#15890">[ subject ]</a>
+              <a href="author.html#15890">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

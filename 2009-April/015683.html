@@ -1,0 +1,276 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30091 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30091%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200904100014.n3A0EA4D014070%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015682.html">
+   <LINK REL="Next"  HREF="015684.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30091 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30091%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200904100014.n3A0EA4D014070%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30091 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Fri Apr 10 02:14:10 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015682.html">[Haiku-commits] r30090 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="015684.html">[Haiku-commits] r30091 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15683">[ date ]</a>
+              <a href="thread.html#15683">[ thread ]</a>
+              <a href="subject.html#15683">[ subject ]</a>
+              <a href="author.html#15683">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-04-10 02:14:07 +0200 (Fri, 10 Apr 2009)
+New Revision: 30091
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30091&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30091&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATARequest.cpp
+Log:
+* Fix race condition between finishing a request and returning a busy status
+  when the channel is in use, which would cause the SCSI scheduler to stop
+  sending requests.
+* Indeed we need to return a status from the interrupt handler, as for PIO
+  transfers there is no way of knowning whether or not the interrupt at hand
+  was ours.
+* Add some debug output.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp	2009-04-09 23:49:49 UTC (rev 30090)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAChannel.cpp	2009-04-10 00:14:07 UTC (rev 30091)
+@@ -222,15 +222,16 @@
+ ATAChannel::ExecuteIO(scsi_ccb *ccb)
+ {
+ 	TRACE_FUNCTION(&quot;%p\n&quot;, ccb);
+-	if (mutex_trylock(&amp;fExecutionLock) != B_OK)
++	if (mutex_trylock(&amp;fExecutionLock) != B_OK) {
++		TRACE(&quot;channel is busy\n&quot;);
+ 		return B_BUSY;
++	}
+ 
+-	MutexLocker _(&amp;fExecutionLock, true);
+-
+ 	fRequest-&gt;SetCCB(ccb);
+ 	if (ccb-&gt;cdb[0] == SCSI_OP_REQUEST_SENSE) {
++		TRACE(&quot;request sense\n&quot;);
+ 		fRequest-&gt;RequestSense();
+-		fRequest-&gt;Finish(false);
++		fRequest-&gt;Finish(false, &amp;fExecutionLock);
+ 		return B_OK;
+ 	}
+ 
+@@ -240,7 +241,7 @@
+ 	if (ccb-&gt;target_id &gt;= fDeviceCount) {
+ 		TRACE_ERROR(&quot;invalid target device\n&quot;);
+ 		fRequest-&gt;SetStatus(SCSI_SEL_TIMEOUT);
+-		fRequest-&gt;Finish(false);
++		fRequest-&gt;Finish(false, &amp;fExecutionLock);
+ 		return B_BAD_INDEX;
+ 	}
+ 
+@@ -248,7 +249,7 @@
+ 	if (device == NULL) {
+ 		TRACE_ERROR(&quot;target device not present\n&quot;);
+ 		fRequest-&gt;SetStatus(SCSI_SEL_TIMEOUT);
+-		fRequest-&gt;Finish(false);
++		fRequest-&gt;Finish(false, &amp;fExecutionLock);
+ 		return B_BAD_INDEX;
+ 	}
+ 
+@@ -256,7 +257,7 @@
+ 		: ATA_STANDARD_TIMEOUT);
+ 
+ 	status_t result = device-&gt;ExecuteIO(fRequest);
+-	fRequest-&gt;Finish(false);
++	fRequest-&gt;Finish(false, &amp;fExecutionLock);
+ 	return result;
+ }
+ 
+@@ -554,7 +555,8 @@
+ 		return B_OK;
+ 
+ 	request-&gt;SetStatus(SCSI_SEQUENCE_FAIL);
+-	TRACE_ERROR(&quot;command failed, error bit is set\n&quot;);
++	TRACE_ERROR(&quot;command failed, error bit is set: 0x%02x\n&quot;,
++		taskFile-&gt;read.error);
+ 	uint8 error = taskFile-&gt;read.error &amp; errorMask;
+ 	if (error &amp; ATA_ERROR_INTERFACE_CRC) {
+ 		TRACE_ERROR(&quot;interface crc error\n&quot;);
+@@ -702,21 +704,22 @@
+ }
+ 
+ 
+-void
++status_t
+ ATAChannel::Interrupt(uint8 status)
+ {
+ 	SpinLocker locker(fInterruptLock);
+ 	if (!fExpectsInterrupt) {
+-		TRACE_ERROR(&quot;interrupt when not expecting transfer\n&quot;);
+-		return;
++		TRACE(&quot;interrupt when not expecting transfer\n&quot;);
++		return B_UNHANDLED_INTERRUPT;
+ 	}
+ 
+ 	if ((status &amp; ATA_STATUS_BUSY) != 0) {
+-		TRACE_ERROR((&quot;interrupt while device is busy\n&quot;));
+-		return;
++		TRACE((&quot;interrupt while device is busy\n&quot;));
++		return B_UNHANDLED_INTERRUPT;
+ 	}
+ 
+ 	fInterruptCondition.NotifyAll();
++	return B_HANDLED_INTERRUPT;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp	2009-04-09 23:49:49 UTC (rev 30090)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATADevice.cpp	2009-04-10 00:14:07 UTC (rev 30091)
+@@ -23,9 +23,6 @@
+ {
+ 	memset(&amp;fInfoBlock, 0, sizeof(fInfoBlock));
+ 	memset(&amp;fTaskFile, 0, sizeof(fTaskFile));
+-
+-	snprintf(fDebugContext, sizeof(fDebugContext), &quot;%s %lu-%u&quot;,
+-		IsATAPI() ? &quot;pi &quot; : &quot;&quot;, channel-&gt;ChannelID(), index);
+ }
+ 
+ 
+@@ -464,6 +461,9 @@
+ status_t
+ ATADevice::Identify()
+ {
++	snprintf(fDebugContext, sizeof(fDebugContext), &quot;%s %lu-%u&quot;,
++		IsATAPI() ? &quot;pi &quot; : &quot;&quot;, fChannel-&gt;ChannelID(), fIndex);
++
+ 	ATARequest request;
+ 	request.SetDevice(this);
+ 	request.SetTimeout(20 * 1000 * 1000);
+@@ -564,8 +564,10 @@
+ 			}
+ 		}
+ 	} else {
+-		if (fChannel-&gt;ExecutePIOTransfer(request) != B_OK)
++		if (fChannel-&gt;ExecutePIOTransfer(request) != B_OK) {
++			TRACE_ERROR(&quot;executing pio transfer failed\n&quot;);
+ 			request-&gt;SetStatus(SCSI_SEQUENCE_FAIL);
++		}
+ 	}
+ 
+ 	return fChannel-&gt;FinishRequest(request, ATA_WAIT_FINISH
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp	2009-04-09 23:49:49 UTC (rev 30090)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAModule.cpp	2009-04-10 00:14:07 UTC (rev 30091)
+@@ -206,12 +206,7 @@
+ ata_interrupt_handler(void *cookie, uint8 status)
+ {
+ 	ATAChannel *channel = (ATAChannel *)cookie;
+-	channel-&gt;Interrupt(status);
+-
+-	// the controller driver already checks if its interrupt status indicates
+-	// that the interrupt was for this device, so we are only here if that's
+-	// the case.
+-	return B_HANDLED_INTERRUPT;
++	return channel-&gt;Interrupt(status);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h	2009-04-09 23:49:49 UTC (rev 30090)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATAPrivate.h	2009-04-10 00:14:07 UTC (rev 30091)
+@@ -107,7 +107,7 @@
+ 		status_t					ReadPIO(uint8 *buffer, size_t length);
+ 		status_t					WritePIO(uint8 *buffer, size_t length);
+ 
+-		void						Interrupt(uint8 status);
++		status_t					Interrupt(uint8 status);
+ 
+ private:
+ 		status_t					_ReadRegs(ata_task_file *taskFile,
+@@ -266,7 +266,8 @@
+ 		void						SetBlocksLeft(uint32 blocksLeft);
+ 		uint32 *					BlocksLeft() { return &fBlocksLeft; };
+ 
+-		status_t					Finish(bool resubmit);
++		status_t					Finish(bool resubmit,
++										mutex *mutexToUnlock);
+ 
+ 		// SCSI stuff
+ 		void						SetCCB(scsi_ccb *ccb);
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATARequest.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATARequest.cpp	2009-04-09 23:49:49 UTC (rev 30090)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ATARequest.cpp	2009-04-10 00:14:07 UTC (rev 30091)
+@@ -76,7 +76,7 @@
+ 
+ 
+ status_t
+-ATARequest::Finish(bool resubmit)
++ATARequest::Finish(bool resubmit, mutex *mutexToUnlock)
+ {
+ 	// when the request completed and has set sense
+     // data, report this to the scsi stack by setting
+@@ -102,6 +102,8 @@
+ 	} else
+ 		fCCB-&gt;subsys_status = fStatus;
+ 
++	mutex_unlock(mutexToUnlock);
++
+ 	if (resubmit)
+ 		gSCSIModule-&gt;resubmit(fCCB);
+ 	else
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015682.html">[Haiku-commits] r30090 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="015684.html">[Haiku-commits] r30091 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15683">[ date ]</a>
+              <a href="thread.html#15683">[ thread ]</a>
+              <a href="subject.html#15683">[ subject ]</a>
+              <a href="author.html#15683">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,1094 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27304 - in haiku/trunk: headers/private/kernel	headers/private/system src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27304%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09headers/private/system%20src/system/kernel&In-Reply-To=%3C200809031510.m83FAmcr027086%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011507.html">
+   <LINK REL="Next"  HREF="011509.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27304 - in haiku/trunk: headers/private/kernel	headers/private/system src/system/kernel</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27304%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09headers/private/system%20src/system/kernel&In-Reply-To=%3C200809031510.m83FAmcr027086%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27304 - in haiku/trunk: headers/private/kernel	headers/private/system src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Sep  3 17:10:48 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011507.html">[Haiku-commits] r27303 - haiku/trunk/headers/private/kernel
+</A></li>
+        <LI>Next message: <A HREF="011509.html">[Haiku-commits] r27305 - haiku/trunk/build/config_headers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11508">[ date ]</a>
+              <a href="thread.html#11508">[ thread ]</a>
+              <a href="subject.html#11508">[ subject ]</a>
+              <a href="author.html#11508">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-03 17:10:44 +0200 (Wed, 03 Sep 2008)
+New Revision: 27304
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27304&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27304&amp;view=rev</A>
+
+Added:
+   haiku/trunk/headers/private/kernel/scheduling_analysis.h
+   haiku/trunk/headers/private/system/scheduler_defs.h
+Modified:
+   haiku/trunk/headers/private/kernel/kscheduler.h
+   haiku/trunk/headers/private/system/syscalls.h
+   haiku/trunk/src/system/kernel/condition_variable.cpp
+   haiku/trunk/src/system/kernel/lock.cpp
+   haiku/trunk/src/system/kernel/scheduler.cpp
+   haiku/trunk/src/system/kernel/sem.cpp
+Log:
+* Fixed bug in the &quot;scheduler&quot; command: The check when a thread was
+  unscheduled was incorrect.
+* Introduced _kern_analyze_scheduling() syscall. It requires scheduler
+  kernel tracing to be enabled. It uses the tracing entries for a given
+  period of time to do a similar analysis the &quot;scheduler&quot; debugger
+  command does (i.e. number of runs, run time, latencies, preemption
+  times) for each thread. Additionally the analysis includes for each
+  thread how long the thread waited on each locking primitive in total.
+* Added kernel tracing for the creation of semaphores and initialization
+  of condition variables, mutexes, and rw locks. The enabling macro is
+  SCHEDULING_ANALYSIS_TRACING. The only purpose is to provide
+  _kern_analyze_scheduling() with more info on the locking primitives
+  (the name in particular).
+
+
+Modified: haiku/trunk/headers/private/kernel/kscheduler.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/kscheduler.h	2008-09-03 14:53:01 UTC (rev 27303)
++++ haiku/trunk/headers/private/kernel/kscheduler.h	2008-09-03 15:10:44 UTC (rev 27304)
+@@ -6,6 +6,10 @@
+ #define KERNEL_SCHEDULER_H
+ 
+ 
++#include &lt;SupportDefs.h&gt;
++
++
++struct scheduling_analysis;
+ struct thread;
+ 
+ 
+@@ -20,6 +24,9 @@
+ void scheduler_init(void);
+ void scheduler_start(void);
+ 
++status_t _user_analyze_scheduling(bigtime_t from, bigtime_t until, void* buffer,
++	size_t size, struct scheduling_analysis* analysis);
++
+ #ifdef __cplusplus
+ }
+ #endif
+
+Added: haiku/trunk/headers/private/kernel/scheduling_analysis.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/scheduling_analysis.h	2008-09-03 14:53:01 UTC (rev 27303)
++++ haiku/trunk/headers/private/kernel/scheduling_analysis.h	2008-09-03 15:10:44 UTC (rev 27304)
+@@ -0,0 +1,193 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _KERNEL_SCHEDULING_ANALYSIS_H
++#define _KERNEL_SCHEDULING_ANALYSIS_H
++
++#include &lt;tracing.h&gt;
++#include &lt;thread_defs.h&gt;
++
++
++class ConditionVariable;
++struct mutex;
++struct rw_lock;
++
++
++#if SCHEDULING_ANALYSIS_TRACING
++namespace SchedulingAnalysisTracing {
++
++class WaitObjectTraceEntry : public AbstractTraceEntry {
++public:
++	virtual uint32 Type() const = 0;
++	virtual void* Object() const = 0;
++	virtual const char* Name() const = 0;
++
++	virtual void* ReferencedObject() const
++	{
++		return NULL;
++	}
++};
++
++
++class CreateSemaphore : public WaitObjectTraceEntry {
++public:
++	CreateSemaphore(sem_id id, const char* name)
++		:
++		fID(id),
++		fName(alloc_tracing_buffer_strcpy(name, 128, false))
++	{
++		Initialized();
++	}
++
++	virtual void AddDump(TraceOutput&amp; out)
++	{
++		out.Print(&quot;sem create \&quot;%s\&quot; -&gt; %ld&quot;, fName, fID);
++	}
++
++	virtual uint32 Type() const
++	{
++		return THREAD_BLOCK_TYPE_SEMAPHORE;
++	}
++
++	virtual void* Object() const
++	{
++		return (void*)(addr_t)fID;
++	}
++
++	virtual const char* Name() const
++	{
++		return fName;
++	}
++
++private:
++	sem_id		fID;
++	const char*	fName;
++};
++
++
++class InitConditionVariable : public WaitObjectTraceEntry {
++public:
++	InitConditionVariable(ConditionVariable* variable, const void* object,
++		const char* objectType)
++		:
++		fVariable(variable),
++		fObject(object),
++		fObjectType(alloc_tracing_buffer_strcpy(objectType, 128, false))
++	{
++		Initialized();
++	}
++
++	virtual void AddDump(TraceOutput&amp; out)
++	{
++		out.Print(&quot;cvar init variable %p: object: %p \&quot;%s\&quot;&quot;, fVariable,
++			fObject, fObjectType);
++	}
++
++	virtual uint32 Type() const
++	{
++		return THREAD_BLOCK_TYPE_CONDITION_VARIABLE;
++	}
++
++	virtual void* Object() const
++	{
++		return fVariable;
++	}
++
++	virtual const char* Name() const
++	{
++		return fObjectType;
++	}
++
++	virtual void* ReferencedObject() const
++	{
++		return (void*)fObject;
++	}
++
++private:
++	ConditionVariable*	fVariable;
++	const void*			fObject;
++	const char*			fObjectType;
++};
++
++
++class InitMutex : public WaitObjectTraceEntry {
++public:
++	InitMutex(mutex* lock, const char* name)
++		:
++		fMutex(lock),
++		fName(alloc_tracing_buffer_strcpy(name, 128, false))
++	{
++		Initialized();
++	}
++
++	virtual void AddDump(TraceOutput&amp; out)
++	{
++		out.Print(&quot;mutex init %p: name: \&quot;%s\&quot;&quot;, fMutex, fName);
++	}
++
++	virtual uint32 Type() const
++	{
++		return THREAD_BLOCK_TYPE_MUTEX;
++	}
++
++	virtual void* Object() const
++	{
++		return fMutex;
++	}
++
++	virtual const char* Name() const
++	{
++		return fName;
++	}
++
++private:
++	mutex*		fMutex;
++	const char*	fName;
++};
++
++
++class InitRWLock : public WaitObjectTraceEntry {
++public:
++	InitRWLock(rw_lock* lock, const char* name)
++		:
++		fLock(lock),
++		fName(alloc_tracing_buffer_strcpy(name, 128, false))
++	{
++		Initialized();
++	}
++
++	virtual void AddDump(TraceOutput&amp; out)
++	{
++		out.Print(&quot;rwlock init %p: name: \&quot;%s\&quot;&quot;, fLock, fName);
++	}
++
++	virtual uint32 Type() const
++	{
++		return THREAD_BLOCK_TYPE_RW_LOCK;
++	}
++
++	virtual void* Object() const
++	{
++		return fLock;
++	}
++
++	virtual const char* Name() const
++	{
++		return fName;
++	}
++
++private:
++	rw_lock*	fLock;
++	const char*	fName;
++};
++
++}	// namespace SchedulingAnalysisTracing
++
++#	define T_SCHEDULING_ANALYSIS(x) \
++		new(std::nothrow) SchedulingAnalysisTracing::x;
++#else
++#	define T_SCHEDULING_ANALYSIS(x) ;
++#endif	// SCHEDULING_ANALYSIS_TRACING
++
++#endif	// _KERNEL_SCHEDULING_ANALYSIS_H
+
+Added: haiku/trunk/headers/private/system/scheduler_defs.h
+===================================================================
+--- haiku/trunk/headers/private/system/scheduler_defs.h	2008-09-03 14:53:01 UTC (rev 27303)
++++ haiku/trunk/headers/private/system/scheduler_defs.h	2008-09-03 15:10:44 UTC (rev 27304)
+@@ -0,0 +1,64 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _SYSTEM_SCHEDULER_DEFS_H
++#define _SYSTEM_SCHEDULER_DEFS_H
++
++#include &lt;OS.h&gt;
++
++
++struct scheduling_analysis_thread_wait_object;
++
++struct scheduling_analysis_thread {
++	thread_id	id;
++	char		name[B_OS_NAME_LENGTH];
++
++	int64		runs;
++	bigtime_t	total_run_time;
++	bigtime_t	min_run_time;
++	bigtime_t	max_run_time;
++
++	int64		latencies;
++	bigtime_t	total_latency;
++	bigtime_t	min_latency;
++	bigtime_t	max_latency;
++
++	int64		reruns;
++	bigtime_t	total_rerun_time;
++	bigtime_t	min_rerun_time;
++	bigtime_t	max_rerun_time;
++
++	bigtime_t	unspecified_wait_time;
++
++	int64		preemptions;
++
++	scheduling_analysis_thread_wait_object* wait_objects;
++};
++
++
++struct scheduling_analysis_wait_object {
++	uint32		type;
++	void*		object;
++	char		name[B_OS_NAME_LENGTH];
++	void*		referenced_object;
++};
++
++
++struct scheduling_analysis_thread_wait_object {
++	thread_id								thread;
++	scheduling_analysis_wait_object*		wait_object;
++	bigtime_t								wait_time;
++	scheduling_analysis_thread_wait_object*	next_in_list;
++};
++
++
++struct scheduling_analysis {
++	uint32							thread_count;
++	scheduling_analysis_thread**	threads;
++	uint64							wait_object_count;
++	uint64							thread_wait_object_count;
++};
++
++
++#endif	/* _SYSTEM_SCHEDULER_DEFS_H */
+
+Modified: haiku/trunk/headers/private/system/syscalls.h
+===================================================================
+--- haiku/trunk/headers/private/system/syscalls.h	2008-09-03 14:53:01 UTC (rev 27303)
++++ haiku/trunk/headers/private/system/syscalls.h	2008-09-03 15:10:44 UTC (rev 27304)
+@@ -27,6 +27,7 @@
+ struct net_stat;
+ struct pollfd;
+ struct rlimit;
++struct scheduling_analysis;
+ struct sigaction;
+ struct stat;
+ struct _sem_t;
+@@ -394,6 +395,9 @@
+ 
+ /* System informations */
+ extern status_t		_kern_get_system_info(system_info *info, size_t size);
++extern status_t		_kern_analyze_scheduling(bigtime_t from, bigtime_t until,
++						void* buffer, size_t size,
++						struct scheduling_analysis* analysis);
+ 
+ /* Debug output */
+ extern void			_kern_debug_output(const char *message);
+
+Modified: haiku/trunk/src/system/kernel/condition_variable.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/condition_variable.cpp	2008-09-03 14:53:01 UTC (rev 27303)
++++ haiku/trunk/src/system/kernel/condition_variable.cpp	2008-09-03 15:10:44 UTC (rev 27304)
+@@ -13,6 +13,7 @@
+ #include &lt;kscheduler.h&gt;
+ #include &lt;ksignal.h&gt;
+ #include &lt;int.h&gt;
++#include &lt;scheduling_analysis.h&gt;
+ #include &lt;thread.h&gt;
+ #include &lt;util/AutoLock.h&gt;
+ 
+@@ -187,6 +188,8 @@
+ 	fObject = object;
+ 	fObjectType = objectType;
+ 	new(&amp;fEntries) EntryList;
++
++	T_SCHEDULING_ANALYSIS(InitConditionVariable(this, object, objectType));
+ }
+ 
+ 
+@@ -199,6 +202,8 @@
+ 	fObjectType = objectType;
+ 	new(&amp;fEntries) EntryList;
+ 
++	T_SCHEDULING_ANALYSIS(InitConditionVariable(this, object, objectType));
++
+ 	InterruptsLocker _;
+ 	SpinLocker locker(sConditionVariablesLock);
+ 
+
+Modified: haiku/trunk/src/system/kernel/lock.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/lock.cpp	2008-09-03 14:53:01 UTC (rev 27303)
++++ haiku/trunk/src/system/kernel/lock.cpp	2008-09-03 15:10:44 UTC (rev 27304)
+@@ -19,6 +19,7 @@
+ #include &lt;debug.h&gt;
+ #include &lt;int.h&gt;
+ #include &lt;kernel.h&gt;
++#include &lt;scheduling_analysis.h&gt;
+ #include &lt;thread.h&gt;
+ #include &lt;util/AutoLock.h&gt;
+ 
+@@ -223,6 +224,8 @@
+ 	lock-&gt;writer_count = 0;
+ 	lock-&gt;owner_count = 0;
+ 	lock-&gt;flags = 0;
++
++	T_SCHEDULING_ANALYSIS(InitRWLock(lock, name));
+ }
+ 
+ 
+@@ -236,6 +239,8 @@
+ 	lock-&gt;writer_count = 0;
+ 	lock-&gt;owner_count = 0;
+ 	lock-&gt;flags = flags &amp; RW_LOCK_FLAG_CLONE_NAME;
++
++	T_SCHEDULING_ANALYSIS(InitRWLock(lock, name));
+ }
+ 
+ 
+@@ -430,6 +435,8 @@
+ 	lock-&gt;count = 0;
+ #endif
+ 	lock-&gt;flags = 0;
++
++	T_SCHEDULING_ANALYSIS(InitMutex(lock, name));
+ }
+ 
+ 
+@@ -444,6 +451,8 @@
+ 	lock-&gt;count = 0;
+ #endif
+ 	lock-&gt;flags = flags &amp; MUTEX_FLAG_CLONE_NAME;
++
++	T_SCHEDULING_ANALYSIS(InitMutex(lock, name));
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/system/kernel/scheduler.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/scheduler.cpp	2008-09-03 14:53:01 UTC (rev 27303)
++++ haiku/trunk/src/system/kernel/scheduler.cpp	2008-09-03 15:10:44 UTC (rev 27304)
+@@ -1,4 +1,5 @@
+ /*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
+  * Copyright 2002-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Copyright 2002, Angelo Mottola, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">a.mottola at libero.it.</A>
+  * Distributed under the terms of the MIT License.
+@@ -13,14 +14,19 @@
+ #include &lt;OS.h&gt;
+ 
+ #include &lt;arch/debug.h&gt;
++#include &lt;cpu.h&gt;
++#include &lt;debug.h&gt;
++#include &lt;elf.h&gt;
++#include &lt;int.h&gt;
++#include &lt;kernel.h&gt;
+ #include &lt;kscheduler.h&gt;
++#include &lt;scheduler_defs.h&gt;
++#include &lt;scheduling_analysis.h&gt;
++#include &lt;smp.h&gt;
+ #include &lt;thread.h&gt;
+ #include &lt;timer.h&gt;
+-#include &lt;int.h&gt;
+-#include &lt;smp.h&gt;
+-#include &lt;cpu.h&gt;
+-#include &lt;debug.h&gt;
+ #include &lt;tracing.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ #include &lt;util/khash.h&gt;
+ 
+ 
+@@ -45,6 +51,8 @@
+ 
+ 	thread_id ThreadID() const	{ return fID; }
+ 
++	virtual const char* Name() const = 0;
++
+ protected:
+ 	thread_id			fID;
+ };
+@@ -75,6 +83,11 @@
+ 			&quot;next %ld)&quot;, fID, fName, fPriority, fPreviousID, fNextID);
+ 	}
+ 
++	virtual const char* Name() const
++	{
++		return fName;
++	}
++
+ private:
+ 	thread_id			fPreviousID;
+ 	thread_id			fNextID;
+@@ -98,6 +111,11 @@
+ 		out.Print(&quot;scheduler remove %ld, priority %d&quot;, fID, fPriority);
+ 	}
+ 
++	virtual const char* Name() const
++	{
++		return NULL;
++	}
++
+ private:
+ 	uint8				fPriority;
+ };
+@@ -170,8 +188,16 @@
+ 		out.Print(&quot;)&quot;);
+ 	}
+ 
+-	thread_id PreviousThreadID() const	{ return fPreviousID; }
++	virtual const char* Name() const
++	{
++		return fName;
++	}
+ 
++	thread_id PreviousThreadID() const		{ return fPreviousID; }
++	uint8 PreviousState() const				{ return fPreviousState; }
++	uint16 PreviousWaitObjectType() const	{ return fPreviousWaitObjectType; }
++	const void* PreviousWaitObject() const	{ return fPreviousWaitObject; }
++
+ private:
+ 	thread_id			fPreviousID;
+ 	int32				fCPU;
+@@ -233,6 +259,20 @@
+ 
+ #if SCHEDULER_TRACING
+ 
++namespace SchedulerTracing {
++
++enum ScheduleState {
++	RUNNING,
++	STILL_RUNNING,
++	PREEMPTED,
++	READY,
++	WAITING,
++	UNKNOWN
++};
++
++}
++
++
+ static int
+ cmd_scheduler(int argc, char** argv)
+ {
+@@ -250,15 +290,6 @@
+ 		return 0;
+ 	}
+ 
+-	enum ScheduleState {
+-		RUNNING,
+-		STILL_RUNNING,
+-		PREEMPTED,
+-		READY,
+-		WAITING,
+-		UNKNOWN
+-	};
+-
+ 	ScheduleState state = UNKNOWN;
+ 	bigtime_t lastTime = 0;
+ 
+@@ -322,7 +353,7 @@
+ 					lastTime = entry-&gt;Time();
+ 					state = RUNNING;
+ 				}
+-			} else if (entry-&gt;PreviousThreadID() != threadID) {
++			} else if (entry-&gt;PreviousThreadID() == threadID) {
+ 				// thread unscheduled
+ 				bigtime_t diffTime = entry-&gt;Time() - lastTime;
+ 
+@@ -360,7 +391,7 @@
+ 
+ 			if (state == RUNNING || state == STILL_RUNNING) {
+ 				// Thread was running and is reentered into the run queue. This
+-				// is done by the scheduler, if the next thread remains ready.
++				// is done by the scheduler, if the thread remains ready.
+ 				state = STILL_RUNNING;
+ 			} else {
+ 				// Thread was waiting and is ready now.
+@@ -691,3 +722,857 @@
+ 	RELEASE_THREAD_LOCK();
+ 	restore_interrupts(state);
+ }
++
++
++// #pragma mark -
++
++
++#if SCHEDULER_TRACING
++
++namespace SchedulingAnalysis {
++
++using namespace SchedulerTracing;
++
++#if SCHEDULING_ANALYSIS_TRACING
++using namespace SchedulingAnalysisTracing;
++#endif
++
++struct ThreadWaitObject;
++
++struct HashObjectKey {
++	virtual ~HashObjectKey()
++	{
++	}
++
++	virtual uint32 HashKey() const = 0;
++};
++
++
++struct HashObject {
++	HashObject*	next;
++
++	virtual ~HashObject()
++	{
++	}
++
++	virtual uint32 HashKey() const = 0;
++	virtual bool Equals(const HashObjectKey* key) const = 0;
++};
++
++
++struct ThreadKey : HashObjectKey {
++	thread_id	id;
++
++	ThreadKey(thread_id id)
++		:
++		id(id)
++	{
++	}
++
++	virtual uint32 HashKey() const
++	{
++		return id;
++	}
++};
++
++
++struct Thread : HashObject, scheduling_analysis_thread {
++	ScheduleState state;
++	bigtime_t lastTime;
++
++	ThreadWaitObject* waitObject;
++
++	Thread(thread_id id)
++		:
++		state(UNKNOWN),
++		lastTime(0),
++
++		waitObject(NULL)
++	{
++		this-&gt;id = id;
++		name[0] = '\0';
++
++		runs = 0;
++		total_run_time = 0;
++		min_run_time = 1;
++		max_run_time = -1;
++
++		latencies = 0;
++		total_latency = 0;
++		min_latency = -1;
++		max_latency = -1;
++
++		reruns = 0;
++		total_rerun_time = 0;
++		min_rerun_time = -1;
++		max_rerun_time = -1;
++
++		unspecified_wait_time = 0;
++
++		preemptions = 0;
++
++		wait_objects = NULL;
++	}
++
++	virtual uint32 HashKey() const
++	{
++		return id;
++	}
++
++	virtual bool Equals(const HashObjectKey* _key) const
++	{
++		const ThreadKey* key = dynamic_cast&lt;const ThreadKey*&gt;(_key);
++		if (key == NULL)
++			return false;
++		return key-&gt;id == id;
++	}
++};
++
++
++struct WaitObjectKey : HashObjectKey {
++	uint32	type;
++	void*	object;
++
++	WaitObjectKey(uint32 type, void* object)
++		:
++		type(type),
++		object(object)
++	{
++	}
++
++	virtual uint32 HashKey() const
++	{
++		return type ^ (uint32)(addr_t)object;
++	}
++};
++
++
++struct WaitObject : HashObject, scheduling_analysis_wait_object {
++	WaitObject(uint32 type, void* object)
++	{
++		this-&gt;type = type;
++		this-&gt;object = object;
++		name[0] = '\0';
++		referenced_object = NULL;
++	}
++
++	virtual uint32 HashKey() const
++	{
++		return type ^ (uint32)(addr_t)object;
++	}
++
++	virtual bool Equals(const HashObjectKey* _key) const
++	{
++		const WaitObjectKey* key = dynamic_cast&lt;const WaitObjectKey*&gt;(_key);
++		if (key == NULL)
++			return false;
++		return key-&gt;type == type &amp;&amp; key-&gt;object == object;
++	}
++};
++
++
++struct ThreadWaitObjectKey : HashObjectKey {
++	thread_id				thread;
++	uint32					type;
++	void*					object;
++
++	ThreadWaitObjectKey(thread_id thread, uint32 type, void* object)
++		:
++		thread(thread),
++		type(type),
++		object(object)
++	{
++	}
++
++	virtual uint32 HashKey() const
++	{
++		return thread ^ type ^ (uint32)(addr_t)object;
++	}
++};
++
++
++struct ThreadWaitObject : HashObject, scheduling_analysis_thread_wait_object {
++	ThreadWaitObject(thread_id thread, WaitObject* waitObject)
++	{
++		this-&gt;thread = thread;
++		wait_object = waitObject;
++		wait_time = 0;
++		next_in_list = NULL;
++	}
++
++	virtual uint32 HashKey() const
++	{
++		return thread ^ wait_object-&gt;type ^ (uint32)(addr_t)wait_object-&gt;object;
++	}
++
++	virtual bool Equals(const HashObjectKey* _key) const
++	{
++		const ThreadWaitObjectKey* key
++			= dynamic_cast&lt;const ThreadWaitObjectKey*&gt;(_key);
++		if (key == NULL)
++			return false;
++		return key-&gt;thread == thread &amp;&amp; key-&gt;type == wait_object-&gt;type
++			&amp;&amp; key-&gt;object == wait_object-&gt;object;
++	}
++};
++
++
++class SchedulingAnalysisManager {
++public:
++	SchedulingAnalysisManager(void* buffer, size_t size)
++		:
++		fBuffer(buffer),
++		fSize(size),
++		fHashTable(),
++		fHashTableSize(0)
++	{
++		fAnalysis.thread_count = 0;
++		fAnalysis.threads = 0;
++		fAnalysis.wait_object_count = 0;
++		fAnalysis.thread_wait_object_count = 0;
++
++		size_t maxObjectSize = max_c(max_c(sizeof(Thread), sizeof(WaitObject)),
++			sizeof(ThreadWaitObject));
++		fHashTableSize = size / (maxObjectSize + sizeof(HashObject*));
++		fHashTable = (HashObject**)((uint8*)fBuffer + fSize) - fHashTableSize;
++		fNextAllocation = (uint8*)fBuffer;
++		fRemainingBytes = (addr_t)fHashTable - (addr_t)fBuffer;
++
++		image_info info;
++		if (elf_get_image_info_for_address((addr_t)&amp;scheduler_start, &amp;info)
++				== B_OK) {
++			fKernelStart = (addr_t)info.text;
++			fKernelEnd = (addr_t)info.data + info.data_size;
++		} else {
++			fKernelStart = 0;
++			fKernelEnd = 0;
++		}
++	}
++
++	const scheduling_analysis* Analysis() const
++	{
++		return &fAnalysis;
++	}
++
++	void* Allocate(size_t size)
++	{
++		size = (size + 7) &amp; ~(size_t)7;
++
++		if (size &gt; fRemainingBytes)
++			return NULL;
++
++		void* address = fNextAllocation;
++		fNextAllocation += size;
++		fRemainingBytes -= size;
++		return address;
++	}
++
++	void Insert(HashObject* object)
++	{
++		uint32 index = object-&gt;HashKey() % fHashTableSize;
++		object-&gt;next = fHashTable[index];
++		fHashTable[index] = object;
++	}
++
++	void Remove(HashObject* object)
++	{
++		uint32 index = object-&gt;HashKey() % fHashTableSize;
++		HashObject** slot = &amp;fHashTable[index];
++		while (*slot != object)
++			slot = &amp;(*slot)-&gt;next;
++
++		*slot = object-&gt;next;
++	}
++
++	HashObject* Lookup(const HashObjectKey&amp; key) const
++	{
++		uint32 index = key.HashKey() % fHashTableSize;
++		HashObject* object = fHashTable[index];
++		while (object != NULL &amp;&amp; !object-&gt;Equals(&amp;key))
++			object = object-&gt;next;
++		return object;
++	}
++
++	Thread* ThreadFor(thread_id id) const
++	{
++		return dynamic_cast&lt;Thread*&gt;(Lookup(ThreadKey(id)));
++	}
++
++	WaitObject* WaitObjectFor(uint32 type, void* object) const
++	{
++		return dynamic_cast&lt;WaitObject*&gt;(Lookup(WaitObjectKey(type, object)));
++	}
++
++	ThreadWaitObject* ThreadWaitObjectFor(thread_id thread, uint32 type,
++		void* object) const
++	{
++		return dynamic_cast&lt;ThreadWaitObject*&gt;(
++			Lookup(ThreadWaitObjectKey(thread, type, object)));
++	}
++
++	status_t AddThread(thread_id id, const char* name)
++	{
++		Thread* thread = ThreadFor(id);
++		if (thread == NULL) {
++			void* memory = Allocate(sizeof(Thread));
++			if (memory == NULL)
++				return B_NO_MEMORY;
++
++			thread = new(memory) Thread(id);
++			Insert(thread);
++			fAnalysis.thread_count++;
++		}
++
++		if (name != NULL &amp;&amp; thread-&gt;name[0] == '\0')
++			strlcpy(thread-&gt;name, name, sizeof(thread-&gt;name));
++
++		return B_OK;
++	}
++
++	status_t AddWaitObject(uint32 type, void* object,
++		WaitObject** _waitObject = NULL)
++	{
++		if (WaitObjectFor(type, object) != NULL)
++			return B_OK;
++
++		void* memory = Allocate(sizeof(WaitObject));
++		if (memory == NULL)
++			return B_NO_MEMORY;
++
++		WaitObject* waitObject = new(memory) WaitObject(type, object);
++		Insert(waitObject);
++		fAnalysis.wait_object_count++;
++
++		// Set a dummy name for snooze() and waiting for signals, so we don't
++		// try to update them later on.
++		if (type == THREAD_BLOCK_TYPE_SNOOZE
++			|| type == THREAD_BLOCK_TYPE_SIGNAL) {
++			strcpy(waitObject-&gt;name, &quot;?&quot;);
++		}
++
++		if (_waitObject != NULL)
++			*_waitObject = waitObject;
++
++		return B_OK;
++	}
++
++	status_t UpdateWaitObject(uint32 type, void* object, const char* name,
++		void* referencedObject)
++	{
++		WaitObject* waitObject = WaitObjectFor(type, object);
++		if (waitObject == NULL)
++			return B_OK;
++
++		if (waitObject-&gt;name[0] != '\0') {
++			// This is a new object at the same address. Replace the old one.
++			Remove(waitObject);
++			status_t error = AddWaitObject(type, object, &amp;waitObject);
++			if (error != B_OK)
++				return error;
++		}
++
++		if (name == NULL)
++			name = &quot;?&quot;;
++
++		strlcpy(waitObject-&gt;name, name, sizeof(waitObject-&gt;name));
++		waitObject-&gt;referenced_object = referencedObject;
++
++		return B_OK;
++	}
++
++	bool UpdateWaitObjectDontAdd(uint32 type, void* object, const char* name,
++		void* referencedObject)
++	{
++		WaitObject* waitObject = WaitObjectFor(type, object);
++		if (waitObject == NULL || waitObject-&gt;name[0] != '\0')
++			return false;
++
++		if (name == NULL)
++			name = &quot;?&quot;;
++
++		strlcpy(waitObject-&gt;name, name, sizeof(waitObject-&gt;name));
++		waitObject-&gt;referenced_object = referencedObject;
++
++		return B_OK;
++	}
++
++	status_t AddThreadWaitObject(Thread* thread, uint32 type, void* object)
++	{
++		WaitObject* waitObject = WaitObjectFor(type, object);
++		if (waitObject == NULL) {
++			// The algorithm should prevent this case.
++			return B_ERROR;
++		}
++
++		ThreadWaitObject* threadWaitObject = ThreadWaitObjectFor(thread-&gt;id,
++			type, object);
++		if (threadWaitObject == NULL
++			|| threadWaitObject-&gt;wait_object != waitObject) {
++			if (threadWaitObject != NULL)
++				Remove(threadWaitObject);
++
++			void* memory = Allocate(sizeof(ThreadWaitObject));
++			if (memory == NULL)
++				return B_NO_MEMORY;
++
++			threadWaitObject = new(memory) ThreadWaitObject(thread-&gt;id,
++				waitObject);
++			Insert(threadWaitObject);
++			fAnalysis.thread_wait_object_count++;
++
++			threadWaitObject-&gt;next_in_list = thread-&gt;wait_objects;
++			thread-&gt;wait_objects = threadWaitObject;
++		}
++
++		thread-&gt;waitObject = threadWaitObject;
++
++		return B_OK;
++	}
++
++	int32 MissingWaitObjects() const
++	{
++		// Iterate through the hash table and count the wait objects that don't
++		// have a name yet.
++		int32 count = 0;
++		for (uint32 i = 0; i &lt; fHashTableSize; i++) {
++			HashObject* object = fHashTable[i];
++			while (object != NULL) {
++				WaitObject* waitObject = dynamic_cast&lt;WaitObject*&gt;(object);
++				if (waitObject != NULL &amp;&amp; waitObject-&gt;name[0] == '\0')
++					count++;
++
++				object = object-&gt;next;
++			}
++		}
++
++		return count;
++	}
++
++	status_t FinishAnalysis()
++	{
++		// allocate the thread array
++		scheduling_analysis_thread** threads
++			= (scheduling_analysis_thread**)Allocate(
++				sizeof(Thread*) * fAnalysis.thread_count);
++		if (threads == NULL)
++			return B_NO_MEMORY;
++
++		// Iterate through the hash table and collect all threads. Also polish
++		// all wait objects that haven't been update yet.
++		int32 index = 0;
++		for (uint32 i = 0; i &lt; fHashTableSize; i++) {
++			HashObject* object = fHashTable[i];
++			while (object != NULL) {
++				Thread* thread = dynamic_cast&lt;Thread*&gt;(object);
++				if (thread != NULL) {
++					threads[index++] = thread;
++				} else if (WaitObject* waitObject
++						= dynamic_cast&lt;WaitObject*&gt;(object)) {
++					_PolishWaitObject(waitObject);
++				}
++
++				object = object-&gt;next;
++			}
++		}
++
++		fAnalysis.threads = threads;
++dprintf(&quot;scheduling analysis: free bytes: %lu/%lu\n&quot;, fRemainingBytes, fSize);
++		return B_OK;
++	}
++
+
+[... truncated: 419 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011507.html">[Haiku-commits] r27303 - haiku/trunk/headers/private/kernel
+</A></li>
+	<LI>Next message: <A HREF="011509.html">[Haiku-commits] r27305 - haiku/trunk/build/config_headers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11508">[ date ]</a>
+              <a href="thread.html#11508">[ thread ]</a>
+              <a href="subject.html#11508">[ subject ]</a>
+              <a href="author.html#11508">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

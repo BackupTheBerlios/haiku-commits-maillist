@@ -1,0 +1,1089 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26488 - in haiku/trunk/src/system/kernel:	device_manager fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26488%20-%20in%20haiku/trunk/src/system/kernel%3A%0A%09device_manager%20fs&In-Reply-To=%3C200807181439.m6IEdlx1019812%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010349.html">
+   <LINK REL="Next"  HREF="010350.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26488 - in haiku/trunk/src/system/kernel:	device_manager fs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26488%20-%20in%20haiku/trunk/src/system/kernel%3A%0A%09device_manager%20fs&In-Reply-To=%3C200807181439.m6IEdlx1019812%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26488 - in haiku/trunk/src/system/kernel:	device_manager fs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Jul 18 16:39:47 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010349.html">[Haiku-commits] r26487 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="010350.html">[Haiku-commits] r26489 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10348">[ date ]</a>
+              <a href="thread.html#10348">[ thread ]</a>
+              <a href="subject.html#10348">[ subject ]</a>
+              <a href="author.html#10348">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-07-18 16:39:46 +0200 (Fri, 18 Jul 2008)
+New Revision: 26488
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26488&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26488&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp
+   haiku/trunk/src/system/kernel/device_manager/IOScheduler.h
+   haiku/trunk/src/system/kernel/device_manager/dma_resources.cpp
+   haiku/trunk/src/system/kernel/device_manager/dma_resources.h
+   haiku/trunk/src/system/kernel/device_manager/io_requests.cpp
+   haiku/trunk/src/system/kernel/device_manager/io_requests.h
+Removed:
+   haiku/trunk/src/system/kernel/fs/IOScheduler.cpp
+   haiku/trunk/src/system/kernel/fs/IOScheduler.h
+Modified:
+   haiku/trunk/src/system/kernel/device_manager/Jamfile
+   haiku/trunk/src/system/kernel/fs/Jamfile
+Log:
+bonefish + axeld:
+* Moved the old I/O scheduler code into the device manager, and replaced its
+  contents completely :-)
+* Implemented the DMA and I/O requests/scheduler framework - for now in C++
+  only. It's a work in progress and not used anywhere yet.
+
+
+Copied: haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp (from rev 26468, haiku/trunk/src/system/kernel/fs/IOScheduler.cpp)
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/IOScheduler.cpp	2008-07-17 01:10:18 UTC (rev 26468)
++++ haiku/trunk/src/system/kernel/device_manager/IOScheduler.cpp	2008-07-18 14:39:46 UTC (rev 26488)
+@@ -0,0 +1,219 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Copyright 2004-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include &quot;IOScheduler.h&quot;
++
++#include &lt;unistd.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++
++#include &lt;KernelExport.h&gt;
++
++#include &lt;khash.h&gt;
++#include &lt;lock.h&gt;
++#include &lt;thread_types.h&gt;
++#include &lt;thread.h&gt;
++#include &lt;util/AutoLock.h&gt;
++
++
++IOScheduler::IOScheduler(DMAResource* resource)
++	:
++	fDMAResource(resource)
++{
++	mutex_init(&amp;fLock, &quot;I/O scheduler&quot;);
++	B_INITIALIZE_SPINLOCK(&amp;fFinisherLock);
++}
++
++
++IOScheduler::~IOScheduler()
++{
++	mutex_lock(&amp;fLock);
++	mutex_destroy(&amp;fLock);
++
++	while (IOOperation* operation = fUnusedOperations.RemoveHead())
++		delete operation;
++}
++
++
++status_t
++IOScheduler::Init(const char* name)
++{
++	fNewRequestCondition.Init(this, &quot;I/O new request&quot;);
++	fFinishedOperationCondition.Init(this, &quot;I/O finished operation&quot;);
++
++	size_t count = fDMAResource != NULL ? fDMAResource-&gt;BufferCount() : 16;
++	for (size_t i = 0; i &lt; count; i++) {
++		IOOperation* operation = new(std::nothrow) IOOperation;
++		if (operation == NULL)
++			return B_NO_MEMORY;
++
++		fUnusedOperations.Add(operation);
++	}
++
++	// start thread for device
++	fThread = spawn_kernel_thread(&amp;_SchedulerThread, name, B_NORMAL_PRIORITY,
++		(void *)this);
++	if (fThread &lt; B_OK)
++		return fThread;
++
++	resume_thread(fThread);
++	return B_OK;
++}
++
++
++status_t
++IOScheduler::ScheduleRequest(IORequest* request)
++{
++	IOBuffer* buffer = request-&gt;Buffer();
++
++	// TODO: it would be nice to be able to lock the memory later, but we can't
++	// easily do it in the I/O scheduler without being able to asynchronously
++	// lock memory (via another thread or a dedicated call).
++
++	if (buffer-&gt;IsVirtual()) {
++		status_t status = buffer-&gt;LockMemory(request-&gt;IsWrite());
++		if (status != B_OK)
++			return status;
++	}
++
++	MutexLocker _(fLock);
++	fUnscheduledRequests.Add(request);
++
++	return B_OK;
++}
++
++
++void
++IOScheduler::AbortRequest(IORequest* request, status_t status)
++{
++	// TODO:...
++//B_CANCELED
++}
++
++
++void
++IOScheduler::OperationCompleted(IOOperation* operation, status_t status)
++{
++	InterruptsLocker _;
++	SpinLocker locker(fFinisherLock);
++
++	// finish operation only once
++	if (operation-&gt;Status() &lt;= 0)
++		return;
++
++	operation-&gt;SetStatus(status);
++
++	fCompletedOperations.Add(operation);
++	locker.Unlock();
++
++	locker.SetTo(thread_spinlock, false);
++	thread_interrupt(thread_get_thread_struct_locked(fThread), false);
++}
++
++
++/*!	Must not be called with the fLock held. */
++void
++IOScheduler::_Finisher()
++{
++	while (true) {
++		InterruptsSpinLocker locker(fFinisherLock);
++		IOOperation* operation = fCompletedOperations.RemoveHead();
++		if (operation == NULL)
++			return;
++
++		locker.Unlock();
++
++		if (!operation-&gt;Finish()) {
++			// TODO: This must be done differently once the scheduler implements
++			// an actual scheduling policy (other than no-op).
++			fIOCallback(fIOCallbackData, operation);
++		} else {
++			MutexLocker _(fLock);
++			operation-&gt;Parent()-&gt;RemoveOperation(operation);
++
++			fUnusedOperations.Add(operation);
++		}
++	}
++}
++
++
++IOOperation*
++IOScheduler::_GetOperation()
++{
++	while (true) {
++		MutexLocker locker(fLock);
++
++		IOOperation* operation = fUnusedOperations.RemoveHead();
++		if (operation != NULL)
++			return operation;
++
++		ConditionVariableEntry entry;
++		fFinishedOperationCondition.Add(&amp;entry);
++
++		locker.Unlock();
++
++		entry.Wait();
++		_Finisher();
++	}
++}
++
++
++status_t
++IOScheduler::_Scheduler()
++{
++// TODO: This is a no-op scheduler. Implement something useful!
++	while (true) {
++		MutexLocker locker(fLock);
++		IORequest* request = fUnscheduledRequests.RemoveHead();
++
++		if (request == NULL) {
++			ConditionVariableEntry entry;
++			fNewRequestCondition.Add(&amp;entry);
++			locker.Unlock();
++
++			if (entry.Wait(B_CAN_INTERRUPT) != B_OK)
++				_Finisher();
++
++			continue;
++		}
++
++		locker.Unlock();
++
++		if (fDMAResource != NULL) {
++			while (request-&gt;RemainingBytes() &gt; 0) {
++				IOOperation* operation = _GetOperation();
++
++				status_t status = fDMAResource-&gt;TranslateNext(request,
++					operation);
++				if (status != B_OK) {
++					AbortRequest(request, status);
++					break;
++				}
++
++				fIOCallback(fIOCallbackData, operation);
++			}
++		} else {
++// TODO: If the device has block size restrictions, we might need to use a
++// bounce buffer.
++			IOOperation* operation = _GetOperation();
++			operation-&gt;SetRequest(request);
++			operation-&gt;SetOriginalRange(request-&gt;Offset(), request-&gt;Length());
++			fIOCallback(fIOCallbackData, operation);
++		}
++	}
++
++	return B_OK;
++}
++
++
++status_t
++IOScheduler::_SchedulerThread(void *_self)
++{
++	IOScheduler *self = (IOScheduler *)_self;
++	return self-&gt;_Scheduler();
++}
++
+
+Copied: haiku/trunk/src/system/kernel/device_manager/IOScheduler.h (from rev 26468, haiku/trunk/src/system/kernel/fs/IOScheduler.h)
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/IOScheduler.h	2008-07-17 01:10:18 UTC (rev 26468)
++++ haiku/trunk/src/system/kernel/device_manager/IOScheduler.h	2008-07-18 14:39:46 UTC (rev 26488)
+@@ -0,0 +1,67 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Copyright 2004-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef IO_SCHEDULER_H
++#define IO_SCHEDULER_H
++
++#include &lt;KernelExport.h&gt;
++
++#include &lt;condition_variable.h&gt;
++#include &lt;lock.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
++
++#include &quot;dma_resources.h&quot;
++#include &quot;io_requests.h&quot;
++
++
++class IOCallback {
++public:
++	virtual	status_t			DoIO(IOOperation* operation);
++};
++
++typedef status_t (*io_callback)(void* data, io_operation* operation);
++
++
++class IOScheduler {
++public:
++								IOScheduler(DMAResource* resource);
++								~IOScheduler();
++
++			status_t			Init(const char* name);
++
++			void				SetCallback(IOCallback&amp; callback);
++			void				SetCallback(io_callback callback, void* data);
++
++			status_t			ScheduleRequest(IORequest* request);
++
++			void				AbortRequest(IORequest* request,
++									status_t status = B_CANCELED);
++			void				OperationCompleted(IOOperation* operation,
++									status_t status);
++									// called by the driver when the operation
++									// has been completed successfully or failed
++									// for some reason
++
++private:
++			void				_Finisher();
++			IOOperation*		_GetOperation();
++			status_t			_Scheduler();
++	static	status_t			_SchedulerThread(void* self);
++
++private:
++			DMAResource*		fDMAResource;
++			spinlock			fFinisherLock;
++			mutex				fLock;
++			thread_id			fThread;
++			io_callback			fIOCallback;
++			void*				fIOCallbackData;
++			IORequestList		fUnscheduledRequests;
++			ConditionVariable	fNewRequestCondition;
++			ConditionVariable	fFinishedOperationCondition;
++			IOOperationList		fUnusedOperations;
++			IOOperationList		fCompletedOperations;
++};
++
++#endif	// IO_SCHEDULER_H
+
+Modified: haiku/trunk/src/system/kernel/device_manager/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/Jamfile	2008-07-18 14:37:23 UTC (rev 26487)
++++ haiku/trunk/src/system/kernel/device_manager/Jamfile	2008-07-18 14:39:46 UTC (rev 26488)
+@@ -9,9 +9,13 @@
+ 	devfs.cpp
+ 	id_generator.cpp
+ 	io_resources.cpp
++	IOScheduler.cpp
+ 	legacy_drivers.cpp
+ #	probe.cpp
+ 	settings.cpp
++
++	dma_resources.cpp
++	io_requests.cpp
+ 	:
+ 	$(TARGET_KERNEL_PIC_CCFLAGS)
+ ;
+
+Added: haiku/trunk/src/system/kernel/device_manager/dma_resources.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/dma_resources.cpp	2008-07-18 14:37:23 UTC (rev 26487)
++++ haiku/trunk/src/system/kernel/device_manager/dma_resources.cpp	2008-07-18 14:39:46 UTC (rev 26488)
+@@ -0,0 +1,378 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Copyright 2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++
++#include &quot;dma_resources.h&quot;
++
++#include &lt;kernel.h&gt;
++#include &lt;util/AutoLock.h&gt;
++
++#include &quot;io_requests.h&quot;
++
++
++const size_t kMaxBounceBufferSize = 4 * B_PAGE_SIZE;
++
++
++DMABuffer*
++DMABuffer::Create(size_t count, void* bounceBuffer, addr_t physicalBounceBuffer)
++{
++	DMABuffer* buffer = (DMABuffer*)malloc(
++		sizeof(DMABuffer) + sizeof(iovec) * (count - 1));
++	if (buffer == NULL)
++		return NULL;
++
++	buffer-&gt;fBounceBuffer = bounceBuffer;
++	buffer-&gt;fPhysicalBounceBuffer = physicalBounceBuffer;
++	buffer-&gt;fVecCount = count;
++
++	return buffer;
++}
++
++
++void
++DMABuffer::SetVecCount(uint32 count)
++{
++	fVecCount = count;
++}
++
++
++void
++DMABuffer::AddVec(void* base, size_t size)
++{
++	iovec&amp; vec = fVecs[fVecCount++];
++	vec.iov_len = size;
++}
++
++
++void
++DMABuffer::SetToBounceBuffer(size_t length)
++{
++	fVecs[0].iov_base = (void*)fPhysicalBounceBuffer;
++	fVecs[0].iov_len = length;
++	fVecCount = 1;
++}
++
++
++//	#pragma mark -
++
++
++DMAResource::DMAResource()
++{
++	mutex_init(&amp;fLock, &quot;dma resource&quot;);
++}
++
++
++DMAResource::~DMAResource()
++{
++	mutex_destroy(&amp;fLock);
++	free(fScratchVecs);
++}
++
++
++status_t
++DMAResource::Init(const dma_restrictions&amp; restrictions, size_t blockSize,
++	uint32 bufferCount)
++{
++	fRestrictions = restrictions;
++	fBlockSize = blockSize == 0 ? 1 : blockSize;
++	fBufferCount = bufferCount;
++	fBounceBufferSize = 0;
++
++	if (fRestrictions.high_address == 0)
++		fRestrictions.high_address = ~(addr_t)0;
++	if (fRestrictions.max_segment_count == 0)
++		fRestrictions.max_segment_count = 16;
++	if (fRestrictions.alignment == 0)
++		fRestrictions.alignment = 1;
++
++	if (_NeedsBoundsBuffers()) {
++// TODO: Enforce that the bounce buffer size won't cross boundaries.
++		fBounceBufferSize = restrictions.max_segment_size;
++		if (fBounceBufferSize &gt; kMaxBounceBufferSize)
++			fBounceBufferSize = max_c(kMaxBounceBufferSize, fBlockSize);
++	}
++
++	fScratchVecs = (iovec*)malloc(
++		sizeof(iovec) * fRestrictions.max_segment_count);
++	if (fScratchVecs == NULL)
++		return B_NO_MEMORY;
++
++	// TODO: create bounce buffers in as few areas as feasible
++	for (size_t i = 0; i &lt; fBufferCount; i++) {
++		DMABuffer* buffer;
++		status_t error = CreateBuffer(fBounceBufferSize, &amp;buffer);
++		if (error != B_OK)
++			return error;
++
++		fDMABuffers.Add(buffer);
++	}
++
++	return B_OK;
++}
++
++
++status_t
++DMAResource::CreateBuffer(size_t size, DMABuffer** _buffer)
++{
++	void* bounceBuffer = NULL;
++	addr_t physicalBase = 0;
++	area_id area = -1;
++
++	if (size != 0) {
++		if (fRestrictions.alignment &gt; B_PAGE_SIZE
++			|| fRestrictions.boundary &gt; B_PAGE_SIZE)
++			panic(&quot;not yet implemented&quot;);
++
++		size = ROUNDUP(size, B_PAGE_SIZE);
++
++		bounceBuffer = (void*)fRestrictions.low_address;
++// TODO: We also need to enforce the boundary restrictions.
++		area = create_area(&quot;dma buffer&quot;, &amp;bounceBuffer, size,
++			B_PHYSICAL_BASE_ADDRESS, B_CONTIGUOUS,
++			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++		if (area &lt; B_OK)
++			return area;
++
++		physical_entry entry;
++		if (get_memory_map(bounceBuffer, size, &amp;entry, 1) != B_OK) {
++			panic(&quot;get_memory_map() failed.&quot;);
++			delete_area(area);
++			return B_ERROR;
++		}
++
++		physicalBase = (addr_t)entry.address;
++
++		if (fRestrictions.high_address &lt; physicalBase + size) {
++			delete_area(area);
++			return B_NO_MEMORY;
++		}
++	}
++
++	DMABuffer* buffer = DMABuffer::Create(fRestrictions.max_segment_count,
++		bounceBuffer, physicalBase);
++	if (buffer == NULL) {
++		delete_area(area);
++		return B_NO_MEMORY;
++	}
++
++	*_buffer = buffer;
++	return B_OK;
++}
++
++
++status_t
++DMAResource::TranslateNext(IORequest* request, IOOperation* operation)
++{
++	IOBuffer* buffer = request-&gt;Buffer();
++	off_t offset = request-&gt;Offset();
++
++	MutexLocker locker(fLock);
++
++	DMABuffer* dmaBuffer = fDMABuffers.RemoveHead();
++	if (dmaBuffer == NULL)
++		return B_BUSY;
++
++	iovec* vecs = NULL;
++	uint32 segmentCount = 0;
++	size_t totalLength = min_c(buffer-&gt;Length(),
++		fRestrictions.max_transfer_size);
++
++	bool partialOperation = (offset &amp; (fBlockSize - 1)) != 0;
++	bool needsBounceBuffer = partialOperation;
++
++	if (buffer-&gt;IsVirtual()) {
++		// Unless we need the bounce buffer anyway, we have to translate the
++		// virtual addresses to physical addresses, so we can check the DMA
++		// restrictions.
++		if (!needsBounceBuffer) {
++			size_t transferLeft = totalLength;
++			vecs = fScratchVecs;
++
++// TODO: take iteration state of the IORequest into account!
++			for (uint32 i = 0; i &lt; buffer-&gt;VecCount(); i++) {
++				iovec&amp; vec = buffer-&gt;VecAt(i);
++				size_t size = vec.iov_len;
++				if (size &gt; transferLeft)
++					size = transferLeft;
++
++				addr_t base = (addr_t)vec.iov_base;
++				while (size &gt; 0 &amp;&amp; segmentCount
++						&lt; fRestrictions.max_segment_count) {
++					physical_entry entry;
++					get_memory_map((void*)base, size, &amp;entry, 1);
++
++					vecs[segmentCount].iov_base = entry.address;
++					vecs[segmentCount].iov_len = entry.size;
++
++					transferLeft -= entry.size;
++					segmentCount++;
++				}
++
++				if (transferLeft == 0)
++					break;
++			}
++
++			totalLength -= transferLeft;
++		}
++	} else {
++		// We do already have physical adresses.
++		locker.Unlock();
++		vecs = buffer-&gt;Vecs();
++		segmentCount = min_c(buffer-&gt;VecCount(),
++			fRestrictions.max_segment_count);
++	}
++
++//	locker.Lock();
++
++	// check alignment, boundaries, etc. and set vecs in DMA buffer
++
++	size_t dmaLength = 0;
++	iovec vec;
++	if (vecs != NULL)
++		vec = vecs[0];
++	for (uint32 i = 0; i &lt; segmentCount;) {
++		addr_t base = (addr_t)vec.iov_base;
++		size_t length = vec.iov_len;
++
++		if ((base &amp; (fRestrictions.alignment - 1)) != 0) {
++			needsBounceBuffer = true;
++			break;
++		}
++
++		if (((base + length) &amp; (fRestrictions.alignment - 1)) != 0) {
++			length = ((base + length) &amp; ~(fRestrictions.alignment - 1)) - base;
++			if (length == 0) {
++				needsBounceBuffer = true;
++				break;
++			}
++		}
++
++		if (fRestrictions.boundary &gt; 0) {
++			addr_t baseBoundary = base / fRestrictions.boundary;
++			if (baseBoundary != (base + (length - 1)) / fRestrictions.boundary)
++				length = (baseBoundary + 1) * fRestrictions.boundary - base;
++		}
++
++		dmaBuffer-&gt;AddVec((void*)base, length);
++		dmaLength += length;
++
++		if ((vec.iov_len -= length) &gt; 0) {
++			vec.iov_base = (void*)((addr_t)vec.iov_base + length);
++		} else {
++			if (++i &lt; segmentCount)
++				vec = vecs[i];
++		}
++	}
++
++	if (dmaLength &lt; fBlockSize) {
++		dmaLength = 0;
++		needsBounceBuffer = true;
++		partialOperation = true;
++	} else if ((dmaLength &amp; (fBlockSize - 1)) != 0) {
++		size_t toCut = dmaLength &amp; (fBlockSize - 1);
++		dmaLength -= toCut;
++		int32 dmaVecCount = dmaBuffer-&gt;VecCount();
++		for (int32 i = dmaVecCount - 1 &amp;&amp; toCut &gt; 0; i &gt;= 0; i--) {
++			iovec&amp; vec = dmaBuffer-&gt;VecAt(i);
++			size_t length = vec.iov_len;
++			if (length &lt;= toCut) {
++				dmaVecCount--;
++				toCut -= length;
++			} else {
++				vec.iov_len -= toCut;
++				break;
++			}
++		}
++
++		dmaBuffer-&gt;SetVecCount(dmaVecCount);
++	}
++
++	operation-&gt;SetOriginalRange(offset, dmaLength);
++
++	if (needsBounceBuffer) {
++		// If the size of the buffer we could transfer is pathologically small,
++		// we always use the bounce buffer.
++		// TODO: Use a better heuristics than bounce buffer size / 2, Or even
++		// better attach the bounce buffer to the DMA buffer.
++		if (dmaLength &lt; fBounceBufferSize / 2) {
++			if (partialOperation) {
++				off_t diff = offset &amp; (fBlockSize - 1);
++				offset -= diff;
++				dmaLength += diff;
++			}
++
++			addr_t base = (addr_t)vecs[0].iov_base;
++			size_t length = vecs[0].iov_len;
++			if ((base &amp; (fRestrictions.alignment - 1)) != 0) {
++				addr_t diff = base - (base &amp; ~(fRestrictions.alignment - 1));
++				length += diff;
++			}
++
++			dmaLength = max_c(totalLength, fBlockSize);
++			dmaLength = (dmaLength + fBlockSize - 1) &amp; ~(fBlockSize - 1);
++			dmaLength = min_c(dmaLength, fBounceBufferSize);
++			dmaBuffer-&gt;SetToBounceBuffer(dmaLength);
++
++			operation-&gt;SetRange(offset, dmaLength);
++		} else
++			needsBounceBuffer = false;
++	}
++
++	operation-&gt;SetPartialOperation(partialOperation);
++	operation-&gt;SetRequest(request);
++	request-&gt;Advance(operation-&gt;OriginalLength());
++
++	return B_OK;
++}
++
++
++void
++DMAResource::RecycleBuffer(DMABuffer* buffer)
++{
++	MutexLocker _(fLock);
++	fDMABuffers.Add(buffer);
++}
++
++
++bool
++DMAResource::_NeedsBoundsBuffers() const
++{
++	return fRestrictions.alignment &gt; 1
++		|| fRestrictions.low_address != 0
++		|| fRestrictions.high_address != ~(addr_t)0
++		|| fBlockSize &gt; 1;
++}
++
++
++
++
++#if 0
++
++
++status_t
++create_dma_resource(restrictions)
++{
++	// Restrictions are: transfer size, address space, alignment
++	// segment min/max size, num segments
++}
++
++
++void
++delete_dma_resource(resource)
++{
++}
++
++
++dma_buffer_alloc(resource, size)
++{
++}
++
++
++dma_buffer_free(buffer)
++{
++//	Allocates or frees memory in that DMA buffer.
++}
++
++#endif	// 0
+
+Added: haiku/trunk/src/system/kernel/device_manager/dma_resources.h
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/dma_resources.h	2008-07-18 14:37:23 UTC (rev 26487)
++++ haiku/trunk/src/system/kernel/device_manager/dma_resources.h	2008-07-18 14:39:46 UTC (rev 26488)
+@@ -0,0 +1,94 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Copyright 2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef DMA_RESOURCES_H
++#define DMA_RESOURCES_H
++
++#include &lt;sys/uio.h&gt;
++
++#include &lt;lock.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
++
++
++struct IOOperation;
++struct IORequest;
++
++
++struct dma_restrictions {
++	addr_t	low_address;
++	addr_t	high_address;
++	size_t	alignment;
++	size_t	boundary;
++	size_t	max_transfer_size;
++	uint32	max_segment_count;
++	size_t	max_segment_size;
++	uint32	flags;
++};
++
++
++class DMABuffer : public DoublyLinkedListLinkImpl&lt;DMABuffer&gt; {
++public:
++	static	DMABuffer*			Create(size_t count, void* bounceBuffer,
++									addr_t physicalBounceBuffer);
++
++			iovec*				Vecs() { return fVecs; }
++			iovec&amp;				VecAt(size_t index) { return fVecs[index]; }
++			uint32				VecCount() const { return fVecCount; }
++			void				SetVecCount(uint32 count);
++
++			void				AddVec(void* base, size_t size);
++
++			void*				BounceBuffer() const { return fBounceBuffer; }
++			addr_t				PhysicalBounceBuffer() const
++									{ return fPhysicalBounceBuffer; }
++
++			void				SetToBounceBuffer(size_t length);
++			bool				UsesBounceBuffer() const
++									{ return fVecCount &gt;= 1
++										&amp;&amp; (addr_t)fVecs[0].iov_base
++											== fPhysicalBounceBuffer; }
++
++private:
++			void*				fBounceBuffer;
++			addr_t				fPhysicalBounceBuffer;
++			uint32				fVecCount;
++			iovec				fVecs[1];
++};
++
++
++typedef DoublyLinkedList&lt;DMABuffer&gt; DMABufferList;
++
++
++class DMAResource {
++public:
++								DMAResource();
++								~DMAResource();
++
++			status_t			Init(const dma_restrictions&amp; restrictions,
++									size_t blockSize, uint32 bufferCount);
++
++			status_t			CreateBuffer(DMABuffer** _buffer)
++									{ return CreateBuffer(0, _buffer); }
++			status_t			CreateBuffer(size_t size, DMABuffer** _buffer);
++
++			status_t			TranslateNext(IORequest* request,
++									IOOperation* operation);
++			void				RecycleBuffer(DMABuffer* buffer);
++
++			uint32				BufferCount() const { return fBufferCount; }
++
++private:
++			bool				_NeedsBoundsBuffers() const;
++
++			mutex				fLock;
++			dma_restrictions	fRestrictions;
++			size_t				fBlockSize;
++			uint32				fBufferCount;
++			size_t				fBounceBufferSize;
++			DMABufferList		fDMABuffers;
++			iovec*				fScratchVecs;
++};
++
++#endif	// DMA_RESOURCES_H
+
+Added: haiku/trunk/src/system/kernel/device_manager/io_requests.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/io_requests.cpp	2008-07-18 14:37:23 UTC (rev 26487)
++++ haiku/trunk/src/system/kernel/device_manager/io_requests.cpp	2008-07-18 14:39:46 UTC (rev 26488)
+@@ -0,0 +1,429 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Copyright 2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++
++#include &quot;io_requests.h&quot;
++
++#include &lt;string.h&gt;
++
++#include &lt;vm.h&gt;
++
++#include &quot;dma_resources.h&quot;
++
++
++IORequestChunk::~IORequestChunk()
++{
++}
++
++
++//	#pragma mark -
++
++
++status_t
++IOBuffer::LockMemory(bool isWrite)
++{
++	for (uint32 i = 0; i &lt; fCount; i++) {
++		status_t status = lock_memory(fVecs[i].iov_base, fVecs[i].iov_len,
++			isWrite ? 0 : B_READ_DEVICE);
++		if (status != B_OK) {
++			_UnlockMemory(i, isWrite);
++			return status;
++		}
++	}
++
++	return B_OK;
++}
++
++
++void
++IOBuffer::_UnlockMemory(size_t count, bool isWrite)
++{
++	for (uint32 i = 0; i &lt; count; i++) {
++		unlock_memory(fVecs[i].iov_base, fVecs[i].iov_len,
++			isWrite ? 0 : B_READ_DEVICE);
++	}
++}
++
++
++void
++IOBuffer::UnlockMemory(bool isWrite)
++{
++	_UnlockMemory(fCount, isWrite);
++}
++
++
++// #pragma mark -
++
++
++bool
++IOOperation::Finish()
++{
++	if (fStatus == B_OK) {
++		if (IsPartialOperation() &amp;&amp; IsWrite()) {
++			// partial write: copy partial request to bounce buffer
++			status_t error = fParent-&gt;CopyData(OriginalOffset(),
++				(uint8*)fDMABuffer-&gt;BounceBuffer()
++					+ (Offset() - OriginalOffset()),
++				OriginalLength());
++			if (error == B_OK) {
++				// We're done with the first phase only (read-in block). Now
++				// do the actual write.
++				SetPartialOperation(false);
++				SetStatus(1);
++					// TODO: Is there a race condition, if the request is
++					// aborted at the same time?
++				return false;
++			}
++
++			SetStatus(error);
++		}
++	}
++
++	if (IsRead() &amp;&amp; UsesBounceBuffer()) {
++		// copy the bounce buffer to the final location
++		status_t error = fParent-&gt;CopyData((uint8*)fDMABuffer-&gt;BounceBuffer()
++				+ (Offset() - OriginalOffset()), OriginalOffset(),
++			OriginalLength());
++		if (error != B_OK)
++			SetStatus(error);
++	}
++
++	// notify parent request
++	if (fParent != NULL)
++		fParent-&gt;ChunkFinished(this, fStatus);
++
++	return true;
++}
++
++
++void
++IOOperation::SetRequest(IORequest* request)
++{
++	if (fParent != NULL)
++		fParent-&gt;RemoveOperation(this);
++
++	fParent = request;
++	fStatus = 1;
++
++	if (fParent != NULL)
++		fParent-&gt;AddOperation(this);
++}
++
++
++void
++IOOperation::SetOriginalRange(off_t offset, size_t length)
++{
++	fOriginalOffset = fOffset = offset;
++	fOriginalLength = fLength = length;
++}
++
++
++void
++IOOperation::SetRange(off_t offset, size_t length)
++{
++	fOffset = offset;
++	fLength = length;
++}
++
++
++void
++IOOperation::SetPartialOperation(bool partialOperation)
++{
++	fIsPartitialOperation = partialOperation;
++}
++
++
++bool
++IOOperation::IsWrite() const
++{
++	return fParent-&gt;IsWrite();
++}
++
++
++bool
++IOOperation::IsRead() const
++{
++	return fParent-&gt;IsRead();
++}
++
++
++// #pragma mark -
++
++
++void
++IORequest::Advance(size_t bySize)
++{
++	fRemainingBytes -= bySize;
++
++	iovec* vecs = fBuffer-&gt;Vecs();
++	while (vecs[fVecIndex].iov_len - fVecOffset &lt;= bySize) {
++		bySize -= vecs[fVecIndex].iov_len - fVecOffset;
++		fVecOffset = 0;
++		fVecIndex++;
++	}
++
++	fVecOffset += bySize;
++}
++
++
++void
++IORequest::AddOperation(IOOperation* operation)
++{
++	// TODO: locking?
++	fChildren.Add(operation);
++}
++
++
++void
++IORequest::RemoveOperation(IOOperation* operation)
++{
++	// TODO: locking?
++	fChildren.Remove(operation);
++}
++
++
++status_t
++IORequest::CopyData(off_t offset, void* buffer, size_t size)
++{
++	return _CopyData(buffer, offset, size, true);
++}
++
++
++status_t
+
+[... truncated: 453 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010349.html">[Haiku-commits] r26487 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="010350.html">[Haiku-commits] r26489 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10348">[ date ]</a>
+              <a href="thread.html#10348">[ thread ]</a>
+              <a href="subject.html#10348">[ subject ]</a>
+              <a href="author.html#10348">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,511 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29386 -	haiku/trunk/src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29386%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200903031404.n23E4wGv017986%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014662.html">
+   <LINK REL="Next"  HREF="014664.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29386 -	haiku/trunk/src/add-ons/kernel/network/stack</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29386%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200903031404.n23E4wGv017986%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29386 -	haiku/trunk/src/add-ons/kernel/network/stack">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Mar  3 15:04:58 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014662.html">[Haiku-commits] r29385 - haiku/trunk/src/tests/kits/interface/bshelf
+</A></li>
+        <LI>Next message: <A HREF="014664.html">[Haiku-commits] r29387 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14663">[ date ]</a>
+              <a href="thread.html#14663">[ thread ]</a>
+              <a href="subject.html#14663">[ subject ]</a>
+              <a href="author.html#14663">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-03-03 15:04:57 +0100 (Tue, 03 Mar 2009)
+New Revision: 29386
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29386&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29386&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/domains.h
+   haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/routes.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/routes.h
+Log:
+* The net_domain's lock is now a recursive lock.
+* Fixed all route locking problems, of which there were numerous
+  ({add|remove}_route(), and list_routes() did not lock at all). Added
+  lock assertions in functions that don't do the locking themselves.
+* A route will now be removed from the list in remove_route(), not in
+  put_route_internal(). Before, a route could easily be removed twice, causing
+  remove_route() to release references it did not own. This fixes bug #2706.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp	2009-03-03 12:36:41 UTC (rev 29385)
++++ haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp	2009-03-03 14:04:57 UTC (rev 29386)
+@@ -195,7 +195,7 @@
+ 	if (user_memcpy(&amp;request, value, expected) &lt; B_OK)
+ 		return B_BAD_ADDRESS;
+ 
+-	MutexLocker _(domain-&gt;lock);
++	RecursiveLocker _(domain-&gt;lock);
+ 	net_interface* interface = NULL;
+ 
+ 	if (getByName)
+@@ -320,7 +320,7 @@
+ 			if (user_memcpy(&amp;request, value, sizeof(struct ifreq)) &lt; B_OK)
+ 				return B_BAD_ADDRESS;
+ 
+-			MutexLocker _(domain-&gt;lock);
++			RecursiveLocker _(domain-&gt;lock);
+ 
+ 			net_interface* interface = find_interface(domain,
+ 				request.ifr_name);
+@@ -413,7 +413,7 @@
+ 	if (domain == NULL || address == NULL)
+ 		return false;
+ 
+-	MutexLocker locker(domain-&gt;lock);
++	RecursiveLocker locker(domain-&gt;lock);
+ 
+ 	net_interface* interface = NULL;
+ 	net_interface* fallback = NULL;
+@@ -466,7 +466,7 @@
+ 	if (domain == NULL)
+ 		return NULL;
+ 
+-	MutexLocker _(domain-&gt;lock);
++	RecursiveLocker _(domain-&gt;lock);
+ 
+ 	net_interface* interface = NULL;
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp	2009-03-03 12:36:41 UTC (rev 29385)
++++ haiku/trunk/src/add-ons/kernel/network/stack/domains.cpp	2009-03-03 14:04:57 UTC (rev 29386)
+@@ -36,11 +36,10 @@
+ static list sDomains;
+ 
+ 
+-/*!
+-	Scans the domain list for the specified family.
++/*!	Scans the domain list for the specified family.
+ 	You need to hold the sDomainLock when calling this function.
+ */
+-static net_domain_private* 
++static net_domain_private*
+ lookup_domain(int family)
+ {
+ 	net_domain_private* domain = NULL;
+@@ -60,10 +59,9 @@
+ //	#pragma mark -
+ 
+ 
+-/*!
+-	Gets the domain of the specified family.
++/*!	Gets the domain of the specified family.
+ */
+-net_domain* 
++net_domain*
+ get_domain(int family)
+ {
+ 	MutexLocker locker(sDomainLock);
+@@ -117,7 +115,7 @@
+ 		if (domain == NULL)
+ 			break;
+ 
+-		MutexLocker locker(domain-&gt;lock);
++		RecursiveLocker locker(domain-&gt;lock);
+ 
+ 		net_interface* interface = NULL;
+ 		while (true) {
+@@ -163,7 +161,7 @@
+ 	if (deviceInterface == NULL)
+ 		return ENODEV;
+ 
+-	MutexLocker locker(domain-&gt;lock);
++	RecursiveLocker locker(domain-&gt;lock);
+ 
+ 	net_interface_private* interface = NULL;
+ 	status_t status;
+@@ -226,7 +224,7 @@
+ 	// and domain locks are required, we MUST obtain the receive
+ 	// lock before the domain lock.
+ 	RecursiveLocker _1(device-&gt;receive_lock);
+-	MutexLocker _2(domain-&gt;lock);
++	RecursiveLocker _2(domain-&gt;lock);
+ 
+ 	net_interface* interface = find_interface(domain, name);
+ 	if (interface != NULL) {
+@@ -273,7 +271,7 @@
+ void
+ domain_interface_went_down(net_interface* interface)
+ {
+-	ASSERT_LOCKED_MUTEX(&amp;((net_domain_private*)interface-&gt;domain)-&gt;lock);
++	ASSERT_LOCKED_RECURSIVE(&amp;((net_domain_private*)interface-&gt;domain)-&gt;lock);
+ 
+ 	TRACE((&quot;domain_interface_went_down(%i, %s)\n&quot;,
+ 		interface-&gt;domain-&gt;family, interface-&gt;name));
+@@ -293,7 +291,7 @@
+ 		if (domain == NULL)
+ 			break;
+ 
+-		MutexLocker locker(domain-&gt;lock);
++		RecursiveLocker locker(domain-&gt;lock);
+ 
+ 		net_interface_private* interface = find_interface(domain,
+ 			deviceInterface-&gt;device-&gt;name);
+@@ -322,7 +320,7 @@
+ 	if (domain == NULL)
+ 		return B_NO_MEMORY;
+ 
+-	mutex_init(&amp;domain-&gt;lock, name);
++	recursive_lock_init(&amp;domain-&gt;lock, name);
+ 
+ 	domain-&gt;family = family;
+ 	domain-&gt;name = name;
+@@ -359,7 +357,7 @@
+ 		delete_interface(interface);
+ 	}
+ 
+-	mutex_destroy(&amp;domain-&gt;lock);
++	recursive_lock_destroy(&amp;domain-&gt;lock);
+ 	delete domain;
+ 	return B_OK;
+ }
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/domains.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/domains.h	2009-03-03 12:36:41 UTC (rev 29385)
++++ haiku/trunk/src/add-ons/kernel/network/stack/domains.h	2009-03-03 14:04:57 UTC (rev 29386)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2006-2007, Haiku, Inc. All Rights Reserved.
++ * Copyright 2006-2009, Haiku, Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -22,7 +22,7 @@
+ struct net_domain_private : net_domain {
+ 	struct list_link	link;
+ 
+-	mutex				lock;
++	recursive_lock		lock;
+ 
+ 	RouteList			routes;
+ 	RouteInfoList		route_infos;
+@@ -33,19 +33,18 @@
+ status_t uninit_domains();
+ 
+ uint32 count_domain_interfaces();
+-status_t list_domain_interfaces(void *buffer, size_t *_bufferSize);
+-status_t add_interface_to_domain(net_domain *domain, struct ifreq&amp; request);
+-status_t remove_interface_from_domain(net_interface *interface);
+-void domain_interface_went_down(net_interface *);
+-void domain_removed_device_interface(net_device_interface *);
+-status_t domain_interface_control(net_domain_private *domain, int32 option,
+-	struct ifreq *request);
++status_t list_domain_interfaces(void* buffer, size_t* _bufferSize);
++status_t add_interface_to_domain(net_domain* domain, struct ifreq&amp; request);
++status_t remove_interface_from_domain(net_interface* interface);
++void domain_interface_went_down(net_interface* interface);
++void domain_removed_device_interface(net_device_interface* interface);
++status_t domain_interface_control(net_domain_private* domain, int32 option,
++	struct ifreq* request);
+ 
+-net_domain *get_domain(int family);
+-status_t register_domain(int family, const char *name,
+-			struct net_protocol_module_info *module, 
+-			struct net_address_module_info *addressModule,
+-			net_domain **_domain);
+-status_t unregister_domain(net_domain *domain);
++net_domain* get_domain(int family);
++status_t register_domain(int family, const char* name,
++	struct net_protocol_module_info* module,
++	struct net_address_module_info* addressModule, net_domain* *_domain);
++status_t unregister_domain(net_domain* domain);
+ 
+ #endif	// DOMAINS_H
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp	2009-03-03 12:36:41 UTC (rev 29385)
++++ haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp	2009-03-03 14:04:57 UTC (rev 29386)
+@@ -327,7 +327,7 @@
+ {
+ 	// TODO: reference counting
+ 	// TODO: better locking scheme
+-	mutex_unlock(&amp;((net_domain_private*)interface-&gt;domain)-&gt;lock);
++	recursive_lock_unlock(&amp;((net_domain_private*)interface-&gt;domain)-&gt;lock);
+ }
+ 
+ 
+@@ -335,7 +335,7 @@
+ get_interface(net_domain* _domain, const char* name)
+ {
+ 	net_domain_private* domain = (net_domain_private*)_domain;
+-	mutex_lock(&amp;domain-&gt;lock);
++	recursive_lock_lock(&amp;domain-&gt;lock);
+ 
+ 	net_interface_private* interface = NULL;
+ 	while (true) {
+@@ -344,11 +344,12 @@
+ 		if (interface == NULL)
+ 			break;
+ 
++		// TODO: We keep the domain locked for now
+ 		if (!strcmp(interface-&gt;name, name))
+ 			return interface;
+ 	}
+ 
+-	mutex_unlock(&amp;domain-&gt;lock);
++	recursive_lock_unlock(&amp;domain-&gt;lock);
+ 	return NULL;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/routes.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/routes.cpp	2009-03-03 12:36:41 UTC (rev 29385)
++++ haiku/trunk/src/add-ons/kernel/network/stack/routes.cpp	2009-03-03 14:04:57 UTC (rev 29386)
+@@ -206,13 +206,17 @@
+ static void
+ put_route_internal(struct net_domain_private* domain, net_route* _route)
+ {
++	ASSERT_LOCKED_RECURSIVE(&amp;domain-&gt;lock);
++
+ 	net_route_private* route = (net_route_private*)_route;
+ 	if (route == NULL || atomic_add(&amp;route-&gt;ref_count, -1) != 1)
+ 		return;
+ 
+-	// remove route
++	// delete route - it must already have been removed at this point
+ 
+-	domain-&gt;routes.Remove(route);
++	ASSERT(route-&gt;GetDoublyLinkedListLink()-&gt;next == NULL
++		&amp;&amp; route-&gt;GetDoublyLinkedListLink()-&gt;previous == NULL);
++
+ 	delete route;
+ }
+ 
+@@ -221,6 +225,7 @@
+ get_route_internal(struct net_domain_private* domain,
+ 	const struct sockaddr* address)
+ {
++	ASSERT_LOCKED_RECURSIVE(&amp;domain-&gt;lock);
+ 	net_route_private* route = NULL;
+ 
+ 	if (address-&gt;sa_family == AF_LINK) {
+@@ -256,6 +261,7 @@
+ static void
+ update_route_infos(struct net_domain_private* domain)
+ {
++	ASSERT_LOCKED_RECURSIVE(&amp;domain-&gt;lock);
+ 	RouteInfoList::Iterator iterator = domain-&gt;route_infos.GetIterator();
+ 
+ 	while (iterator.HasNext()) {
+@@ -304,7 +310,7 @@
+ uint32
+ route_table_size(net_domain_private* domain)
+ {
+-	MutexLocker locker(domain-&gt;lock);
++	RecursiveLocker locker(domain-&gt;lock);
+ 	uint32 size = 0;
+ 
+ 	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();
+@@ -331,6 +337,8 @@
+ status_t
+ list_routes(net_domain_private* domain, void* buffer, size_t size)
+ {
++	RecursiveLocker _(domain-&gt;lock);
++
+ 	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();
+ 	size_t spaceLeft = size;
+ 
+@@ -456,6 +464,8 @@
+ 		|| !domain-&gt;address_module-&gt;check_mask(newRoute-&gt;mask))
+ 		return B_BAD_VALUE;
+ 
++	RecursiveLocker _(domain-&gt;lock);
++
+ 	net_route_private* route = find_route(domain, newRoute);
+ 	if (route != NULL)
+ 		return B_FILE_EXISTS;
+@@ -480,9 +490,6 @@
+ 	route-&gt;mtu = 0;
+ 	route-&gt;ref_count = 1;
+ 
+-	// TODO: for now...
+-	//MutexLocker locker(domain-&gt;lock);
+-
+ 	// Insert the route sorted by completeness of its mask
+ 
+ 	RouteList::Iterator iterator = domain-&gt;routes.GetIterator();
+@@ -524,13 +531,14 @@
+ 		AddressString(domain, removeRoute-&gt;gateway ? removeRoute-&gt;gateway : NULL).Data(),
+ 		removeRoute-&gt;flags));
+ 
+-	// TODO: for now...
+-	//MutexLocker locker(domain-&gt;lock);
++	RecursiveLocker locker(domain-&gt;lock);
+ 
+ 	net_route_private* route = find_route(domain, removeRoute);
+ 	if (route == NULL)
+ 		return B_ENTRY_NOT_FOUND;
+ 
++	domain-&gt;routes.Remove(route);
++
+ 	put_route_internal(domain, route);
+ 	update_route_infos(domain);
+ 
+@@ -555,7 +563,7 @@
+ 	if (status != B_OK)
+ 		return status;
+ 
+-	MutexLocker locker(domain-&gt;lock);
++	RecursiveLocker locker(domain-&gt;lock);
+ 
+ 	net_route_private* route = find_route(domain, (sockaddr*)&amp;destination);
+ 	if (route == NULL)
+@@ -582,19 +590,6 @@
+ 	while (iterator.HasNext()) {
+ 		net_route* route = iterator.Next();
+ 
+-		// TODO If we are removing the interface this will bork.
+-		//      Consider the following case:
+-		//      [thread 1] ipv4_send_data()
+-		//      [thread 1]  get_route() [domain locked, unlocked] &lt;- route
+-		//      [thread 2] ... [domain locked]
+-		//      [thread 2]  invalidate_routes()
+-		//      [thread 2]   remove_route() &lt;- route
+-		//      [thread 1] ... ipv4_send_data() accesses `route'. Bork bork.
+-		//
+-		//      We could either add per-route locks (expensive) or
+-		//      lock the domain throughout the send_data() routine.
+-		//      These are the easy solutions, need to think about this. -hugo
+-
+ 		if (route-&gt;interface-&gt;index == interface-&gt;index)
+ 			remove_route(domain, route);
+ 	}
+@@ -605,7 +600,7 @@
+ get_route(struct net_domain* _domain, const struct sockaddr* address)
+ {
+ 	struct net_domain_private* domain = (net_domain_private*)_domain;
+-	MutexLocker locker(domain-&gt;lock);
++	RecursiveLocker locker(domain-&gt;lock);
+ 
+ 	return get_route_internal(domain, address);
+ }
+@@ -616,7 +611,7 @@
+ {
+ 	net_domain_private* domain = (net_domain_private*)_domain;
+ 
+-	MutexLocker _(domain-&gt;lock);
++	RecursiveLocker _(domain-&gt;lock);
+ 
+ 	net_interface_private* interface = NULL;
+ 
+@@ -642,7 +637,7 @@
+ {
+ 	net_domain_private* domain = (net_domain_private*)_domain;
+ 
+-	MutexLocker _(domain-&gt;lock);
++	RecursiveLocker _(domain-&gt;lock);
+ 
+ 	net_route* route = get_route_internal(domain, buffer-&gt;destination);
+ 	if (route == NULL)
+@@ -677,7 +672,7 @@
+ put_route(struct net_domain* _domain, net_route* route)
+ {
+ 	struct net_domain_private* domain = (net_domain_private*)_domain;
+-	MutexLocker locker(domain-&gt;lock);
++	RecursiveLocker locker(domain-&gt;lock);
+ 
+ 	put_route_internal(domain, (net_route*)route);
+ }
+@@ -687,7 +682,7 @@
+ register_route_info(struct net_domain* _domain, struct net_route_info* info)
+ {
+ 	struct net_domain_private* domain = (net_domain_private*)_domain;
+-	MutexLocker locker(domain-&gt;lock);
++	RecursiveLocker locker(domain-&gt;lock);
+ 
+ 	domain-&gt;route_infos.Add(info);
+ 	info-&gt;route = get_route_internal(domain, &amp;info-&gt;address);
+@@ -700,7 +695,7 @@
+ unregister_route_info(struct net_domain* _domain, struct net_route_info* info)
+ {
+ 	struct net_domain_private* domain = (net_domain_private*)_domain;
+-	MutexLocker locker(domain-&gt;lock);
++	RecursiveLocker locker(domain-&gt;lock);
+ 
+ 	domain-&gt;route_infos.Remove(info);
+ 	if (info-&gt;route != NULL)
+@@ -714,7 +709,7 @@
+ update_route_info(struct net_domain* _domain, struct net_route_info* info)
+ {
+ 	struct net_domain_private* domain = (net_domain_private*)_domain;
+-	MutexLocker locker(domain-&gt;lock);
++	RecursiveLocker locker(domain-&gt;lock);
+ 
+ 	put_route_internal(domain, info-&gt;route);
+ 	info-&gt;route = get_route_internal(domain, &amp;info-&gt;address);
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/routes.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/routes.h	2009-03-03 12:36:41 UTC (rev 29385)
++++ haiku/trunk/src/add-ons/kernel/network/stack/routes.h	2009-03-03 14:04:57 UTC (rev 29386)
+@@ -15,7 +15,8 @@
+ #include &lt;util/DoublyLinkedList.h&gt;
+ 
+ 
+-struct net_route_private : net_route, public DoublyLinkedListLinkImpl&lt;net_route_private&gt; {
++struct net_route_private
++	: net_route, DoublyLinkedListLinkImpl&lt;net_route_private&gt; {
+ 	int32	ref_count;
+ 
+ 	net_route_private();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014662.html">[Haiku-commits] r29385 - haiku/trunk/src/tests/kits/interface/bshelf
+</A></li>
+	<LI>Next message: <A HREF="014664.html">[Haiku-commits] r29387 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14663">[ date ]</a>
+              <a href="thread.html#14663">[ thread ]</a>
+              <a href="subject.html#14663">[ subject ]</a>
+              <a href="author.html#14663">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

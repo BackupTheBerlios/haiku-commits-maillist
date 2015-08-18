@@ -1,0 +1,734 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28739 -	haiku/trunk/src/add-ons/kernel/network/devices/bluetooth
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28739%20-%0A%09haiku/trunk/src/add-ons/kernel/network/devices/bluetooth&In-Reply-To=%3C200811271944.mARJiKf3030073%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013669.html">
+   <LINK REL="Next"  HREF="013671.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28739 -	haiku/trunk/src/add-ons/kernel/network/devices/bluetooth</H1>
+    <B>oruizdorantes at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28739%20-%0A%09haiku/trunk/src/add-ons/kernel/network/devices/bluetooth&In-Reply-To=%3C200811271944.mARJiKf3030073%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28739 -	haiku/trunk/src/add-ons/kernel/network/devices/bluetooth">oruizdorantes at mail.berlios.de
+       </A><BR>
+    <I>Thu Nov 27 20:44:20 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013669.html">[Haiku-commits] r28738 -	haiku/trunk/src/add-ons/kernel/network/protocols/l2cap
+</A></li>
+        <LI>Next message: <A HREF="013671.html">[Haiku-commits] r28740 - haiku/trunk/src/preferences/time
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13670">[ date ]</a>
+              <a href="thread.html#13670">[ thread ]</a>
+              <a href="subject.html#13670">[ subject ]</a>
+              <a href="author.html#13670">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: oruizdorantes
+Date: 2008-11-27 20:44:19 +0100 (Thu, 27 Nov 2008)
+New Revision: 28739
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28739&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28739&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/acl.cpp
+   haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/acl.h
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/Jamfile
+   haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/bluetooth.cpp
+Log:
+- Implement ACL Segmentation and Reassembly
+- Kernel traces for bluetooth devices
+- Register connections helper funcs
+
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/Jamfile
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/Jamfile	2008-11-27 19:12:33 UTC (rev 28738)
++++ haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/Jamfile	2008-11-27 19:44:19 UTC (rev 28739)
+@@ -15,6 +15,7 @@
+ 
+ KernelAddon bluetooth :
+ 	bluetooth.cpp
++	acl.cpp
+ ;
+ 
+ # Installation
+
+Added: haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/acl.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/acl.cpp	2008-11-27 19:12:33 UTC (rev 28738)
++++ haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/acl.cpp	2008-11-27 19:44:19 UTC (rev 28739)
+@@ -0,0 +1,174 @@
++/*
++ * Copyright 2008 Oliver Ruiz Dorantes, oliver.ruiz.dorantes_at_gmail.com
++ * All rights reserved. Distributed under the terms of the MIT License.
++ */
++
++#include &lt;KernelExport.h&gt;
++#include &lt;string.h&gt;
++
++#include &lt;NetBufferUtilities.h&gt;
++#include &lt;net_protocol.h&gt;
++
++#include &lt;bluetooth/HCI/btHCI_acl.h&gt;
++#include &lt;bluetooth/HCI/btHCI_transport.h&gt;
++#include &lt;bluetooth/HCI/btHCI_event.h&gt;
++#include &lt;bluetooth/bdaddrUtils.h&gt;
++
++//#define BT_DEBUG_THIS_MODULE
++#define SUBMODULE_NAME &quot;ACL&quot;
++#define SUBMODULE_COLOR 34
++#include &lt;btDebug.h&gt;
++#include &lt;btCoreData.h&gt;
++#include &lt;btModules.h&gt;
++#include &lt;l2cap.h&gt;
++
++#include &quot;acl.h&quot;
++
++extern struct bluetooth_core_data_module_info* btCoreData;
++
++struct net_protocol_module_info* L2cap = NULL;
++
++extern void RegisterConnection(hci_id hid, uint16 handle);
++extern void unRegisterConnection(hci_id hid, uint16 handle);
++
++status_t PostToUpper(HciConnection* conn, net_buffer* buf);
++
++status_t
++AclAssembly(net_buffer* nbuf, hci_id hid)
++{
++	status_t	error = B_OK;
++
++	/* Check ACL data packet. Driver should ensure report complete ACL packets */
++	if (nbuf-&gt;size &lt; sizeof(struct hci_acl_header)) {
++		debugf(&quot;Transport driver has reported invalid ACL data packet, too small, length=%ld\n&quot;, nbuf-&gt;size);
++		gBufferModule-&gt;free(nbuf);
++		return (EMSGSIZE);
++	}
++
++	/* Strip ACL data packet header */
++	NetBufferHeaderReader&lt;struct hci_acl_header&gt; aclHeader(nbuf);
++	status_t status = aclHeader.Status();
++	if (status &lt; B_OK) {
++		gBufferModule-&gt;free(nbuf);
++		return ENOBUFS;
++	}
++
++
++	/* Get ACL connection handle, PB flag and payload length */
++	aclHeader-&gt;handle = le16toh(aclHeader-&gt;handle);
++
++	uint16 con_handle = get_acl_handle(aclHeader-&gt;handle);
++	uint16 pb = get_acl_pb_flag(aclHeader-&gt;handle);
++	uint16 length = le16toh(aclHeader-&gt;alen);
++
++	aclHeader.Remove();	
++
++	debugf(&quot;got ACL data packet, con_handle=%#x, PB=%#x, length=%d\n&quot;, con_handle, pb, length);
++
++	/*  a) Ensure there is HCI connection
++		b) Get connection descriptor
++		c) veryfy the status of the connection
++	*/
++
++    HciConnection* conn = btCoreData-&gt;ConnectionByHandle(con_handle, hid);
++	if (conn == NULL) {
++		//debugf(&quot;unexpected ACL!Connection does not exist!schedule! con_handle=%#x\n&quot;, con_handle);
++		panic(&quot;unexpected ACL!Connection does not exist!schedule!\n&quot;);
++		conn = btCoreData-&gt;AddConnection(con_handle, BT_ACL, BDADDR_NULL, hid);
++	}
++
++	// Verify connection state
++	if (conn-&gt;status!= HCI_CONN_OPEN) {
++		flowf(&quot;unexpected ACL data packet. Connection not open\n&quot;);
++		gBufferModule-&gt;free(nbuf);
++		return EHOSTDOWN;
++	}
++
++
++	/* Process packet */
++	if (pb == HCI_ACL_PACKET_START) {
++		if (conn-&gt;currentRxPacket != NULL) {
++			debugf(&quot;dropping incomplete L2CAP packet, got %ld bytes, want %d bytes\n&quot;, conn-&gt;currentRxPacket-&gt;size, length );
++			gBufferModule-&gt;free(conn-&gt;currentRxPacket);
++			conn-&gt;currentRxPacket = NULL;
++			conn-&gt;currentRxExpectedLength = 0;
++		}
++
++		// Get L2CAP header, ACL header was dimissed
++		if (nbuf-&gt;size &lt; sizeof(l2cap_hdr_t)) {
++			debugf(&quot;invalid L2CAP packet start fragment. Packet too small, length=%ld\n&quot;, nbuf-&gt;size);
++			gBufferModule-&gt;free(nbuf);
++			return (EMSGSIZE);
++		}
++
++
++		NetBufferHeaderReader&lt;l2cap_hdr_t&gt; l2capHeader(nbuf);
++		status_t status = l2capHeader.Status();
++		if (status &lt; B_OK) {
++			gBufferModule-&gt;free(nbuf);
++			return ENOBUFS;
++		}
++
++		l2capHeader-&gt;length = le16toh(l2capHeader-&gt;length);
++		l2capHeader-&gt;dcid = le16toh(l2capHeader-&gt;dcid);
++
++		debugf(&quot;staring new L2CAP packet, con_handle=%#x, length=%d\n&quot;, con_handle, le16toh(l2capHeader-&gt;length));
++
++		/* Start new L2CAP packet */
++		conn-&gt;currentRxPacket = nbuf;
++		conn-&gt;currentRxExpectedLength = l2capHeader-&gt;length + sizeof(l2cap_hdr_t);
++
++
++	} else if (pb == HCI_ACL_PACKET_FRAGMENT) {
++		if (conn-&gt;currentRxPacket == NULL) {
++			gBufferModule-&gt;free(nbuf);
++			return (EINVAL);
++		}
++
++		/* Add fragment to the L2CAP packet */
++		gBufferModule-&gt;merge(conn-&gt;currentRxPacket, nbuf, true);
++
++	} else {
++		debugf(&quot;invalid ACL data packet. Invalid PB flag=%#x\n&quot;, pb);
++		gBufferModule-&gt;free(nbuf);
++		return (EINVAL);
++	}
++
++	conn-&gt;currentRxExpectedLength -= length; /* substract the length of content of the ACL packet*/
++
++	if (conn-&gt;currentRxExpectedLength &lt; 0) {
++
++		debugf(&quot;packet length mismatch. Got %ld bytes, expected %ld bytes\n&quot;, conn-&gt;currentRxPacket-&gt;size,
++																			conn-&gt;currentRxExpectedLength);
++		gBufferModule-&gt;free(conn-&gt;currentRxPacket);
++		conn-&gt;currentRxPacket = NULL;
++		conn-&gt;currentRxExpectedLength = 0;
++
++	} else if (conn-&gt;currentRxExpectedLength == 0) {
++		// OK, we have got complete L2CAP packet, so process it
++		debugf(&quot;L2cap packet ready %ld bytes\n&quot;, conn-&gt;currentRxPacket-&gt;size);
++		error = PostToUpper(conn, conn-&gt;currentRxPacket);
++		// clean
++		conn-&gt;currentRxPacket = NULL;
++		conn-&gt;currentRxExpectedLength = 0;
++	} else {
++		debugf(&quot;Expected %ld current acl apports %d\n&quot;, conn-&gt;currentRxExpectedLength, length);	
++	}
++
++	return error;
++}
++
++
++status_t
++PostToUpper(HciConnection* conn, net_buffer* buf)
++{
++	if (L2cap == NULL)
++	
++	if (get_module(NET_BLUETOOTH_L2CAP_NAME,(module_info**)&amp;L2cap) != B_OK) {
++		debugf(&quot;cannot get module \&quot;%s\&quot;\n&quot;, NET_BLUETOOTH_L2CAP_NAME);
++		return B_ERROR;
++	} // TODO: someone put it
++	
++	return L2cap-&gt;receive_data((net_buffer*)conn);// XXX:HACK -&gt; pass handle in type
++
++}
+
+Added: haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/acl.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/acl.h	2008-11-27 19:12:33 UTC (rev 28738)
++++ haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/acl.h	2008-11-27 19:44:19 UTC (rev 28739)
+@@ -0,0 +1,17 @@
++/*
++ * Copyright 2008 Oliver Ruiz Dorantes, oliver.ruiz.dorantes_at_gmail.com
++ * All rights reserved. Distributed under the terms of the MIT License.
++ */
++#ifndef _ACL_PROC_H_
++#define _ACL_PROC_H_
++
++#include &lt;net_buffer.h&gt;
++
++#include &lt;bluetooth/HCI/btHCI.h&gt;
++
++status_t AclAssembly(net_buffer* buffer, hci_id hid);
++
++status_t InitializeAclConnectionThread();
++status_t QuitAclConnectionThread();
++
++#endif
+
+Modified: haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/bluetooth.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/bluetooth.cpp	2008-11-27 19:12:33 UTC (rev 28738)
++++ haiku/trunk/src/add-ons/kernel/network/devices/bluetooth/bluetooth.cpp	2008-11-27 19:44:19 UTC (rev 28739)
+@@ -6,7 +6,6 @@
+  *		Oliver Ruiz Dorantes, oliver.ruiz.dorantes_at_gmail.com
+  */
+ 
+-
+ #include &lt;net_buffer.h&gt;
+ #include &lt;net_device.h&gt;
+ #include &lt;net_stack.h&gt;
+@@ -18,53 +17,109 @@
+ #include &lt;KernelExport.h&gt;
+ 
+ #include &lt;errno.h&gt;
+-#include &lt;net/if.h&gt;
+-#include &lt;net/if_dl.h&gt;
+-#include &lt;net/if_media.h&gt;
+-#include &lt;net/if_types.h&gt;
++
+ #include &lt;new&gt;
+-
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
++#include &lt;NetBufferUtilities.h&gt;
+ 
++#include &lt;bluetooth/HCI/btHCI.h&gt;
++#include &lt;bluetooth/bdaddrUtils.h&gt;
++
+ #define BT_DEBUG_THIS_MODULE
+ #define SUBMODULE_NAME &quot;bluetooth_device&quot;
+ #define SUBMODULE_COLOR 34
+ #include &lt;btDebug.h&gt;
++#include &lt;btCoreData.h&gt;
++#include &lt;btModules.h&gt;
+ 
+-#include &lt;bluetooth/HCI/btHCI.h&gt;
++#include &lt;bluetooth/HCI/btHCI_acl.h&gt;
+ 
++#include &quot;acl.h&quot;
++
++
++
+ struct bluetooth_device : net_device, DoublyLinkedListLinkImpl&lt;bluetooth_device&gt; {
++	DoublyLinkedList&lt;HciConnection&gt; sConnectionList;
+ 	int		fd;
+ 	uint16	frame_size;
++	uint16	mtu;
+ };
+ 
+ /* Modules references */
+-net_buffer_module_info *gBufferModule = NULL;
+-static net_stack_module_info *sStackModule = NULL;
++net_buffer_module_info* gBufferModule = NULL;
++static net_stack_module_info* sStackModule = NULL;
++struct bluetooth_core_data_module_info* btCoreData = NULL;
+ 
++
+ static mutex sListLock;
+ static DoublyLinkedList&lt;bluetooth_device&gt; sDeviceList;
+ static sem_id sLinkChangeSemaphore;
+ 
++
++bluetooth_device*
++FindDeviceByID(hci_id hid)
++{
++
++	bluetooth_device*	device;
++
++	DoublyLinkedList&lt;bluetooth_device&gt;::Iterator iterator = sDeviceList.GetIterator();
++	while (iterator.HasNext()) {
++
++		device = iterator.Next();
++		if (device-&gt;index == (uint32 )hid)
++			return device;
++	}
++	
++	return NULL;
++}
++
++// TODO: keeping this list might not be strictily needed
++void
++RegisterConnection(hci_id hid, uint16 handle)
++{
++	bluetooth_device*	device = FindDeviceByID(hid);
++	HciConnection* conn = btCoreData-&gt;ConnectionByHandle(handle, hid);
++
++	if (device != NULL &amp;&amp; conn != NULL) {
++		conn-&gt;ndevice = (struct net_device*)device;
++		device-&gt;sConnectionList.Add(conn);
++	} else {
++		panic(&quot;problem registering connection&quot;);	
++	}
++}
++
++
++void
++unRegisterConnection(hci_id hid, uint16 handle)
++{
++
++	bluetooth_device*	device;
++	device = FindDeviceByID(hid);
++
++	if (device != NULL) {
++		device-&gt;sConnectionList.Remove(btCoreData-&gt;ConnectionByHandle(handle, hid));
++	}
++}
++
+ //	#pragma mark -
+ 
+ status_t
+-bluetooth_init(const char *name, net_device **_device)
++bluetooth_init(const char* name, net_device** _device)
+ {
+ 	debugf(&quot;Initializing bluetooth device %s\n&quot;,name);
+-	
++
+ 	// TODO: make sure this is a device in /dev/bluetooth
+ 	if (strncmp(name, &quot;bluetooth/h&quot;, 11))
+ 		return B_BAD_VALUE;
+ 
+ 	if (gBufferModule == NULL) { // lazy allocation
+-		status_t status = get_module(NET_BUFFER_MODULE_NAME, (module_info **)&amp;gBufferModule);
++		status_t status = get_module(NET_BUFFER_MODULE_NAME, (module_info**)&amp;gBufferModule);
+ 		if (status &lt; B_OK)
+ 			return status;
+ 	}
+ 
+-	bluetooth_device *device = new (std::nothrow) bluetooth_device;
++	bluetooth_device* device = new (std::nothrow) bluetooth_device;
+ 	if (device == NULL) {
+ 		put_module(NET_BUFFER_MODULE_NAME);
+ 		return B_NO_MEMORY;
+@@ -76,7 +131,7 @@
+ 	strcpy(device-&gt;name, name);
+ 
+ 	MutexLocker _(&amp;sListLock);
+-	
++
+ 	if (sDeviceList.IsEmpty())
+ 		device-&gt;index = HCI_DEVICE_INDEX_OFFSET; // REVIEW: dev index
+ 	else
+@@ -93,9 +148,9 @@
+ 
+ 
+ status_t
+-bluetooth_uninit(net_device *_device)
++bluetooth_uninit(net_device* _device)
+ {
+-	bluetooth_device *device = (bluetooth_device *)_device;
++	bluetooth_device* device = (bluetooth_device *)_device;
+ 
+ 	debugf(&quot;index %lx\n&quot;,device-&gt;index);
+ 
+@@ -113,9 +168,9 @@
+ 
+ 
+ status_t
+-bluetooth_up(net_device *_device)
+-{	
+-	bluetooth_device *device = (bluetooth_device *)_device;
++bluetooth_up(net_device* _device)
++{
++	bluetooth_device* device = (bluetooth_device*)_device;
+ 
+ 	debugf(&quot;index %ld\n&quot;,device-&gt;index);
+ 
+@@ -133,9 +188,9 @@
+ 
+ 
+ void
+-bluetooth_down(net_device *_device)
+-{	
+-	bluetooth_device *device = (bluetooth_device *)_device;
++bluetooth_down(net_device* _device)
++{
++	bluetooth_device *device = (bluetooth_device*)_device;
+ 
+ 	debugf(&quot;index %ld\n&quot;,device-&gt;index);
+ 
+@@ -145,60 +200,94 @@
+ 
+ 
+ status_t
+-bluetooth_control(net_device *_device, int32 op, void *argument,
++bluetooth_control(net_device* _device, int32 op, void* argument,
+ 	size_t length)
+-{	
+-	bluetooth_device *device = (bluetooth_device *)_device;
++{
++	bluetooth_device* device = (bluetooth_device*)_device;
+ 
+ 	debugf(&quot;index %ld\n&quot;,device-&gt;index);
+-	
++
+ 	// Forward the call to the driver
+ 	return ioctl(device-&gt;fd, op, argument, length);
+ }
+ 
+ 
+ status_t
+-bluetooth_send_data(net_device *_device, net_buffer *buffer)
++bluetooth_send_data(net_device *_device, net_buffer* buffer)
+ {
+-	bluetooth_device *device = (bluetooth_device *)_device;
++	bluetooth_device* device = (bluetooth_device*)_device;
++	net_buffer*	curr_frame = NULL;
++	net_buffer*	next_frame = buffer;
++	uint16 		handle = buffer-&gt;type; //TODO: net_routes??
++	uint8		  flag = HCI_ACL_PACKET_START;
+ 
+ 	debugf(&quot;index %ld try to send bt packet of %lu bytes (flags %ld):\n&quot;,device-&gt;index, buffer-&gt;size, buffer-&gt;flags);
+-	
+-	/* TODO:
+ 
+-	*/
++	//TODO: ATOMIC!!! any other thread should stop here
++	do {
++		// Divide packet if big enough
++		curr_frame = next_frame;
+ 
+-//  MTU and size possiblities to be checked in l2cap....
+-//	if (buffer-&gt;size &gt; device-&gt;frame_size)
+-//		return B_BAD_VALUE;
++		if (next_frame-&gt;size &gt; device-&gt;mtu) {
++			next_frame = gBufferModule-&gt;split(curr_frame, device-&gt;mtu);
++		} else {
++			next_frame = NULL;		
++		}
++		
++		// Attach acl header
++		NetBufferPrepend&lt;struct hci_acl_header&gt; bufferHeader(curr_frame);
++		status_t status = bufferHeader.Status();
++		if (status &lt; B_OK) {
++			// free the buffer
++			continue;
++		}
+ 
++		bufferHeader-&gt;handle = pack_acl_handle_flags(handle, flag, 0); /* Handle &amp; Flags(PB, BC) */
++		bufferHeader-&gt;alen = curr_frame-&gt;size - sizeof(struct hci_acl_header);
++
++		bufferHeader.Sync();
++
++		// Send to driver  XXX: another inter-layer trick
++		debugf(&quot;tolower nbuf %p\n&quot;,curr_frame);
++		curr_frame-&gt;protocol = BT_ACL;
++		((status_t(*)(hci_id id, net_buffer* nbuf))device-&gt;media)(device-&gt;index, curr_frame);
++			
++		flag = HCI_ACL_PACKET_FRAGMENT;
++
++	} while (next_frame == NULL);
++
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-bluetooth_receive_data(net_device *_device, net_buffer **_buffer)
++bluetooth_receive_data(net_device* _device, net_buffer** _buffer)
+ {
+ 	bluetooth_device *device = (bluetooth_device *)_device;
+ 	status_t status = B_OK;
+ 
+-	debugf(&quot;index %ld try to send bt packet of %lu bytes (flags %ld):\n&quot;, device-&gt;index, (*_buffer)-&gt;size, (*_buffer)-&gt;flags);
++	debugf(&quot;index %ld packet of %lu bytes (flags %ld):\n&quot;, device-&gt;index, (*_buffer)-&gt;size, (*_buffer)-&gt;flags);
+ 
+ 	if (device-&gt;fd == -1)
+ 		return B_FILE_ERROR;
+ 
+-	/* TODO:
++	switch ((*_buffer)-&gt;protocol) {
++		case BT_ACL:
++			status = AclAssembly(*_buffer, device-&gt;index);
++		break;
++		default:
++			panic(&quot;Protocol not supported&quot;);
++		break;
++	}
+ 
+-	*/
+-
+ 	return status;
+ }
+ 
+ 
+ status_t
+-bluetooth_set_mtu(net_device *_device, size_t mtu)
++bluetooth_set_mtu(net_device* _device, size_t mtu)
+ {
+-	bluetooth_device *device = (bluetooth_device *)_device;
++	bluetooth_device* device = (bluetooth_device*)_device;
+ 
+ 	debugf(&quot;index %ld mtu %ld\n&quot;,device-&gt;index, mtu);
+ 
+@@ -209,9 +298,9 @@
+ 
+ 
+ status_t
+-bluetooth_set_promiscuous(net_device *_device, bool promiscuous)
++bluetooth_set_promiscuous(net_device* _device, bool promiscuous)
+ {
+-	bluetooth_device *device = (bluetooth_device *)_device;
++	bluetooth_device* device = (bluetooth_device*)_device;
+ 
+ 	debugf(&quot;index %ld promiscuous %d\n&quot;,device-&gt;index, promiscuous);
+ 
+@@ -220,18 +309,18 @@
+ 
+ 
+ status_t
+-bluetooth_set_media(net_device *device, uint32 media)
++bluetooth_set_media(net_device* device, uint32 media)
+ {
+ 	debugf(&quot;index %ld media %ld\n&quot;,device-&gt;index, media);
+-	
++
+ 	return EOPNOTSUPP;
+ }
+ 
+ 
+ status_t
+-bluetooth_add_multicast(struct net_device *_device, const sockaddr *_address)
++bluetooth_add_multicast(struct net_device* _device, const sockaddr* _address)
+ {
+-	bluetooth_device* device = (bluetooth_device *)_device;
++	bluetooth_device* device = (bluetooth_device*)_device;
+ 
+ 	debugf(&quot;index %ld\n&quot;,device-&gt;index);
+ 
+@@ -239,9 +328,9 @@
+ }
+ 
+ status_t
+-bluetooth_remove_multicast(struct net_device *_device, const sockaddr *_address)
++bluetooth_remove_multicast(struct net_device* _device, const sockaddr* _address)
+ {
+-	bluetooth_device* device = (bluetooth_device *)_device;
++	bluetooth_device* device = (bluetooth_device*)_device;
+ 
+ 	debugf(&quot;index %ld\n&quot;,device-&gt;index);
+ 
+@@ -259,9 +348,14 @@
+ 	while (iterator.HasNext()) {
+ 
+ 		device = iterator.Next();
+-		kprintf(&quot;\tname=%s index=%#lx\n&quot;,device-&gt;name, device-&gt;index);
++		kprintf(&quot;\tname=%s index=%#lx @%p\n&quot;,device-&gt;name, device-&gt;index, device);
++		DoublyLinkedList&lt;HciConnection&gt;::Iterator connIterator = device-&gt;sConnectionList.GetIterator();
++		while (connIterator.HasNext()) {
++			HciConnection* conn = connIterator.Next();
++			kprintf(&quot;\t\t handle=%#x destination=%s @%p\n&quot;, conn-&gt;handle, bdaddrUtils::ToString(conn-&gt;destination), conn);
++		}
+ 	}
+-	
++
+ 	return 0;
+ }
+ 
+@@ -271,14 +365,23 @@
+ {
+ 
+ 	flowf(&quot;\n&quot;);
+-	
++
+ 	switch (op) {
+ 		case B_MODULE_INIT:
+ 		{
+-			status_t status = get_module(NET_STACK_MODULE_NAME,
+-				(module_info **)&amp;sStackModule);
+-			if (status &lt; B_OK)
++			status_t status;
++
++			status = get_module(NET_STACK_MODULE_NAME,(module_info**)&amp;sStackModule);
++			if (status &lt; B_OK) {
++				flowf(&quot;problem getting netstack module\n&quot;);
+ 				return status;
++			} 
++			
++			status = get_module(BT_CORE_DATA_MODULE_NAME,(module_info**)&amp;btCoreData);
++			if (status &lt; B_OK) {
++				flowf(&quot;problem getting datacore\n&quot;);
++				return status;
++			}
+ 
+ 			new (&amp;sDeviceList) DoublyLinkedList&lt;bluetooth_device&gt;;
+ 				// static C++ objects are not initialized in the module startup
+@@ -286,11 +389,15 @@
+ 			sLinkChangeSemaphore = create_sem(0, &quot;bt sem&quot;);
+ 			if (sLinkChangeSemaphore &lt; B_OK) {
+ 				put_module(NET_STACK_MODULE_NAME);
++				flowf(&quot;sem failed\n&quot;);
+ 				return sLinkChangeSemaphore;
+ 			}
+ 
+ 			mutex_init(&amp;sListLock, &quot;bluetooth devices&quot;);
+ 
++			//status = InitializeAclConnectionThread();
++			debugf(&quot;Connection Thread error=%lx\n&quot;, status);
++			
+ 			add_debugger_command(&quot;btLocalDevices&quot;, &amp;dump_bluetooth_devices, &quot;Lists Bluetooth LocalDevices registered in the Stack&quot;);
+ 
+ 			return B_OK;
+@@ -302,9 +409,10 @@
+ 
+ 			mutex_destroy(&amp;sListLock);
+ 			put_module(NET_STACK_MODULE_NAME);
+-			
++			put_module(BT_CORE_DATA_MODULE_NAME);
+ 			remove_debugger_command(&quot;btLocalDevices&quot;, &amp;dump_bluetooth_devices);
+-			
++			//status_t status = QuitAclConnectionThread();
++
+ 			return B_OK;
+ 		}
+ 
+@@ -316,8 +424,8 @@
+ 
+ net_device_module_info sBluetoothModule = {
+ 	{
+-		&quot;network/devices/bluetooth/v1&quot;,
+-		0,
++		NET_BLUETOOTH_DEVICE_NAME,
++		B_KEEP_LOADED,
+ 		bluetooth_std_ops
+ 	},
+ 	bluetooth_init,
+@@ -334,8 +442,9 @@
+ 	bluetooth_remove_multicast,
+ };
+ 
++
++
+ module_info *modules[] = {
+ 	(module_info *)&amp;sBluetoothModule,
+-
+ 	NULL
+ };
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013669.html">[Haiku-commits] r28738 -	haiku/trunk/src/add-ons/kernel/network/protocols/l2cap
+</A></li>
+	<LI>Next message: <A HREF="013671.html">[Haiku-commits] r28740 - haiku/trunk/src/preferences/time
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13670">[ date ]</a>
+              <a href="thread.html#13670">[ thread ]</a>
+              <a href="subject.html#13670">[ subject ]</a>
+              <a href="author.html#13670">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

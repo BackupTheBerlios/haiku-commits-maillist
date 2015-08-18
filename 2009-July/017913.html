@@ -1,0 +1,680 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31517 - haiku/trunk/src/apps/powerstatus
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31517%20-%20haiku/trunk/src/apps/powerstatus&In-Reply-To=%3C200907111054.n6BAs3RM023410%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017912.html">
+   <LINK REL="Next"  HREF="017914.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31517 - haiku/trunk/src/apps/powerstatus</H1>
+    <B>czeidler at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31517%20-%20haiku/trunk/src/apps/powerstatus&In-Reply-To=%3C200907111054.n6BAs3RM023410%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31517 - haiku/trunk/src/apps/powerstatus">czeidler at mail.berlios.de
+       </A><BR>
+    <I>Sat Jul 11 12:54:03 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017912.html">[Haiku-commits] r31516 - haiku/trunk
+</A></li>
+        <LI>Next message: <A HREF="017914.html">[Haiku-commits] r31518 - haiku/trunk/src/libs/print/libprint
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17913">[ date ]</a>
+              <a href="thread.html#17913">[ thread ]</a>
+              <a href="subject.html#17913">[ subject ]</a>
+              <a href="author.html#17913">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: czeidler
+Date: 2009-07-11 12:53:29 +0200 (Sat, 11 Jul 2009)
+New Revision: 31517
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31517&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31517&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/powerstatus/ACPIDriverInterface.cpp
+   haiku/trunk/src/apps/powerstatus/ACPIDriverInterface.h
+   haiku/trunk/src/apps/powerstatus/ExtendedInfoWindow.cpp
+   haiku/trunk/src/apps/powerstatus/ExtendedInfoWindow.h
+   haiku/trunk/src/apps/powerstatus/PowerStatusView.cpp
+Log:
+- extended info window looks a little bit better now.
+- cache the battery status and read it out in the polling thread
+- fix time label
+
+
+
+Modified: haiku/trunk/src/apps/powerstatus/ACPIDriverInterface.cpp
+===================================================================
+--- haiku/trunk/src/apps/powerstatus/ACPIDriverInterface.cpp	2009-07-11 10:17:06 UTC (rev 31516)
++++ haiku/trunk/src/apps/powerstatus/ACPIDriverInterface.cpp	2009-07-11 10:53:29 UTC (rev 31517)
+@@ -76,26 +76,33 @@
+ 
+ 
+ status_t
+-Battery::GetBatteryInfo(battery_info* info)
++Battery::ReadBatteryInfo()
+ {
+-	acpi_battery_info acpiInfo;
+ 	status_t status;
+-	status = ioctl(fDriverHandler, GET_BATTERY_INFO, &amp;acpiInfo,
++	status = ioctl(fDriverHandler, GET_BATTERY_INFO, &amp;fCachedAcpiInfo,
+ 		sizeof(acpi_battery_info));
+ 	
+ 	if (status != B_OK)
+ 		return status;
+ 		
+-	info-&gt;state = acpiInfo.state;
+-	info-&gt;current_rate = acpiInfo.current_rate;
+-	info-&gt;capacity = acpiInfo.capacity;
++	return B_OK;
++}
++
++
++status_t
++Battery::GetBatteryInfoCached(battery_info* info)
++{
++	info-&gt;state = fCachedAcpiInfo.state;
++	info-&gt;current_rate = fCachedAcpiInfo.current_rate;
++	info-&gt;capacity = fCachedAcpiInfo.capacity;
+ 	info-&gt;full_capacity = fExtendedBatteryInfo.last_full_charge;
+-	fRateBuffer.AddRate(acpiInfo.current_rate);
+-	if (acpiInfo.current_rate &gt; 0)
+-		info-&gt;time_left = 3600 * acpiInfo.capacity / fRateBuffer.GetMeanRate();
++	fRateBuffer.AddRate(fCachedAcpiInfo.current_rate);
++	if (fCachedAcpiInfo.current_rate &gt; 0)
++		info-&gt;time_left = 3600 * fCachedAcpiInfo.capacity
++			/ fRateBuffer.GetMeanRate();
+ 	else
+ 		info-&gt;time_left = -1;
+-	
++
+ 	return B_OK;
+ }
+ 
+@@ -125,8 +132,7 @@
+ 	if (fInitStatus != B_OK)
+ 		return;
+ 	
+-	acpi_battery_info info;
+-	fInitStatus = ioctl(fDriverHandler, GET_BATTERY_INFO, &amp;info,
++	fInitStatus = ioctl(fDriverHandler, GET_BATTERY_INFO, &amp;fCachedAcpiInfo,
+ 		sizeof(acpi_battery_info));
+ 	if (fInitStatus != B_OK)
+ 		return;
+@@ -158,12 +164,12 @@
+ status_t
+ ACPIDriverInterface::GetBatteryInfo(battery_info* info, int32 index)
+ {
+-	BAutolock autolock(fBatteryStatusLock);
++	BAutolock autolock(fInterfaceLocker);
+ 	if (index &lt; 0 || index &gt;= fDriverList.CountItems())
+ 		return B_ERROR;
+ 		
+ 	status_t status;
+-	status = fDriverList.ItemAt(index)-&gt;GetBatteryInfo(info);
++	status = fDriverList.ItemAt(index)-&gt;GetBatteryInfoCached(info);
+ 	return status;
+ }
+ 
+@@ -172,7 +178,7 @@
+ ACPIDriverInterface::GetExtendedBatteryInfo(acpi_extended_battery_info* info,
+ 	int32 index)
+ {
+-	BAutolock autolock(fBatteryStatusLock);
++	BAutolock autolock(fInterfaceLocker);
+ 	if (index &lt; 0 || index &gt;= fDriverList.CountItems())
+ 		return B_ERROR;
+ 		
+@@ -190,6 +196,16 @@
+ }
+ 
+ 
++status_t
++ACPIDriverInterface::_ReadBatteryInfo()
++{
++	for (int i = 0; i &lt; fDriverList.CountItems(); i++)
++		fDriverList.ItemAt(i)-&gt;ReadBatteryInfo();
++	
++	return B_OK;
++}
++
++
+ void
+ ACPIDriverInterface::_WatchPowerStatus()
+ {
+@@ -197,6 +213,7 @@
+ 		// every two seconds
+ 
+ 	while (atomic_get(&amp;fIsWatching) &gt; 0) {
++		_ReadBatteryInfo();
+ 		Broadcast(kMsgUpdate);
+ 		snooze(kUpdateInterval);
+ 	}
+
+Modified: haiku/trunk/src/apps/powerstatus/ACPIDriverInterface.h
+===================================================================
+--- haiku/trunk/src/apps/powerstatus/ACPIDriverInterface.h	2009-07-11 10:17:06 UTC (rev 31516)
++++ haiku/trunk/src/apps/powerstatus/ACPIDriverInterface.h	2009-07-11 10:53:29 UTC (rev 31517)
+@@ -14,6 +14,7 @@
+ #include &lt;Locker.h&gt;
+ #include &lt;ObjectList.h&gt;
+ 
++
+ const int8 kRateBufferSize = 10;
+ 
+ class RateBuffer
+@@ -39,7 +40,9 @@
+ 
+ 	status_t					InitCheck();
+ 
+-	status_t 					GetBatteryInfo(battery_info* info);
++	// Read battery info and update the cache.
++	status_t 					ReadBatteryInfo();
++	status_t 					GetBatteryInfoCached(battery_info* info);
+ 	status_t 					GetExtendedBatteryInfo(
+ 									acpi_extended_battery_info* info);
+ 
+@@ -53,6 +56,7 @@
+ 	acpi_extended_battery_info	fExtendedBatteryInfo;
+ 	
+ 	RateBuffer					fRateBuffer;
++	acpi_battery_info			fCachedAcpiInfo;
+ };
+ 
+ 
+@@ -69,12 +73,15 @@
+ 	virtual int32			GetBatteryCount();
+ 
+ protected:
++	// Read the battery info from the hardware.
++	virtual status_t 		_ReadBatteryInfo();
++	
+ 	virtual void			_WatchPowerStatus();
+ 	virtual status_t		_FindDrivers(const char* path);
+ 
+ 	BObjectList&lt;Battery&gt;	fDriverList;
+ 	
+-	BLocker					fBatteryStatusLock;
++	BLocker					fInterfaceLocker;
+ };
+ 
+ #endif
+
+Modified: haiku/trunk/src/apps/powerstatus/ExtendedInfoWindow.cpp
+===================================================================
+--- haiku/trunk/src/apps/powerstatus/ExtendedInfoWindow.cpp	2009-07-11 10:17:06 UTC (rev 31516)
++++ haiku/trunk/src/apps/powerstatus/ExtendedInfoWindow.cpp	2009-07-11 10:53:29 UTC (rev 31517)
+@@ -15,20 +15,38 @@
+ #include &lt;String.h&gt;
+ 
+ 
+-BatteryInfoView::BatteryInfoView(BRect frame, int32 resizingMode)
++FontString::FontString()
++{
++	font = be_plain_font;
++}
++
++
++const int kLineSpacing = 5;
++
++BatteryInfoView::BatteryInfoView()
+ 	:
+-	BView(frame, &quot;battery info view&quot;, resizingMode, B_WILL_DRAW |
+-		B_FULL_UPDATE_ON_RESIZE)
++	BView(&quot;battery info view&quot;, B_WILL_DRAW |
++		B_FULL_UPDATE_ON_RESIZE),
++	fPreferredSize(200, 200),
++	fMaxStringSize(0, 0)
+ {
+ 	SetViewColor(ui_color(B_PANEL_BACKGROUND_COLOR));
+ }
+ 
+ 
++BatteryInfoView::~BatteryInfoView()
++{
++	_ClearStringList();
++}
++
++
+ void
+ BatteryInfoView::Update(battery_info&amp; info, acpi_extended_battery_info&amp; extInfo)
+ {
+ 	fBatteryInfo = info;
+ 	fBatteryExtendedInfo = extInfo;
++	
++	_FillStringList();
+ }
+ 
+ 
+@@ -37,6 +55,50 @@
+ {
+ 	SetLowColor(ui_color(B_PANEL_BACKGROUND_COLOR));
+ 	
++	BPoint point(10, 10);
++	
++	float space = _MeasureString(&quot;&quot;).height + kLineSpacing;
++
++	for (int i = 0; i &lt; fStringList.CountItems(); i ++)
++	{
++		FontString* fontString = fStringList.ItemAt(i);
++		SetFont(fontString-&gt;font);
++		DrawString(fontString-&gt;string.String(), point);
++		point.y += space;
++	}	
++}		
++
++
++void
++BatteryInfoView::GetPreferredSize(float *width, float *height)
++{
++	*width = fPreferredSize.width;
++	*height = fPreferredSize.height;
++}
++
++
++BSize
++BatteryInfoView::_MeasureString(const BString&amp; string)
++{
++	BFont font;
++	GetFont(&amp;font);
++	BSize size;
++	
++	size.width = font.StringWidth(string);
++
++	font_height height;
++	font.GetHeight(&amp;height);
++	size.height = height.ascent + height.descent;
++
++	return size;
++}
++
++
++void
++BatteryInfoView::_FillStringList()
++{
++	_ClearStringList();
++
+ 	BString powerUnit;
+ 	BString rateUnit;
+ 	switch (fBatteryExtendedInfo.power_unit) {
+@@ -51,103 +113,128 @@
+ 			break;
+ 	}
+ 
+-	BString text;
++	FontString* fontString;
++
++	fontString = new FontString;
++	fStringList.AddItem(fontString);
++	fontString-&gt;font = be_bold_font;
++	
+ 	if (fBatteryInfo.state &amp; BATTERY_CHARGING)
+-		text = &quot;Battery charging&quot;;
++		fontString-&gt;string = &quot;Battery charging&quot;;
+ 	else if (fBatteryInfo.state &amp; BATTERY_DISCHARGING)
+-		text = &quot;Battery discharging&quot;;
++		fontString-&gt;string = &quot;Battery discharging&quot;;
+ 	else if (fBatteryInfo.state &amp; BATTERY_CRITICAL_STATE)
+-		text = &quot;Empty Battery Slot&quot;;
++		fontString-&gt;string = &quot;Empty Battery Slot&quot;;
+ 	else
+-		text = &quot;Battery unused&quot;;
+-	BPoint point(10, 10);
+-	int textHeight = 15;
+-	int space = textHeight + 5;
+-	DrawString(text.String(), point);
+-	point.y += space;
++		fontString-&gt;string = &quot;Battery unused&quot;;
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Capacity: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryInfo.capacity;
++	fontString-&gt;string &lt;&lt; powerUnit;
++	_AddToStringList(fontString);
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Last full Charge: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryInfo.full_capacity;
++	fontString-&gt;string &lt;&lt; powerUnit;
++	_AddToStringList(fontString);
+ 	
+-	text = &quot;Capacity: &quot;;
+-	text &lt;&lt; fBatteryInfo.capacity;
+-	text &lt;&lt; powerUnit;
+-	DrawString(text.String(), point);
+-	point.y += space;
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Current Rate: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryInfo.current_rate;
++	fontString-&gt;string &lt;&lt; rateUnit;
++	_AddToStringList(fontString);
+ 	
+-	text = &quot;Last full Charge: &quot;;
+-	text &lt;&lt; fBatteryInfo.full_capacity;
+-	text &lt;&lt; powerUnit;
+-	DrawString(text.String(), point);
+-	point.y += space;
+-
+-	text = &quot;Current Rate: &quot;;
+-	text &lt;&lt; fBatteryInfo.current_rate;
+-	text &lt;&lt; rateUnit;
+-	DrawString(text.String(), point);
+-	point.y += space;
++	// empty line
++	fontString = new FontString;
++	_AddToStringList(fontString);
+ 	
+-	point.y += space;
+-
+-	text = &quot;Design Capacity: &quot;;
+-	text &lt;&lt; fBatteryExtendedInfo.design_capacity;
+-	text &lt;&lt; powerUnit;
+-	DrawString(text.String(), point);
+-	point.y += space;
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Design Capacity: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryExtendedInfo.design_capacity;
++	fontString-&gt;string &lt;&lt; powerUnit;
++	_AddToStringList(fontString);
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Technology: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryExtendedInfo.technology;
++	_AddToStringList(fontString);
+ 	
+-	text = &quot;Technology: &quot;;
+-	text &lt;&lt; fBatteryExtendedInfo.technology;
+-	DrawString(text.String(), point);
+-	point.y += space;
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Design Voltage: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryExtendedInfo.design_voltage;
++	fontString-&gt;string &lt;&lt; &quot; mV&quot;;
++	_AddToStringList(fontString);
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Design Capacity Warning: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryExtendedInfo.design_capacity_warning;
++	fontString-&gt;string &lt;&lt; powerUnit;
++	_AddToStringList(fontString);
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Design Capacity low Warning: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryExtendedInfo.design_capacity_low;
++	fontString-&gt;string &lt;&lt; powerUnit;
++	_AddToStringList(fontString);
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Capacity Granularity 1: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryExtendedInfo.capacity_granularity_1;
++	_AddToStringList(fontString);
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Capacity Granularity 2: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryExtendedInfo.capacity_granularity_2;
++	_AddToStringList(fontString);
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Model Number: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryExtendedInfo.model_number;
++	_AddToStringList(fontString);
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Serial number: &quot;;
++	fontString-&gt;string &lt;&lt; fBatteryExtendedInfo.serial_number;
++	_AddToStringList(fontString);
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;Type: &quot;;
++	fontString-&gt;string += fBatteryExtendedInfo.type;
++	_AddToStringList(fontString);
++		
++	fontString = new FontString;
++	fontString-&gt;string = &quot;OEM Info: &quot;;
++	fontString-&gt;string += fBatteryExtendedInfo.oem_info;
++	_AddToStringList(fontString);
+ 	
+-	text = &quot;Design Voltage: &quot;;
+-	text &lt;&lt; fBatteryExtendedInfo.design_voltage;
+-	text &lt;&lt; &quot; mV&quot;;
+-	DrawString(text.String(), point);
+-	point.y += space;
+-	
+-	text = &quot;Design Capacity Warning: &quot;;
+-	text &lt;&lt; fBatteryExtendedInfo.design_capacity_warning;
+-	text &lt;&lt; powerUnit;
+-	DrawString(text.String(), point);
+-	point.y += space;
+-	
+-	text = &quot;Design Capacity low Warning: &quot;;
+-	text &lt;&lt; fBatteryExtendedInfo.design_capacity_low;
+-	text &lt;&lt; powerUnit;
+-	DrawString(text.String(), point);
+-	point.y += space;
+-	
+-	text = &quot;Capacity Granularity 1: &quot;;
+-	text &lt;&lt; fBatteryExtendedInfo.capacity_granularity_1;
+-	DrawString(text.String(), point);
+-	point.y += space;
+-	
+-	text = &quot;Capacity Granularity 2: &quot;;
+-	text &lt;&lt; fBatteryExtendedInfo.capacity_granularity_2;
+-	DrawString(text.String(), point);
+-	point.y += space;
+-	
+-	text = &quot;Model Number: &quot;;
+-	text &lt;&lt; fBatteryExtendedInfo.model_number;
+-	DrawString(text.String(), point);
+-	point.y += space;
+-	
+-	text = &quot;Serial number: &quot;;
+-	text &lt;&lt; fBatteryExtendedInfo.serial_number;
+-	DrawString(text.String(), point);
+-	point.y += space;
+-	
+-	text = &quot;Type: &quot;;
+-	text += fBatteryExtendedInfo.type;
+-	DrawString(text.String(), point);
+-	point.y += space;
+-	
+-	text = &quot;OEM Info: &quot;;
+-	text += fBatteryExtendedInfo.oem_info;
+-	DrawString(text.String(), point);
+-	point.y += space;
+-	
+-}		
+-		
++	fPreferredSize.width = fMaxStringSize.width + 10;
++	fPreferredSize.height = (fMaxStringSize.height + kLineSpacing) *
++		fStringList.CountItems();
++}
+ 
++
++void
++BatteryInfoView::_AddToStringList(FontString* fontString)
++{
++	fStringList.AddItem(fontString);
++	BSize stringSize = _MeasureString(fontString-&gt;string);
++	if (fMaxStringSize.width &lt; stringSize.width)
++		fMaxStringSize = stringSize;
++}
++
++
++void
++BatteryInfoView::_ClearStringList()
++{
++	for (int i = 0; i &lt; fStringList.CountItems(); i ++)
++		delete fStringList.ItemAt(i);
++	fStringList.MakeEmpty();
++	fMaxStringSize = BSize(0, 0);
++}
++
++
+ ExtPowerStatusView::ExtPowerStatusView(PowerStatusDriverInterface* interface,
+ 			BRect frame, int32 resizingMode, int batteryId,
+ 			ExtendedInfoWindow* window)
+@@ -157,7 +244,7 @@
+ 	fBatteryInfoView(window-&gt;GetExtendedBatteryInfoView()),
+ 	fSelected(false)
+ {
+-	
++			
+ }
+ 
+ 
+@@ -225,7 +312,8 @@
+ ExtendedInfoWindow::ExtendedInfoWindow(PowerStatusDriverInterface* interface)
+ 	:
+ 	BWindow(BRect(100, 150, 500, 500), &quot;Extended Battery Info&quot;, B_TITLED_WINDOW,
+-		B_NOT_ZOOMABLE | B_ASYNCHRONOUS_CONTROLS),
++		B_NOT_RESIZABLE | B_NOT_ZOOMABLE | B_AVOID_FRONT |
++		B_ASYNCHRONOUS_CONTROLS),
+ 	fDriverInterface(interface),
+ 	fSelectedView(NULL)
+ {
+@@ -252,13 +340,17 @@
+ 	batteryView-&gt;GroupLayout()-&gt;SetSpacing(10);
+ 	infoLayout-&gt;AddView(batteryView);
+ 
+-	fBatteryInfoView = new BatteryInfoView(BRect(0, 0, 270, 310), B_FOLLOW_ALL);
++	// create before the battery views
++	fBatteryInfoView = new BatteryInfoView();
+ 	
+ 	BGroupLayout* batteryLayout = batteryView-&gt;GroupLayout();
+ 	BRect batteryRect(0, 0, 50, 30);
+ 	for (int i = 0; i &lt; interface-&gt;GetBatteryCount(); i++) {
+ 		ExtPowerStatusView* view = new ExtPowerStatusView(interface,
+-			batteryRect, B_FOLLOW_ALL, i, this);
++			batteryRect, B_FOLLOW_NONE, i, this);
++		view-&gt;SetExplicitMaxSize(BSize(70, 80));
++		view-&gt;SetExplicitMinSize(BSize(70, 80));
++
+ 		batteryLayout-&gt;AddView(view);
+ 		fBatteryViewList.AddItem(view);
+ 		fDriverInterface-&gt;StartWatching(view);
+@@ -268,7 +360,7 @@
+ 
+ 	batteryLayout-&gt;AddItem(BSpaceLayoutItem::CreateGlue());	
+ 	
+-	infoLayout-&gt;AddView(fBatteryInfoView, 20);
++	infoLayout-&gt;AddView(fBatteryInfoView);
+ 	
+ 	if (!fSelectedView &amp;&amp; fBatteryViewList.CountItems() &gt; 0)
+ 		fSelectedView = fBatteryViewList.ItemAt(0);	
+
+Modified: haiku/trunk/src/apps/powerstatus/ExtendedInfoWindow.h
+===================================================================
+--- haiku/trunk/src/apps/powerstatus/ExtendedInfoWindow.h	2009-07-11 10:17:06 UTC (rev 31516)
++++ haiku/trunk/src/apps/powerstatus/ExtendedInfoWindow.h	2009-07-11 10:53:29 UTC (rev 31517)
+@@ -10,7 +10,7 @@
+ #define EXTENDED_INFO_WINDOW_H
+ 
+ #include &lt;ObjectList.h&gt;
+-#include &lt;StringView.h&gt;
++#include &lt;String.h&gt;
+ #include &lt;View.h&gt;
+ #include &lt;Window.h&gt;
+ 
+@@ -18,18 +18,40 @@
+ #include &quot;PowerStatusView.h&quot;
+ 
+ 
++class FontString
++{
++public:
++					FontString();
++
++	const BFont*	font;
++	BString			string;	
++};
++
++
+ class BatteryInfoView : public BView
+ {
+ 	public:
+-						BatteryInfoView(BRect frame, int32 resizingMode);
++						BatteryInfoView();
++						~BatteryInfoView();
+ 
+ 		virtual void	Update(battery_info&amp; info,
+ 							acpi_extended_battery_info&amp; extInfo);
+ 		virtual	void	Draw(BRect updateRect);
+-	
++		virtual void	GetPreferredSize(float *width, float *height);
++		
+ 	private:
+-		battery_info	fBatteryInfo;
+-		acpi_extended_battery_info fBatteryExtendedInfo;
++		BSize			_MeasureString(const BString&amp; string);
++		void			_FillStringList();
++		void			_AddToStringList(FontString* fontString);
++		void			_ClearStringList();
++
++		battery_info				fBatteryInfo;
++		acpi_extended_battery_info	fBatteryExtendedInfo;
++		
++		BSize						fPreferredSize;
++		
++		BObjectList&lt;FontString&gt;		fStringList;
++		BSize						fMaxStringSize;
+ };
+ 
+ 
+@@ -44,7 +66,7 @@
+ 			
+ 		virtual	void	Draw(BRect updateRect);
+ 		virtual	void	MouseDown(BPoint where);
+-	
++
+ 		virtual void	Select(bool select = true);
+ 		
+ 		// return true if it battery is in a none critical state
+
+Modified: haiku/trunk/src/apps/powerstatus/PowerStatusView.cpp
+===================================================================
+--- haiku/trunk/src/apps/powerstatus/PowerStatusView.cpp	2009-07-11 10:17:06 UTC (rev 31516)
++++ haiku/trunk/src/apps/powerstatus/PowerStatusView.cpp	2009-07-11 10:53:29 UTC (rev 31517)
+@@ -295,7 +295,7 @@
+ 	if (!fShowTime &amp;&amp; fPercent &gt;= 0)
+ 		snprintf(buffer, bufferLength, &quot;%s%ld%%%s&quot;, open, fPercent, close);
+ 	else if (fShowTime &amp;&amp; fTimeLeft &gt;= 0) {
+-		snprintf(buffer, bufferLength, &quot;%s%ld:%ld%s&quot;,
++		snprintf(buffer, bufferLength, &quot;%s%ld:%02ld%s&quot;,
+ 			open, fTimeLeft / 3600, (fTimeLeft / 60) % 60, close);
+ 	}
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017912.html">[Haiku-commits] r31516 - haiku/trunk
+</A></li>
+	<LI>Next message: <A HREF="017914.html">[Haiku-commits] r31518 - haiku/trunk/src/libs/print/libprint
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17913">[ date ]</a>
+              <a href="thread.html#17913">[ thread ]</a>
+              <a href="subject.html#17913">[ subject ]</a>
+              <a href="author.html#17913">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

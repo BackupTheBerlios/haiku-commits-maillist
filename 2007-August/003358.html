@@ -1,0 +1,172 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21816 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21816%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200708040033.l740XogJ003235%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003357.html">
+   <LINK REL="Next"  HREF="003359.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21816 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21816%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200708040033.l740XogJ003235%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21816 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Aug  4 02:33:50 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003357.html">[Haiku-commits] r21815 - haiku/trunk/src/system/kernel/cache
+</A></li>
+        <LI>Next message: <A HREF="003359.html">[Haiku-commits] r21817 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3358">[ date ]</a>
+              <a href="thread.html#3358">[ thread ]</a>
+              <a href="subject.html#3358">[ subject ]</a>
+              <a href="author.html#3358">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-08-04 02:33:47 +0200 (Sat, 04 Aug 2007)
+New Revision: 21816
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21816&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21816&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+fault_find_page(): Fixed a race condition in case of reading the page
+from the store into the top cache, which could lead to pages inserted
+multiple times into the cache. We don't insert a dummy page in this case
+anymore. Instead we mark a freshly allocated page busy and insert that
+one. That's exactly the approach the file cache uses too. This does
+probably make the whole dummy page special handling in the file cache
+obsolete.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-04 00:24:13 UTC (rev 21815)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-04 00:33:47 UTC (rev 21816)
+@@ -3239,59 +3239,56 @@
+ 
+ 		// The current cache does not contain the page we're looking for
+ 
+-		// If we're at the top most cache, insert the dummy page here to keep other threads
+-		// from faulting on the same address and chasing us up the cache chain
+-		if (cache == topCache &amp;&amp; dummyPage.state != PAGE_STATE_BUSY)
+-			fault_insert_dummy_page(cache, dummyPage, cacheOffset);
+-
+ 		// see if the vm_store has it
+ 		vm_store *store = cache-&gt;store;
+-		if (store-&gt;ops-&gt;has_page != NULL &amp;&amp; store-&gt;ops-&gt;has_page(store, cacheOffset)) {
+-			size_t bytesRead;
+-			iovec vec;
++		if (store-&gt;ops-&gt;has_page != NULL
++			&amp;&amp; store-&gt;ops-&gt;has_page(store, cacheOffset)) {
+ 
++			// insert a fresh page and mark it busy -- we're going to read it in
+ 			page = vm_page_allocate_page(PAGE_STATE_FREE);
++			page-&gt;state = PAGE_STATE_BUSY;
++			vm_cache_insert_page(cache, page, cacheOffset);
+ 
+-			// we mark that page busy reading, so that the file cache can
+-			// ignore us in case it works on the very same page
+-			// (this is actually only needed if this is the topRefCache, but we
+-			// do it anyway for simplicity's sake)
+-			dummyPage.queue_next = page;
+-			dummyPage.busy_reading = true;
+-
+ 			mutex_unlock(&amp;cache-&gt;lock);
+ 
+-			map-&gt;ops-&gt;get_physical_page(page-&gt;physical_page_number * B_PAGE_SIZE,
++			// get a virtual address for the page
++			iovec vec;
++			map-&gt;ops-&gt;get_physical_page(
++				page-&gt;physical_page_number * B_PAGE_SIZE,
+ 				(addr_t *)&amp;vec.iov_base, PHYSICAL_PAGE_CAN_WAIT);
+-			vec.iov_len = bytesRead = B_PAGE_SIZE;
++			size_t bytesRead = vec.iov_len = B_PAGE_SIZE;
+ 
++			// read it in
+ 			status_t status = store-&gt;ops-&gt;read(store, cacheOffset, &amp;vec, 1,
+ 				&amp;bytesRead, false);
+-			if (status &lt; B_OK) {
+-				// TODO: real error handling!
+-				panic(&quot;reading from store %p (cache %p) returned: %s!\n&quot;,
+-					store, cache, strerror(status));
+-			}
++
+ 			map-&gt;ops-&gt;put_physical_page((addr_t)vec.iov_base);
+ 
+ 			mutex_lock(&amp;cache-&gt;lock);
+ 
+-			if (cache == topCache)
+-				fault_remove_dummy_page(dummyPage, true);
++			if (status &lt; B_OK) {
++				// on error remove and free the page
++				dprintf(&quot;reading page from store %p (cache %p) returned: %s!\n&quot;,
++					store, cache, strerror(status));
+ 
+-			// We insert the queue_next here, because someone else could have
+-			// replaced our page
+-			vm_cache_insert_page(cache, dummyPage.queue_next, cacheOffset);
+-
+-			if (dummyPage.queue_next != page) {
+-				// Indeed, the page got replaced by someone else - we can safely
+-				// throw our page away now
++				vm_cache_remove_page(cache, page);
+ 				vm_page_set_state(page, PAGE_STATE_FREE);
+-				page = dummyPage.queue_next;
++
++				return NULL;
+ 			}
++
++			// mark the page unbusy again
++			page-&gt;state = PAGE_STATE_ACTIVE;
++
+ 			break;
+ 		}
+ 
++		// If we're at the top most cache, insert the dummy page here to keep
++		// other threads from faulting on the same address and chasing us up the
++		// cache chain
++		if (cache == topCache &amp;&amp; dummyPage.state != PAGE_STATE_BUSY)
++			fault_insert_dummy_page(cache, dummyPage, cacheOffset);
++
+ 		vm_cache *nextCache;
+ 		status_t status = fault_acquire_locked_source(cache, &amp;nextCache);
+ 		if (status == B_BUSY) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003357.html">[Haiku-commits] r21815 - haiku/trunk/src/system/kernel/cache
+</A></li>
+	<LI>Next message: <A HREF="003359.html">[Haiku-commits] r21817 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3358">[ date ]</a>
+              <a href="thread.html#3358">[ thread ]</a>
+              <a href="subject.html#3358">[ subject ]</a>
+              <a href="author.html#3358">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

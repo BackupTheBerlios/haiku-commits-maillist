@@ -1,0 +1,282 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22858 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22858%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200711081345.lA8Dj6wj026680%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004669.html">
+   <LINK REL="Next"  HREF="004665.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22858 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22858%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200711081345.lA8Dj6wj026680%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22858 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Nov  8 14:45:06 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004669.html">[Haiku-commits] r22857 - haiku/trunk/src/system/kernel/cache
+</A></li>
+        <LI>Next message: <A HREF="004665.html">[Haiku-commits] r22859 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4663">[ date ]</a>
+              <a href="thread.html#4663">[ thread ]</a>
+              <a href="subject.html#4663">[ subject ]</a>
+              <a href="author.html#4663">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-11-08 14:45:04 +0100 (Thu, 08 Nov 2007)
+New Revision: 22858
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22858&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22858&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+Log:
+* read_into_cache() and write_to_cache() both did not compute the number of
+  needed pages correctly, and would also not read/write enough in case the
+  offset didn't start at 0 resulting in undetected short reads/writes. It's
+  amazing how many bugs can be hidden in a few lines of code.
+* Fixed a bug that might have been the cause for bug #1601: when the last part
+  of the write did not end on a page boundary, the last page had to be read
+  first, but that was done from the wrong offset. Also, if only parts of that
+  page could be read (because the file size didn't span over the whole page)
+  the remaining parts needed to be cleared.
+* The cache_funcs were always called with the same value for numBytes and
+  bufferSize so I've eliminated the former.
+* Large reads now also bypass the cache in case of low memory, large writes now
+  also only bypass the cache in that case, following Ingo's suggestion.
+* Fixed compilation with debugging turned on.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-11-08 09:30:58 UTC (rev 22857)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-11-08 13:45:04 UTC (rev 22858)
+@@ -41,6 +41,7 @@
+ 	// must be smaller than MAX_FILE_IO_VECS
+ 	// ToDo: find out how much of these are typically used
+ 
++#define BYPASS_IO_SIZE		65536
+ #define LAST_ACCESSES		3
+ 
+ struct file_extent {
+@@ -79,7 +80,7 @@
+ };
+ 
+ typedef status_t (*cache_func)(file_cache_ref *ref, off_t offset,
+-	size_t numBytes, int32 pageOffset, addr_t buffer, size_t bufferSize,
++	int32 pageOffset, addr_t buffer, size_t bufferSize,
+ 	size_t lastReservedPages, size_t reservePages);
+ 
+ 
+@@ -610,13 +611,12 @@
+ 	operation it will unlock the cache, though.
+ */
+ static status_t
+-read_into_cache(file_cache_ref *ref, off_t offset, size_t numBytes,
+-	int32 pageOffset, addr_t buffer, size_t bufferSize,
+-	size_t lastReservedPages, size_t reservePages)
++read_into_cache(file_cache_ref *ref, off_t offset, int32 pageOffset,
++	addr_t buffer, size_t bufferSize, size_t lastReservedPages,
++	size_t reservePages)
+ {
+-	TRACE((&quot;read_into_cache(offset = %Ld, size = %lu, pageOffset = %ld, buffer &quot;
+-		&quot;= %#lx, bufferSize = %lu\n&quot;, offset, numBytes, pageOffset, buffer,
+-		bufferSize));
++	TRACE((&quot;read_into_cache(offset = %Ld, pageOffset = %ld, buffer = %#lx, &quot;
++		&quot;bufferSize = %lu\n&quot;, offset, pageOffset, buffer, bufferSize));
+ 
+ 	vm_cache *cache = ref-&gt;cache;
+ 
+@@ -625,6 +625,7 @@
+ 	iovec vecs[MAX_IO_VECS];
+ 	int32 vecCount = 0;
+ 
++	size_t numBytes = PAGE_ALIGN(pageOffset + bufferSize);
+ 	vm_page *pages[MAX_IO_VECS];
+ 	ConditionVariable&lt;vm_page&gt; busyConditions[MAX_IO_VECS];
+ 	int32 pageIndex = 0;
+@@ -716,20 +717,43 @@
+ }
+ 
+ 
++static status_t
++read_from_file(file_cache_ref *ref, off_t offset, int32 pageOffset,
++	addr_t buffer, size_t bufferSize, size_t lastReservedPages,
++	size_t reservePages)
++{
++	iovec vec;
++	vec.iov_base = (void *)buffer;
++	vec.iov_len = bufferSize;
++
++	mutex_unlock(&amp;ref-&gt;cache-&gt;lock);
++	vm_page_unreserve_pages(lastReservedPages);
++
++	status_t status = pages_io(ref, offset, &amp;vec, 1, &amp;bufferSize, false);
++	if (status == B_OK)
++		reserve_pages(ref, reservePages, false);
++
++	mutex_lock(&amp;ref-&gt;cache-&gt;lock);
++
++	return status;
++}
++
++
+ /*!	Like read_into_cache() but writes data into the cache.
+ 	To preserve data consistency, it might also read pages into the cache,
+ 	though, if only a partial page gets written.
+ 	The same restrictions apply.
+ */
+ static status_t
+-write_to_cache(file_cache_ref *ref, off_t offset, size_t numBytes,
+-	int32 pageOffset, addr_t buffer, size_t bufferSize,
+-	size_t lastReservedPages, size_t reservePages)
++write_to_cache(file_cache_ref *ref, off_t offset, int32 pageOffset,
++	addr_t buffer, size_t bufferSize, size_t lastReservedPages,
++	size_t reservePages)
+ {
+ 	// TODO: We're using way too much stack! Rather allocate a sufficiently
+ 	// large chunk on the heap.
+ 	iovec vecs[MAX_IO_VECS];
+ 	int32 vecCount = 0;
++	size_t numBytes = PAGE_ALIGN(pageOffset + bufferSize);
+ 	vm_page *pages[MAX_IO_VECS];
+ 	int32 pageIndex = 0;
+ 	status_t status = B_OK;
+@@ -786,17 +810,22 @@
+ 			// the space in the page after this write action needs to be cleaned
+ 			memset((void *)(last + lastPageOffset), 0,
+ 				B_PAGE_SIZE - lastPageOffset);
+-		} else if (vecCount &gt; 1) {
++		} else {
+ 			// the end of this write does not happen on a page boundary, so we
+ 			// need to fetch the last page before we can update it
+ 			iovec readVec = { (void *)last, B_PAGE_SIZE };
+ 			size_t bytesRead = B_PAGE_SIZE;
+ 
+-			status = pages_io(ref, offset + numBytes - B_PAGE_SIZE, &amp;readVec, 1,
+-				&amp;bytesRead, false);
++			status = pages_io(ref, PAGE_ALIGN(offset + pageOffset + bufferSize)
++				- B_PAGE_SIZE, &amp;readVec, 1, &amp;bytesRead, false);
+ 			// ToDo: handle errors for real!
+ 			if (status &lt; B_OK)
+ 				panic(&quot;pages_io() failed: %s!\n&quot;, strerror(status));
++
++			if (bytesRead &lt; B_PAGE_SIZE) {
++				// the space beyond the file size needs to be cleaned
++				memset((void *)(last + bytesRead), 0, B_PAGE_SIZE - bytesRead);
++			}
+ 		}
+ 	}
+ 
+@@ -857,9 +886,9 @@
+ 
+ 
+ static status_t
+-write_to_file(file_cache_ref *ref, off_t offset, size_t numBytes,
+-	int32 pageOffset, addr_t buffer, size_t bufferSize,
+-	size_t lastReservedPages, size_t reservePages)
++write_to_file(file_cache_ref *ref, off_t offset, int32 pageOffset,
++	addr_t buffer, size_t bufferSize, size_t lastReservedPages,
++	size_t reservePages)
+ {
+ 	iovec vec;
+ 	vec.iov_base = (void *)buffer;
+@@ -868,7 +897,7 @@
+ 	mutex_unlock(&amp;ref-&gt;cache-&gt;lock);
+ 	vm_page_unreserve_pages(lastReservedPages);
+ 
+-	status_t status = pages_io(ref, offset, &amp;vec, 1, &amp;numBytes, true);
++	status_t status = pages_io(ref, offset, &amp;vec, 1, &amp;bufferSize, true);
+ 	if (status == B_OK)
+ 		reserve_pages(ref, reservePages, true);
+ 
+@@ -891,8 +920,8 @@
+ 	reservePages = min_c(MAX_IO_VECS,
+ 		(lastLeft - requestSize + B_PAGE_SIZE - 1) &gt;&gt; PAGE_SHIFT);
+ 
+-	status_t status = function(ref, lastOffset, requestSize, lastPageOffset,
+-		lastBuffer, requestSize, lastReservedPages, reservePages);
++	status_t status = function(ref, lastOffset, lastPageOffset, lastBuffer,
++		requestSize, lastReservedPages, reservePages);
+ 	if (status == B_OK) {
+ 		lastReservedPages = reservePages;
+ 		lastBuffer = buffer;
+@@ -939,12 +968,18 @@
+ 
+ 	cache_func function;
+ 	if (doWrite) {
+-		if (size &gt;= 65536)
++		// in low memory situations, we bypass the cache beyond a
++		// certain I/O size
++		if (size &gt;= BYPASS_IO_SIZE &amp;&amp; vm_low_memory_state() != B_NO_LOW_MEMORY)
+ 			function = write_to_file;
+ 		else
+ 			function = write_to_cache;
+-	} else
+-		function = read_into_cache;
++	} else {
++		if (size &gt;= BYPASS_IO_SIZE &amp;&amp; vm_low_memory_state() != B_NO_LOW_MEMORY)
++			function = read_from_file;
++		else
++			function = read_into_cache;
++	}
+ 
+ 	// &quot;offset&quot; and &quot;lastOffset&quot; are always aligned to B_PAGE_SIZE,
+ 	// the &quot;last*&quot; variables always point to the end of the last
+@@ -1048,8 +1083,8 @@
+ 
+ 	// fill the last remaining bytes of the request (either write or read)
+ 
+-	return function(ref, lastOffset, lastLeft, lastPageOffset,
+-		lastBuffer, lastLeft, lastReservedPages, 0);
++	return function(ref, lastOffset, lastPageOffset, lastBuffer, lastLeft,
++		lastReservedPages, 0);
+ }
+ 
+ 
+@@ -1340,7 +1375,7 @@
+ {
+ 	file_cache_ref *ref = (file_cache_ref *)_cacheRef;
+ 
+-	TRACE((&quot;file_cache_set_size(ref = %p, size = %Ld)\n&quot;, ref, size));
++	TRACE((&quot;file_cache_set_size(ref = %p, size = %Ld)\n&quot;, ref, newSize));
+ 
+ 	if (ref == NULL)
+ 		return B_OK;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004669.html">[Haiku-commits] r22857 - haiku/trunk/src/system/kernel/cache
+</A></li>
+	<LI>Next message: <A HREF="004665.html">[Haiku-commits] r22859 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4663">[ date ]</a>
+              <a href="thread.html#4663">[ thread ]</a>
+              <a href="subject.html#4663">[ subject ]</a>
+              <a href="author.html#4663">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

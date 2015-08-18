@@ -1,0 +1,1034 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22506 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22506%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200710110801.l9B81J4w026262%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004221.html">
+   <LINK REL="Next"  HREF="004223.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22506 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22506%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200710110801.l9B81J4w026262%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22506 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Oct 11 10:01:19 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004221.html">[Haiku-commits] r22505 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="004223.html">[Haiku-commits] r22507 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4222">[ date ]</a>
+              <a href="thread.html#4222">[ thread ]</a>
+              <a href="subject.html#4222">[ subject ]</a>
+              <a href="author.html#4222">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-10-11 10:01:18 +0200 (Thu, 11 Oct 2007)
+New Revision: 22506
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22506&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22506&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_priv.h
+   haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+   haiku/trunk/src/system/kernel/vm/vm_low_memory.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* Reworked stealing pages: the page thief thread is gone now,
+  vm_page_reserve_pages() and vm_page_allocate_page() will now steal pages from
+  the inactive queue as needed.
+* We currently never steal active pages anymore, but this might need to be
+  revised later (therefore, the page scanner never waits anymore, but uses
+  mutex_trylock() to lock a cache).
+* The page scanner and writer now both run at normal priority - let's see how
+  that will work out.
+* Introduced an inactive queue.
+* Instead of shuffling pages around in the queue (and therefore destroying LRU)
+  the page stealing mechanism now uses a marker page to be able to release the
+  page lock without losing its position in the queue.
+* The page writer now always grabs the whole release count of the semaphore, so
+  that there won't be a huge backlog to catch up with. 
+* vm_page_num_free_pages() now also includes the inactive queue as well as the
+  reserved pages (they are no longer regarded as free pages).
+* Added a insert_page_after() function that inserts a page after another one,
+  needed by the marker code.
+* clear_page() now gets a vm_page instead of a physical address which simplified
+  some code.
+* Removed superfluous initialization of the queues (if those aren't zeroed on
+  start, we would have serious problems, anyway).
+* Removed old and unimplemented dump_free_page_table() (&quot;free_pages&quot;) KDL
+  command.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_priv.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_priv.h	2007-10-11 07:49:04 UTC (rev 22505)
++++ haiku/trunk/headers/private/kernel/vm_priv.h	2007-10-11 08:01:18 UTC (rev 22506)
+@@ -49,6 +49,7 @@
+ 	bool isUser, addr_t *newip);
+ void vm_unreserve_memory(size_t bytes);
+ status_t vm_try_reserve_memory(size_t bytes);
++void vm_schedule_page_scanner(uint32 target);
+ status_t vm_daemon_init(void);
+ 
+ const char *page_state_to_string(int state);
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-10-11 07:49:04 UTC (rev 22505)
++++ haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-10-11 08:01:18 UTC (rev 22506)
+@@ -65,7 +65,14 @@
+ 	if (cache == NULL)
+ 		return false;
+ 
++#if 0
+ 	mutex_lock(&amp;cache-&gt;lock);
++#else
++	if (mutex_trylock(&amp;cache-&gt;lock) != B_OK) {
++		vm_cache_release_ref(cache);
++		return false;
++	}
++#endif
+ 
+ 	if (cache != page-&gt;cache || _IgnorePage(page)) {
+ 		mutex_unlock(&amp;cache-&gt;lock);
+@@ -185,8 +192,7 @@
+ 		scanPagesCount = kMaxScanPagesCount
+ 			- (kMaxScanPagesCount - kMinScanPagesCount)
+ 			* pagesLeft / sLowPagesCount;
+-		uint32 leftToFree = 32 + (scanPagesCount - 32)
+-			* pagesLeft / sLowPagesCount;
++		uint32 leftToFree = sLowPagesCount - pagesLeft;
+ dprintf(&quot;wait interval %Ld, scan pages %lu, free %lu, target %lu\n&quot;,
+ 	scanWaitInterval, scanPagesCount, pagesLeft, leftToFree);
+ 
+@@ -210,6 +216,13 @@
+ }
+ 
+ 
++void
++vm_schedule_page_scanner(uint32 target)
++{
++	release_sem(sPageDaemonSem);
++}
++
++
+ status_t
+ vm_daemon_init()
+ {
+@@ -223,7 +236,7 @@
+ 
+ 	// create a kernel thread to select pages for pageout
+ 	thread_id thread = spawn_kernel_thread(&amp;page_daemon, &quot;page daemon&quot;,
+-		B_LOW_PRIORITY + 1, NULL);
++		B_NORMAL_PRIORITY, NULL);
+ 	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 
+ 	return B_OK;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_low_memory.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_low_memory.cpp	2007-10-11 07:49:04 UTC (rev 22505)
++++ haiku/trunk/src/system/kernel/vm/vm_low_memory.cpp	2007-10-11 08:01:18 UTC (rev 22506)
+@@ -17,6 +17,7 @@
+ #include &lt;util/AutoLock.h&gt;
+ #include &lt;util/DoublyLinkedList.h&gt;
+ #include &lt;vm_page.h&gt;
++#include &lt;vm_priv.h&gt;
+ 
+ 
+ //#define TRACE_LOW_MEMORY
+@@ -144,6 +145,7 @@
+ {
+ 	// TODO: take requirements into account
+ 
++	vm_schedule_page_scanner(requirements);
+ 	release_sem(sLowMemoryWaitSem);
+ }
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-10-11 07:49:04 UTC (rev 22505)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-10-11 08:01:18 UTC (rev 22506)
+@@ -46,22 +46,21 @@
+ 	uint32	count;
+ } page_queue;
+ 
+-extern bool trimming_cycle;
+-
+ static page_queue sFreePageQueue;
+ static page_queue sClearPageQueue;
+ static page_queue sModifiedPageQueue;
++static page_queue sInactivePageQueue;
+ static page_queue sActivePageQueue;
+ 
+ static vm_page *sPages;
+ static addr_t sPhysicalPageOffset;
+ static size_t sNumPages;
+ static size_t sReservedPages;
++static vint32 sPageDeficit;
+ 
+ static ConditionVariable&lt;page_queue&gt; sFreePageCondition;
+ static spinlock sPageLock;
+ 
+-static sem_id sThiefWaitSem;
+ static sem_id sWriterWaitSem;
+ 
+ 
+@@ -188,11 +187,36 @@
+ }
+ 
+ 
+-static int
+-dump_free_page_table(int argc, char **argv)
++/*! Inserts \a page after the \a before page in the \a queue. */
++static void
++insert_page_after(page_queue *queue, vm_page *before, vm_page *page)
+ {
+-	dprintf(&quot;not finished\n&quot;);
+-	return 0;
++#ifdef DEBUG_PAGE_QUEUE
++	if (page-&gt;queue != NULL) {
++		panic(&quot;enqueue_page(queue: %p, page: %p): page thinks it is &quot;
++			&quot;already in queue %p&quot;, queue, page, page-&gt;queue);
++	}
++#endif	// DEBUG_PAGE_QUEUE
++
++	if (before == NULL) {
++		enqueue_page(queue, page);
++		return;
++	}
++
++	page-&gt;queue_next = before-&gt;queue_next;
++	if (page-&gt;queue_next != NULL)
++		page-&gt;queue_next-&gt;queue_prev = page;
++	page-&gt;queue_prev = before;
++	before-&gt;queue_next = page;
++
++	if (queue-&gt;tail == before)
++		queue-&gt;tail = page;
++
++	queue-&gt;count++;
++
++#ifdef DEBUG_PAGE_QUEUE
++	page-&gt;queue = queue;
++#endif
+ }
+ 
+ 
+@@ -292,7 +316,7 @@
+ 		|| argv[index][1] != 'x') {
+ 		kprintf(&quot;usage: page [-p|-v] &lt;address&gt;\n&quot;
+ 			&quot;  -v looks up a virtual address for the page, -p a physical address.\n&quot;
+-			&quot;  Default is to look for the page structure address directly\n.&quot;);
++			&quot;  Default is to look for the page structure address directly.\n&quot;);
+ 		return 0;
+ 	}
+ 
+@@ -308,7 +332,6 @@
+ 
+ 			addressSpace-&gt;translation_map.ops-&gt;query_interrupt(
+ 				&amp;addressSpace-&gt;translation_map, address, &amp;address, &amp;flags);
+-
+ 		}
+ 		page = vm_lookup_page(address / B_PAGE_SIZE);
+ 	} else
+@@ -365,6 +388,8 @@
+ 		queue = &sModifiedPageQueue;
+ 	else if (!strcmp(argv[1], &quot;active&quot;))
+ 		queue = &sActivePageQueue;
++	else if (!strcmp(argv[1], &quot;inactive&quot;))
++		queue = &sInactivePageQueue;
+ 	else {
+ 		kprintf(&quot;page_queue: unknown queue \&quot;%s\&quot;.\n&quot;, argv[1]);
+ 		return 0;
+@@ -375,24 +400,27 @@
+ 
+ 	if (argc == 3) {
+ 		struct vm_page *page = queue-&gt;head;
+-		const char *type = &quot;unknown&quot;;
++		const char *type = &quot;none&quot;;
+ 		int i;
+ 
+-		switch (page-&gt;cache-&gt;type) {
+-			case CACHE_TYPE_RAM:
+-				type = &quot;RAM&quot;;
+-				break;
+-			case CACHE_TYPE_DEVICE:
+-				type = &quot;device&quot;;
+-				break;
+-			case CACHE_TYPE_VNODE:
+-				type = &quot;vnode&quot;;
+-				break;
+-			case CACHE_TYPE_NULL:
+-				type = &quot;null&quot;;
+-				break;
+-			default:
+-				break;
++		if (page-&gt;cache != NULL) {
++			switch (page-&gt;cache-&gt;type) {
++				case CACHE_TYPE_RAM:
++					type = &quot;RAM&quot;;
++					break;
++				case CACHE_TYPE_DEVICE:
++					type = &quot;device&quot;;
++					break;
++				case CACHE_TYPE_VNODE:
++					type = &quot;vnode&quot;;
++					break;
++				case CACHE_TYPE_NULL:
++					type = &quot;null&quot;;
++					break;
++				default:
++					type = &quot;???&quot;;
++					break;
++			}
+ 		}
+ 
+ 		kprintf(&quot;page        cache       type       state  wired  usage\n&quot;);
+@@ -430,6 +458,7 @@
+ 		counter[PAGE_STATE_WIRED], counter[PAGE_STATE_MODIFIED],
+ 		counter[PAGE_STATE_FREE], counter[PAGE_STATE_CLEAR]);
+ 	kprintf(&quot;reserved pages: %lu\n&quot;, sReservedPages);
++	kprintf(&quot;page deficit: %lu\n&quot;, sPageDeficit);
+ 
+ 	kprintf(&quot;\nfree queue: %p, count = %ld\n&quot;, &amp;sFreePageQueue,
+ 		sFreePageQueue.count);
+@@ -439,10 +468,19 @@
+ 		sModifiedPageQueue.count);
+ 	kprintf(&quot;active queue: %p, count = %ld\n&quot;, &amp;sActivePageQueue,
+ 		sActivePageQueue.count);
++	kprintf(&quot;inactive queue: %p, count = %ld\n&quot;, &amp;sInactivePageQueue,
++		sInactivePageQueue.count);
+ 	return 0;
+ }
+ 
+ 
++static inline size_t
++free_page_queue_count(void)
++{
++	return sFreePageQueue.count + sClearPageQueue.count;
++}
++
++
+ static status_t
+ set_page_state_nolock(vm_page *page, int pageState)
+ {
+@@ -452,11 +490,13 @@
+ 	switch (page-&gt;state) {
+ 		case PAGE_STATE_BUSY:
+ 		case PAGE_STATE_ACTIVE:
+-		case PAGE_STATE_INACTIVE:
+ 		case PAGE_STATE_WIRED:
+ 		case PAGE_STATE_UNUSED:
+ 			fromQueue = &sActivePageQueue;
+ 			break;
++		case PAGE_STATE_INACTIVE:
++			fromQueue = &sInactivePageQueue;
++			break;
+ 		case PAGE_STATE_MODIFIED:
+ 			fromQueue = &sModifiedPageQueue;
+ 			break;
+@@ -480,11 +520,13 @@
+ 	switch (pageState) {
+ 		case PAGE_STATE_BUSY:
+ 		case PAGE_STATE_ACTIVE:
+-		case PAGE_STATE_INACTIVE:
+ 		case PAGE_STATE_WIRED:
+ 		case PAGE_STATE_UNUSED:
+ 			toQueue = &sActivePageQueue;
+ 			break;
++		case PAGE_STATE_INACTIVE:
++			toQueue = &sInactivePageQueue;
++			break;
+ 		case PAGE_STATE_MODIFIED:
+ 			toQueue = &sModifiedPageQueue;
+ 			break;
+@@ -498,11 +540,11 @@
+ 			panic(&quot;vm_page_set_state: invalid target state %d\n&quot;, pageState);
+ 	}
+ 
+-	if (pageState == PAGE_STATE_CLEAR || pageState == PAGE_STATE_FREE) {
+-		if (sFreePageQueue.count + sClearPageQueue.count &lt;= sReservedPages)
+-			sFreePageCondition.NotifyAll();
++	if (pageState == PAGE_STATE_CLEAR || pageState == PAGE_STATE_FREE || pageState == PAGE_STATE_INACTIVE) {
++		if (sPageDeficit &gt; 0)
++			sFreePageCondition.NotifyOne();
+ 
+-		if (page-&gt;cache != NULL)
++		if (pageState != PAGE_STATE_INACTIVE &amp;&amp; page-&gt;cache != NULL)
+ 			panic(&quot;to be freed page %p has cache&quot;, page);
+ 	}
+ 
+@@ -526,24 +568,23 @@
+ 
+ 	if (dequeued) {
+ 		page-&gt;state = state;
+-		enqueue_page(&amp;sActivePageQueue, page);
++		enqueue_page(state == PAGE_STATE_ACTIVE
++			? &amp;sActivePageQueue : &amp;sInactivePageQueue, page);
+ 	} else
+ 		set_page_state_nolock(page, state);
+ }
+ 
+ 
+ static void
+-clear_page(addr_t pa)
++clear_page(struct vm_page *page)
+ {
+-	addr_t va;
++	addr_t virtualAddress;
++	vm_get_physical_page(page-&gt;physical_page_number &lt;&lt; PAGE_SHIFT,
++		&amp;virtualAddress, PHYSICAL_PAGE_CAN_WAIT);
+ 
+-//	dprintf(&quot;clear_page: clearing page 0x%x\n&quot;, pa);
++	memset((void *)virtualAddress, 0, B_PAGE_SIZE);
+ 
+-	vm_get_physical_page(pa, &amp;va, PHYSICAL_PAGE_CAN_WAIT);
+-
+-	memset((void *)va, 0, B_PAGE_SIZE);
+-
+-	vm_put_physical_page(va);
++	vm_put_physical_page(virtualAddress);
+ }
+ 
+ 
+@@ -588,7 +629,7 @@
+ 			scrubCount = i;
+ 
+ 			for (i = 0; i &lt; scrubCount; i++) {
+-				clear_page(page[i]-&gt;physical_page_number * B_PAGE_SIZE);
++				clear_page(page[i]);
+ 			}
+ 
+ 			state = disable_interrupts();
+@@ -650,7 +691,12 @@
+ page_writer(void* /*unused*/)
+ {
+ 	while (true) {
+-		acquire_sem_etc(sWriterWaitSem, 1, B_RELATIVE_TIMEOUT, 3000000);
++		int32 count = 0;
++		get_sem_count(sWriterWaitSem, &amp;count);
++		if (count == 0)
++			count = 1;
++
++		acquire_sem_etc(sWriterWaitSem, count, B_RELATIVE_TIMEOUT, 3000000);
+ 			// all 3 seconds when no one triggers us
+ 
+ 		const uint32 kNumPages = 32;
+@@ -754,171 +800,233 @@
+ }
+ 
+ 
+-/*! The page thief is a &quot;service&quot; that runs in its own thread, and only
+-	gets active in low memory situations.
+-	Its job is to remove unused pages from caches and recycle it. When
+-	low memory is critical, this is potentially the only source of free
+-	pages for the system, so it cannot block on an external service.
+-*/
+-static status_t
+-page_thief(void* /*unused*/)
++static bool
++steal_page(vm_page *page, bool stealActive)
+ {
+-	bigtime_t timeout = B_INFINITE_TIMEOUT;
++	// try to lock the page's cache
+ 
+-	while (true) {
+-		acquire_sem_etc(sThiefWaitSem, 1, B_RELATIVE_TIMEOUT, timeout);
++	class PageCacheTryLocker {
++	public:
++		PageCacheTryLocker(vm_page *page)
++			:
++			fIsLocked(false),
++			fOwnsLock(false)
++		{
++			fCache = vm_cache_acquire_page_cache_ref(page);
++			if (fCache != NULL) {
++				if (fCache-&gt;lock.holder != thread_get_current_thread_id()) {
++					if (mutex_trylock(&amp;fCache-&gt;lock) != B_OK)
++						return;
+ 
+-		int32 state = vm_low_memory_state();
+-		uint32 steal;
+-		int32 score;
+-		switch (state) {
+-			default:
+-				timeout = B_INFINITE_TIMEOUT;
+-				continue;
+-			case B_LOW_MEMORY_NOTE:
+-				timeout = 1000000;
+-				continue;
++					fOwnsLock = true;
++				}
+ 
+-			case B_LOW_MEMORY_WARNING:
+-				steal = 50;
+-				score = -5;
+-				timeout = 1000000;
+-				break;
+-			case B_LOW_MEMORY_CRITICAL:
+-				steal = 500;
+-				score = -1;
+-				timeout = 100000;
+-				break;
++				if (fCache == page-&gt;cache)
++					fIsLocked = true;
++			}
+ 		}
+ 
+-		vm_page* page = NULL;
+-		bool stealActive = false, desperate = false;
+-		InterruptsSpinLocker locker(sPageLock);
++		~PageCacheTryLocker()
++		{
++			if (fOwnsLock)
++				mutex_unlock(&amp;fCache-&gt;lock);
++			if (fCache != NULL)
++				vm_cache_release_ref(fCache);
++		}
+ 
+-		while (steal &gt; 0) {
+-			if (!locker.IsLocked())
+-				locker.Lock();
++		bool IsLocked() { return fIsLocked; }
+ 
+-			// find a candidate to steal from the inactive queue
++	private:
++		vm_cache *fCache;
++		bool fIsLocked;
++		bool fOwnsLock;
++	} cacheLocker(page);
+ 
+-			int32 i = sActivePageQueue.count;
+-			while (i-- &gt; 0) {
+-				// move page to the tail of the queue so that we don't
+-				// scan it again directly
+-				page = dequeue_page(&amp;sActivePageQueue);
+-				enqueue_page(&amp;sActivePageQueue, page);
++	if (!cacheLocker.IsLocked())
++		return false;
+ 
+-				if ((page-&gt;state == PAGE_STATE_INACTIVE
+-						|| (stealActive &amp;&amp; page-&gt;state == PAGE_STATE_ACTIVE
+-							&amp;&amp; page-&gt;wired_count == 0))
+-					&amp;&amp; page-&gt;usage_count &lt;= score)
+-					break;
+-			}
++	// check again if that page is still a candidate
++	if (page-&gt;state != PAGE_STATE_INACTIVE
++		&amp;&amp; (!stealActive || page-&gt;state != PAGE_STATE_ACTIVE
++			|| page-&gt;wired_count != 0))
++		return false;
+ 
+-			if (i &lt; 0) {
+-				if (score == 0) {
+-					if (state != B_LOW_MEMORY_CRITICAL)
+-						break;
+-					if (stealActive &amp;&amp; score &gt; 5)
+-						break;
++	// recheck eventual last minute changes
++	uint32 flags;
++	vm_remove_all_page_mappings(page, &amp;flags);
++	if ((flags &amp; PAGE_MODIFIED) != 0) {
++		// page was modified, don't steal it
++		vm_page_set_state(page, PAGE_STATE_MODIFIED);
++		return false;
++	} else if ((flags &amp; PAGE_ACCESSED) != 0) {
++		// page is in active use, don't steal it
++		vm_page_set_state(page, PAGE_STATE_ACTIVE);
++		return false;
++	}
+ 
+-					// when memory is really low, we really want pages
+-					if (stealActive) {
+-						score = 127;
+-						desperate = true;
+-					} else {
+-						stealActive = true;
+-						score = 5;
+-						steal = 5;
+-					}
++	// we can now steal this page
+ 
+-					// let the page writer clear some pages for reuse
+-					release_sem_etc(sWriterWaitSem, 1, B_DO_NOT_RESCHEDULE);
+-					continue;
+-				}
++	//dprintf(&quot;  steal page %p from cache %p%s\n&quot;, page, page-&gt;cache,
++	//	page-&gt;state == PAGE_STATE_INACTIVE ? &quot;&quot; : &quot; (ACTIVE)&quot;);
+ 
+-				score = 0;
+-				continue;
+-			}
++	vm_cache_remove_page(page-&gt;cache, page);
++	remove_page_from_queue(page-&gt;state == PAGE_STATE_ACTIVE
++		? &amp;sActivePageQueue : &amp;sInactivePageQueue, page);
++	return true;
++}
+ 
+-			locker.Unlock();
+ 
+-			// try to lock the page's cache
++static void
++remove_page_marker(struct vm_page &amp;marker)
++{
++	if (marker.state == PAGE_STATE_UNUSED)
++		return;
+ 
+-			class PageCacheTryLocker {
+-			public:
+-				PageCacheTryLocker(vm_page *page)
+-					: fIsLocked(false)
+-				{
+-					fCache = vm_cache_acquire_page_cache_ref(page);
+-					if (fCache != NULL
+-						&amp;&amp; mutex_trylock(&amp;fCache-&gt;lock) == B_OK) {
+-						if (fCache == page-&gt;cache)
+-							fIsLocked = true;
+-						else
+-							mutex_unlock(&amp;fCache-&gt;lock);
+-					}
+-				}
++	page_queue *queue;
++	vm_page *page;
+ 
+-				~PageCacheTryLocker()
+-				{
+-					if (fIsLocked)
+-						mutex_unlock(&amp;fCache-&gt;lock);
+-					if (fCache != NULL)
+-						vm_cache_release_ref(fCache);
+-				}
++	switch (marker.state) {
++		case PAGE_STATE_ACTIVE:
++			queue = &sActivePageQueue;
++			break;
++		case PAGE_STATE_INACTIVE:
++			queue = &sInactivePageQueue;
++			break;
+ 
+-				bool IsLocked() { return fIsLocked; }
++		default:
++			return;
++	}
+ 
+-			private:
+-				vm_cache *fCache;
+-				bool fIsLocked;
+-			} cacheLocker(page);
++	remove_page_from_queue(queue, &amp;marker);
++	marker.state = PAGE_STATE_UNUSED;
++}
+ 
+-			if (!cacheLocker.IsLocked())
+-				continue;
+ 
+-			// check again if that page is still a candidate
+-			if (page-&gt;state != PAGE_STATE_INACTIVE
+-				&amp;&amp; (!stealActive || page-&gt;state != PAGE_STATE_ACTIVE
+-					|| page-&gt;wired_count != 0))
+-				continue;
++static vm_page *
++find_page_candidate(struct vm_page &amp;marker, bool stealActive)
++{
++	InterruptsSpinLocker locker(sPageLock);
++	page_queue *queue;
++	vm_page *page;
+ 
+-			// recheck eventual last minute changes
+-			uint32 flags;
+-			vm_remove_all_page_mappings(page, &amp;flags);
+-			if ((flags &amp; PAGE_MODIFIED) != 0) {
+-				// page was modified, don't steal it
+-				vm_page_set_state(page, PAGE_STATE_MODIFIED);
+-				continue;
+-			} else if ((flags &amp; PAGE_ACCESSED) != 0 &amp;&amp; !desperate) {
+-				// page is in active use, don't steal it
+-				vm_page_set_state(page, PAGE_STATE_ACTIVE);
+-				continue;
++	switch (marker.state) {
++		case PAGE_STATE_ACTIVE:
++			queue = &sActivePageQueue;
++			page = marker.queue_next;
++			remove_page_from_queue(queue, &amp;marker);
++			marker.state = PAGE_STATE_UNUSED;
++			break;
++		case PAGE_STATE_INACTIVE:
++			queue = &sInactivePageQueue;
++			page = marker.queue_next;
++			remove_page_from_queue(queue, &amp;marker);
++			marker.state = PAGE_STATE_UNUSED;
++			break;
++		default:
++			queue = &sInactivePageQueue;
++			page = sInactivePageQueue.head;
++			if (page == NULL &amp;&amp; stealActive) {
++				queue = &sActivePageQueue;
++				page = sActivePageQueue.head;
+ 			}
++			break;
++	}
+ 
+-			// we can now steal this page
++	while (page != NULL) {
++		if (page-&gt;type != PAGE_TYPE_DUMMY
++			&amp;&amp; (page-&gt;state == PAGE_STATE_INACTIVE
++				|| (stealActive &amp;&amp; page-&gt;state == PAGE_STATE_ACTIVE
++					&amp;&amp; page-&gt;wired_count == 0))) {
++			// insert marker
++			marker.state = queue == &amp;sActivePageQueue ? PAGE_STATE_ACTIVE : PAGE_STATE_INACTIVE;
++			insert_page_after(queue, page, &amp;marker);
++			return page;
++		}
+ 
+-			//dprintf(&quot;  steal page %p from cache %p\n&quot;, page, page-&gt;cache);
+-
+-			vm_cache_remove_page(page-&gt;cache, page);
+-			vm_page_set_state(page, PAGE_STATE_FREE);
+-			steal--;
++		page = page-&gt;queue_next;
++		if (page == NULL &amp;&amp; stealActive &amp;&amp; queue != &amp;sActivePageQueue) {
++			queue = &sActivePageQueue;
++			page = sActivePageQueue.head;
+ 		}
+ 	}
+ 
+-	return B_OK;
++	return NULL;
+ }
+ 
+ 
+-/*!	This triggers a run of the page thief - depending on the memory
+-	pressure, it might not actually do anything, though.
+-	This function is registered as a low memory handler.
+-*/
+-static void
+-schedule_page_thief(void* /*unused*/, int32 level)
++static size_t
++steal_pages(vm_page **pages, size_t count, bool reserve)
+ {
+-	release_sem(sThiefWaitSem);
++	size_t maxCount = count;
++
++	while (true) {
++		vm_page marker;
++		marker.type = PAGE_TYPE_DUMMY;
++		marker.cache = NULL;
++		marker.state = PAGE_STATE_UNUSED;
++
++		bool tried = false;
++		size_t stolen = 0;
++
++		while (count &gt; 0) {
++			vm_page *page = find_page_candidate(marker, false);
++			if (page == NULL)
++				break;
++
++			if (steal_page(page, false)) {
++				if (reserve) {
++					InterruptsSpinLocker _(sPageLock);
++					enqueue_page(&amp;sFreePageQueue, page);
++					page-&gt;state = PAGE_STATE_FREE;
++				} else if (stolen &lt; maxCount) {
++					pages[stolen] = page;
++				}
++				stolen++;
++				count--;
++			} else
++				tried = true;
++		}
++
++		InterruptsSpinLocker locker(sPageLock);
++		remove_page_marker(marker);
++
++		if (reserve &amp;&amp; sReservedPages &lt;= free_page_queue_count()
++			|| count == 0
++			|| !reserve &amp;&amp; (sInactivePageQueue.count &gt; 0
++				|| free_page_queue_count() &gt; sReservedPages))
++			return stolen;
++
++		if (stolen &amp;&amp; !tried &amp;&amp; sInactivePageQueue.count &gt; 0) {
++			count++;
++			continue;
++		}
++		if (tried) {
++			// we had our go, but there are pages left, let someone else
++			// try
++			locker.Unlock();
++			sFreePageCondition.NotifyOne();
++			locker.Lock();
++		}
++
++		// we need to wait for pages to become inactive
++
++		ConditionVariableEntry&lt;page_queue&gt; freeConditionEntry;
++		sPageDeficit++;
++		freeConditionEntry.Add(&amp;sFreePageQueue);
++		locker.Unlock();
++
++		vm_low_memory(count);
++		//snooze(50000);
++			// sleep for 50ms
++
++		freeConditionEntry.Wait();
++
++		locker.Lock();
++		sPageDeficit--;
++
++		if (reserve &amp;&amp; sReservedPages &lt;= free_page_queue_count())
++			return stolen;
++	}
+ }
+ 
+ 
+@@ -1028,26 +1136,8 @@
+ status_t
+ vm_page_init(kernel_args *args)
+ {
+-	uint32 i;
+-
+ 	TRACE((&quot;vm_page_init: entry\n&quot;));
+ 
+-	sPageLock = 0;
+-
+-	// initialize queues
+-	sFreePageQueue.head = NULL;
+-	sFreePageQueue.tail = NULL;
+-	sFreePageQueue.count = 0;
+-	sClearPageQueue.head = NULL;
+-	sClearPageQueue.tail = NULL;
+-	sClearPageQueue.count = 0;
+-	sModifiedPageQueue.head = NULL;
+-	sModifiedPageQueue.tail = NULL;
+-	sModifiedPageQueue.count = 0;
+-	sActivePageQueue.head = NULL;
+-	sActivePageQueue.tail = NULL;
+-	sActivePageQueue.count = 0;
+-
+ 	// map in the new free page table
+ 	sPages = (vm_page *)vm_allocate_early(args, sNumPages * sizeof(vm_page),
+ 		~0L, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+@@ -1056,7 +1146,7 @@
+ 		sPages, sNumPages, (unsigned int)(sNumPages * sizeof(vm_page))));
+ 
+ 	// initialize the free page table
+-	for (i = 0; i &lt; sNumPages; i++) {
++	for (uint32 i = 0; i &lt; sNumPages; i++) {
+ 		sPages[i].physical_page_number = sPhysicalPageOffset + i;
+ 		sPages[i].type = PAGE_TYPE_PHYSICAL;
+ 		sPages[i].state = PAGE_STATE_FREE;
+@@ -1077,7 +1167,7 @@
+ 	TRACE((&quot;initialized table\n&quot;));
+ 
+ 	// mark some of the page ranges inuse
+-	for (i = 0; i &lt; args-&gt;num_physical_allocated_ranges; i++) {
++	for (uint32 i = 0; i &lt; args-&gt;num_physical_allocated_ranges; i++) {
+ 		vm_mark_page_range_inuse(args-&gt;physical_allocated_range[i].start / B_PAGE_SIZE,
+ 			args-&gt;physical_allocated_range[i].size / B_PAGE_SIZE);
+ 	}
+@@ -1099,7 +1189,6 @@
+ 		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+ 
+ 	add_debugger_command(&quot;page_stats&quot;, &amp;dump_page_stats, &quot;Dump statistics about page usage&quot;);
+-	add_debugger_command(&quot;free_pages&quot;, &amp;dump_free_page_table, &quot;Dump list of free pages&quot;);
+ 	add_debugger_command(&quot;page&quot;, &amp;dump_page, &quot;Dump page info&quot;);
+ 	add_debugger_command(&quot;page_queue&quot;, &amp;dump_page_queue, &quot;Dump page queue&quot;);
+ 	add_debugger_command(&quot;find_page&quot;, &amp;find_page,
+@@ -1124,17 +1213,11 @@
+ 	// start page writer and page thief
+ 
+ 	sWriterWaitSem = create_sem(0, &quot;page writer&quot;);
+-	sThiefWaitSem = create_sem(0, &quot;page thief&quot;);
+ 
+ 	thread = spawn_kernel_thread(&amp;page_writer, &quot;page writer&quot;,
+-		B_LOW_PRIORITY + 2, NULL);
++		B_NORMAL_PRIORITY, NULL);
+ 	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 
+-	thread = spawn_kernel_thread(&amp;page_thief, &quot;page thief&quot;,
+-		B_LOW_PRIORITY, NULL);
+-	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
+-
+-	register_low_memory_handler(schedule_page_thief, NULL, 100);
+ 	return B_OK;
+ }
+ 
+@@ -1211,9 +1294,7 @@
+ 
+ 	sReservedPages -= count;
+ 
+-	// TODO: find out why the line below won't work correctly
+-	//if (vm_page_num_free_pages() &lt;= sReservedPages + count)
+-	if (!kernel_startup)
++	if (sPageDeficit &gt; 0)
+ 		sFreePageCondition.NotifyAll();
+ }
+ 
+@@ -1232,24 +1313,15 @@
+ 	InterruptsSpinLocker locker(sPageLock);
+ 
+ 	sReservedPages += count;
+-	size_t freePages = vm_page_num_free_pages();
++	size_t freePages = free_page_queue_count();
+ 	if (sReservedPages &lt;= freePages)
+ 		return;
+ 
+-	ConditionVariableEntry&lt;page_queue&gt; freeConditionEntry;
+-	vm_low_memory(sReservedPages - freePages);
++	locker.Unlock();
+ 
+-	while (true) {
+-		// we need to wait until new pages become available
+-		freeConditionEntry.Add(&amp;sFreePageQueue);
+-		locker.Unlock();
+-	
+-		freeConditionEntry.Wait();
+-
+-		locker.Lock();
+-		if (sReservedPages &lt;= vm_page_num_free_pages())
+-			break;
+-	}
++	steal_pages(NULL, count + 1, true);
++		// we get one more, just in case we can do something someone
++		// else can't
+ }
+ 
+ 
+@@ -1277,7 +1349,7 @@
+ 
+ 	vm_page *page = NULL;
+ 	while (true) {
+-		if (reserved || sReservedPages &lt; vm_page_num_free_pages()) {
++		if (reserved || sReservedPages &lt; free_page_queue_count()) {
+ 			page = dequeue_page(queue);
+ 			if (page == NULL) {
+ #ifdef DEBUG
+@@ -1291,29 +1363,21 @@
+ 			}
+ 		}
+ 
+-		if (page == NULL) {
+-			if (reserved)
+-				panic(&quot;Had reserved page, but there is none!&quot;);
+-#ifdef DEBUG
+-			if (otherQueue-&gt;count != 0) {
+-				panic(&quot;other queue %p corrupted, count = %d\n&quot;, otherQueue,
+-					otherQueue-&gt;count);
+-			}
+-#endif
+-
+-			freeConditionEntry.Add(&amp;sFreePageQueue);
+-			vm_low_memory(sReservedPages + 1);
+-		}
+-
+ 		if (page != NULL)
+ 			break;
+ 
+-		// we need to wait until new pages become available
++		if (reserved)
++			panic(&quot;Had reserved page, but there is none!&quot;);
++
++		// steal one from the inactive list
+ 		locker.Unlock();
++		size_t stolen = steal_pages(&amp;page, 1, false);
++		locker.Lock();
+ 
+-		freeConditionEntry.Wait();
+-
+-		locker.Lock();
++		if (stolen == 0) {
++			// just try again
++			continue;
++		}
+ 	}
+ 
+ 	if (page-&gt;cache != NULL)
+@@ -1329,7 +1393,7 @@
+ 
+ 	// if needed take the page from the free queue and zero it out
+ 	if (pageState == PAGE_STATE_CLEAR &amp;&amp; oldPageState != PAGE_STATE_CLEAR)
+-		clear_page(page-&gt;physical_page_number * B_PAGE_SIZE);
++		clear_page(page);
+ 
+ 	return page;
+ }
+@@ -1406,10 +1470,8 @@
+ 
+ 	if (firstPage != NULL &amp;&amp; pageState == PAGE_STATE_CLEAR) {
+ 		for (uint32 i = 0; i &lt; length; i++) {
+-			if (!sPages[start + i].is_cleared) {
+-	 			clear_page(sPages[start + i].physical_page_number
+-	 				* B_PAGE_SIZE);
+-			}
++			if (!sPages[start + i].is_cleared)
++	 			clear_page(&amp;sPages[start + i]);
+ 		}
+ 	}
+ 
+@@ -1459,11 +1521,13 @@
+ 	switch (page-&gt;state) {
+ 		case PAGE_STATE_BUSY:
+ 		case PAGE_STATE_ACTIVE:
+-		case PAGE_STATE_INACTIVE:
+ 		case PAGE_STATE_WIRED:
+ 		case PAGE_STATE_UNUSED:
+ 			queue = &sActivePageQueue;
+ 			break;
++		case PAGE_STATE_INACTIVE:
++			queue = &sInactivePageQueue;
++			break;
+ 		case PAGE_STATE_MODIFIED:
+ 			queue = &sModifiedPageQueue;
+ 			break;
+@@ -1498,6 +1562,11 @@
+ size_t
+ vm_page_num_free_pages(void)
+ {
+-	return sFreePageQueue.count + sClearPageQueue.count;
++	size_t reservedPages = sReservedPages;
++	size_t count = free_page_queue_count() + sInactivePageQueue.count;
++	if (reservedPages &gt; count)
++		return 0;
++
++	return count - reservedPages;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004221.html">[Haiku-commits] r22505 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="004223.html">[Haiku-commits] r22507 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4222">[ date ]</a>
+              <a href="thread.html#4222">[ thread ]</a>
+              <a href="subject.html#4222">[ subject ]</a>
+              <a href="author.html#4222">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

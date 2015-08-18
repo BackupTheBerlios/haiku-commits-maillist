@@ -1,0 +1,818 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22410 - haiku/trunk/src/servers/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22410%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200710021409.l92E9CFN007505%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004097.html">
+   <LINK REL="Next"  HREF="004099.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22410 - haiku/trunk/src/servers/app</H1>
+    <B>stippi at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22410%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200710021409.l92E9CFN007505%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22410 - haiku/trunk/src/servers/app">stippi at mail.berlios.de
+       </A><BR>
+    <I>Tue Oct  2 16:09:12 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004097.html">[Haiku-commits] r22409 - haiku/trunk/src/system/runtime_loader
+</A></li>
+        <LI>Next message: <A HREF="004099.html">[Haiku-commits] r22411 - haiku/trunk/src/apps/clock
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4098">[ date ]</a>
+              <a href="thread.html#4098">[ thread ]</a>
+              <a href="subject.html#4098">[ subject ]</a>
+              <a href="author.html#4098">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2007-10-02 16:09:11 +0200 (Tue, 02 Oct 2007)
+New Revision: 22410
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22410&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22410&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/Desktop.cpp
+   haiku/trunk/src/servers/app/Desktop.h
+   haiku/trunk/src/servers/app/EventDispatcher.cpp
+   haiku/trunk/src/servers/app/MultiLocker.cpp
+   haiku/trunk/src/servers/app/ServerWindow.cpp
+   haiku/trunk/src/servers/app/ServerWindow.h
+   haiku/trunk/src/servers/app/ViewLayer.cpp
+Log:
+* added a way for the ServerWindow message loop to determine the required type
+  of locking before processing the message (single/all window lock)
+  -&gt; in most message cases, I could comment out the unlocking/locking which
+  switched to the different lock, because the required lock is now already held,
+  this removes some race conditions which were commented in the code already
+* EventDispatcher::SetDragMessage() didn't lock the object, this would have
+  been bad if multiple windows tried to set a drag bitmap at once
+* the Desktop object keeps track of mouse position and pressed buttons, so
+  that it doesn't need to lock the EventDispatcher for sending fake mouse
+  moves to windows on show/hide of windows (solves some cases of possible
+  dead locks with the new locking strategy)
+* the keyboard EventFilter switches the current workspace asynchrnously from
+  the Desktop thread (another source of possible deadlocks)
+* the &quot;reader is trying to become writer&quot; check in MultiLocker is only used
+  in DEBUG mode now
+
+As a summary: It would be nice if ServerWindow used a readlock for all messages
+it processes itself, and forwards all messages for which it needs a write lock
+to the Desktop thread. All cases where either the Desktop or the ServerWindow
+mess with the EventDispatcher are possible sources of deadlocks. This is solved
+right now by making sure that the lock is released before using the
+EventDispatcher.
+
+I have not observed any deadlocks while switching workspaces and launching
+many apps anymore, neither crashes. But I have not tested extensively except
+for in the test environment. That being said, I could reproduce the problems
+on first try before in Haiku.
+
+
+Modified: haiku/trunk/src/servers/app/Desktop.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/Desktop.cpp	2007-10-02 13:17:19 UTC (rev 22409)
++++ haiku/trunk/src/servers/app/Desktop.cpp	2007-10-02 14:09:11 UTC (rev 22410)
+@@ -167,7 +167,7 @@
+ 			{
+ 				STRACE((&quot;Set Workspace %ld\n&quot;, key - 1));
+ 
+-				fDesktop-&gt;SetWorkspace(key - 2);
++				fDesktop-&gt;SetWorkspaceAsync(key - 2);
+ 				return B_SKIP_MESSAGE;
+ 			}
+ 		}
+@@ -228,6 +228,10 @@
+ 	if (message-&gt;FindPoint(&quot;where&quot;, &amp;where) != B_OK)
+ 		return B_DISPATCH_MESSAGE;
+ 
++	int32 buttons;
++	if (message-&gt;FindInt32(&quot;buttons&quot;, &amp;buttons) != B_OK)
++		buttons = 0;
++
+ 	if (!fDesktop-&gt;LockAllWindows())
+ 		return B_DISPATCH_MESSAGE;
+ 
+@@ -271,6 +275,8 @@
+ 		*_target = NULL;
+ 	}
+ 
++	fDesktop-&gt;SetLastMouseState(where, buttons);
++
+ 	fDesktop-&gt;UnlockAllWindows();
+ 
+ 	return B_DISPATCH_MESSAGE;
+@@ -310,10 +316,17 @@
+ 	fSubsetWindows(kSubsetList),
+ 	fWorkspacesLayer(NULL),
+ 	fActiveScreen(NULL),
++
+ 	fWindowLock(&quot;window lock&quot;),
++
++	fFocusFollowsMouse(false),
++
+ 	fMouseEventWindow(NULL),
+ 	fWindowUnderMouse(NULL),
+ 	fViewUnderMouse(B_NULL_TOKEN),
++	fLastMousePosition(B_ORIGIN),
++	fLastMouseButtons(0),
++
+ 	fFocus(NULL),
+ 	fFront(NULL),
+ 	fBack(NULL)
+@@ -605,6 +618,14 @@
+ 				PostMessage(kMsgQuitLooper);
+ 			break;
+ 
++		case AS_ACTIVATE_WORKSPACE: {
++			int32 index;
++			link.Read&lt;int32&gt;(&amp;index);
++
++			SetWorkspace(index);
++			break;
++		}
++
+ 		default:
+ 			printf(&quot;Desktop %d:%s received unexpected code %ld\n&quot;, 0, &quot;baron&quot;, code);
+ 
+@@ -660,11 +681,7 @@
+ }
+ 
+ 
+-ServerCursor*
+-Desktop::Cursor() const
+-{
+-	return HWInterface()-&gt;Cursor();
+-}
++// #pragma mark -
+ 
+ 
+ void
+@@ -681,6 +698,32 @@
+ }
+ 
+ 
++ServerCursor*
++Desktop::Cursor() const
++{
++	return HWInterface()-&gt;Cursor();
++}
++
++
++void
++Desktop::SetLastMouseState(const BPoint&amp; position, int32 buttons)
++{
++	fLastMousePosition = position;
++	fLastMouseButtons = buttons;
++}
++
++
++void
++Desktop::GetLastMouseState(BPoint* position, int32* buttons) const
++{
++	*position = fLastMousePosition;
++	*buttons = fLastMouseButtons;
++}
++
++
++// #pragma mark -
++
++
+ /*!
+ 	\brief Redraws the background (ie. the desktop window, if any).
+ */
+@@ -774,6 +817,20 @@
+ 	You must not hold any window lock when calling this method.
+ */
+ void
++Desktop::SetWorkspaceAsync(int32 index)
++{
++	BPrivate::LinkSender link(MessagePort());
++	link.StartMessage(AS_ACTIVATE_WORKSPACE);
++	link.Attach&lt;int32&gt;(index);
++	link.Flush();
++}
++
++
++/*!
++	Changes the current workspace to the one specified by \a index.
++	You must not hold any window lock when calling this method.
++*/
++void
+ Desktop::SetWorkspace(int32 index)
+ {
+ 	LockAllWindows();
+@@ -1163,10 +1220,6 @@
+ void
+ Desktop::_SendFakeMouseMoved(WindowLayer* window)
+ {
+-	BPoint where;
+-	int32 buttons;
+-	EventDispatcher().GetMouse(where, buttons);
+-
+ 	int32 viewToken = B_NULL_TOKEN;
+ 	EventTarget* target = NULL;
+ 
+@@ -1175,11 +1228,11 @@
+ 	if (window == NULL)
+ 		window = MouseEventWindow();
+ 	if (window == NULL)
+-		window = WindowAt(where);
++		window = WindowAt(fLastMousePosition);
+ 
+ 	if (window != NULL) {
+ 		BMessage message;
+-		window-&gt;MouseMoved(&amp;message, where, &amp;viewToken, true);
++		window-&gt;MouseMoved(&amp;message, fLastMousePosition, &amp;viewToken, true);
+ 
+ 		if (viewToken != B_NULL_TOKEN)
+ 			target = &amp;window-&gt;EventTarget();
+
+Modified: haiku/trunk/src/servers/app/Desktop.h
+===================================================================
+--- haiku/trunk/src/servers/app/Desktop.h	2007-10-02 13:17:19 UTC (rev 22409)
++++ haiku/trunk/src/servers/app/Desktop.h	2007-10-02 14:09:11 UTC (rev 22410)
+@@ -77,6 +77,15 @@
+ 
+ 		void					SetCursor(ServerCursor* cursor);
+ 		ServerCursor*			Cursor() const;
++		void					SetLastMouseState(const BPoint&amp; position,
++									int32 buttons);
++									// for use by the mouse filter only
++									// both mouse position calls require
++									// the Desktop object to be locked
++									// already
++		void					GetLastMouseState(BPoint* position,
++									int32* buttons) const;
++									// for use by ServerWindow
+ 
+ 		void					ScreenChanged(Screen* screen, bool makeDefault);
+ 
+@@ -92,6 +101,7 @@
+ 
+ 		// Workspace methods
+ 
++		void					SetWorkspaceAsync(int32 index);
+ 		void					SetWorkspace(int32 index);
+ 		int32					CurrentWorkspace()
+ 									{ return fCurrentWorkspace; }
+@@ -263,6 +273,8 @@
+ 		WindowLayer*			fMouseEventWindow;
+ 		const WindowLayer*		fWindowUnderMouse;
+ 		int32					fViewUnderMouse;
++		BPoint					fLastMousePosition;
++		int32					fLastMouseButtons;
+ 
+ 		WindowLayer*			fFocus;
+ 		WindowLayer*			fFront;
+
+Modified: haiku/trunk/src/servers/app/EventDispatcher.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/EventDispatcher.cpp	2007-10-02 13:17:19 UTC (rev 22409)
++++ haiku/trunk/src/servers/app/EventDispatcher.cpp	2007-10-02 14:09:11 UTC (rev 22410)
+@@ -551,6 +551,8 @@
+ {
+ 	ETRACE((&quot;EventDispatcher::SetDragMessage()\n&quot;));
+ 
++	BAutolock _(this);
++
+ 	if (fDragBitmap != bitmap) {
+ 		if (fDragBitmap)
+ 			gBitmapManager-&gt;DeleteBitmap(fDragBitmap);
+
+Modified: haiku/trunk/src/servers/app/MultiLocker.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/MultiLocker.cpp	2007-10-02 13:17:19 UTC (rev 22409)
++++ haiku/trunk/src/servers/app/MultiLocker.cpp	2007-10-02 14:09:11 UTC (rev 22410)
+@@ -443,8 +443,10 @@
+ 		locked = true;
+ 	} else {
+ 		// new writer acquiring the lock
++#if DEBUG
+ 		if (IsReadLocked())
+ 			debugger(&quot;Reader wants to become writer!&quot;);
++#endif
+ 
+ 		status_t status;
+ 		do {
+
+Modified: haiku/trunk/src/servers/app/ServerWindow.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ServerWindow.cpp	2007-10-02 13:17:19 UTC (rev 22409)
++++ haiku/trunk/src/servers/app/ServerWindow.cpp	2007-10-02 14:09:11 UTC (rev 22410)
+@@ -368,11 +368,16 @@
+ 	if (fQuitting || !fWindowLayer-&gt;IsHidden() || fWindowLayer-&gt;IsOffscreenWindow())
+ 		return;
+ 
+-// TODO: race condition? maybe we need to dispatch a message to the desktop to show/hide us
++// TODO: deadlock. Desktop::ShowWindow() will eventually lock the event thread,
++// which might be blocking on the all window lock with it's own lock already
++// head.
++// Maybe we need to dispatch a message to the desktop to show/hide us
+ // instead of doing it from this thread.
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
++fDesktop-&gt;UnlockAllWindows();
+ 	fDesktop-&gt;ShowWindow(fWindowLayer);
+-fDesktop-&gt;LockSingleWindow();
++fDesktop-&gt;LockAllWindows();
++//fDesktop-&gt;LockSingleWindow();
+ 
+ 	if (fDirectWindowData != NULL)
+ 		HandleDirectConnection(B_DIRECT_START | B_BUFFER_RESET);
+@@ -394,9 +399,7 @@
+ 
+ // TODO: race condition? maybe we need to dispatch a message to the desktop to show/hide us
+ // instead of doing it from this thread.
+-fDesktop-&gt;UnlockSingleWindow();
+ 	fDesktop-&gt;HideWindow(fWindowLayer);
+-fDesktop-&gt;LockSingleWindow();
+ }
+ 
+ 
+@@ -436,9 +439,9 @@
+ 	}
+ 
+ 	if (fWindowLayer != NULL) {
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 		fDesktop-&gt;SetWindowTitle(fWindowLayer, newTitle);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 	}
+ }
+ 
+@@ -586,12 +589,18 @@
+ 	newLayer-&gt;SetEventMask(eventMask, eventOptions);
+ 
+ 	if (eventMask != 0 || eventOptions != 0) {
+-		fDesktop-&gt;UnlockSingleWindow();
++//		fDesktop-&gt;UnlockSingleWindow();
++//		fDesktop-&gt;LockAllWindows();
++fDesktop-&gt;UnlockAllWindows();
++		// TODO: possible deadlock
+ 		fDesktop-&gt;EventDispatcher().AddListener(EventTarget(),
+ 			newLayer-&gt;Token(), eventMask, eventOptions);
+-		fDesktop-&gt;LockSingleWindow();
++fDesktop-&gt;LockAllWindows();
++//		fDesktop-&gt;UnlockAllWindows();
++//		fDesktop-&gt;LockSingleWindow();
+ 	}
+ 
++	// TODO: default fonts should be created and stored in the Application
+ 	DesktopSettings settings(fDesktop);
+ 	ServerFont font;
+ 	settings.GetDefaultPlainFont(font);
+@@ -661,12 +670,12 @@
+ 
+ 			link.Read&lt;bool&gt;(&amp;activate);
+ 
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 			if (activate)
+ 				fDesktop-&gt;ActivateWindow(fWindowLayer);
+ 			else
+ 				fDesktop-&gt;SendWindowBehind(fWindowLayer, NULL);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 			break;
+ 		}
+ 		case AS_SEND_BEHIND:
+@@ -681,10 +690,10 @@
+ 
+ 			WindowLayer *behindOf;
+ 			if ((behindOf = fDesktop-&gt;FindWindowLayerByClientToken(token, teamID)) != NULL) {
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ // TODO: there is a big race condition when we unlock here (window could be gone by now)!
+ 				fDesktop-&gt;SendWindowBehind(fWindowLayer, behindOf);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 				status = B_OK;
+ 			} else
+ 				status = B_NAME_NOT_FOUND;
+@@ -748,11 +757,11 @@
+ 					|| windowLayer-&gt;Feel() != B_NORMAL_WINDOW_FEEL) {
+ 					status = B_BAD_VALUE;
+ 				} else {
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ // TODO: there is a big race condition when we unlock here (window could be gone by now)!
+ 					status = fDesktop-&gt;AddWindowToSubset(fWindowLayer, windowLayer)
+ 						? B_OK : B_NO_MEMORY;
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 				}
+ 			}
+ 
+@@ -770,10 +779,10 @@
+ 				WindowLayer* windowLayer = fDesktop-&gt;FindWindowLayerByClientToken(
+ 					token, App()-&gt;ClientTeam());
+ 				if (windowLayer != NULL) {
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ // TODO: there is a big race condition when we unlock here (window could be gone by now)!
+ 					fDesktop-&gt;RemoveWindowFromSubset(fWindowLayer, windowLayer);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 					status = B_OK;
+ 				} else
+ 					status = B_BAD_VALUE;
+@@ -797,9 +806,9 @@
+ 			}
+ 
+ 			if (status == B_OK &amp;&amp; !fWindowLayer-&gt;IsOffscreenWindow()) {
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 				fDesktop-&gt;SetWindowLook(fWindowLayer, (window_look)look);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 			}
+ 
+ 			fLink.StartMessage(status);
+@@ -819,9 +828,9 @@
+ 			}
+ 
+ 			if (status == B_OK &amp;&amp; !fWindowLayer-&gt;IsOffscreenWindow()) {
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 				fDesktop-&gt;SetWindowFeel(fWindowLayer, (window_feel)feel);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 			}
+ 
+ 			fLink.StartMessage(status);
+@@ -841,9 +850,9 @@
+ 			}
+ 
+ 			if (status == B_OK &amp;&amp; !fWindowLayer-&gt;IsOffscreenWindow()) {
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 				fDesktop-&gt;SetWindowFlags(fWindowLayer, flags);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 			}
+ 
+ 			fLink.StartMessage(status);
+@@ -886,9 +895,9 @@
+ 			STRACE((&quot;ServerWindow %s: Message AS_SET_WORKSPACES %lx\n&quot;,
+ 				Title(), newWorkspaces));
+ 
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 			fDesktop-&gt;SetWindowWorkspaces(fWindowLayer, newWorkspaces);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 			break;
+ 		}
+ 		case AS_WINDOW_RESIZE:
+@@ -907,9 +916,9 @@
+ 				// pragmatically set window bounds
+ 				fLink.StartMessage(B_BUSY);
+ 			} else {
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 				fDesktop-&gt;ResizeWindowBy(fWindowLayer, xResizeBy, yResizeBy);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 				fLink.StartMessage(B_OK);
+ 			}
+ 			fLink.Flush();
+@@ -931,9 +940,9 @@
+ 				// pragmatically set window positions
+ 				fLink.StartMessage(B_BUSY);
+ 			} else {
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 				fDesktop-&gt;MoveWindowBy(fWindowLayer, xMoveBy, yMoveBy);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 				fLink.StartMessage(B_OK);
+ 			}
+ 			fLink.Flush();
+@@ -960,7 +969,7 @@
+ 			link.Read&lt;int32&gt;(&amp;minHeight);
+ 			link.Read&lt;int32&gt;(&amp;maxHeight);
+ */
+-			fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 
+ 			if (fDesktop-&gt;LockAllWindows()) {
+ 				fWindowLayer-&gt;SetSizeLimits(minWidth, maxWidth,
+@@ -968,7 +977,7 @@
+ 				fDesktop-&gt;UnlockAllWindows();
+ 			}
+ 
+-			fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 
+ 			// and now, sync the client to the limits that we were able to enforce
+ 			fWindowLayer-&gt;GetSizeLimits(&amp;minWidth, &amp;maxWidth,
+@@ -995,9 +1004,9 @@
+ 				if (link.Read(buffer, size) == B_OK) {
+ 					BMessage settings;
+ 					if (settings.Unflatten(buffer) == B_OK) {
+-fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 						fDesktop-&gt;SetWindowDecoratorSettings(fWindowLayer, settings);
+-fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 					}
+ 				}
+ 			}
+@@ -1058,15 +1067,15 @@
+ 		{
+ 			DTRACE((&quot;ServerWindow %s: Message AS_GET_MOUSE\n&quot;, fTitle));
+ 
+-			fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 			// Returns
+ 			// 1) BPoint mouse location
+ 			// 2) int32 button state
+ 
+ 			BPoint where;
+ 			int32 buttons;
+-			fDesktop-&gt;EventDispatcher().GetMouse(where, buttons);
+-			fDesktop-&gt;LockSingleWindow();
++			fDesktop-&gt;GetLastMouseState(&amp;where, &amp;buttons);
++//fDesktop-&gt;LockSingleWindow();
+ 
+ 			fLink.StartMessage(B_OK);
+ 			fLink.Attach&lt;BPoint&gt;(where);
+@@ -1103,10 +1112,10 @@
+ 
+ 			status_t status = B_OK;
+ 			if (!fWindowLayer-&gt;IsOffscreenWindow()) {
+-				fDesktop-&gt;UnlockSingleWindow();
++//fDesktop-&gt;UnlockSingleWindow();
+ 				fDesktop-&gt;SetWindowFeel(fWindowLayer,
+ 					enable ? kWindowScreenFeel : B_NORMAL_WINDOW_FEEL);
+-				fDesktop-&gt;LockSingleWindow();
++//fDesktop-&gt;LockSingleWindow();
+ 			} else
+ 				status = B_BAD_TYPE;
+ 
+@@ -1246,8 +1255,14 @@
+ 					parent-&gt;RemoveChild(view);
+ 
+ 					if (view-&gt;EventMask() != 0) {
+-						fDesktop-&gt;EventDispatcher().RemoveListener(EventTarget(),
+-							token);
++						// TODO: possible deadlock (event dispatcher already
++						// locked itself, waits for Desktop write lock, but
++						// we have it, now we are trying to lock the event
++						// dispatcher -&gt; deadlock)
++fDesktop-&gt;UnlockSingleWindow();
++						fDesktop-&gt;EventDispatcher().RemoveListener(
++							EventTarget(), token);
++fDesktop-&gt;LockSingleWindow();
+ 					}
+ 					if (fCurrentLayer == view)
+ 						_SetCurrentLayer(parent);
+@@ -1288,14 +1303,15 @@
+ 		}
+ 		case AS_LAYER_SET_EVENT_MASK:
+ 		{
+-			STRACE((&quot;ServerWindow %s: Message AS_LAYER_SET_MOUSE_EVENT_MASK: ViewLayer name: %s\n&quot;, fTitle, fCurrentLayer-&gt;Name()));			
++			STRACE((&quot;ServerWindow %s: Message AS_LAYER_SET_EVENT_MASK: ViewLayer name: %s\n&quot;, fTitle, fCurrentLayer-&gt;Name()));			
+ 			uint32 eventMask, options;
+ 
+ 			link.Read&lt;uint32&gt;(&amp;eventMask);
+ 			if (link.Read&lt;uint32&gt;(&amp;options) == B_OK) {
+-				fDesktop-&gt;UnlockSingleWindow();
+ 				fCurrentLayer-&gt;SetEventMask(eventMask, options);
+ 
++fDesktop-&gt;UnlockSingleWindow();
++				// TODO: possible deadlock!
+ 				if (eventMask != 0 || options != 0) {
+ 					fDesktop-&gt;EventDispatcher().AddListener(EventTarget(),
+ 						fCurrentLayer-&gt;Token(), eventMask, options);
+@@ -1303,7 +1319,7 @@
+ 					fDesktop-&gt;EventDispatcher().RemoveListener(EventTarget(),
+ 						fCurrentLayer-&gt;Token());
+ 				}
+-				fDesktop-&gt;LockSingleWindow();
++fDesktop-&gt;LockSingleWindow();
+ 			}
+ 			break;
+ 		}
+@@ -1314,7 +1330,8 @@
+ 
+ 			link.Read&lt;uint32&gt;(&amp;eventMask);
+ 			if (link.Read&lt;uint32&gt;(&amp;options) == B_OK) {
+-				fDesktop-&gt;UnlockSingleWindow();
++fDesktop-&gt;UnlockSingleWindow();
++				// TODO: possible deadlock
+ 				if (eventMask != 0 || options != 0) {
+ 					fDesktop-&gt;EventDispatcher().AddTemporaryListener(EventTarget(),
+ 						fCurrentLayer-&gt;Token(), eventMask, options);
+@@ -1322,7 +1339,7 @@
+ 					fDesktop-&gt;EventDispatcher().RemoveTemporaryListener(EventTarget(),
+ 						fCurrentLayer-&gt;Token());
+ 				}
+-				fDesktop-&gt;LockSingleWindow();
++fDesktop-&gt;LockSingleWindow();
+ 			}
+ 
+ 			// TODO: support B_LOCK_WINDOW_FOCUS option in Desktop
+@@ -1896,8 +1913,11 @@
+ 				if (link.Read(buffer, bufferSize) == B_OK
+ 					&amp;&amp; dragMessage.Unflatten(buffer) == B_OK) {
+ 						ServerBitmap* bitmap = fServerApp-&gt;FindBitmap(bitmapToken);
++						// TODO: possible deadlock
++fDesktop-&gt;UnlockSingleWindow();
+ 						fDesktop-&gt;EventDispatcher().SetDragMessage(dragMessage,
+-																   bitmap, offset);
++							bitmap, offset);
++fDesktop-&gt;LockSingleWindow();
+ 				}
+ 				delete[] buffer;
+ 			}
+@@ -1925,8 +1945,11 @@
+ 				BMessage dragMessage;
+ 				if (link.Read(buffer, bufferSize) == B_OK
+ 					&amp;&amp; dragMessage.Unflatten(buffer) == B_OK) {
++						// TODO: possible deadlock
++fDesktop-&gt;UnlockSingleWindow();
+ 						fDesktop-&gt;EventDispatcher().SetDragMessage(dragMessage,
+ 							NULL /* should be dragRect */, offset);
++fDesktop-&gt;LockSingleWindow();
+ 				}
+ 				delete[] buffer;
+ 			}
+@@ -2857,6 +2880,7 @@
+ 
+ 		int32 messagesProcessed = 0;
+ 		bool lockedDesktop = false;
++		bool needsAllWindowsLocked = false;
+ 
+ 		while (true) {
+ 			if (code == AS_DELETE_WINDOW || code == kMsgQuitLooper) {
+@@ -2881,10 +2905,21 @@
+ 				break;
+ 			}
+ 
+-			if (!lockedDesktop) {
++			needsAllWindowsLocked = _MessageNeedsAllWindowsLocked(code);
++
++			if (!lockedDesktop &amp;&amp; !needsAllWindowsLocked) {
+ 				// only lock it once
+ 				fDesktop-&gt;LockSingleWindow();
+ 				lockedDesktop = true;
++			} else if (lockedDesktop &amp;&amp; !needsAllWindowsLocked) {
++				// nothing to do
++			} else if (needsAllWindowsLocked) {
++				if (lockedDesktop) {
++					// unlock single before locking all
++					fDesktop-&gt;UnlockSingleWindow();
++					lockedDesktop = false;
++				}
++				fDesktop-&gt;LockAllWindows();
+ 			}
+ 
+ 			if (atomic_and(&amp;fRedrawRequested, 0) != 0) {
+@@ -2902,7 +2937,6 @@
+ # endif
+ #endif
+ 			}
+-		
+ 
+ 
+ #ifdef PROFILE_MESSAGE_LOOP
+@@ -2924,9 +2958,13 @@
+ 			}
+ #endif
+ 
++			if (needsAllWindowsLocked)
++				fDesktop-&gt;UnlockAllWindows();
++
+ 			// only process up to 70 waiting messages at once (we have the Desktop locked)
+ 			if (!receiver.HasMessages() || ++messagesProcessed &gt; 70) {
+-				fDesktop-&gt;UnlockSingleWindow();
++				if (lockedDesktop)
++					fDesktop-&gt;UnlockSingleWindow();
+ 				break;
+ 			}
+ 
+@@ -2935,7 +2973,8 @@
+ 			if (status &lt; B_OK) {
+ 				// that shouldn't happen, it's our port
+ 				printf(&quot;Someone deleted our message port!\n&quot;);
+-				fDesktop-&gt;UnlockSingleWindow();
++				if (lockedDesktop)
++					fDesktop-&gt;UnlockSingleWindow();
+ 
+ 				// try to let our client die happily
+ 				NotifyQuitRequested();
+@@ -3152,6 +3191,39 @@
+ }
+ 
+ 
++bool
++ServerWindow::_MessageNeedsAllWindowsLocked(uint32 code) const
++{
++	switch (code) {
++		case AS_SHOW_WINDOW:
++		case AS_HIDE_WINDOW:
++		case AS_MINIMIZE_WINDOW:
++		case AS_ACTIVATE_WINDOW:
++		case AS_SET_WINDOW_TITLE:
++		case AS_ADD_TO_SUBSET:
++		case AS_REMOVE_FROM_SUBSET:
++		case AS_LAYER_CREATE_ROOT:
++		case AS_LAYER_CREATE:
++		case AS_SEND_BEHIND:
++		case AS_SET_LOOK:
++		case AS_SET_FEEL:
++		case AS_SET_FLAGS:
++		case AS_SET_WORKSPACES:
++		case AS_WINDOW_MOVE:
++		case AS_WINDOW_RESIZE:
++		case AS_SET_SIZE_LIMITS:
++		case AS_SET_DECORATOR_SETTINGS:
++		case AS_GET_MOUSE:
++		case AS_DIRECT_WINDOW_SET_FULLSCREEN:
++//		case AS_LAYER_SET_EVENT_MASK:
++//		case AS_LAYER_SET_MOUSE_EVENT_MASK:
++			return true;
++		default:
++			return false;
++	}
++}
++
++
+ status_t
+ ServerWindow::PictureToRegion(ServerPicture *picture, BRegion &amp;region,
+ 	bool inverse, BPoint where)
+
+Modified: haiku/trunk/src/servers/app/ServerWindow.h
+===================================================================
+--- haiku/trunk/src/servers/app/ServerWindow.h	2007-10-02 13:17:19 UTC (rev 22409)
++++ haiku/trunk/src/servers/app/ServerWindow.h	2007-10-02 14:09:11 UTC (rev 22410)
+@@ -127,6 +127,8 @@
+ 			void				_SetCurrentLayer(ViewLayer* view);
+ 			void				_UpdateDrawState(ViewLayer* view);
+ 
++			bool				_MessageNeedsAllWindowsLocked(uint32 code) const;
++
+ 			// TODO: Move me elsewhere
+ 			status_t			PictureToRegion(ServerPicture *picture,
+ 												BRegion &amp;,
+@@ -158,7 +160,7 @@
+ 			ViewLayer*			fCurrentLayer;
+ 			BRegion				fCurrentDrawingRegion;
+ 			bool				fCurrentDrawingRegionValid;
+-			
++
+ 			direct_window_data*	fDirectWindowData;
+ };
+ 
+
+Modified: haiku/trunk/src/servers/app/ViewLayer.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ViewLayer.cpp	2007-10-02 13:17:19 UTC (rev 22409)
++++ haiku/trunk/src/servers/app/ViewLayer.cpp	2007-10-02 14:09:11 UTC (rev 22410)
+@@ -1289,6 +1289,9 @@
+ }
+ 
+ 
++// #pragma mark -
++
++
+ void
+ ViewLayer::MouseDown(BMessage* message, BPoint where)
+ {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004097.html">[Haiku-commits] r22409 - haiku/trunk/src/system/runtime_loader
+</A></li>
+	<LI>Next message: <A HREF="004099.html">[Haiku-commits] r22411 - haiku/trunk/src/apps/clock
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4098">[ date ]</a>
+              <a href="thread.html#4098">[ thread ]</a>
+              <a href="subject.html#4098">[ subject ]</a>
+              <a href="author.html#4098">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

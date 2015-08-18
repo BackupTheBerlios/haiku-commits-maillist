@@ -1,0 +1,419 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25632 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25632%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200805232230.m4NMUMJj014520%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009052.html">
+   <LINK REL="Next"  HREF="009054.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25632 - haiku/trunk/src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25632%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200805232230.m4NMUMJj014520%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25632 - haiku/trunk/src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat May 24 00:30:22 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009052.html">[Haiku-commits] r25631 -	haiku/trunk/src/add-ons/kernel/drivers/random
+</A></li>
+        <LI>Next message: <A HREF="009054.html">[Haiku-commits] r25633 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9053">[ date ]</a>
+              <a href="thread.html#9053">[ thread ]</a>
+              <a href="subject.html#9053">[ subject ]</a>
+              <a href="author.html#9053">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-05-24 00:30:20 +0200 (Sat, 24 May 2008)
+New Revision: 25632
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25632&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25632&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/heap.cpp
+Log:
+* When KERNEL_HEAP_LEAK_CHECK is enabled we also store the calling
+  function requesting the allocation.
+* The &quot;allocations&quot; commands does also print the caller and can filter
+  by caller, now.
+* Added new &quot;allocations_per_caller&quot; command, which sums up allocations
+  per caller and prints them in a table sorted by size or count.
+
+
+Modified: haiku/trunk/src/system/kernel/heap.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/heap.cpp	2008-05-23 22:18:58 UTC (rev 25631)
++++ haiku/trunk/src/system/kernel/heap.cpp	2008-05-23 22:30:20 UTC (rev 25632)
+@@ -8,7 +8,9 @@
+  * Copyright 2001, Travis Geiselbrecht. All rights reserved.
+  * Distributed under the terms of the NewOS License.
+  */
++#include &lt;arch/debug.h&gt;
+ #include &lt;debug.h&gt;
++#include &lt;elf.h&gt;
+ #include &lt;heap.h&gt;
+ #include &lt;int.h&gt;
+ #include &lt;kernel.h&gt;
+@@ -41,10 +43,21 @@
+ 
+ #if KERNEL_HEAP_LEAK_CHECK
+ typedef struct heap_leak_check_info_s {
++	addr_t		caller;
+ 	size_t		size;
+ 	thread_id	thread;
+ 	team_id		team;
+ } heap_leak_check_info;
++
++struct caller_info {
++	addr_t		caller;
++	uint32		count;
++	uint32		size;
++};
++
++static const int32 kCallerInfoTableSize = 1024;
++static caller_info sCallerInfoTable[kCallerInfoTableSize];
++static int32 sCallerInfoCount = 0;
+ #endif
+ 
+ typedef struct heap_page_s {
+@@ -175,6 +188,27 @@
+ // #pragma mark - Debug functions
+ 
+ 
++#if KERNEL_HEAP_LEAK_CHECK
++static addr_t
++get_caller()
++{
++	// Find the first return address outside of the allocator code. Note, that
++	// this makes certain assumptions about how the code for the functions
++	// ends up in the kernel object.
++	addr_t returnAddresses[5];
++	int32 depth = arch_debug_get_stack_trace(returnAddresses, 5, 1, false);
++	for (int32 i = 0; i &lt; depth; i++) {
++		if (returnAddresses[i] &lt; (addr_t)&amp;get_caller
++			|| returnAddresses[i] &gt; (addr_t)&amp;malloc_referenced_release) {
++			return returnAddresses[i];
++		}
++	}
++
++	return 0;
++}
++#endif
++
++
+ static void
+ dump_page(heap_page *page)
+ {
+@@ -251,17 +285,21 @@
+ 
+ 
+ #if KERNEL_HEAP_LEAK_CHECK
++
+ static int
+ dump_allocations(int argc, char **argv)
+ {
+ 	team_id team = -1;
+ 	thread_id thread = -1;
++	addr_t caller = 0;
+ 	bool statsOnly = false;
+ 	for (int32 i = 1; i &lt; argc; i++) {
+ 		if (strcmp(argv[i], &quot;team&quot;) == 0)
+ 			team = strtoul(argv[++i], NULL, 0);
+ 		else if (strcmp(argv[i], &quot;thread&quot;) == 0)
+ 			thread = strtoul(argv[++i], NULL, 0);
++		else if (strcmp(argv[i], &quot;caller&quot;) == 0)
++			caller = strtoul(argv[++i], NULL, 0);
+ 		else if (strcmp(argv[i], &quot;stats&quot;) == 0)
+ 			statsOnly = true;
+ 		else {
+@@ -302,13 +340,15 @@
+ 					info = (heap_leak_check_info *)(base + elementSize
+ 						- sizeof(heap_leak_check_info));
+ 
+-					if ((team == -1 &amp;&amp; thread == -1)
+-						|| (team == -1 &amp;&amp; info-&gt;thread == thread)
+-						|| (thread == -1 &amp;&amp; info-&gt;team == team)) {
++					if ((team == -1 || info-&gt;team == team)
++						&amp;&amp; (thread == -1 || info-&gt;thread == thread)
++						&amp;&amp; (caller == 0 || info-&gt;caller == caller)) {
+ 						// interesting...
+ 						if (!statsOnly) {
+-							dprintf(&quot;team: % 6ld; thread: % 6ld; address: 0x%08lx; size: %lu bytes\n&quot;,
+-								info-&gt;team, info-&gt;thread, base, info-&gt;size);
++							dprintf(&quot;team: % 6ld; thread: % 6ld; &quot;
++								&quot;address: 0x%08lx; size: %lu bytes, &quot;
++								&quot;caller: %#lx\n&quot;, info-&gt;team, info-&gt;thread,
++								base, info-&gt;size, info-&gt;caller);
+ 						}
+ 
+ 						totalSize += info-&gt;size;
+@@ -327,13 +367,14 @@
+ 				info = (heap_leak_check_info *)(base + pageCount * B_PAGE_SIZE
+ 					- sizeof(heap_leak_check_info));
+ 
+-				if ((team == -1 &amp;&amp; thread == -1)
+-					|| (team == -1 &amp;&amp; info-&gt;thread == thread)
+-					|| (thread == -1 &amp;&amp; info-&gt;team == team)) {
++				if ((team == -1 || info-&gt;team == team)
++					&amp;&amp; (thread == -1 || info-&gt;thread == thread)
++					&amp;&amp; (caller == 0 || info-&gt;caller == caller)) {
+ 					// interesting...
+ 					if (!statsOnly) {
+-						dprintf(&quot;team: % 6ld; thread: % 6ld; address: 0x%08lx; size: %lu bytes\n&quot;,
+-							info-&gt;team, info-&gt;thread, base, info-&gt;size);
++						dprintf(&quot;team: % 6ld; thread: % 6ld; address: 0x%08lx;&quot;
++							&quot; size: %lu bytes, caller: %#lx\n&quot;, info-&gt;team,
++							info-&gt;thread, base, info-&gt;size, info-&gt;caller);
+ 					}
+ 
+ 					totalSize += info-&gt;size;
+@@ -351,6 +392,163 @@
+ 	dprintf(&quot;total allocations: %lu; total bytes: %lu\n&quot;, totalCount, totalSize);
+ 	return 0;
+ }
++
++
++static caller_info*
++get_caller_info(addr_t caller)
++{
++	// find the caller info
++	for (int32 i = 0; i &lt; sCallerInfoCount; i++) {
++		if (caller == sCallerInfoTable[i].caller)
++			return &amp;sCallerInfoTable[i];
++	}
++
++	// not found, add a new entry, if there are free slots
++	if (sCallerInfoCount &gt;= kCallerInfoTableSize)
++		return NULL;
++
++	caller_info* info = &amp;sCallerInfoTable[sCallerInfoCount++];
++	info-&gt;caller = caller;
++	info-&gt;count = 0;
++	info-&gt;size = 0;
++
++	return info;
++}
++
++
++static int
++caller_info_compare_size(const void* _a, const void* _b)
++{
++	const caller_info* a = (const caller_info*)_a;
++	const caller_info* b = (const caller_info*)_b;
++	return (int)(b-&gt;size - a-&gt;size);
++}
++
++
++static int
++caller_info_compare_count(const void* _a, const void* _b)
++{
++	const caller_info* a = (const caller_info*)_a;
++	const caller_info* b = (const caller_info*)_b;
++	return (int)(b-&gt;count - a-&gt;count);
++}
++
++
++static int
++dump_allocations_per_caller(int argc, char **argv)
++{
++	bool sortBySize = true;
++	
++	for (int32 i = 1; i &lt; argc; i++) {
++		if (strcmp(argv[i], &quot;-c&quot;) == 0) {
++			sortBySize = false;
++		} else {
++			print_debugger_command_usage(argv[0]);
++			return 0;
++		}
++	}
++
++	sCallerInfoCount = 0;
++
++	heap_allocator *heap = sHeapList;
++	while (heap) {
++		// go through all the pages
++		heap_leak_check_info *info = NULL;
++		for (uint32 i = 0; i &lt; heap-&gt;page_count; i++) {
++			heap_page *page = &amp;heap-&gt;page_table[i];
++			if (!page-&gt;in_use)
++				continue;
++
++			addr_t base = heap-&gt;base + i * B_PAGE_SIZE;
++			if (page-&gt;bin_index &lt; heap-&gt;bin_count) {
++				// page is used by a small allocation bin
++				uint32 elementCount = page-&gt;empty_index;
++				size_t elementSize = heap-&gt;bins[page-&gt;bin_index].element_size;
++				for (uint32 j = 0; j &lt; elementCount; j++, base += elementSize) {
++					// walk the free list to see if this element is in use
++					bool elementInUse = true;
++					for (addr_t *temp = page-&gt;free_list; temp != NULL;
++							temp = (addr_t *)*temp) {
++						if ((addr_t)temp == base) {
++							elementInUse = false;
++							break;
++						}
++					}
++
++					if (!elementInUse)
++						continue;
++
++					info = (heap_leak_check_info *)(base + elementSize
++						- sizeof(heap_leak_check_info));
++
++					caller_info* callerInfo = get_caller_info(info-&gt;caller);
++					if (callerInfo == NULL) {
++						kprintf(&quot;out of space for caller infos\n&quot;);
++						return 0;
++					}
++
++					callerInfo-&gt;count++;
++					callerInfo-&gt;size += info-&gt;size;
++				}
++			} else {
++				// page is used by a big allocation, find the page count
++				uint32 pageCount = 1;
++				while (i + pageCount &lt; heap-&gt;page_count
++					&amp;&amp; heap-&gt;page_table[i + pageCount].in_use
++					&amp;&amp; heap-&gt;page_table[i + pageCount].bin_index == heap-&gt;bin_count
++					&amp;&amp; heap-&gt;page_table[i + pageCount].allocation_id == page-&gt;allocation_id)
++					pageCount++;
++
++				info = (heap_leak_check_info *)(base + pageCount * B_PAGE_SIZE
++					- sizeof(heap_leak_check_info));
++
++				caller_info* callerInfo = get_caller_info(info-&gt;caller);
++				if (callerInfo == NULL) {
++					kprintf(&quot;out of space for caller infos\n&quot;);
++					return 0;
++				}
++
++				callerInfo-&gt;count++;
++				callerInfo-&gt;size += info-&gt;size;
++
++				// skip the allocated pages
++				i += pageCount - 1;
++			}
++		}
++
++		heap = heap-&gt;next;
++	}
++
++	// sort the array
++	qsort(sCallerInfoTable, sCallerInfoCount, sizeof(caller_info),
++		sortBySize ? &amp;caller_info_compare_size : &amp;caller_info_compare_count);
++
++	kprintf(&quot;%ld different callers, sorted by %s...\n\n&quot;, sCallerInfoCount,
++		sortBySize ? &quot;size&quot; : &quot;count&quot;);
++
++	kprintf(&quot;     count        size      caller\n&quot;);
++	kprintf(&quot;----------------------------------\n&quot;);
++	for (int32 i = 0; i &lt; sCallerInfoCount; i++) {
++		caller_info&amp; info = sCallerInfoTable[i];
++		kprintf(&quot;%10ld  %10ld  %#08lx&quot;, info.count, info.size, info.caller);
++
++		const char* symbol;
++		const char* imageName;
++		bool exactMatch;
++		addr_t baseAddress;
++
++		if (elf_debug_lookup_symbol_address(info.caller, &amp;baseAddress, &amp;symbol,
++				&amp;imageName, &amp;exactMatch) == B_OK) {
++			kprintf(&quot;  %s + 0x%lx (%s)%s\n&quot;, symbol,
++				info.caller - baseAddress, imageName,
++				exactMatch ? &quot;&quot; : &quot; (nearest)&quot;);
++		} else
++			kprintf(&quot;\n&quot;);
++	}
++
++	return 0;
++}
++
+ #endif // KERNEL_HEAP_LEAK_CHECK
+ 
+ 
+@@ -589,6 +787,7 @@
+ 		info-&gt;size = size - sizeof(heap_leak_check_info);
+ 		info-&gt;thread = (kernel_startup ? 0 : thread_get_current_thread_id());
+ 		info-&gt;team = (kernel_startup ? 0 : team_get_current_team_id());
++		info-&gt;caller = get_caller();
+ #endif
+ 		return address;
+ 	}
+@@ -626,6 +825,7 @@
+ 		info-&gt;size = size - sizeof(heap_leak_check_info);
+ 		info-&gt;thread = (kernel_startup ? 0 : thread_get_current_thread_id());
+ 		info-&gt;team = (kernel_startup ? 0 : team_get_current_team_id());
++		info-&gt;caller = get_caller();
+ #endif
+ 
+ 		// we return the first slot in this page
+@@ -674,6 +874,7 @@
+ 	info-&gt;size = size - sizeof(heap_leak_check_info);
+ 	info-&gt;thread = (kernel_startup ? 0 : thread_get_current_thread_id());
+ 	info-&gt;team = (kernel_startup ? 0 : team_get_current_team_id());
++	info-&gt;caller = get_caller();
+ #endif
+ 	return (void *)(heap-&gt;base + first * B_PAGE_SIZE);
+ }
+@@ -1039,13 +1240,21 @@
+ 		&quot;given as the argument, currently only the heap count is printed\n&quot;, 0);
+ #if KERNEL_HEAP_LEAK_CHECK
+ 	add_debugger_command_etc(&quot;allocations&quot;, &amp;dump_allocations,
+-		&quot;Dump current allocations&quot;, &quot;[(\&quot;team\&quot; | \&quot;thread\&quot;) &lt;id&gt;] [\&quot;stats\&quot;]\n&quot;
++		&quot;Dump current allocations&quot;,
++		&quot;[(\&quot;team\&quot; | \&quot;thread\&quot;) &lt;id&gt;] [ \&quot;caller\&quot; &lt;address&gt; ] [\&quot;stats\&quot;]\n&quot;
+ 		&quot;If no parameters are given, all current alloactions are dumped.\n&quot;
+-		&quot;If either \&quot;team\&quot; or \&quot;thread\&quot; is specified as the first argument,\n&quot;
+-		&quot;only allocations matching the team or thread id given in the second\n&quot;
+-		&quot;argument are printed.\n&quot;
++		&quot;If \&quot;team\&quot;, \&quot;thread\&quot;, and/or \&quot;caller\&quot; is specified as the first\n&quot;
++		&quot;argument, only allocations matching the team id, thread id, or \n&quot;
++		&quot;caller address given in the second argument are printed.\n&quot;
+ 		&quot;If the optional argument \&quot;stats\&quot; is specified, only the allocation\n&quot;
+ 		&quot;counts and no individual allocations are printed\n&quot;, 0);
++	add_debugger_command_etc(&quot;allocations_per_caller&quot;,
++		&amp;dump_allocations_per_caller,
++		&quot;Dump current allocations summed up per caller&quot;,
++		&quot;[ \&quot;-c\&quot; ]\n&quot;
++		&quot;The current allocations will by summed up by caller (their count and\n&quot;
++		&quot;size) printed in decreasing order by size or, if \&quot;-c\&quot; is\n&quot;
++		&quot;specified, by allocation count.\n&quot;, 0);
+ #endif
+ 	return B_OK;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009052.html">[Haiku-commits] r25631 -	haiku/trunk/src/add-ons/kernel/drivers/random
+</A></li>
+	<LI>Next message: <A HREF="009054.html">[Haiku-commits] r25633 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9053">[ date ]</a>
+              <a href="thread.html#9053">[ thread ]</a>
+              <a href="subject.html#9053">[ subject ]</a>
+              <a href="author.html#9053">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

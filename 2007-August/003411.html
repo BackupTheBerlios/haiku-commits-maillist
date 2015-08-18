@@ -1,0 +1,1086 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21848 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21848%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200708072146.l77Lkxr1028645%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003408.html">
+   <LINK REL="Next"  HREF="003412.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21848 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21848%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200708072146.l77Lkxr1028645%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21848 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Aug  7 23:46:59 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003408.html">[Haiku-commits] r21847 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="003412.html">[Haiku-commits] r21849 - haiku/trunk/headers/posix
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3411">[ date ]</a>
+              <a href="thread.html#3411">[ thread ]</a>
+              <a href="subject.html#3411">[ subject ]</a>
+              <a href="author.html#3411">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-08-07 23:46:58 +0200 (Tue, 07 Aug 2007)
+New Revision: 21848
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21848&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21848&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+bonefish+axeld:
+* Removed the ref_count from vm_areas. You now always need to have the address
+  space locked (read or write, depending on what you do) when dealing with
+  areas.
+* Added helper classes for locking the address space: AddressSpace{Read|Write}Locker,
+  and MultiAddressSpaceLocker which can lock several spaces at once and makes
+  sure no dead locks can happen.
+* resize_area() is now using the MultiAddressSpaceLocker instead of no locking
+  at all; ie. it should now be safely to use.
+* Disabled transfer_area() for now; it will be changed to work like an atomic
+  clone_area()/delete_area(), that is, it will hand out a new ID for the
+  transfered area.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2007-08-07 01:54:08 UTC (rev 21847)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2007-08-07 21:46:58 UTC (rev 21848)
+@@ -163,7 +163,6 @@
+ 	uint32				protection;
+ 	uint16				wiring;
+ 	uint16				memory_type;
+-	vint32				ref_count;
+ 
+ 	struct vm_cache		*cache;
+ 	vint32				no_cache_change;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-07 01:54:08 UTC (rev 21847)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-07 21:46:58 UTC (rev 21848)
+@@ -59,6 +59,79 @@
+ #define ROUNDOWN(a, b) (((a) / (b)) * (b))
+ 
+ 
++class AddressSpaceReadLocker {
++public:
++	AddressSpaceReadLocker(team_id team);
++	AddressSpaceReadLocker();
++	~AddressSpaceReadLocker();
++
++	status_t SetTo(team_id team);
++	status_t SetFromArea(area_id areaID, vm_area*&amp; area);
++
++	bool IsLocked() const { return fLocked; }
++	void Unlock();
++
++	void Unset();
++
++	vm_address_space* AddressSpace() { return fSpace; }
++
++private:
++	vm_address_space* fSpace;
++	bool	fLocked;
++};
++
++class AddressSpaceWriteLocker {
++public:
++	AddressSpaceWriteLocker(team_id team);
++	AddressSpaceWriteLocker();
++	~AddressSpaceWriteLocker();
++
++	status_t SetTo(team_id team);
++	status_t SetFromArea(area_id areaID, vm_area*&amp; area);
++	status_t SetFromArea(team_id team, area_id areaID, bool allowKernel,
++		vm_area*&amp; area);
++	status_t SetFromArea(team_id team, area_id areaID, vm_area*&amp; area);
++
++	bool IsLocked() const { return fLocked; }
++	void Unlock();
++
++	void DegradeToReadLock();
++	void Unset();
++
++	vm_address_space* AddressSpace() { return fSpace; }
++
++private:
++	vm_address_space* fSpace;
++	bool	fLocked;
++	bool	fDegraded;
++};
++
++class MultiAddressSpaceLocker {
++public:
++	MultiAddressSpaceLocker();
++	~MultiAddressSpaceLocker();
++
++	status_t AddTeam(team_id team, vm_address_space** _space = NULL);
++	status_t AddArea(area_id area, vm_address_space** _space = NULL);
++
++	status_t Lock();
++	void Unlock();
++	bool IsLocked() const { return fLocked; }
++
++	void Unset();
++
++private:
++	bool _ResizeIfNeeded();
++	vm_address_space*&amp; _CurrentItem() { return fSpaces[fCount]; }
++
++	static int _CompareItems(const void* _a, const void* _b);
++
++	vm_address_space** fSpaces;
++	int32		fCapacity;
++	int32		fCount;
++	bool		fLocked;
++};
++
+ #define REGION_HASH_TABLE_SIZE 1024
+ static area_id sNextAreaID;
+ static hash_table *sAreaHash;
+@@ -70,10 +143,376 @@
+ static benaphore sAvailableMemoryLock;
+ 
+ // function declarations
+-static status_t vm_soft_fault(addr_t address, bool is_write, bool is_user);
+-static bool vm_put_area(vm_area *area);
++static void delete_area(vm_address_space *addressSpace, vm_area *area);
++static vm_address_space *get_address_space_by_area_id(area_id id);
++static status_t vm_soft_fault(addr_t address, bool isWrite, bool isUser);
+ 
+ 
++//	#pragma mark -
++
++
++AddressSpaceReadLocker::AddressSpaceReadLocker(team_id team)
++	:
++	fSpace(NULL),
++	fLocked(false)
++{
++	SetTo(team);
++}
++
++
++AddressSpaceReadLocker::AddressSpaceReadLocker()
++	:
++	fSpace(NULL),
++	fLocked(false)
++{
++}
++
++
++AddressSpaceReadLocker::~AddressSpaceReadLocker()
++{
++	Unset();
++}
++
++
++void
++AddressSpaceReadLocker::Unset()
++{
++	Unlock();
++	if (fSpace != NULL)
++		vm_put_address_space(fSpace);
++}
++
++
++status_t
++AddressSpaceReadLocker::SetTo(team_id team)
++{
++	fSpace = vm_get_address_space_by_id(team);
++	if (fSpace == NULL)
++		return B_BAD_TEAM_ID;
++
++	acquire_sem_etc(fSpace-&gt;sem, READ_COUNT, 0, 0);
++	fLocked = true;
++	return B_OK;
++}
++
++
++status_t
++AddressSpaceReadLocker::SetFromArea(area_id areaID, vm_area*&amp; area)
++{
++	fSpace = get_address_space_by_area_id(areaID);
++	if (fSpace == NULL)
++		return B_BAD_TEAM_ID;
++
++	acquire_sem_etc(fSpace-&gt;sem, READ_COUNT, 0, 0);
++
++	acquire_sem_etc(sAreaHashLock, READ_COUNT, 0, 0);
++	area = (vm_area *)hash_lookup(sAreaHash, &amp;areaID);
++	release_sem_etc(sAreaHashLock, READ_COUNT, 0);
++
++	if (area == NULL || area-&gt;address_space != fSpace) {
++		release_sem_etc(fSpace-&gt;sem, READ_COUNT, 0);
++		return B_BAD_VALUE;
++	}
++
++	fLocked = true;
++	return B_OK;
++}
++
++
++void
++AddressSpaceReadLocker::Unlock()
++{
++	if (fLocked) {
++		release_sem_etc(fSpace-&gt;sem, READ_COUNT, 0);
++		fLocked = false;
++	}
++}
++
++
++//	#pragma mark -
++
++
++AddressSpaceWriteLocker::AddressSpaceWriteLocker(team_id team)
++	:
++	fSpace(NULL),
++	fLocked(false),
++	fDegraded(false)
++{
++	SetTo(team);
++}
++
++
++AddressSpaceWriteLocker::AddressSpaceWriteLocker()
++	:
++	fSpace(NULL),
++	fLocked(false),
++	fDegraded(false)
++{
++}
++
++
++AddressSpaceWriteLocker::~AddressSpaceWriteLocker()
++{
++	Unset();
++}
++
++
++void
++AddressSpaceWriteLocker::Unset()
++{
++	Unlock();
++	if (fSpace != NULL)
++		vm_put_address_space(fSpace);
++}
++
++
++status_t
++AddressSpaceWriteLocker::SetTo(team_id team)
++{
++	fSpace = vm_get_address_space_by_id(team);
++	if (fSpace == NULL)
++		return B_BAD_TEAM_ID;
++
++	acquire_sem_etc(fSpace-&gt;sem, WRITE_COUNT, 0, 0);
++	fLocked = true;
++	return B_OK;
++}
++
++
++status_t
++AddressSpaceWriteLocker::SetFromArea(area_id areaID, vm_area*&amp; area)
++{
++	fSpace = get_address_space_by_area_id(areaID);
++	if (fSpace == NULL)
++		return B_BAD_VALUE;
++
++	acquire_sem_etc(fSpace-&gt;sem, WRITE_COUNT, 0, 0);
++
++	acquire_sem_etc(sAreaHashLock, READ_COUNT, 0, 0);
++	area = (vm_area*)hash_lookup(sAreaHash, &amp;areaID);
++	release_sem_etc(sAreaHashLock, READ_COUNT, 0);
++
++	if (area == NULL || area-&gt;address_space != fSpace) {
++		release_sem_etc(fSpace-&gt;sem, WRITE_COUNT, 0);
++		return B_BAD_VALUE;
++	}
++
++	fLocked = true;
++	return B_OK;
++}
++
++
++status_t
++AddressSpaceWriteLocker::SetFromArea(team_id team, area_id areaID,
++	bool allowKernel, vm_area*&amp; area)
++{
++	acquire_sem_etc(sAreaHashLock, READ_COUNT, 0, 0);
++
++	area = (vm_area *)hash_lookup(sAreaHash, &amp;areaID);
++	if (area != NULL
++		&amp;&amp; (area-&gt;address_space-&gt;id == team
++			|| allowKernel &amp;&amp; team == vm_kernel_address_space_id())) {
++		fSpace = area-&gt;address_space;
++		atomic_add(&amp;fSpace-&gt;ref_count, 1);
++	}
++
++	release_sem_etc(sAreaHashLock, READ_COUNT, 0);
++
++	if (fSpace == NULL)
++		return B_BAD_VALUE;
++
++	// Second try to get the area -- this time with the address space
++	// write lock held
++
++	acquire_sem_etc(fSpace-&gt;sem, WRITE_COUNT, 0, 0);
++
++	acquire_sem_etc(sAreaHashLock, READ_COUNT, 0, 0);
++	area = (vm_area *)hash_lookup(sAreaHash, &amp;areaID);
++	release_sem_etc(sAreaHashLock, READ_COUNT, 0);
++
++	if (area == NULL) {
++		release_sem_etc(fSpace-&gt;sem, WRITE_COUNT, 0);
++		return B_BAD_VALUE;
++	}
++
++	fLocked = true;
++	return B_OK;
++}
++
++
++status_t
++AddressSpaceWriteLocker::SetFromArea(team_id team, area_id areaID,
++	vm_area*&amp; area)
++{
++	return SetFromArea(team, areaID, false, area);
++}
++
++
++void
++AddressSpaceWriteLocker::Unlock()
++{
++	if (fLocked) {
++		release_sem_etc(fSpace-&gt;sem, fDegraded ? READ_COUNT : WRITE_COUNT, 0);
++		fLocked = false;
++	}
++}
++
++
++void
++AddressSpaceWriteLocker::DegradeToReadLock()
++{
++	release_sem_etc(fSpace-&gt;sem, WRITE_COUNT - READ_COUNT, 0);
++	fDegraded = true;
++}
++
++
++//	#pragma mark -
++
++
++MultiAddressSpaceLocker::MultiAddressSpaceLocker()
++	:
++	fSpaces(NULL),
++	fCapacity(0),
++	fCount(0),
++	fLocked(false)
++{
++}
++
++
++MultiAddressSpaceLocker::~MultiAddressSpaceLocker()
++{
++	Unset();
++	free(fSpaces);
++}
++
++
++/*static*/ int
++MultiAddressSpaceLocker::_CompareItems(const void* _a, const void* _b)
++{
++	vm_address_space* a = *(vm_address_space **)_a;
++	vm_address_space* b = *(vm_address_space **)_b;
++	return a-&gt;id - b-&gt;id;
++}
++
++
++bool
++MultiAddressSpaceLocker::_ResizeIfNeeded()
++{
++	if (fCount == fCapacity) {
++		vm_address_space** items = (vm_address_space**)realloc(fSpaces,
++			(fCapacity + 4) * sizeof(void*));
++		if (items == NULL)
++			return false;
++
++		fCapacity += 4;
++		fSpaces = items;
++	}
++
++	return true;
++}
++
++
++status_t
++MultiAddressSpaceLocker::AddTeam(team_id team, vm_address_space** _space)
++{
++	if (!_ResizeIfNeeded())
++		return B_NO_MEMORY;
++
++	vm_address_space*&amp; space = _CurrentItem();
++	space = vm_get_address_space_by_id(team);
++	if (space == NULL)
++		return B_BAD_VALUE;
++
++	fCount++;
++
++	if (_space != NULL)
++		*_space = space;
++
++	return B_OK;
++}
++
++
++status_t
++MultiAddressSpaceLocker::AddArea(area_id area, vm_address_space** _space)
++{
++	if (!_ResizeIfNeeded())
++		return B_NO_MEMORY;
++
++	vm_address_space*&amp; space = _CurrentItem();
++	space = get_address_space_by_area_id(area);
++	if (space == NULL)
++		return B_BAD_VALUE;
++
++	// check if we have already added this address space
++	for (int32 i = 0; i &lt; fCount; i++) {
++		if (fSpaces[i] == space) {
++			// no need to add it again
++			vm_put_address_space(space);
++			if (_space != NULL)
++				*_space = space;
++			return B_OK;
++		}
++	}
++
++	fCount++;
++
++	if (_space != NULL)
++		*_space = space;
++
++	return B_OK;
++}
++
++
++void
++MultiAddressSpaceLocker::Unset()
++{
++	Unlock();
++
++	for (int32 i = 0; i &lt; fCount; i++) {
++		vm_put_address_space(fSpaces[i]);
++	}
++
++	fCount = 0;
++}
++
++
++status_t
++MultiAddressSpaceLocker::Lock()
++{
++	qsort(fSpaces, fCount, sizeof(void*), &amp;_CompareItems);
++
++	for (int32 i = 0; i &lt; fCount; i++) {
++		status_t status = acquire_sem_etc(fSpaces[i]-&gt;sem, WRITE_COUNT, 0, 0);
++		if (status &lt; B_OK) {
++			while (--i &gt;= 0) {
++				release_sem_etc(fSpaces[i]-&gt;sem, WRITE_COUNT, 0);
++			}
++			return status;
++		}
++	}
++
++	fLocked = true;
++	return B_OK;
++}
++
++
++void
++MultiAddressSpaceLocker::Unlock()
++{
++	if (!fLocked)
++		return;
++
++	for (int32 i = 0; i &lt; fCount; i++) {
++		release_sem_etc(fSpaces[i]-&gt;sem, WRITE_COUNT, 0);
++	}
++
++	fLocked = false;
++}
++
++
++//	#pragma mark -
++
++
+ static int
+ area_compare(void *_area, const void *key)
+ {
+@@ -100,14 +539,34 @@
+ }
+ 
+ 
++static vm_address_space *
++get_address_space_by_area_id(area_id id)
++{
++	vm_address_space* addressSpace = NULL;
++
++	acquire_sem_etc(sAreaHashLock, READ_COUNT, 0, 0);
++
++	vm_area *area = (vm_area *)hash_lookup(sAreaHash, &amp;id);
++	if (area != NULL) {
++		addressSpace = area-&gt;address_space;
++		atomic_add(&amp;addressSpace-&gt;ref_count, 1);
++	}
++
++	release_sem_etc(sAreaHashLock, READ_COUNT, 0);
++
++	return addressSpace;
++}
++
++
++//! You need to have the address space locked when calling this function
+ static vm_area *
+-vm_get_area(area_id id)
++lookup_area(vm_address_space* addressSpace, area_id id)
+ {
+ 	acquire_sem_etc(sAreaHashLock, READ_COUNT, 0, 0);
+ 
+ 	vm_area *area = (vm_area *)hash_lookup(sAreaHash, &amp;id);
+-	if (area != NULL)
+-		atomic_add(&amp;area-&gt;ref_count, 1);
++	if (area != NULL &amp;&amp; area-&gt;address_space != addressSpace)
++		area = NULL;
+ 
+ 	release_sem_etc(sAreaHashLock, READ_COUNT, 0);
+ 
+@@ -158,7 +617,6 @@
+ 	area-&gt;protection = protection;
+ 	area-&gt;wiring = wiring;
+ 	area-&gt;memory_type = 0;
+-	area-&gt;ref_count = 1;
+ 
+ 	area-&gt;cache = NULL;
+ 	area-&gt;no_cache_change = 0;
+@@ -496,18 +954,22 @@
+ }
+ 
+ 
+-//! You need to hold the lock of the cache when calling this function.
++/*! You need to hold the lock of the cache and the write lock of the address
++	space when calling this function.
++*/
+ static status_t
+ map_backing_store(vm_address_space *addressSpace, vm_cache *cache,
+ 	void **_virtualAddress, off_t offset, addr_t size, uint32 addressSpec,
+-	int wiring, int protection, int mapping, vm_area **_area, const char *areaName)
++	int wiring, int protection, int mapping, vm_area **_area,
++	const char *areaName)
+ {
+ 	TRACE((&quot;map_backing_store: aspace %p, cache %p, *vaddr %p, offset 0x%Lx, size %lu, addressSpec %ld, wiring %d, protection %d, _area %p, area_name '%s'\n&quot;,
+ 		addressSpace, cache, *_virtualAddress, offset, size, addressSpec,
+ 		wiring, protection, _area, areaName));
+ 	ASSERT_LOCKED_MUTEX(&amp;cache-&gt;lock);
+ 
+-	vm_area *area = create_area_struct(addressSpace, areaName, wiring, protection);
++	vm_area *area = create_area_struct(addressSpace, areaName, wiring,
++		protection);
+ 	if (area == NULL)
+ 		return B_NO_MEMORY;
+ 
+@@ -521,8 +983,8 @@
+ 		vm_store *newStore;
+ 
+ 		// create an anonymous store object
+-		newStore = vm_store_create_anonymous_noswap((protection &amp; B_STACK_AREA) != 0,
+-			0, USER_STACK_GUARD_PAGES);
++		newStore = vm_store_create_anonymous_noswap(
++			(protection &amp; B_STACK_AREA) != 0, 0, USER_STACK_GUARD_PAGES);
+ 		if (newStore == NULL) {
+ 			status = B_NO_MEMORY;
+ 			goto err1;
+@@ -551,19 +1013,17 @@
+ 	if (status != B_OK)
+ 		goto err2;
+ 
+-	acquire_sem_etc(addressSpace-&gt;sem, WRITE_COUNT, 0, 0);
+-
+ 	// check to see if this address space has entered DELETE state
+ 	if (addressSpace-&gt;state == VM_ASPACE_STATE_DELETION) {
+ 		// okay, someone is trying to delete this address space now, so we can't
+ 		// insert the area, so back out
+ 		status = B_BAD_TEAM_ID;
+-		goto err3;
++		goto err2;
+ 	}
+ 
+ 	status = insert_area(addressSpace, _virtualAddress, addressSpec, size, area);
+ 	if (status &lt; B_OK)
+-		goto err3;
++		goto err2;
+ 
+ 	// attach the cache to the area
+ 	area-&gt;cache = cache;
+@@ -582,13 +1042,9 @@
+ 	// grab a ref to the address space (the area holds this)
+ 	atomic_add(&amp;addressSpace-&gt;ref_count, 1);
+ 
+-	release_sem_etc(addressSpace-&gt;sem, WRITE_COUNT, 0);
+-
+ 	*_area = area;
+ 	return B_OK;
+ 
+-err3:
+-	release_sem_etc(addressSpace-&gt;sem, WRITE_COUNT, 0);
+ err2:
+ 	if (mapping == REGION_PRIVATE_MAP) {
+ 		// we created this cache, so we must delete it again
+@@ -605,27 +1061,21 @@
+ status_t
+ vm_unreserve_address_range(team_id team, void *address, addr_t size)
+ {
+-	vm_address_space *addressSpace;
+-	vm_area *area, *last = NULL;
+-	status_t status = B_OK;
+-
+-	addressSpace = vm_get_address_space_by_id(team);
+-	if (addressSpace == NULL)
++	AddressSpaceWriteLocker locker(team);
++	if (!locker.IsLocked())
+ 		return B_BAD_TEAM_ID;
+ 
+-	acquire_sem_etc(addressSpace-&gt;sem, WRITE_COUNT, 0, 0);
+-
+ 	// check to see if this address space has entered DELETE state
+-	if (addressSpace-&gt;state == VM_ASPACE_STATE_DELETION) {
++	if (locker.AddressSpace()-&gt;state == VM_ASPACE_STATE_DELETION) {
+ 		// okay, someone is trying to delete this address space now, so we can't
+ 		// insert the area, so back out
+-		status = B_BAD_TEAM_ID;
+-		goto out;
++		return B_BAD_TEAM_ID;
+ 	}
+ 
+ 	// search area list and remove any matching reserved ranges
+ 
+-	area = addressSpace-&gt;areas;
++	vm_area* area = locker.AddressSpace()-&gt;areas;
++	vm_area* last = NULL;
+ 	while (area) {
+ 		// the area must be completely part of the reserved range
+ 		if (area-&gt;id == RESERVED_AREA_ID &amp;&amp; area-&gt;base &gt;= (addr_t)address
+@@ -635,10 +1085,10 @@
+ 			if (last)
+ 				last-&gt;address_space_next = reserved-&gt;address_space_next;
+ 			else
+-				addressSpace-&gt;areas = reserved-&gt;address_space_next;
++				locker.AddressSpace()-&gt;areas = reserved-&gt;address_space_next;
+ 
+ 			area = reserved-&gt;address_space_next;
+-			vm_put_address_space(addressSpace);
++			vm_put_address_space(locker.AddressSpace());
+ 			free(reserved);
+ 			continue;
+ 		}
+@@ -646,11 +1096,8 @@
+ 		last = area;
+ 		area = area-&gt;address_space_next;
+ 	}
+-	
+-out:
+-	release_sem_etc(addressSpace-&gt;sem, WRITE_COUNT, 0);
+-	vm_put_address_space(addressSpace);
+-	return status;
++
++	return B_OK;
+ }
+ 
+ 
+@@ -658,56 +1105,42 @@
+ vm_reserve_address_range(team_id team, void **_address, uint32 addressSpec, 
+ 	addr_t size, uint32 flags)
+ {
+-	vm_address_space *addressSpace;
+-	vm_area *area;
+-	status_t status = B_OK;
+-
+ 	if (size == 0)
+ 		return B_BAD_VALUE;
+ 
+-	addressSpace = vm_get_address_space_by_id(team);
+-	if (addressSpace == NULL)
++	AddressSpaceWriteLocker locker(team);
++	if (!locker.IsLocked())
+ 		return B_BAD_TEAM_ID;
+ 
+-	area = create_reserved_area_struct(addressSpace, flags);
+-	if (area == NULL) {
+-		status = B_NO_MEMORY;
+-		goto err1;
++	// check to see if this address space has entered DELETE state
++	if (locker.AddressSpace()-&gt;state == VM_ASPACE_STATE_DELETION) {
++		// okay, someone is trying to delete this address space now, so we
++		// can't insert the area, let's back out
++		return B_BAD_TEAM_ID;
+ 	}
+ 
+-	acquire_sem_etc(addressSpace-&gt;sem, WRITE_COUNT, 0, 0);
++	vm_area *area = create_reserved_area_struct(locker.AddressSpace(), flags);
++	if (area == NULL)
++		return B_NO_MEMORY;
+ 
+-	// check to see if this address space has entered DELETE state
+-	if (addressSpace-&gt;state == VM_ASPACE_STATE_DELETION) {
+-		// okay, someone is trying to delete this address space now, so we can't
+-		// insert the area, let's back out
+-		status = B_BAD_TEAM_ID;
+-		goto err2;
++	status_t status = insert_area(locker.AddressSpace(), _address, addressSpec,
++		size, area);
++	if (status &lt; B_OK) {
++		free(area);
++		return status;
+ 	}
+ 
+-	status = insert_area(addressSpace, _address, addressSpec, size, area);
+-	if (status &lt; B_OK)
+-		goto err2;
+-
+ 	// the area is now reserved!
+ 
+ 	area-&gt;cache_offset = area-&gt;base;
+ 		// we cache the original base address here
+ 
+-	release_sem_etc(addressSpace-&gt;sem, WRITE_COUNT, 0);
+ 	return B_OK;
+-
+-err2:
+-	release_sem_etc(addressSpace-&gt;sem, WRITE_COUNT, 0);
+-	free(area);
+-err1:
+-	vm_put_address_space(addressSpace);
+-	return status;
+ }
+ 
+ 
+ area_id
+-vm_create_anonymous_area(team_id aid, const char *name, void **address, 
++vm_create_anonymous_area(team_id team, const char *name, void **address, 
+ 	uint32 addressSpec, addr_t size, uint32 wiring, uint32 protection)
+ {
+ 	vm_area *area;
+@@ -716,7 +1149,6 @@
+ 	vm_page *page = NULL;
+ 	bool isStack = (protection &amp; B_STACK_AREA) != 0;
+ 	bool canOvercommit = false;
+-	status_t status;
+ 
+ 	TRACE((&quot;create_anonymous_area %s: size 0x%lx\n&quot;, name, size));
+ 
+@@ -761,20 +1193,20 @@
+ 			return B_BAD_VALUE;
+ 	}
+ 
+-	vm_address_space *addressSpace = vm_get_address_space_by_id(aid);
+-	if (addressSpace == NULL)
+-		return B_BAD_TEAM_ID;
++	AddressSpaceWriteLocker locker;
++	status_t status = locker.SetTo(team);
++	if (status != NULL)
++		return status;
+ 
++	vm_address_space *addressSpace = locker.AddressSpace();
+ 	size = PAGE_ALIGN(size);
+ 
+ 	if (wiring == B_CONTIGUOUS) {
+ 		// we try to allocate the page run here upfront as this may easily
+ 		// fail for obvious reasons
+ 		page = vm_page_allocate_page_run(PAGE_STATE_CLEAR, size / B_PAGE_SIZE);
+-		if (page == NULL) {
+-			vm_put_address_space(addressSpace);
++		if (page == NULL)
+ 			return B_NO_MEMORY;
+-		}
+ 	}
+ 
+ 	// create an anonymous store object
+@@ -820,6 +1252,8 @@
+ 		goto err1;
+ 	}
+ 
++	locker.DegradeToReadLock();
++
+ 	switch (wiring) {
+ 		case B_NO_LOCK:
+ 		case B_LAZY_LOCK:
+@@ -938,7 +1372,6 @@
+ 		default:
+ 			break;
+ 	}
+-	vm_put_address_space(addressSpace);
+ 
+ 	TRACE((&quot;vm_create_anonymous_area: done\n&quot;));
+ 
+@@ -961,31 +1394,28 @@
+ 		}
+ 	}	
+ 
+-	vm_put_address_space(addressSpace);
+ 	return status;	
+ }
+ 
+ 
+ area_id
+-vm_map_physical_memory(team_id aspaceID, const char *name, void **_address,
++vm_map_physical_memory(team_id team, const char *name, void **_address,
+ 	uint32 addressSpec, addr_t size, uint32 protection, addr_t physicalAddress)
+ {
+ 	vm_area *area;
+ 	vm_cache *cache;
+ 	vm_store *store;
+ 	addr_t mapOffset;
+-	status_t status;
+ 
+-	TRACE((&quot;vm_map_physical_memory(aspace = %ld, \&quot;%s\&quot;, virtual = %p, spec = %ld,&quot;
+-		&quot; size = %lu, protection = %ld, phys = %p)\n&quot;,
+-		aspaceID, name, _address, addressSpec, size, protection,
+-		(void *)physicalAddress));
++	TRACE((&quot;vm_map_physical_memory(aspace = %ld, \&quot;%s\&quot;, virtual = %p, &quot;
++		&quot;spec = %ld, size = %lu, protection = %ld, phys = %#lx)\n&quot;, team,
++		name, _address, addressSpec, size, protection, physicalAddress));
+ 
+ 	if (!arch_vm_supports_protection(protection))
+ 		return B_NOT_SUPPORTED;
+ 
+-	vm_address_space *addressSpace = vm_get_address_space_by_id(aspaceID);
+-	if (addressSpace == NULL)
++	AddressSpaceWriteLocker locker(team);
++	if (!locker.IsLocked())
+ 		return B_BAD_TEAM_ID;
+ 
+ 	// if the physical address is somewhat inside a page,
+@@ -999,14 +1429,13 @@
+ 	// create an device store object
+ 
+ 	store = vm_store_create_device(physicalAddress);
+-	if (store == NULL) {
+-		status = B_NO_MEMORY;
+-		goto err1;
+-	}
++	if (store == NULL)
++		return B_NO_MEMORY;
++
+ 	cache = vm_cache_create(store);
+ 	if (cache == NULL) {
+-		status = B_NO_MEMORY;
+-		goto err2;
++		store-&gt;ops-&gt;destroy(store);
++		return B_NO_MEMORY;
+ 	}
+ 
+ 	// tell the page scanner to skip over this area, it's pages are special
+@@ -1016,8 +1445,8 @@
+ 
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 
+-	status = map_backing_store(addressSpace, cache, _address, 0, size,
+-		addressSpec &amp; ~B_MTR_MASK, B_FULL_LOCK, protection,
++	status_t status = map_backing_store(locker.AddressSpace(), cache, _address,
++		0, size, addressSpec &amp; ~B_MTR_MASK, B_FULL_LOCK, protection,
+ 		REGION_NO_PRIVATE_MAP, &amp;area, name);
+ 
+ 	mutex_unlock(&amp;cache-&gt;lock);
+@@ -1030,13 +1459,13 @@
+ 		status = arch_vm_set_memory_type(area, physicalAddress,
+ 			addressSpec &amp; B_MTR_MASK);
+ 		if (status &lt; B_OK)
+-			vm_put_area(area);
++			delete_area(locker.AddressSpace(), area);
+ 	}
+ 
+ 	if (status &gt;= B_OK) {
+ 		// make sure our area is mapped in completely
+ 
+-		vm_translation_map *map = &amp;addressSpace-&gt;translation_map;
++		vm_translation_map *map = &amp;locker.AddressSpace()-&gt;translation_map;
+ 		map-&gt;ops-&gt;lock(map);
+ 
+ 		for (addr_t offset = 0; offset &lt; size; offset += B_PAGE_SIZE) {
+@@ -1047,7 +1476,6 @@
+ 		map-&gt;ops-&gt;unlock(map);
+ 	}
+ 
+-	vm_put_address_space(addressSpace);
+ 	if (status &lt; B_OK)
+ 		return status;
+ 
+@@ -1057,12 +1485,6 @@
+ 
+ 	area-&gt;cache_type = CACHE_TYPE_DEVICE;
+ 	return area-&gt;id;
+-
+-err2:
+-	store-&gt;ops-&gt;destroy(store);
+-err1:
+-	vm_put_address_space(addressSpace);
+-	return status;
+ }
+ 
+ 
+@@ -1075,8 +1497,8 @@
+ 	vm_store *store;
+ 	status_t status;
+ 
+-	vm_address_space *addressSpace = vm_get_address_space_by_id(team);
+-	if (addressSpace == NULL)
++	AddressSpaceWriteLocker locker(team);
++	if (!locker.IsLocked())
+ 		return B_BAD_TEAM_ID;
+ 
+ 	size = PAGE_ALIGN(size);
+@@ -1084,14 +1506,13 @@
+ 	// create an null store object
+ 
+ 	store = vm_store_create_null();
+-	if (store == NULL) {
+-		status = B_NO_MEMORY;
+-		goto err1;
+-	}
++	if (store == NULL)
++		return B_NO_MEMORY;
++
+ 	cache = vm_cache_create(store);
+ 	if (cache == NULL) {
+-		status = B_NO_MEMORY;
+-		goto err2;
++		store-&gt;ops-&gt;destroy(store);
++		return B_NO_MEMORY;
+ 	}
+ 
+ 	// tell the page scanner to skip over this area, no pages will be mapped here
+@@ -1101,11 +1522,10 @@
+ 
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 
+-	status = map_backing_store(addressSpace, cache, address, 0, size, addressSpec, 0,
+-		B_KERNEL_READ_AREA, REGION_NO_PRIVATE_MAP, &amp;area, name);
++	status = map_backing_store(locker.AddressSpace(), cache, address, 0, size,
++		addressSpec, 0, B_KERNEL_READ_AREA, REGION_NO_PRIVATE_MAP, &amp;area, name);
+ 
+ 	mutex_unlock(&amp;cache-&gt;lock);
+-	vm_put_address_space(addressSpace);
+ 
+ 	if (status &lt; B_OK) {
+ 		vm_cache_release_ref(cache);
+@@ -1114,12 +1534,6 @@
+ 
+ 	area-&gt;cache_type = CACHE_TYPE_NULL;
+ 	return area-&gt;id;
+-
+-err2:
+-	store-&gt;ops-&gt;destroy(store);
+-err1:
+-	vm_put_address_space(addressSpace);
+-	return status;
+ }
+ 
+ 
+@@ -1174,11 +1588,6 @@
+ 	//	copy of a file at a given time, ie. later changes should not
+ 	//	make it into the mapped copy -- this will need quite some changes
+ 	//	to be done in a nice way
+-
+-	vm_address_space *addressSpace = vm_get_address_space_by_id(team);
+-	if (addressSpace == NULL)
+-		return B_BAD_TEAM_ID;
+-
+ 	TRACE((&quot;_vm_map_file(\&quot;%s\&quot;, offset = %Ld, size = %lu, mapping %ld)\n&quot;,
+ 		path, offset, size, mapping));
+ 
+@@ -1188,8 +1597,14 @@
+ 	// get the vnode for the object, this also grabs a ref to it
+ 	status = vfs_get_vnode_from_path(path, kernel, &amp;vnode);
+ 	if (status &lt; B_OK)
+-		goto err1;
++		return status;
+ 
++	AddressSpaceWriteLocker locker(team);
++	if (!locker.IsLocked()) {
++		vfs_put_vnode(vnode);
++		return B_BAD_TEAM_ID;
++	}
++
+ 	// ToDo: this only works for file systems that use the file cache
+ 	status = vfs_get_vnode_cache(vnode, &amp;cache, false);
+ 
+@@ -1198,11 +1613,11 @@
+ 		// successful, the store already has a ref to it
+ 
+ 	if (status &lt; B_OK)
+-		goto err1;
++		return status;
+ 
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 
+-	status = map_backing_store(addressSpace, cache, _address,
++	status = map_backing_store(locker.AddressSpace(), cache, _address,
+ 		offset, size, addressSpec, 0, protection, mapping, &amp;area, name);
+ 
+ 	mutex_unlock(&amp;cache-&gt;lock);
+@@ -1212,21 +1627,17 @@
+ 		vm_cache_release_ref(cache);
+ 	}
+ 	if (status &lt; B_OK)
+-		goto err1;
++		return status;
+ 
+-	vm_put_address_space(addressSpace);
+ 	area-&gt;cache_type = CACHE_TYPE_VNODE;
+ 	return area-&gt;id;
+-
+-err1:
+-	vm_put_address_space(addressSpace);
+
+[... truncated: 848 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003408.html">[Haiku-commits] r21847 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="003412.html">[Haiku-commits] r21849 - haiku/trunk/headers/posix
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3411">[ date ]</a>
+              <a href="thread.html#3411">[ thread ]</a>
+              <a href="subject.html#3411">[ subject ]</a>
+              <a href="author.html#3411">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,290 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23486 - in haiku/trunk: headers/private/kernel	src/system/libroot src/system/libroot/posix/stdlib	src/system/runtime_loader
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23486%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/libroot%20src/system/libroot/posix/stdlib%0A%09src/system/runtime_loader&In-Reply-To=%3C200801131208.m0DC8ZMI029779%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005449.html">
+   <LINK REL="Next"  HREF="005451.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23486 - in haiku/trunk: headers/private/kernel	src/system/libroot src/system/libroot/posix/stdlib	src/system/runtime_loader</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23486%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/libroot%20src/system/libroot/posix/stdlib%0A%09src/system/runtime_loader&In-Reply-To=%3C200801131208.m0DC8ZMI029779%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23486 - in haiku/trunk: headers/private/kernel	src/system/libroot src/system/libroot/posix/stdlib	src/system/runtime_loader">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun Jan 13 13:08:35 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005449.html">[Haiku-commits] r23485 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+</A></li>
+        <LI>Next message: <A HREF="005451.html">[Haiku-commits] r23487 -	haiku/trunk/src/add-ons/kernel/drivers/network/pegasus
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5450">[ date ]</a>
+              <a href="thread.html#5450">[ thread ]</a>
+              <a href="subject.html#5450">[ subject ]</a>
+              <a href="author.html#5450">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-01-13 13:08:34 +0100 (Sun, 13 Jan 2008)
+New Revision: 23486
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23486&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23486&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/user_runtime.h
+   haiku/trunk/src/system/libroot/libroot_init.c
+   haiku/trunk/src/system/libroot/posix/stdlib/exit.c
+   haiku/trunk/src/system/runtime_loader/elf.cpp
+   haiku/trunk/src/system/runtime_loader/export.c
+Log:
+bonefish+mmlr:
+As (our) gcc unfortunately uses atexit() to clean up lazily initialized static
+variables inside functions we have to ensure that we do the right thing with
+unloadable shared objects. In case a shared object was unloaded that installed
+an atexit() hook the application would crash on exit. We now implement a
+callback into libroot that is used to call all the atexit() hooks of a
+component that is to be unloaded. Most prominently this fixes the media_server
+crash at shutdown.
+
+Modified: haiku/trunk/headers/private/kernel/user_runtime.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/user_runtime.h	2008-01-13 12:02:13 UTC (rev 23485)
++++ haiku/trunk/headers/private/kernel/user_runtime.h	2008-01-13 12:08:34 UTC (rev 23486)
+@@ -41,6 +41,8 @@
+ 
+ 	status_t (*reinit_after_fork)();
+ 
++	void (*call_atexit_hooks_for_range)(addr_t start, addr_t size);
++
+ 	const struct user_space_program_args *program_args;
+ };
+ 
+
+Modified: haiku/trunk/src/system/libroot/libroot_init.c
+===================================================================
+--- haiku/trunk/src/system/libroot/libroot_init.c	2008-01-13 12:02:13 UTC (rev 23485)
++++ haiku/trunk/src/system/libroot/libroot_init.c	2008-01-13 12:08:34 UTC (rev 23486)
+@@ -13,6 +13,8 @@
+ 
+ 
+ void initialize_before(image_id imageID);
++void _call_atexit_hooks_for_range(addr_t start, addr_t size);
++void __init_exit_stack_lock();
+ 
+ struct rld_export *__gRuntimeLoader = NULL;
+ 	// This little bugger is set to something meaningful by the runtime loader
+@@ -48,6 +50,10 @@
+ 	__libc_argc = __gRuntimeLoader-&gt;program_args-&gt;arg_count;
+ 	__libc_argv = __gRuntimeLoader-&gt;program_args-&gt;args;
+ 
++	__gRuntimeLoader-&gt;call_atexit_hooks_for_range
++		= _call_atexit_hooks_for_range;
++
++	__init_exit_stack_lock();
+ 	__init_time();
+ 	__init_fork();
+ 	__init_heap();
+
+Modified: haiku/trunk/src/system/libroot/posix/stdlib/exit.c
+===================================================================
+--- haiku/trunk/src/system/libroot/posix/stdlib/exit.c	2008-01-13 12:02:13 UTC (rev 23485)
++++ haiku/trunk/src/system/libroot/posix/stdlib/exit.c	2008-01-13 12:08:34 UTC (rev 23486)
+@@ -13,16 +13,94 @@
+ #include &lt;stdlib.h&gt;
+ #include &lt;signal.h&gt;
+ #include &lt;limits.h&gt;
++#include &lt;SupportDefs.h&gt;
+ 
+ 
+ extern void _IO_cleanup(void);
+ extern void _thread_do_exit_notification(void);
+ 
+-static void (*sExitStack[ATEXIT_MAX])(void) = {0};
+-static int32 sExitStackIndex = 0;
++struct exit_stack_info {
++	void		(*exit_stack[ATEXIT_MAX])(void);
++	int32		stack_size;
++	sem_id		lock;
++	vint32		lock_count;
++	thread_id	lock_owner;
++	size_t		recursion_count;
++};
+ 
+ 
++static struct exit_stack_info sExitStackInfo = { {}, 0, -1, 0, -1, 0 };
++
++
+ void
++__init_exit_stack_lock()
++{
++	sExitStackInfo.lock = create_sem(0, &quot;exit stack lock&quot;);
++	if (sExitStackInfo.lock &lt; 0)
++		debugger(&quot;failed to create exit stack lock&quot;);
++}
++
++
++static void
++_exit_stack_lock()
++{
++	thread_id self = find_thread(NULL);
++	if (self != sExitStackInfo.lock_owner) {
++		if (atomic_add(&amp;sExitStackInfo.lock_count, 1) &gt; 0)
++			acquire_sem(sExitStackInfo.lock);
++		sExitStackInfo.lock_owner = self;
++	}
++	sExitStackInfo.recursion_count++;
++}
++
++
++static void
++_exit_stack_unlock()
++{
++	if (sExitStackInfo.lock_owner != find_thread(NULL))
++		debugger(&quot;exit stack lock not owned&quot;);
++
++	if (sExitStackInfo.recursion_count-- == 1) {
++		sExitStackInfo.lock_owner = -1;
++		if (atomic_add(&amp;sExitStackInfo.lock_count, -1) == 1)
++			release_sem(sExitStackInfo.lock);
++	}
++}
++
++
++void
++_call_atexit_hooks_for_range(addr_t start, addr_t size)
++{
++	int32 index;
++	int32 insertIndex = -1;
++
++	_exit_stack_lock();
++	for (index = sExitStackInfo.stack_size - 1; index &gt; 0; index--) {
++		addr_t function = (addr_t)sExitStackInfo.exit_stack[index];
++		if (function &gt;= start &amp;&amp; function &lt; start + size) {
++			(*sExitStackInfo.exit_stack[index])();
++			sExitStackInfo.exit_stack[index] = NULL;
++			insertIndex = index;
++		}
++	}
++
++	if (insertIndex &gt;= 0) {
++		for (index = insertIndex + 1;
++			index &lt; sExitStackInfo.stack_size;
++			index++) {
++			if (sExitStackInfo.exit_stack[index] != NULL) {
++				sExitStackInfo.exit_stack[insertIndex++]
++					= sExitStackInfo.exit_stack[index];
++			}
++		}
++		sExitStackInfo.stack_size = insertIndex;
++	}
++
++	_exit_stack_unlock();
++}
++
++
++void
+ abort()
+ {
+ 	fprintf(stderr, &quot;Abort\n&quot;);
+@@ -36,13 +114,16 @@
+ atexit(void (*func)(void))
+ {
+ 	// push the function pointer onto the exit stack
+-	int32 index = atomic_add(&amp;sExitStackIndex, 1);
++	int result = -1;
++	_exit_stack_lock();
+ 
+-	if (index &gt;= ATEXIT_MAX)
+-		return -1;
++	if (sExitStackInfo.stack_size &lt; ATEXIT_MAX) {
++		sExitStackInfo.exit_stack[sExitStackInfo.stack_size++] = func;
++		result = 0;
++	}
+ 
+-	sExitStack[index] = func;
+-	return 0;
++	_exit_stack_unlock();
++	return result;
+ }
+ 
+ 
+@@ -53,8 +134,10 @@
+ 	_thread_do_exit_notification();
+ 
+ 	// unwind the exit stack, calling the registered functions
+-	while (sExitStackIndex-- &gt; 0)
+-		(*sExitStack[sExitStackIndex])();
++	_exit_stack_lock();
++	while (--sExitStackInfo.stack_size &gt;= 0)
++		(*sExitStackInfo.exit_stack[sExitStackInfo.stack_size])();
++	_exit_stack_unlock();
+ 
+ 	// close all open files
+ 	_IO_cleanup();
+
+Modified: haiku/trunk/src/system/runtime_loader/elf.cpp
+===================================================================
+--- haiku/trunk/src/system/runtime_loader/elf.cpp	2008-01-13 12:02:13 UTC (rev 23485)
++++ haiku/trunk/src/system/runtime_loader/elf.cpp	2008-01-13 12:08:34 UTC (rev 23486)
+@@ -1458,6 +1458,11 @@
+ 	if (status == B_OK) {
+ 		while ((image = sDisposableImages.head) != NULL) {
+ 			// call image fini here...
++			if (gRuntimeLoader.call_atexit_hooks_for_range) {
++				gRuntimeLoader.call_atexit_hooks_for_range(
++					image-&gt;regions[0].start, image-&gt;regions[0].size);
++			}
++
+ 			if (image-&gt;term_routine)
+ 				((init_term_function)image-&gt;term_routine)(image-&gt;id);
+ 
+
+Modified: haiku/trunk/src/system/runtime_loader/export.c
+===================================================================
+--- haiku/trunk/src/system/runtime_loader/export.c	2008-01-13 12:02:13 UTC (rev 23485)
++++ haiku/trunk/src/system/runtime_loader/export.c	2008-01-13 12:08:34 UTC (rev 23486)
+@@ -36,7 +36,8 @@
+ 	test_executable,
+ 	get_next_image_dependency,
+ 
+-	elf_reinit_after_fork
++	elf_reinit_after_fork,
++	NULL // call_atexit_hooks_for_range
+ };
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005449.html">[Haiku-commits] r23485 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+</A></li>
+	<LI>Next message: <A HREF="005451.html">[Haiku-commits] r23487 -	haiku/trunk/src/add-ons/kernel/drivers/network/pegasus
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5450">[ date ]</a>
+              <a href="thread.html#5450">[ thread ]</a>
+              <a href="subject.html#5450">[ subject ]</a>
+              <a href="author.html#5450">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

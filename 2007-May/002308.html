@@ -1,0 +1,409 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21151 - in haiku/trunk/src:	add-ons/kernel/file_systems/cdda	tests/add-ons/kernel/file_systems/cdda
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21151%20-%20in%20haiku/trunk/src%3A%0A%09add-ons/kernel/file_systems/cdda%0A%09tests/add-ons/kernel/file_systems/cdda&In-Reply-To=%3C200705160919.l4G9Jgg7009694%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002307.html">
+   <LINK REL="Next"  HREF="002309.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21151 - in haiku/trunk/src:	add-ons/kernel/file_systems/cdda	tests/add-ons/kernel/file_systems/cdda</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21151%20-%20in%20haiku/trunk/src%3A%0A%09add-ons/kernel/file_systems/cdda%0A%09tests/add-ons/kernel/file_systems/cdda&In-Reply-To=%3C200705160919.l4G9Jgg7009694%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21151 - in haiku/trunk/src:	add-ons/kernel/file_systems/cdda	tests/add-ons/kernel/file_systems/cdda">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed May 16 11:19:42 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002307.html">[Haiku-commits] r21150 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+        <LI>Next message: <A HREF="002309.html">[Haiku-commits] r21152 - haiku/trunk/src/kits/storage/mime
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2308">[ date ]</a>
+              <a href="thread.html#2308">[ thread ]</a>
+              <a href="subject.html#2308">[ subject ]</a>
+              <a href="author.html#2308">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-05-16 11:19:42 +0200 (Wed, 16 May 2007)
+New Revision: 21151
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21151&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21151&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/cdda/cdda.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/cdda/cdda.h
+   haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp
+   haiku/trunk/src/tests/add-ons/kernel/file_systems/cdda/cdda_text.cpp
+Log:
+Implemented reading from CD and prepending a fake WAV header - not yet tested, though.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/cdda/cdda.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/cdda/cdda.cpp	2007-05-15 21:21:01 UTC (rev 21150)
++++ haiku/trunk/src/add-ons/kernel/file_systems/cdda/cdda.cpp	2007-05-16 09:19:42 UTC (rev 21151)
+@@ -10,6 +10,7 @@
+ #include &lt;device/scsi.h&gt;
+ 
+ #include &lt;ctype.h&gt;
++#include &lt;errno.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+ 
+@@ -412,6 +413,46 @@
+ 
+ 
+ static status_t
++read_frames(int fd, off_t frame, uint8 *buffer, size_t count)
++{
++	size_t framesLeft = count;
++
++	while (framesLeft &gt; 0) {
++		scsi_read_cd read;
++		read.start_m = frame / kFramesPerMinute;
++		read.start_s = (frame / kFramesPerSecond) % 60;
++		read.start_f = frame % kFramesPerSecond;
++
++		read.length_m = count / kFramesPerMinute;
++		read.length_s = (count / kFramesPerSecond) % 60;
++		read.length_f = count % kFramesPerSecond;
++
++		read.buffer_length = count * kFrameSize;
++		read.buffer = (char *)buffer;
++		read.play = false;
++
++		if (ioctl(fd, B_SCSI_READ_CD, &amp;read) &lt; 0) {
++			// drive couldn't read data - try again to read with a smaller block size
++			if (count == 1)
++				return errno;
++
++			if (count &gt;= 32)
++				count = 8;
++			else
++				count = 1;
++			continue;
++		}
++
++		buffer += count * kFrameSize;
++		framesLeft -= count;
++		frame += count;
++	}
++
++	return B_OK;
++}
++
++
++static status_t
+ read_table_of_contents(int fd, uint32 track, uint8 format, uint8 *buffer,
+ 	size_t bufferSize)
+ {
+@@ -559,3 +600,35 @@
+ 	return B_OK;
+ }
+ 
++
++status_t
++read_cdda_data(int fd, off_t offset, void *data, size_t length,
++	off_t bufferOffset, void *buffer, size_t bufferSize)
++{
++	if (bufferOffset &gt;= 0 &amp;&amp; bufferOffset &lt;= offset + length
++		&amp;&amp; bufferOffset + bufferSize &gt; offset) {
++		// TODO: fill request from buffer
++	}
++
++	while (length &gt; 0) {
++		off_t frame = offset / kFrameSize;
++		uint32 count = bufferSize / kFrameSize;
++
++		status_t status = read_frames(fd, frame, (uint8 *)buffer, count);
++		if (status &lt; B_OK)
++			return status;
++
++		off_t dataOffset = offset - frame * kFrameSize;
++		size_t bytes = bufferSize - dataOffset;
++		if (bytes &gt; length)
++			bytes = length;
++
++		if (user_memcpy(data, (uint8 *)buffer + dataOffset, bytes) &lt; B_OK)
++			return B_BAD_ADDRESS;
++
++		length -= bytes;
++		offset += bytes;
++	}
++
++	return B_OK;
++}
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/cdda/cdda.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/cdda/cdda.h	2007-05-15 21:21:01 UTC (rev 21150)
++++ haiku/trunk/src/add-ons/kernel/file_systems/cdda/cdda.h	2007-05-16 09:19:42 UTC (rev 21151)
+@@ -30,5 +30,7 @@
+ 
+ status_t read_cdtext(int fd, cdtext &amp;text);
+ status_t read_table_of_contents(int fd, scsi_toc_toc *toc, size_t length);
++status_t read_cdda_data(int fd, off_t offset, void *data, size_t length,
++	off_t bufferOffset, void *buffer, size_t bufferSize);
+ 
+ #endif	// CDDA_H
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp	2007-05-15 21:21:01 UTC (rev 21150)
++++ haiku/trunk/src/add-ons/kernel/file_systems/cdda/kernel_interface.cpp	2007-05-16 09:19:42 UTC (rev 21151)
+@@ -40,6 +40,32 @@
+ typedef DoublyLinkedList&lt;Attribute&gt; AttributeList;
+ typedef DoublyLinkedList&lt;attr_cookie&gt; AttrCookieList;
+ 
++struct riff_header {
++	uint32	magic;
++	uint32	length;
++	uint32	id;
++} _PACKED;
++
++struct riff_chunk {
++	uint32	fourcc;
++	uint32	length;
++} _PACEKD;
++
++struct wav_format_chunk : riff_chunk {
++	uint16		format_tag;
++	uint16		channels;
++	uint32		samples_per_second;
++	uint32		average_bytes_per_second;
++	uint16		block_align;
++	uint16		bits_per_sample;
++} _PACKED;
++
++struct wav_header {
++	riff_header			header;
++	wav_format_chunk	format;
++	riff_chunk			data;
++} _PACKED;
++
+ class Volume {
+ 	public:
+ 		Volume(mount_id id);
+@@ -62,7 +88,10 @@
+ 		Inode			*Find(const char *name);
+ 
+ 		Inode			*FirstEntry() const { return fFirstEntry; }
++
+ 		off_t			NumBlocks() const { return fNumBlocks; }
++		size_t			BufferSize() const { return 32 * kFrameSize; }
++			// TODO: for now
+ 
+ 		static void		DetermineName(cdtext &amp;text, char *name, size_t length);
+ 
+@@ -147,6 +176,8 @@
+ 		void		RemoveAttrCookie(attr_cookie *cookie);
+ 		void		RewindAttrCookie(attr_cookie *cookie);
+ 
++		const wav_header *WAVHeader() const { return &fWAVHeader; }
++
+ 		Inode		*Next() const { return fNext; }
+ 		void		SetNext(Inode *inode) { fNext = inode; }
+ 
+@@ -163,6 +194,7 @@
+ 		off_t		fFrameCount;
+ 		AttributeList fAttributes;
+ 		AttrCookieList fAttrCookies;
++		wav_header	fWAVHeader;
+ };
+ 
+ struct dir_cookie {
+@@ -184,6 +216,8 @@
+ 
+ struct file_cookie {
+ 	int			open_mode;
++	off_t		buffer_offset;
++	void		*buffer;
+ };
+ 
+ 
+@@ -268,6 +302,7 @@
+ 		dprintf(&quot;CDDA: no CD-Text found.\n&quot;);
+ 
+ 	int32 trackCount = toc-&gt;last_track + 1 - toc-&gt;first_track;
++	off_t totalFrames = 0;
+ 	char title[256];
+ 
+ 	for (int32 i = 0; i &lt; trackCount; i++) {
+@@ -302,6 +337,8 @@
+ 				title[j] = '-';
+ 		}
+ 
++		totalFrames += frames;
++
+ 		Inode *inode = _CreateNode(fRootNode, title, startFrame, frames,
+ 			S_IFREG | 0444);
+ 		if (inode == NULL)
+@@ -330,6 +367,7 @@
+ 	if (fName == NULL)
+ 		return B_NO_MEMORY;
+ 
++	fNumBlocks = totalFrames;
+ 	return B_OK;
+ }
+ 
+@@ -539,6 +577,32 @@
+ 	fGroupID = parent ? parent-&gt;GroupID() : getegid();
+ 
+ 	fCreationTime = fModificationTime = time(NULL);
++
++	if (frames) {
++		// initialize WAV header
++
++		// RIFF header
++		fWAVHeader.header.magic = B_HOST_TO_LENDIAN_INT32('RIFF');
++		fWAVHeader.header.length = B_HOST_TO_LENDIAN_INT32(Size()
++			+ sizeof(wav_header) - sizeof(riff_chunk));
++		fWAVHeader.header.id = B_HOST_TO_LENDIAN_INT32('WAVE');
++
++		// 'fmt ' format chunk
++		fWAVHeader.format.fourcc = B_HOST_TO_LENDIAN_INT32('fmt ');
++		fWAVHeader.format.length = B_HOST_TO_LENDIAN_INT32(
++			sizeof(wav_format_chunk) - sizeof(riff_chunk));
++		fWAVHeader.format.format_tag = B_HOST_TO_LENDIAN_INT16(1);
++		fWAVHeader.format.channels = B_HOST_TO_LENDIAN_INT16(2);
++		fWAVHeader.format.samples_per_second = B_HOST_TO_LENDIAN_INT32(44100);
++		fWAVHeader.format.average_bytes_per_second = B_HOST_TO_LENDIAN_INT32(
++			44100 * sizeof(uint16) * 2);
++		fWAVHeader.format.block_align = B_HOST_TO_LENDIAN_INT16(4);
++		fWAVHeader.format.bits_per_sample = B_HOST_TO_LENDIAN_INT16(16);
++
++		// 'data' chunk
++		fWAVHeader.data.fourcc = B_HOST_TO_LENDIAN_INT32('data');
++		fWAVHeader.data.length = B_HOST_TO_LENDIAN_INT32(Size());
++	}
+ }
+ 
+ 
+@@ -943,6 +1007,7 @@
+ 
+ 	TRACE((&quot;  open cookie = %p\n&quot;, cookie));
+ 	cookie-&gt;open_mode = openMode;
++	cookie-&gt;buffer = NULL;
+ 
+ 	*_cookie = (void *)cookie;
+ 
+@@ -981,6 +1046,7 @@
+ 	void *buffer, size_t *_length)
+ {
+ 	file_cookie *cookie = (file_cookie *)_cookie;
++	Volume *volume = (Volume *)_volume;
+ 	Inode *inode = (Inode *)_node;
+ 
+ 	TRACE((&quot;cdda_read(vnode = %p, offset %Ld, length = %lu, mode = %d)\n&quot;,
+@@ -990,10 +1056,52 @@
+ 		return B_IS_A_DIRECTORY;
+ 	if ((cookie-&gt;open_mode &amp; O_RWMASK) != O_RDONLY)
+ 		return B_NOT_ALLOWED;
++	if (offset &lt; 0)
++		return B_BAD_VALUE;
+ 
+-	// TODO: read!
+-	*_length = 0;
+-	return B_OK;
++	off_t maxSize = inode-&gt;Size() + sizeof(wav_header);
++	if (offset &gt;= maxSize) {
++		*_length = 0;
++		return B_OK;
++	}
++
++	if (cookie-&gt;buffer == NULL) {
++		// TODO: move that to open() to make sure reading can't fail for this reason?
++		cookie-&gt;buffer = malloc(volume-&gt;BufferSize());
++		if (cookie-&gt;buffer == NULL)
++			return B_NO_MEMORY;
++
++		cookie-&gt;buffer_offset = -1;
++	}
++
++	size_t length = *_length;
++	if (offset + length &gt; maxSize)
++		length = maxSize - offset;
++
++	status_t status = B_OK;
++
++	if (offset &lt; sizeof(wav_header)) {
++		// read fake WAV header
++		size_t size = sizeof(wav_header) - offset;
++		size = min_c(size, length);
++
++		if (user_memcpy(buffer, (uint8 *)inode-&gt;WAVHeader() + offset, size) &lt; B_OK)
++			return B_BAD_ADDRESS;
++
++		length -= size;
++	}
++
++	if (length &gt; 0) {
++		// read actual CD data
++		offset -= sizeof(wav_header);
++
++		status = read_cdda_data(volume-&gt;Device(), offset, buffer, length,
++			cookie-&gt;buffer_offset, cookie-&gt;buffer, volume-&gt;BufferSize());
++	}
++	if (status == B_OK)
++		*_length = length;
++
++	return status;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/tests/add-ons/kernel/file_systems/cdda/cdda_text.cpp
+===================================================================
+--- haiku/trunk/src/tests/add-ons/kernel/file_systems/cdda/cdda_text.cpp	2007-05-15 21:21:01 UTC (rev 21150)
++++ haiku/trunk/src/tests/add-ons/kernel/file_systems/cdda/cdda_text.cpp	2007-05-16 09:19:42 UTC (rev 21151)
+@@ -16,6 +16,14 @@
+ extern const char* __progname;
+ 
+ 
++extern &quot;C&quot; status_t
++user_memcpy(void *dest, const void *source, size_t length)
++{
++	memcpy(dest, source, length);
++	return B_OK;
++}
++
++
+ extern &quot;C&quot; void
+ dprintf(const char* format, ...)
+ {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002307.html">[Haiku-commits] r21150 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+	<LI>Next message: <A HREF="002309.html">[Haiku-commits] r21152 - haiku/trunk/src/kits/storage/mime
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2308">[ date ]</a>
+              <a href="thread.html#2308">[ thread ]</a>
+              <a href="subject.html#2308">[ subject ]</a>
+              <a href="author.html#2308">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

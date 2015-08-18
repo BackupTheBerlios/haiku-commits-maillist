@@ -1,0 +1,367 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26244 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26244%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200807032257.m63MvUZ8016225%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010004.html">
+   <LINK REL="Next"  HREF="010015.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26244 - haiku/trunk/src/system/kernel</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26244%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200807032257.m63MvUZ8016225%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26244 - haiku/trunk/src/system/kernel">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Fri Jul  4 00:57:30 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010004.html">[Haiku-commits] r26243 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+        <LI>Next message: <A HREF="010015.html">[Haiku-commits] r26244 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10005">[ date ]</a>
+              <a href="thread.html#10005">[ thread ]</a>
+              <a href="subject.html#10005">[ subject ]</a>
+              <a href="author.html#10005">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-07-04 00:57:27 +0200 (Fri, 04 Jul 2008)
+New Revision: 26244
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26244&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26244&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/heap.cpp
+Log:
+* Implement freeing of empty heap areas. When a heap_area becomes completely
+  empty and there is another empty area already, it is now removed from the
+  heap and the underlying area is deleted.
+* Fix grow suggestions to be based on 20% of a grow size instead of 10% of the
+  current page count, as the current page count obviously gets larger over time
+  making 10% of it larger than the grow size itself.
+* Fix non-urgent grow request handling so that not two areas at once get added.
+* Made some of the debug output more useful, turned off some other and fixed
+  some comments.
+
+Modified: haiku/trunk/src/system/kernel/heap.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/heap.cpp	2008-07-03 21:14:54 UTC (rev 26243)
++++ haiku/trunk/src/system/kernel/heap.cpp	2008-07-03 22:57:27 UTC (rev 26244)
+@@ -108,6 +108,7 @@
+ 
+ 	uint32		total_pages;
+ 	uint32		total_free_pages;
++	uint32		empty_areas;
+ 
+ 	heap_bin *	bins;
+ 	heap_area *	areas; // sorted so that the desired area is always first
+@@ -303,9 +304,10 @@
+ {
+ 	heap_area *area = heap-&gt;all_areas;
+ 	while (area) {
+-		dprintf(&quot;\tarea %p: area: %ld; base: 0x%08lx; size: %lu; free_pages: %p (%lu entr%s)\n&quot;,
+-			area, area-&gt;area, area-&gt;base, area-&gt;size, area-&gt;free_pages,
+-			area-&gt;free_page_count, area-&gt;free_page_count == 1 ? &quot;y&quot; : &quot;ies&quot;);
++		dprintf(&quot;\tarea %p: area: %ld; base: 0x%08lx; size: %lu; page_count: %lu; free_pages: %p (%lu entr%s)\n&quot;,
++			area, area-&gt;area, area-&gt;base, area-&gt;size, area-&gt;page_count,
++			area-&gt;free_pages, area-&gt;free_page_count,
++			area-&gt;free_page_count == 1 ? &quot;y&quot; : &quot;ies&quot;);
+ 		area = area-&gt;all_next;
+ 	}
+ 
+@@ -316,9 +318,9 @@
+ static void
+ dump_allocator(heap_allocator *heap, bool areas, bool bins)
+ {
+-	dprintf(&quot;allocator %p: class: %s; page_size: %lu; bin_count: %lu; pages: %lu; free: %lu\n&quot;, heap,
++	dprintf(&quot;allocator %p: class: %s; page_size: %lu; bin_count: %lu; pages: %lu; free_pages: %lu; empty_areas: %lu\n&quot;, heap,
+ 		sHeapClasses[heap-&gt;heap_class].name, heap-&gt;page_size, heap-&gt;bin_count,
+-		heap-&gt;total_pages, heap-&gt;total_free_pages);
++		heap-&gt;total_pages, heap-&gt;total_free_pages, heap-&gt;empty_areas);
+ 
+ 	if (areas)
+ 		dump_allocator_areas(heap);
+@@ -846,14 +848,73 @@
+ 	heap-&gt;total_pages += area-&gt;page_count;
+ 	heap-&gt;total_free_pages += area-&gt;free_page_count;
+ 
++	if (areaID &gt;= B_OK) {
++		// this later on deletable area is yet empty - the empty count will be
++		// decremented as soon as this area is used for the first time
++		heap-&gt;empty_areas++;
++	}
++
+ 	mutex_unlock(&amp;heap-&gt;lock);
+ 
+-	dprintf(&quot;heap_add_area: area added to %s heap %p - usable range 0x%08lx - 0x%08lx\n&quot;,
+-		sHeapClasses[heap-&gt;heap_class].name, heap, area-&gt;base,
++	dprintf(&quot;heap_add_area: area %ld added to %s heap %p - usable range 0x%08lx - 0x%08lx\n&quot;,
++		area-&gt;area, sHeapClasses[heap-&gt;heap_class].name, heap, area-&gt;base,
+ 		area-&gt;base + area-&gt;size);
+ }
+ 
+ 
++static status_t
++heap_remove_area(heap_allocator *heap, heap_area *area, bool locked)
++{
++	if (!locked)
++		mutex_lock(&amp;heap-&gt;lock);
++
++	if (area-&gt;free_page_count != area-&gt;page_count) {
++		panic(&quot;tried removing heap area that has still pages in use&quot;);
++		return B_ERROR;
++	}
++
++	if (area-&gt;prev == NULL &amp;&amp; area-&gt;next == NULL) {
++		panic(&quot;tried removing the last non-full heap area&quot;);
++		return B_ERROR;
++	}
++
++	if (heap-&gt;areas == area)
++		heap-&gt;areas = area-&gt;next;
++	if (area-&gt;prev != NULL)
++		area-&gt;prev-&gt;next = area-&gt;next;
++	if (area-&gt;next != NULL)
++		area-&gt;next-&gt;prev = area-&gt;prev;
++
++	if (heap-&gt;all_areas == area)
++		heap-&gt;all_areas = area-&gt;all_next;
++	else {
++		heap_area *previous = heap-&gt;all_areas;
++		while (previous) {
++			if (previous-&gt;all_next == area) {
++				previous-&gt;all_next = area-&gt;all_next;
++				break;
++			}
++
++			previous = previous-&gt;all_next;
++		}
++
++		if (previous == NULL)
++			panic(&quot;removing heap area that is not in all list&quot;);
++	}
++
++	heap-&gt;total_pages -= area-&gt;page_count;
++	heap-&gt;total_free_pages -= area-&gt;free_page_count;
++
++	if (!locked)
++		mutex_unlock(&amp;heap-&gt;lock);
++
++	dprintf(&quot;heap_remove_area: area %ld with range 0x%08lx - 0x%08lx removed from %s heap %p\n&quot;,
++		area-&gt;area, area-&gt;base, area-&gt;base + area-&gt;size,
++		sHeapClasses[heap-&gt;heap_class].name, heap);
++	return B_OK;
++}
++
++
+ static heap_allocator *
+ heap_create_allocator(addr_t base, size_t size, uint32 heapClass)
+ {
+@@ -863,7 +924,7 @@
+ 
+ 	heap-&gt;heap_class = heapClass;
+ 	heap-&gt;page_size = sHeapClasses[heapClass].page_size;
+-	heap-&gt;total_pages = heap-&gt;total_free_pages = 0;
++	heap-&gt;total_pages = heap-&gt;total_free_pages = heap-&gt;empty_areas = 0;
+ 	heap-&gt;areas = heap-&gt;all_areas = NULL;
+ 	heap-&gt;bins = (heap_bin *)base;
+ 
+@@ -890,7 +951,7 @@
+ }
+ 
+ 
+-static inline void
++static inline area_id
+ heap_free_pages_added(heap_allocator *heap, heap_area *area, uint32 pageCount)
+ {
+ 	area-&gt;free_page_count += pageCount;
+@@ -932,19 +993,31 @@
+ 
+ 	// can and should we free this area?
+ 	if (area-&gt;free_page_count == area-&gt;page_count &amp;&amp; area-&gt;area &gt;= B_OK) {
+-		uint32 pagesLeft = heap-&gt;total_pages - area-&gt;page_count;
+-		uint32 freePagesLeft = heap-&gt;total_free_pages - area-&gt;free_page_count;
+-		if (freePagesLeft &gt; pagesLeft / 10) {
+-			// there are still more than 10% of free pages if we free it
+-			dprintf(&quot;heap: should free empty area %ld\n&quot;, area-&gt;area);
++		if (heap-&gt;empty_areas &gt; 0) {
++			// we already have at least another empty area, just free this one
++			if (heap_remove_area(heap, area, true) == B_OK) {
++				// we cannot delete the area here, because it would result
++				// in calls to free, which would necessarily deadlock as we
++				// are locked at this point
++				return area-&gt;area;
++			}
+ 		}
++
++		heap-&gt;empty_areas++;
+ 	}
++
++	return -1;
+ }
+ 
+ 
+ static inline void
+ heap_free_pages_removed(heap_allocator *heap, heap_area *area, uint32 pageCount)
+ {
++	if (area-&gt;free_page_count == area-&gt;page_count &amp;&amp; area-&gt;area &gt;= B_OK) {
++		// this area was completely empty
++		heap-&gt;empty_areas--;
++	}
++
+ 	area-&gt;free_page_count -= pageCount;
+ 	heap-&gt;total_free_pages -= pageCount;
+ 
+@@ -1129,8 +1202,8 @@
+ inline bool
+ heap_should_grow(heap_allocator *heap)
+ {
+-	// suggest growing if there are less than 10% free pages
+-	return heap-&gt;total_free_pages &lt; heap-&gt;total_pages / 10;
++	// suggest growing if there is less than 20% of a grow size available
++	return heap-&gt;total_free_pages * heap-&gt;page_size &lt; HEAP_GROW_SIZE / 5;
+ }
+ 
+ 
+@@ -1234,6 +1307,7 @@
+ 		return B_ERROR;
+ 	}
+ 
++	area_id areaToDelete = -1;
+ 	if (page-&gt;bin_index &lt; heap-&gt;bin_count) {
+ 		// small allocation
+ 		heap_bin *bin = &amp;heap-&gt;bins[page-&gt;bin_index];
+@@ -1279,7 +1353,7 @@
+ 			heap_unlink_page(page, &amp;bin-&gt;page_list);
+ 			page-&gt;in_use = 0;
+ 			heap_link_page(page, &amp;area-&gt;free_pages);
+-			heap_free_pages_added(heap, area, 1);
++			areaToDelete = heap_free_pages_added(heap, area, 1);
+ 		} else if (page-&gt;free_count == 1) {
+ 			// we need to add ourselfs to the page list of the bin
+ 			heap_link_page(page, &amp;bin-&gt;page_list);
+@@ -1321,11 +1395,18 @@
+ 			pageCount++;
+ 		}
+ 
+-		heap_free_pages_added(heap, area, pageCount);
++		areaToDelete = heap_free_pages_added(heap, area, pageCount);
+ 	}
+ 
+ 	T(Free((addr_t)address));
+ 	mutex_unlock(&amp;heap-&gt;lock);
++
++	if (areaToDelete &gt;= B_OK) {
++		// adding free pages caused an area to become empty and freeable that
++		// we can now delete as we don't hold the heap lock anymore
++		delete_area(areaToDelete);
++	}
++
+ 	return B_OK;
+ }
+ 
+@@ -1493,8 +1574,8 @@
+ 			continue;
+ 
+ 		if (sAddGrowHeap) {
+-			// the last grow heap is going to run full soon, try to allocate
+-			// a new one to make some room.
++			// the grow heap is going to run full soon, try to allocate a new
++			// one to make some room.
+ 			TRACE((&quot;heap_grower: grow heaps will run out of memory soon\n&quot;));
+ 			if (heap_create_new_heap_area(sGrowHeap, &quot;additional grow heap&quot;,
+ 				HEAP_DEDICATED_GROW_SIZE) != B_OK)
+@@ -1502,7 +1583,6 @@
+ 		}
+ 
+ 		for (uint32 i = 0; i &lt; HEAP_CLASS_COUNT; i++) {
+-			// find the last heap
+ 			heap_allocator *heap = sHeapList[i];
+ 			if (sLastGrowRequest[i] &gt; sLastHandledGrowRequest[i]
+ 				|| heap_should_grow(heap)) {
+@@ -1629,7 +1709,6 @@
+ 
+ 	if (!kernel_startup &amp;&amp; size &gt; HEAP_AREA_USE_THRESHOLD) {
+ 		// don't even attempt such a huge allocation - use areas instead
+-		dprintf(&quot;heap: using area for huge allocation of %lu bytes!\n&quot;, size);
+ 		size_t areaSize = size + sizeof(area_allocation_info);
+ 		if (alignment != 0)
+ 			areaSize = ROUNDUP(areaSize, alignment);
+@@ -1656,28 +1735,27 @@
+ 		if (alignment != 0)
+ 			address = (void *)ROUNDUP((addr_t)address, alignment);
+ 
+-		dprintf(&quot;heap: allocated area %ld for huge allocation returning %p\n&quot;,
+-			allocationArea, address);
++		dprintf(&quot;heap: allocated area %ld for huge allocation of %lu bytes\n&quot;,
++			allocationArea, size);
+ 
+ 		info-&gt;allocation_base = address;
+ 		return address;
+ 	}
+ 
+-	heap_allocator *heap = sHeapList[heap_class_for(size)];
++	uint32 heapClass = heap_class_for(size);
++	heap_allocator *heap = sHeapList[heapClass];
+ 	bool shouldGrow = false;
+ 	void *result = heap_memalign(heap, alignment, size, &amp;shouldGrow);
+-	if (shouldGrow || result == NULL) {
+-		// the heap will or has run out of memory, notify the grower
+-		sLastGrowRequest[heap_class_for(size)]++;
+-		if (result == NULL) {
+-			// urgent request, do the request and wait
+-			switch_sem(sHeapGrowSem, sHeapGrownNotify);
+-			// try again now
+-			result = heap_memalign(heap, alignment, size, NULL);
+-		} else {
+-			// not so urgent, just notify the grower
+-			release_sem_etc(sHeapGrowSem, 1, B_DO_NOT_RESCHEDULE);
+-		}
++	if (result == NULL) {
++		// request an urgent grow and wait
++		sLastGrowRequest[heapClass]++;
++		switch_sem(sHeapGrowSem, sHeapGrownNotify);
++
++		// and then try again
++		result = heap_memalign(heap, alignment, size, NULL);
++	} else if (shouldGrow) {
++		// should grow sometime soon, notify the grower
++		release_sem_etc(sHeapGrowSem, 1, B_DO_NOT_RESCHEDULE);
+ 	}
+ 
+ #if PARANOID_VALIDATION
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010004.html">[Haiku-commits] r26243 - haiku/trunk/src/system/kernel/arch/x86
+</A></li>
+	<LI>Next message: <A HREF="010015.html">[Haiku-commits] r26244 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10005">[ date ]</a>
+              <a href="thread.html#10005">[ thread ]</a>
+              <a href="subject.html#10005">[ subject ]</a>
+              <a href="author.html#10005">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

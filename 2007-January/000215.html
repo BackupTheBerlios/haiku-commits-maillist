@@ -1,0 +1,346 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r19806 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19806%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200701151140.l0FBeEZk011324%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000214.html">
+   <LINK REL="Next"  HREF="000216.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r19806 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19806%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200701151140.l0FBeEZk011324%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r19806 - haiku/trunk/src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Jan 15 12:40:14 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000214.html">[Haiku-commits] r19805 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="000216.html">[Haiku-commits] r19807 - haiku/trunk/src/kits/network
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#215">[ date ]</a>
+              <a href="thread.html#215">[ thread ]</a>
+              <a href="subject.html#215">[ subject ]</a>
+              <a href="author.html#215">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-01-15 12:40:13 +0100 (Mon, 15 Jan 2007)
+New Revision: 19806
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=19806&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=19806&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+Moved locking into map_backing_store() - it now gets a vm_cache_ref instead of a vm_store,
+so that this can be done safely.
+It was also needed, as it would call vm_cache_release_ref() on failure which requires you
+to have no vm_cache_ref locks around (as it might deadlock in this case).
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-01-15 10:24:22 UTC (rev 19805)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-01-15 11:40:13 UTC (rev 19806)
+@@ -69,9 +69,6 @@
+ static benaphore sAvailableMemoryLock;
+ 
+ // function declarations
+-static vm_area *_vm_create_region_struct(vm_address_space *addressSpace, const char *name, int wiring, int lock);
+-static status_t map_backing_store(vm_address_space *addressSpace, vm_store *store, void **vaddr,
+-	off_t offset, addr_t size, uint32 addressSpec, int wiring, int lock, int mapping, vm_area **_area, const char *area_name);
+ static status_t vm_soft_fault(addr_t address, bool is_write, bool is_user);
+ static bool vm_put_area(vm_area *area);
+ 
+@@ -500,18 +497,11 @@
+ }
+ 
+ 
+-/*!
+-	The \a store's owner must be locked when calling this function.
+-*/
+ static status_t
+-map_backing_store(vm_address_space *addressSpace, vm_store *store, void **_virtualAddress,
+-	off_t offset, addr_t size, uint32 addressSpec, int wiring, int protection,
+-	int mapping, vm_area **_area, const char *areaName)
++map_backing_store(vm_address_space *addressSpace, vm_cache_ref *cacheRef,
++	void **_virtualAddress, off_t offset, addr_t size, uint32 addressSpec,
++	int wiring, int protection, int mapping, vm_area **_area, const char *areaName)
+ {
+-	vm_cache_ref *cacheRef;
+-	vm_cache *cache;
+-	status_t status;
+-
+ 	TRACE((&quot;map_backing_store: aspace %p, store %p, *vaddr %p, offset 0x%Lx, size %lu, addressSpec %ld, wiring %d, protection %d, _area %p, area_name '%s'\n&quot;,
+ 		addressSpace, store, *_virtualAddress, offset, size, addressSpec,
+ 		wiring, protection, _area, areaName));
+@@ -520,12 +510,17 @@
+ 	if (area == NULL)
+ 		return B_NO_MEMORY;
+ 
+-	cache = store-&gt;cache;
+-	cacheRef = cache-&gt;ref;
++	mutex_lock(&amp;cacheRef-&gt;lock);
+ 
++	vm_cache *cache = cacheRef-&gt;cache;
++	vm_store *store = cache-&gt;store;
++	bool unlock = true;
++	status_t status;
++
+ 	// if this is a private map, we need to create a new cache &amp; store object
+ 	// pair to handle the private copies of pages as they are written to
+ 	if (mapping == REGION_PRIVATE_MAP) {
++		vm_cache_ref *newCacheRef;
+ 		vm_cache *newCache;
+ 		vm_store *newStore;
+ 
+@@ -549,11 +544,15 @@
+ 			goto err1;
+ 		}
+ 
++		newCacheRef = newCache-&gt;ref;
+ 		newCache-&gt;temporary = 1;
+ 		newCache-&gt;scan_skip = cache-&gt;scan_skip;
+ 
+ 		vm_cache_add_consumer_locked(cacheRef, newCache);
+ 
++		mutex_unlock(&amp;cacheRef-&gt;lock);
++		mutex_lock(&amp;newCacheRef-&gt;lock);
++
+ 		cache = newCache;
+ 		cacheRef = newCache-&gt;ref;
+ 		store = newStore;
+@@ -584,6 +583,7 @@
+ 	area-&gt;cache_offset = offset;
+ 	// point the cache back to the area
+ 	vm_cache_insert_area_locked(cacheRef, area);
++	mutex_unlock(&amp;cacheRef-&gt;lock);
+ 
+ 	// insert the area in the global area hash table
+ 	acquire_sem_etc(sAreaHashLock, WRITE_COUNT, 0 ,0);
+@@ -603,9 +603,13 @@
+ err2:
+ 	if (mapping == REGION_PRIVATE_MAP) {
+ 		// we created this cache, so we must delete it again
++		mutex_unlock(&amp;cacheRef-&gt;lock);
+ 		vm_cache_release_ref(cacheRef);
++		unlock = false;
+ 	}
+ err1:
++	if (unlock)
++		mutex_unlock(&amp;cacheRef-&gt;lock);
+ 	free(area-&gt;name);
+ 	free(area);
+ 	return status;
+@@ -819,20 +823,15 @@
+ 			break;
+ 	}
+ 
+-	mutex_lock(&amp;cache-&gt;ref-&gt;lock);
++	cacheRef = cache-&gt;ref;
+ 
+-	status = map_backing_store(addressSpace, store, address, 0, size, addressSpec, wiring,
+-		protection, REGION_NO_PRIVATE_MAP, &amp;area, name);
+-
+-	mutex_unlock(&amp;cache-&gt;ref-&gt;lock);
+-
++	status = map_backing_store(addressSpace, cacheRef, address, 0, size,
++		addressSpec, wiring, protection, REGION_NO_PRIVATE_MAP, &amp;area, name);
+ 	if (status &lt; B_OK) {
+-		vm_cache_release_ref(cache-&gt;ref);
++		vm_cache_release_ref(cacheRef);
+ 		goto err1;
+ 	}
+ 
+-	cacheRef = store-&gt;cache-&gt;ref;
+-
+ 	switch (wiring) {
+ 		case B_NO_LOCK:
+ 		case B_LAZY_LOCK:
+@@ -967,6 +966,7 @@
+ 	uint32 addressSpec, addr_t size, uint32 protection,
+ 	addr_t physicalAddress)
+ {
++	vm_cache_ref *cacheRef;
+ 	vm_area *area;
+ 	vm_cache *cache;
+ 	vm_store *store;
+@@ -1013,15 +1013,12 @@
+ 	cache-&gt;scan_skip = 1;
+ 	cache-&gt;virtual_size = size;
+ 
+-	mutex_lock(&amp;cache-&gt;ref-&gt;lock);
++	cacheRef = cache-&gt;ref;
+ 
+-	status = map_backing_store(addressSpace, store, _address, 0, size,
++	status = map_backing_store(addressSpace, cacheRef, _address, 0, size,
+ 		addressSpec &amp; ~B_MTR_MASK, 0, protection, REGION_NO_PRIVATE_MAP, &amp;area, name);
+-
+-	mutex_unlock(&amp;cache-&gt;ref-&gt;lock);
+-
+ 	if (status &lt; B_OK)
+-		vm_cache_release_ref(cache-&gt;ref);
++		vm_cache_release_ref(cacheRef);
+ 
+ 	if (status &gt;= B_OK &amp;&amp; (addressSpec &amp; B_MTR_MASK) != 0) {
+ 		// set requested memory type
+@@ -1032,11 +1029,15 @@
+ 	}
+ 
+ 	if (status &gt;= B_OK) {
++		mutex_lock(&amp;cacheRef-&gt;lock);
++		store = cacheRef-&gt;cache-&gt;store;
++
+ 		// make sure our area is mapped in completely
+ 		// (even if that makes the fault routine pretty much useless)
+ 		for (addr_t offset = 0; offset &lt; size; offset += B_PAGE_SIZE) {
+ 			store-&gt;ops-&gt;fault(store, addressSpace, offset);
+ 		}
++		mutex_unlock(&amp;cacheRef-&gt;lock);
+ 	}
+ 
+ 	vm_put_address_space(addressSpace);
+@@ -1060,16 +1061,16 @@
+ 
+ 
+ area_id
+-vm_create_null_area(team_id aid, const char *name, void **address,
++vm_create_null_area(team_id team, const char *name, void **address,
+ 	uint32 addressSpec, addr_t size)
+ {
+ 	vm_area *area;
+ 	vm_cache *cache;
+-	vm_cache_ref *cache_ref;
++	vm_cache_ref *cacheRef;
+ 	vm_store *store;
+ 	status_t status;
+ 
+-	vm_address_space *addressSpace = vm_get_address_space_by_id(aid);
++	vm_address_space *addressSpace = vm_get_address_space_by_id(team);
+ 	if (addressSpace == NULL)
+ 		return B_BAD_TEAM_ID;
+ 
+@@ -1095,16 +1096,15 @@
+ 	cache-&gt;scan_skip = 1;
+ 	cache-&gt;virtual_size = size;
+ 
+-	mutex_lock(&amp;cache-&gt;ref-&gt;lock);
++	cacheRef = cache-&gt;ref;
+ 
+-	status = map_backing_store(addressSpace, store, address, 0, size, addressSpec, 0,
++	status = map_backing_store(addressSpace, cacheRef, address, 0, size, addressSpec, 0,
+ 		B_KERNEL_READ_AREA, REGION_NO_PRIVATE_MAP, &amp;area, name);
+ 
+-	mutex_unlock(&amp;cache-&gt;ref-&gt;lock);
+ 	vm_put_address_space(addressSpace);
+ 
+ 	if (status &lt; B_OK) {
+-		vm_cache_release_ref(cache-&gt;ref);
++		vm_cache_release_ref(cacheRef);
+ 		return status;
+ 	}
+ 
+@@ -1164,8 +1164,9 @@
+  */
+ 
+ static area_id
+-_vm_map_file(team_id aid, const char *name, void **_address, uint32 addressSpec,
+-	size_t size, uint32 protection, uint32 mapping, const char *path, off_t offset, bool kernel)
++_vm_map_file(team_id team, const char *name, void **_address, uint32 addressSpec,
++	size_t size, uint32 protection, uint32 mapping, const char *path,
++	off_t offset, bool kernel)
+ {
+ 	vm_cache_ref *cacheRef;
+ 	vm_area *area;
+@@ -1179,7 +1180,7 @@
+ 	//	make it into the mapped copy -- this will need quite some changes
+ 	//	to be done in a nice way
+ 
+-	vm_address_space *addressSpace = vm_get_address_space_by_id(aid);
++	vm_address_space *addressSpace = vm_get_address_space_by_id(team);
+ 	if (addressSpace == NULL)
+ 		return B_BAD_TEAM_ID;
+ 
+@@ -1204,13 +1205,8 @@
+ 	if (status &lt; B_OK)
+ 		goto err1;
+ 
+-	mutex_lock(&amp;cacheRef-&gt;lock);
+-
+-	status = map_backing_store(addressSpace, cacheRef-&gt;cache-&gt;store, _address,
++	status = map_backing_store(addressSpace, cacheRef, _address,
+ 		offset, size, addressSpec, 0, protection, mapping, &amp;area, name);
+-
+-	mutex_unlock(&amp;cacheRef-&gt;lock);
+-
+ 	if (status &lt; B_OK || mapping == REGION_PRIVATE_MAP) {
+ 		// map_backing_store() cannot know we no longer need the ref
+ 		vm_cache_release_ref(cacheRef);
+@@ -1302,13 +1298,9 @@
+ 	} else
+ #endif
+ 	{
+-		mutex_lock(&amp;sourceArea-&gt;cache_ref-&gt;lock);
+-
+-		status = map_backing_store(addressSpace, sourceArea-&gt;cache_ref-&gt;cache-&gt;store,
++		status = map_backing_store(addressSpace, sourceArea-&gt;cache_ref,
+ 			address, sourceArea-&gt;cache_offset, sourceArea-&gt;size, addressSpec,
+ 			sourceArea-&gt;wiring, protection, mapping, &amp;newArea, name);
+-
+-		mutex_unlock(&amp;sourceArea-&gt;cache_ref-&gt;lock);
+ 	}
+ 	if (status == B_OK &amp;&amp; mapping != REGION_PRIVATE_MAP) {
+ 		// If the mapping is REGION_PRIVATE_MAP, map_backing_store() needed
+@@ -1603,15 +1595,10 @@
+ 
+ 	// First, create a cache on top of the source area
+ 
+-	mutex_lock(&amp;cacheRef-&gt;lock);
+-
+-	status = map_backing_store(addressSpace, cacheRef-&gt;cache-&gt;store, _address,
++	status = map_backing_store(addressSpace, cacheRef, _address,
+ 		source-&gt;cache_offset, source-&gt;size, addressSpec, source-&gt;wiring, protection,
+ 		writableCopy ? REGION_PRIVATE_MAP : REGION_NO_PRIVATE_MAP,
+ 		&amp;target, name);
+-
+-	mutex_unlock(&amp;cacheRef-&gt;lock);
+-
+ 	if (status &lt; B_OK)
+ 		goto err;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000214.html">[Haiku-commits] r19805 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="000216.html">[Haiku-commits] r19807 - haiku/trunk/src/kits/network
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#215">[ date ]</a>
+              <a href="thread.html#215">[ thread ]</a>
+              <a href="subject.html#215">[ subject ]</a>
+              <a href="author.html#215">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

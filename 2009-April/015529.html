@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29992 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29992%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200904071406.n37E68X3021065%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015528.html">
+   <LINK REL="Next"  HREF="015530.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29992 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29992%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200904071406.n37E68X3021065%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29992 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Apr  7 16:06:08 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015528.html">[Haiku-commits] r29991 - haiku/trunk/build/jam
+</A></li>
+        <LI>Next message: <A HREF="015530.html">[Haiku-commits] r29993 - haiku/trunk/src/tests/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15529">[ date ]</a>
+              <a href="thread.html#15529">[ thread ]</a>
+              <a href="subject.html#15529">[ subject ]</a>
+              <a href="author.html#15529">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-04-07 16:06:07 +0200 (Tue, 07 Apr 2009)
+New Revision: 29992
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29992&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29992&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* PageWriterRun::Go(), vm_page_write_modified_page_range(): When writing the
+  page failed since the cache has been shrunk, we need not only remove the
+  page from the cache, we also need to remove all of its area mappings and
+  free it. Not removing the area mappings might have been the cause of #3110,
+  not freeing it would cause it to be leaked for good.
+* vm_page_write_modified_page_range(): When writing failed for another reason
+  and the page wasn't in the modified queue before, we would lose the info
+  in which queue it was before and setting the page state to modified would
+  assume the active queue. This could potentially screw up our page queue
+  structures.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2009-04-07 13:53:22 UTC (rev 29991)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2009-04-07 14:06:07 UTC (rev 29992)
+@@ -1116,17 +1116,20 @@
+ 			move_page_to_active_or_inactive_queue(page, true);
+ 			page-&gt;busy_writing = false;
+ 		} else {
+-			// We don't have to put the PAGE_MODIFIED bit back, as it's
+-			// still in the modified pages list.
++			// Writing failed, so move the page back to the modified queue.
+ 			{
+ 				InterruptsSpinLocker locker(sPageLock);
+ 				page-&gt;state = PAGE_STATE_MODIFIED;
+ 				enqueue_page(&amp;sModifiedPageQueue, page);
+ 			}
++
+ 			if (!page-&gt;busy_writing) {
+-				// someone has cleared the busy_writing flag which tells
+-				// us our page has gone invalid
++				// Someone has cleared the busy_writing flag which tells
++				// us our page has gone invalid. We need to remove it from the
++				// cache and free it completely.
++				vm_remove_all_page_mappings(page, NULL);
+ 				cache-&gt;RemovePage(page);
++				vm_page_free(cache, page);
+ 			} else
+ 				page-&gt;busy_writing = false;
+ 		}
+@@ -1519,6 +1522,7 @@
+ 			continue;
+ 		}
+ 
++		int oldPageState = page-&gt;state;
+ 		page-&gt;state = PAGE_STATE_BUSY;
+ 		page-&gt;busy_writing = true;
+ 
+@@ -1542,6 +1546,14 @@
+ 		status_t status = write_page(page, 0, NULL);
+ 		cache-&gt;Lock();
+ 
++		// Before disabling interrupts handle part of the special case that
++		// writing the page failed due the cache having been shrunk. We need to
++		// remove the page from the cache and free it.
++		if (status != B_OK &amp;&amp; !page-&gt;busy_writing) {
++			vm_remove_all_page_mappings(page, NULL);
++			cache-&gt;RemovePage(page);
++		}
++
+ 		InterruptsSpinLocker locker(&amp;sPageLock);
+ 
+ 		if (status == B_OK) {
+@@ -1549,23 +1561,31 @@
+ 			move_page_to_active_or_inactive_queue(page, dequeuedPage);
+ 			page-&gt;busy_writing = false;
+ 		} else {
+-			// We don't have to put the PAGE_MODIFIED bit back, as it's still
+-			// in the modified pages list.
++			// Writing the page failed -- move to the modified queue. If we
++			// dequeued it from there, just enqueue it again, otherwise set the
++			// page set explicitly, which will take care of moving between the
++			// queues.
+ 			if (dequeuedPage) {
+ 				page-&gt;state = PAGE_STATE_MODIFIED;
+ 				enqueue_page(&amp;sModifiedPageQueue, page);
++			} else {
++				page-&gt;state = oldPageState;
++				set_page_state_nolock(page, PAGE_STATE_MODIFIED);
+ 			}
+ 
+ 			if (!page-&gt;busy_writing) {
+-				// someone has cleared the busy_writing flag which tells
+-				// us our page has gone invalid
+-				cache-&gt;RemovePage(page);
+-			} else {
+-				if (!dequeuedPage)
+-					set_page_state_nolock(page, PAGE_STATE_MODIFIED);
++				// The busy_writing flag was cleared. That means the cache has
++				// been shrunk while we were trying to write the page and we
++				// have to free it now.
+ 
++				// Adjust temporary modified pages count, if necessary.
++				if (dequeuedPage &amp;&amp; cache-&gt;temporary)
++					sModifiedTemporaryPages--;
++
++				// free the page
++				set_page_state_nolock(page, PAGE_STATE_FREE);
++			} else
+ 				page-&gt;busy_writing = false;
+-			}
+ 		}
+ 
+ 		busyCondition.Unpublish();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015528.html">[Haiku-commits] r29991 - haiku/trunk/build/jam
+</A></li>
+	<LI>Next message: <A HREF="015530.html">[Haiku-commits] r29993 - haiku/trunk/src/tests/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15529">[ date ]</a>
+              <a href="thread.html#15529">[ thread ]</a>
+              <a href="subject.html#15529">[ subject ]</a>
+              <a href="author.html#15529">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

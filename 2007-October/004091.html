@@ -1,0 +1,167 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22403 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22403%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200710012246.l91MkvgS031744%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004090.html">
+   <LINK REL="Next"  HREF="004092.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22403 - haiku/trunk/src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22403%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200710012246.l91MkvgS031744%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22403 - haiku/trunk/src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Oct  2 00:46:57 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004090.html">[Haiku-commits] r22402 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="004092.html">[Haiku-commits] r22404 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4091">[ date ]</a>
+              <a href="thread.html#4091">[ thread ]</a>
+              <a href="subject.html#4091">[ subject ]</a>
+              <a href="author.html#4091">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-10-02 00:46:56 +0200 (Tue, 02 Oct 2007)
+New Revision: 22403
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22403&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22403&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/thread.cpp
+Log:
+Fixed a race condition on thread exit: There was a gap between releasing
+the death stack and reacquiring the thread lock in which another thread
+could snatch our stack that we were still going to use for the
+scheduler. Now we've got a second spinlock that we can hold while
+releasing a semaphore.
+
+
+Modified: haiku/trunk/src/system/kernel/thread.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/thread.cpp	2007-10-01 22:28:54 UTC (rev 22402)
++++ haiku/trunk/src/system/kernel/thread.cpp	2007-10-01 22:46:56 UTC (rev 22403)
+@@ -87,6 +87,7 @@
+ static unsigned int sNumDeathStacks;
+ static unsigned int volatile sDeathStackBitmap;
+ static sem_id sDeathStackSem;
++static spinlock sDeathStackLock = 0;
+ 
+ static struct thread *last_thread_dumped = NULL;
+ 
+@@ -524,14 +525,19 @@
+ 
+ 	acquire_sem(sDeathStackSem);
+ 
++	// grab the death stack and thread locks, find a free spot and release
++
+ 	state = disable_interrupts();
+ 
+-	// grap the thread lock, find a free spot and release
++	acquire_spinlock(&amp;sDeathStackLock);
+ 	GRAB_THREAD_LOCK();
++
+ 	bit = sDeathStackBitmap;
+ 	bit = (~bit) &amp; ~((~bit) - 1);
+ 	sDeathStackBitmap |= bit;
++
+ 	RELEASE_THREAD_LOCK();
++	release_spinlock(&amp;sDeathStackLock);
+ 
+ 	restore_interrupts(state);
+ 
+@@ -553,12 +559,12 @@
+ }
+ 
+ 
+-/*!	Returns the thread's death stack to the pool. */
++/*!	Returns the thread's death stack to the pool.
++	Interrupts must be disabled and the sDeathStackLock be held.
++*/
+ static void
+ put_death_stack(uint32 index)
+ {
+-	cpu_status state;
+-
+ 	TRACE((&quot;put_death_stack...: passed %lu\n&quot;, index));
+ 
+ 	if (index &gt;= sNumDeathStacks)
+@@ -567,16 +573,12 @@
+ 	if (!(sDeathStackBitmap &amp; (1 &lt;&lt; index)))
+ 		panic(&quot;put_death_stack: passed invalid stack index %ld\n&quot;, index);
+ 
+-	state = disable_interrupts();
+-
+ 	GRAB_THREAD_LOCK();
+ 	sDeathStackBitmap &amp;= ~(1 &lt;&lt; index);
+ 	RELEASE_THREAD_LOCK();
+ 
+-	restore_interrupts(state);
+-
+ 	release_sem_etc(sDeathStackSem, 1, B_DO_NOT_RESCHEDULE);
+-		// we must not have acquired the thread lock when releasing a semaphore
++		// we must not hold the thread lock when releasing a semaphore
+ }
+ 
+ 
+@@ -634,9 +636,14 @@
+ 
+ 	// return the death stack and reschedule one last time
+ 
++	// Note that we need to hold sDeathStackLock until we've got the thread
++	// lock. Otherwise someone else might grab our stack in the meantime.
++	acquire_spinlock(&amp;sDeathStackLock);
+ 	put_death_stack(args.death_stack);
+ 
+ 	GRAB_THREAD_LOCK();
++	release_spinlock(&amp;sDeathStackLock);
++
+ 	scheduler_reschedule();
+ 		// requires thread lock to be held
+ 
+@@ -1273,6 +1280,7 @@
+ 		args.death_sem = cachedDeathSem;
+ 		args.original_team_id = teamID;
+ 
++
+ 		disable_interrupts();
+ 
+ 		// set the new kernel stack officially to the death stack, it won't be
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004090.html">[Haiku-commits] r22402 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="004092.html">[Haiku-commits] r22404 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4091">[ date ]</a>
+              <a href="thread.html#4091">[ thread ]</a>
+              <a href="subject.html#4091">[ subject ]</a>
+              <a href="author.html#4091">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

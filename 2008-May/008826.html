@@ -1,0 +1,169 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25479 - haiku/trunk/src/servers/app/drawing
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25479%20-%20haiku/trunk/src/servers/app/drawing&In-Reply-To=%3C200805122110.m4CLA8t7002647%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008825.html">
+   <LINK REL="Next"  HREF="008827.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25479 - haiku/trunk/src/servers/app/drawing</H1>
+    <B>stippi at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25479%20-%20haiku/trunk/src/servers/app/drawing&In-Reply-To=%3C200805122110.m4CLA8t7002647%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25479 - haiku/trunk/src/servers/app/drawing">stippi at mail.berlios.de
+       </A><BR>
+    <I>Mon May 12 23:10:08 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008825.html">[Haiku-commits] r25478 - haiku/trunk/src/system/libroot/posix/stdlib
+</A></li>
+        <LI>Next message: <A HREF="008827.html">[Haiku-commits] r25480 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8826">[ date ]</a>
+              <a href="thread.html#8826">[ thread ]</a>
+              <a href="subject.html#8826">[ subject ]</a>
+              <a href="author.html#8826">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2008-05-12 23:10:05 +0200 (Mon, 12 May 2008)
+New Revision: 25479
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25479&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25479&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/drawing/HWInterface.cpp
+Log:
+When drawing is double buffered, there is no excuse for a flickering cursor
+(including any drag bitmap). HWInterface::HideFloatingOverlays() was plain
+stupid, I know it did check double buffering at one point, but I must have
+removed that when messing with it. But copying anything from back to front
+buffer is now not overwriting the cursor area anymore, which is painted
+immediatly afterwards. Also moving the cursor invalidates only one rect
+if old and new cursor area overlap. All these changes should save some cycles
+too. Added TODO with regard to caching the on-the-fly cursor compositing
+buffer.
+If you have
+* a more recent computer
+* a decent VESA BIOS which supports your native resolution
+* don't need video overlays
+.. I recommend using the VESA driver.
+
+
+Modified: haiku/trunk/src/servers/app/drawing/HWInterface.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/HWInterface.cpp	2008-05-12 20:48:03 UTC (rev 25478)
++++ haiku/trunk/src/servers/app/drawing/HWInterface.cpp	2008-05-12 21:10:05 UTC (rev 25479)
+@@ -226,7 +226,7 @@
+ 		if (fCursorObscured) {
+ 			SetCursorVisible(true);
+ 		}
+-		BRect oldFrame = _CursorFrame();
++		IntRect oldFrame = _CursorFrame();
+ 		fCursorLocation = p;
+ 		if (fCursorVisible) {
+ 			// Invalidate and _DrawCursor would not draw
+@@ -238,8 +238,13 @@
+ 				_RestoreCursorArea();
+ 				_DrawCursor(_CursorFrame());
+ 			}
+-			Invalidate(oldFrame);
+-			Invalidate(_CursorFrame());
++			IntRect newFrame = _CursorFrame();
++			if (newFrame.Intersects(oldFrame))
++				Invalidate(oldFrame | newFrame);
++			else {
++				Invalidate(oldFrame);
++				Invalidate(newFrame);
++			}
+ 		}
+ 	}
+ 	fFloatingOverlaysLock.Unlock();
+@@ -334,16 +339,18 @@
+ 		uint32 srcBPR = backBuffer-&gt;BytesPerRow();
+ 		uint8* src = (uint8*)backBuffer-&gt;Bits();
+ 
+-		// convert to integer coordinates
+-		int32 left = (int32)floorf(area.left);
+-		int32 top = (int32)floorf(area.top);
+-		int32 right = (int32)ceilf(area.right);
+-		int32 bottom = (int32)ceilf(area.bottom);
++		BRegion region((BRect)area);
++		if (IsDoubleBuffered())
++			region.Exclude((clipping_rect)_CursorFrame());
++		
++		int32 count = region.CountRects();
++		for (int32 i = 0; i &lt; count; i++) {
++			clipping_rect r = region.RectAtInt(i);
++			// offset to left top pixel in source buffer (always B_RGBA32)
++			uint8* srcOffset = src + r.top * srcBPR + r.left * 4;
++			_CopyToFront(srcOffset, srcBPR, r.left, r.top, r.right, r.bottom);
++		}
+ 
+-		// offset to left top pixel in source buffer (always B_RGBA32)
+-		src += top * srcBPR + left * 4;
+-
+-		_CopyToFront(src, srcBPR, left, top, right, bottom);
+ 		_DrawCursor(area);
+ 
+ 		return B_OK;
+@@ -415,6 +422,8 @@
+ bool
+ HWInterface::HideFloatingOverlays(const BRect&amp; area)
+ {
++	if (IsDoubleBuffered())
++		return false;
+ 	if (!fFloatingOverlaysLock.Lock())
+ 		return false;
+ 	if (fCursorAreaBackup &amp;&amp; !fCursorAreaBackup-&gt;cursor_hidden) {
+@@ -436,6 +445,8 @@
+ bool
+ HWInterface::HideFloatingOverlays()
+ {
++	if (IsDoubleBuffered())
++		return false;
+ 	if (!fFloatingOverlaysLock.Lock())
+ 		return false;
+ 
+@@ -505,6 +516,7 @@
+ 
+ 		// blending buffer
+ 		uint8* buffer = new uint8[width * height * 4];
++			// TODO: cache this buffer
+ 
+ 		// offset into back buffer
+ 		uint8* src = (uint8*)backBuffer-&gt;Bits();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008825.html">[Haiku-commits] r25478 - haiku/trunk/src/system/libroot/posix/stdlib
+</A></li>
+	<LI>Next message: <A HREF="008827.html">[Haiku-commits] r25480 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8826">[ date ]</a>
+              <a href="thread.html#8826">[ thread ]</a>
+              <a href="subject.html#8826">[ subject ]</a>
+              <a href="author.html#8826">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

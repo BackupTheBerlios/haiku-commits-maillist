@@ -1,0 +1,380 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23328 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23328%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid&In-Reply-To=%3C200801091946.m09Jkshw014427%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005287.html">
+   <LINK REL="Next"  HREF="005289.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23328 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid</H1>
+    <B>stippi at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23328%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid&In-Reply-To=%3C200801091946.m09Jkshw014427%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23328 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid">stippi at mail.berlios.de
+       </A><BR>
+    <I>Wed Jan  9 20:46:54 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005287.html">[Haiku-commits] r23327 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+</A></li>
+        <LI>Next message: <A HREF="005289.html">[Haiku-commits] r23329 - haiku/trunk/src/apps/codycam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5288">[ date ]</a>
+              <a href="thread.html#5288">[ thread ]</a>
+              <a href="subject.html#5288">[ subject ]</a>
+              <a href="author.html#5288">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2008-01-09 20:46:54 +0100 (Wed, 09 Jan 2008)
+New Revision: 23328
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23328&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23328&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/hid.c
+   haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/hid.h
+Log:
+mmlr+stippi+axeld:
+* changed the way the interrupt schedules and repeats are handled, the
+  input server thread (via ioctl) is now triggering the scheduling and
+  processing of usb interrupt transfers. As long as it is blocking on
+  the usb_callback semaphore, it is using it as timeout for the key
+  repeats.
+-&gt; no more deadlock because the driver is issuing usb commands from
+   within the usb_callback function (hotplugging should be fixed
+   when using the Haiku usb stack)
+-&gt; the driver is no longer installing one timer per key down event
+-&gt; simplifications
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/hid.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/hid.c	2008-01-09 19:45:44 UTC (rev 23327)
++++ haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/hid.c	2008-01-09 19:46:54 UTC (rev 23328)
+@@ -339,7 +339,7 @@
+ 	device-&gt;open = 0;
+ 	device-&gt;open_fds = NULL;
+ 	device-&gt;active = true;
+-	device-&gt;unplugged = false;
++	device-&gt;transfer_scheduled = false;
+ 	device-&gt;insns = NULL;
+ 	device-&gt;num_insns = 0;
+ 	device-&gt;flags = 0;
+@@ -355,7 +355,6 @@
+ 	// default values taken from the PS/2 driver
+ 	device-&gt;repeat_rate = 35000;
+ 	device-&gt;repeat_delay = 300000;
+-	device-&gt;repeat_timer.device = device;
+ 
+ 	return device;
+ }
+@@ -365,7 +364,6 @@
+ remove_device(hid_device_info *device)
+ {
+ 	assert(device != NULL);
+-	cancel_timer(&amp;device-&gt;repeat_timer.timer);
+ 
+ 	if (device-&gt;rbuf != NULL) {
+ 		delete_ring_buffer(device-&gt;rbuf);
+@@ -388,31 +386,9 @@
+ 	raw.timestamp = system_time();
+ 
+ 	ring_buffer_write(device-&gt;rbuf, (const uint8*)&amp;raw, sizeof(raw_key_info));
+-	release_sem_etc(device-&gt;sem_cb, 1, B_DO_NOT_RESCHEDULE);
+ }
+ 
+ 
+-static int32
+-timer_repeat_hook(struct timer *timer)
+-{
+-	hid_device_info *device = ((struct hid_repeat_timer *)timer)-&gt;device;
+-
+-	write_key(device, device-&gt;repeat_timer.key, true);
+-	return B_HANDLED_INTERRUPT;
+-}
+-
+-
+-static int32
+-timer_delay_hook(struct timer *timer)
+-{
+-	hid_device_info *device = ((struct hid_repeat_timer *)timer)-&gt;device;
+-
+-	add_timer(&amp;device-&gt;repeat_timer.timer, timer_repeat_hook, device-&gt;repeat_rate,
+-		B_PERIODIC_TIMER);
+-	return B_HANDLED_INTERRUPT;
+-}
+-
+-
+ // here we don't need to follow a report descriptor for typical keyboards
+ // TODO : but we should for keypads for example because they aren't boot keyboard devices !
+ // see hidparse.c
+@@ -457,10 +433,8 @@
+ 				write_key(device, key, true);
+ 
+ 				// repeat handling
+-				cancel_timer(&amp;device-&gt;repeat_timer.timer);
+ 				device-&gt;repeat_timer.key = key;
+-				add_timer(&amp;device-&gt;repeat_timer.timer, timer_delay_hook,
+-					device-&gt;repeat_delay, B_ONE_SHOT_RELATIVE_TIMER);
++				device-&gt;repeat_timer.current_delay = device-&gt;repeat_delay;
+ 			}
+ 		} else
+ 			break;
+@@ -492,8 +466,10 @@
+ 				}
+ 
+ 				write_key(device, key, false);
++
++				// cancel the repeats if they are for this key
+ 				if (device-&gt;repeat_timer.key == key)
+-					cancel_timer(&amp;device-&gt;repeat_timer.timer);
++					device-&gt;repeat_timer.current_delay = B_INFINITE_TIMEOUT;
+ 			}
+ 		} else
+ 			break;
+@@ -590,10 +566,11 @@
+ 
+ 	info.timestamp = device-&gt;timestamp;
+ 	ring_buffer_write(device-&gt;rbuf, (const uint8*)&amp;info, sizeof(info));
+-	release_sem_etc(device-&gt;sem_cb, 1, B_DO_NOT_RESCHEDULE);
+ }
+ 
++// #pragma mark - interrupt transfers
+ 
++
+ /*!
+ 	callback: got a report, issue next request
+ */
+@@ -602,21 +579,39 @@
+ 	void *data, size_t actualLength)
+ {
+ 	hid_device_info *device = cookie;
+-	status_t status;
+ 
+-	if (device == NULL || device-&gt;unplugged)
+-		return;
+-
+-	acquire_sem(device-&gt;sem_lock);
+ 	device-&gt;actual_length = actualLength;
+ 	device-&gt;bus_status = busStatus;	/* B_USB_STATUS_* */
+-	if (busStatus != B_OK) {
++
++	// release the notification semaphore so the input_server
++	// thread which is blocking in hid_device_control can continue
++	// to run (see you in handle_interrupt_transfer())
++	release_sem_etc(device-&gt;sem_cb, 1, B_DO_NOT_RESCHEDULE);
++}
++
++static status_t
++schedule_interrupt_transfer(hid_device_info* device)
++{
++	status_t status = usb-&gt;queue_interrupt(device-&gt;ept-&gt;handle, device-&gt;buffer,
++		device-&gt;total_report_size, usb_callback, device);
++	if (status != B_OK) {
++		/* XXX probably endpoint stall */
++		DPRINTF_ERR ((MY_ID &quot;queue_interrupt() error %d\n&quot;, (int)status));
++	}
++	return status;
++}
++
++static status_t
++handle_interrupt_transfer(hid_device_info* device)
++{
++	status_t status = device-&gt;bus_status;
++
++	if (status != B_OK) {
+ 		/* request failed */
+-		release_sem(device-&gt;sem_lock);
+-		DPRINTF_ERR((MY_ID &quot;bus status %d\n&quot;, (int)busStatus));
+-		if (busStatus == B_CANCELED) {
++		DPRINTF_ERR((MY_ID &quot;bus status %d\n&quot;, (int)device-&gt;bus_status));
++		if (status == B_CANCELED) {
+ 			/* cancelled: device is unplugged */
+-			return;
++			return status;
+ 		}
+ #if 1
+ 		status = usb-&gt;clear_feature(device-&gt;ept-&gt;handle, USB_FEATURE_ENDPOINT_HALT);
+@@ -641,18 +636,9 @@
+ 			memcpy(device-&gt;last_buffer, device-&gt;buffer, device-&gt;total_report_size);
+ 		} else
+ 			interpret_mouse_buffer(device);
+-		
+-		release_sem(device-&gt;sem_lock);
+ 	}
+ 
+-	/* issue next request */
+-
+-	status = usb-&gt;queue_interrupt(device-&gt;ept-&gt;handle, device-&gt;buffer,
+-		device-&gt;total_report_size, usb_callback, device);
+-	if (status != B_OK) {
+-		/* XXX probably endpoint stall */
+-		DPRINTF_ERR ((MY_ID &quot;queue_interrupt() error %d\n&quot;, (int)status));
+-	}
++	return status;
+ }
+ 
+ 
+@@ -841,15 +827,7 @@
+ 
+ 	DPRINTF_INFO ((MY_ID &quot;%08lx %08lx %08lx\n&quot;, *(((uint32*)device-&gt;buffer)), *(((uint32*)device-&gt;buffer)+1), *(((uint32*)device-&gt;buffer)+2)));
+ 
+-	/* issue interrupt transfer */
+-
+ 	device-&gt;ept = &amp;intf-&gt;endpoint[0];		/* interrupt IN */
+-	status = usb-&gt;queue_interrupt(device-&gt;ept-&gt;handle, device-&gt;buffer,
+-		device-&gt;total_report_size, usb_callback, device);
+-	if (status != B_OK) {
+-		DPRINTF_ERR ((MY_ID &quot;queue_interrupt() error %d\n&quot;, (int)status));
+-		return B_ERROR;
+-	}
+ 
+ 	/* create a port */
+ 
+@@ -870,7 +848,6 @@
+ 
+ 	DPRINTF_INFO((MY_ID &quot;device_removed(%s)\n&quot;, device-&gt;name));
+ 	
+-	device-&gt;unplugged = true;
+ 	usb-&gt;cancel_queued_transfers (device-&gt;ept-&gt;handle);
+ 	remove_device_info(device);
+ 
+@@ -950,14 +927,43 @@
+ 	if (device-&gt;is_keyboard)
+ 		switch (op) {
+ 			case KB_READ:
+-	    		err = acquire_sem_etc(device-&gt;sem_cb, 1, B_CAN_INTERRUPT, 0LL);
+-	    		if (err != B_OK)
+-					return err;
+-				acquire_sem(device-&gt;sem_lock);
++				while (ring_buffer_readable(device-&gt;rbuf) == 0) {
++					if (!device-&gt;transfer_scheduled) {
++						err = schedule_interrupt_transfer(device);
++						if (err != B_OK)
++							return err;
++						device-&gt;transfer_scheduled = true;
++						// NOTE: this thread is now blocking until
++						// the semaphore will be released from the
++						// call_back function
++					}
++
++		    		err = acquire_sem_etc(device-&gt;sem_cb, 1,
++		    			B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT,
++		    			device-&gt;repeat_timer.current_delay);
++		    		if (err == B_TIMED_OUT) {
++		    			// this case is for handling key repeats, it means
++		    			// no interrupt transfer has happened
++		    			write_key(device, device-&gt;repeat_timer.key, true);
++		    			// the next timeout is reduced to the repeat_rate
++		    			device-&gt;repeat_timer.current_delay = device-&gt;repeat_rate;
++		    		} else if (err == B_OK) {
++		    			// this case is for when an actual interrupt transfer
++		    			// happened, it is the only possible reason to be here
++						device-&gt;transfer_scheduled = false;
++						err = handle_interrupt_transfer(device);
++						if (err != B_OK)
++							return err;
++		    		} else {
++						return err;
++		    		}
++				}
++
++				// process what is in the ring_buffer, it could be written
++				// there because we handled an interrupt transfer or because
++				// we wrote the current repeat key
+ 				ring_buffer_user_read(device-&gt;rbuf, arg, sizeof(raw_key_info));
+-				release_sem(device-&gt;sem_lock);
+-				return err;
+-				break;
++				return B_OK;
+ 	    
+ 			case KB_SET_LEDS:
+ 				set_leds(device, (uint8 *)arg);
+@@ -966,9 +972,21 @@
+ 	else
+ 		switch (op) {
+ 			case MS_READ:
++				err = schedule_interrupt_transfer(device);
++				if (err != B_OK)
++					return err;
++				// NOTE: this thread is now blocking until
++				// the semaphore will be released from the
++				// call_back function
++
+ 				err = acquire_sem_etc(device-&gt;sem_cb, 1, B_CAN_INTERRUPT, 0LL);
+ 	    		if (err != B_OK)
+ 					return err;
++
++				err = handle_interrupt_transfer(device);
++				if (err != B_OK)
++					return err;
++
+ 				acquire_sem(device-&gt;sem_lock);
+ 				ring_buffer_user_read(device-&gt;rbuf, arg, sizeof(mouse_movement));
+ 				release_sem(device-&gt;sem_lock);
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/hid.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/hid.h	2008-01-09 19:45:44 UTC (rev 23327)
++++ haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/hid.h	2008-01-09 19:46:54 UTC (rev 23328)
+@@ -45,8 +45,7 @@
+ struct driver_cookie;
+ 
+ struct hid_repeat_timer {
+-	struct timer timer;
+-	struct hid_device_info *device;
++	bigtime_t current_delay;
+ 	uint32 key;
+ };
+ 
+@@ -68,7 +67,6 @@
+ 	struct ring_buffer *rbuf;
+ 
+ 	bool active;
+-	bool unplugged;
+ 	int open;
+ 	struct driver_cookie *open_fds;
+ 
+@@ -76,6 +74,7 @@
+ 	int usbd_status, bus_status, cmd_status;
+ 	int actual_length;
+ 	const usb_endpoint_info *ept;
++	bool transfer_scheduled;
+ 
+ 	report_insn	*insns;
+ 	size_t num_insns;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005287.html">[Haiku-commits] r23327 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+</A></li>
+	<LI>Next message: <A HREF="005289.html">[Haiku-commits] r23329 - haiku/trunk/src/apps/codycam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5288">[ date ]</a>
+              <a href="thread.html#5288">[ thread ]</a>
+              <a href="subject.html#5288">[ subject ]</a>
+              <a href="author.html#5288">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

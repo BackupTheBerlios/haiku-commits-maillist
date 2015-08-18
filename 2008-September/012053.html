@@ -1,0 +1,392 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27658 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27658%20-%20in%20haiku/trunk%3A%20headers/os/kernel%0A%09headers/private/kernel%20src/system/kernel/debug&In-Reply-To=%3C200809202204.m8KM44j0012733%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012052.html">
+   <LINK REL="Next"  HREF="012054.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27658 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27658%20-%20in%20haiku/trunk%3A%20headers/os/kernel%0A%09headers/private/kernel%20src/system/kernel/debug&In-Reply-To=%3C200809202204.m8KM44j0012733%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27658 - in haiku/trunk: headers/os/kernel	headers/private/kernel src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Sep 21 00:04:04 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012052.html">[Haiku-commits] r27657 - haiku/trunk/src/bin/debug
+</A></li>
+        <LI>Next message: <A HREF="012054.html">[Haiku-commits] r27659 - haiku/trunk/src/bin/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12053">[ date ]</a>
+              <a href="thread.html#12053">[ thread ]</a>
+              <a href="subject.html#12053">[ subject ]</a>
+              <a href="author.html#12053">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-21 00:04:03 +0200 (Sun, 21 Sep 2008)
+New Revision: 27658
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27658&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27658&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/os/kernel/debugger.h
+   haiku/trunk/headers/private/kernel/user_debugger.h
+   haiku/trunk/src/system/kernel/debug/user_debugger.cpp
+Log:
+Solution for the potential deadlock when needing to flush the profiling
+buffer during a timer event that interrupted a kernel function: We do
+now flush the buffer as soon as it is 70% full, *if* we didn't interrupt
+a kernel function. When the buffer runs full and we still haven't hit a
+user function, we drop the tick. The number of dropped ticks is recorded
+and sent to the debugger with the next update message.
+Reverted the previous partial solution (the temporary disabling of
+profiling while in debugger support code).
+
+
+Modified: haiku/trunk/headers/os/kernel/debugger.h
+===================================================================
+--- haiku/trunk/headers/os/kernel/debugger.h	2008-09-20 20:44:19 UTC (rev 27657)
++++ haiku/trunk/headers/os/kernel/debugger.h	2008-09-20 22:04:03 UTC (rev 27658)
+@@ -556,6 +556,9 @@
+ 	int32				stack_depth;		// number of return addresses per
+ 											// tick
+ 	int32				sample_count;		// number of samples in the buffer
++	int32				dropped_ticks;		// number of ticks that had been
++											// dropped, since the buffer was
++											// full
+ 	bool				stopped;			// if true, the thread is no longer
+ 											// being profiled
+ } debug_profiler_update;
+
+Modified: haiku/trunk/headers/private/kernel/user_debugger.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/user_debugger.h	2008-09-20 20:44:19 UTC (rev 27657)
++++ haiku/trunk/headers/private/kernel/user_debugger.h	2008-09-20 22:04:03 UTC (rev 27658)
+@@ -15,9 +15,10 @@
+ 
+ 
+ // limits
+-#define B_DEBUG_MAX_PROFILE_FUNCTIONS	100000
+-#define B_DEBUG_MIN_PROFILE_INTERVAL	100			/* in us */
+-#define B_DEBUG_STACK_TRACE_DEPTH		5
++#define B_DEBUG_MAX_PROFILE_FUNCTIONS			100000
++#define B_DEBUG_MIN_PROFILE_INTERVAL			100			/* in us */
++#define B_DEBUG_STACK_TRACE_DEPTH				5
++#define	B_DEBUG_PROFILE_BUFFER_FLUSH_THRESHOLD	70			/* in % */
+ 
+ 
+ struct function_profile_info;
+@@ -84,15 +85,18 @@
+ 			// sample buffer
+ 		int32			max_samples;
+ 			// maximum number of samples the buffer can hold
++		int32			flush_threshold;
++			// number of sample when the buffer is flushed (if possible)
+ 		int32			sample_count;
+ 			// number of samples the buffer currently holds
+ 		int32			stack_depth;
+ 			// number of return addresses to record per timer interval
++		int32			dropped_ticks;
++			// number of ticks that had to be dropped when the sample buffer was
++			// full and couldn't be flushed
+ 		int32			image_event;
+ 			// number of the image event when the first sample was written into
+ 			// the buffer
+-		int32			disabled;
+-			// if &gt; 0, profiling is temporarily disabled for the thread
+ 		bool			buffer_full;
+ 			// indicates that the sample buffer is full
+ 		union {
+
+Modified: haiku/trunk/src/system/kernel/debug/user_debugger.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/user_debugger.cpp	2008-09-20 20:44:19 UTC (rev 27657)
++++ haiku/trunk/src/system/kernel/debug/user_debugger.cpp	2008-09-20 22:04:03 UTC (rev 27658)
+@@ -54,51 +54,6 @@
+ static void get_team_debug_info(team_debug_info &amp;teamDebugInfo);
+ 
+ 
+-static void
+-enable_profiling()
+-{
+-	struct thread* thread = thread_get_current_thread();
+-
+-	InterruptsSpinLocker _(gThreadSpinlock);
+-
+-	if (--thread-&gt;debug_info.profile.disabled &gt; 0)
+-		return;
+-
+-	if (thread-&gt;debug_info.profile.samples != NULL
+-		&amp;&amp; !thread-&gt;debug_info.profile.buffer_full) {
+-		// install profiling timer
+-		schedule_profiling_timer(thread,
+-			thread-&gt;debug_info.profile.interval_left);
+-	}
+-}
+-
+-
+-static void
+-disable_profiling()
+-{
+-	struct thread* thread = thread_get_current_thread();
+-
+-	InterruptsSpinLocker _(gThreadSpinlock);
+-
+-	if (thread-&gt;debug_info.profile.disabled++ &gt; 0) {
+-		ASSERT(thread-&gt;debug_info.profile.installed_timer == NULL);
+-		return;
+-	}
+-
+-	// if running, cancel the profiling timer
+-	struct timer* timer = thread-&gt;debug_info.profile.installed_timer;
+-	if (timer != NULL) {
+-		// track remaining time
+-		bigtime_t left = thread-&gt;debug_info.profile.timer_end - system_time();
+-		thread-&gt;debug_info.profile.interval_left = max_c(left, 0);
+-		thread-&gt;debug_info.profile.installed_timer = NULL;
+-
+-		// cancel timer
+-		cancel_timer(timer);
+-	}
+-}
+-
+-
+ static status_t
+ kill_interruptable_write_port(port_id port, int32 code, const void *buffer,
+ 	size_t bufferSize)
+@@ -119,8 +74,6 @@
+ 
+ 	status_t error = B_OK;
+ 
+-	disable_profiling();
+-
+ 	// get the team debug info
+ 	team_debug_info teamDebugInfo;
+ 	get_team_debug_info(teamDebugInfo);
+@@ -132,7 +85,6 @@
+ 		dontWait ? (uint32)B_RELATIVE_TIMEOUT : (uint32)B_KILL_CAN_INTERRUPT, 0);
+ 	if (error != B_OK) {
+ 		TRACE((&quot;debugger_write() done1: %lx\n&quot;, error));
+-		enable_profiling();
+ 		return error;
+ 	}
+ 
+@@ -159,7 +111,6 @@
+ 
+ 	TRACE((&quot;debugger_write() done: %lx\n&quot;, error));
+ 
+-	enable_profiling();
+ 	return error;
+ }
+ 
+@@ -337,7 +288,6 @@
+ 		info-&gt;ignore_signals_once = 0;
+ 		info-&gt;profile.sample_area = -1;
+ 		info-&gt;profile.samples = NULL;
+-		info-&gt;profile.disabled = 0;
+ 		info-&gt;profile.buffer_full = false;
+ 		info-&gt;profile.installed_timer = NULL;
+ 	}
+@@ -364,7 +314,6 @@
+ 		info-&gt;ignore_signals_once = 0;
+ 		info-&gt;profile.sample_area = -1;
+ 		info-&gt;profile.samples = NULL;
+-		info-&gt;profile.disabled = 0;
+ 		info-&gt;profile.buffer_full = false;
+ 	}
+ }
+@@ -735,8 +684,6 @@
+ thread_hit_debug_event(debug_debugger_message event, const void *message,
+ 	int32 size, bool requireDebugger)
+ {
+-	disable_profiling();
+-
+ 	status_t result;
+ 	bool restart;
+ 	do {
+@@ -745,8 +692,6 @@
+ 			requireDebugger, restart);
+ 	} while (result &gt;= 0 &amp;&amp; restart);
+ 
+-	enable_profiling();
+-
+ 	return result;
+ }
+ 
+@@ -1082,11 +1027,11 @@
+ 
+ 	area_id sampleArea = threadDebugInfo.profile.sample_area;
+ 	int32 sampleCount = threadDebugInfo.profile.sample_count;
++	int32 droppedTicks = threadDebugInfo.profile.dropped_ticks;
+ 	int32 stackDepth = threadDebugInfo.profile.stack_depth;
+ 	int32 imageEvent = threadDebugInfo.profile.image_event;
+ 	threadDebugInfo.profile.sample_area = -1;
+ 	threadDebugInfo.profile.samples = NULL;
+-	threadDebugInfo.profile.disabled = 0;
+ 	threadDebugInfo.profile.buffer_full = false;
+ 
+ 	atomic_or(&amp;threadDebugInfo.flags, B_THREAD_DEBUG_DYING);
+@@ -1100,6 +1045,7 @@
+ 	message.origin.team = thread-&gt;team-&gt;id;
+ 	message.origin.nub_port = -1;	// asynchronous message
+ 	message.sample_count = sampleCount;
++	message.dropped_ticks = droppedTicks;
+ 	message.stack_depth = stackDepth;
+ 	message.image_event = imageEvent;
+ 	message.stopped = true;
+@@ -1254,9 +1200,19 @@
+ 	int32 imageEvent = thread-&gt;team-&gt;debug_info.image_event;
+ 	if (debugInfo.profile.sample_count &gt; 0) {
+ 		if (debugInfo.profile.image_event &lt; imageEvent
+-			|| debugInfo.profile.max_samples - sampleCount &lt; stackDepth) {
+-			flushBuffer = true;
+-			return true;
++			|| debugInfo.profile.flush_threshold - sampleCount &lt; stackDepth) {
++			if (!IS_KERNEL_ADDRESS(arch_debug_get_interrupt_pc())) {
++				flushBuffer = true;
++				return true;
++			}
++
++			// We can't flush the buffer now, since we interrupted a kernel
++			// function. If the buffer is not full yet, we add the samples,
++			// otherwise we have to drop them.
++			if (debugInfo.profile.max_samples - sampleCount &lt; stackDepth) {
++				debugInfo.profile.dropped_ticks++;
++				return true;
++			}
+ 		}
+ 	} else {
+ 		// first sample -- set the image event
+@@ -1291,11 +1247,13 @@
+ 
+ 	if (debugInfo.profile.samples != NULL &amp;&amp; debugInfo.profile.buffer_full) {
+ 		int32 sampleCount = debugInfo.profile.sample_count;
++		int32 droppedTicks = debugInfo.profile.dropped_ticks;
+ 		int32 stackDepth = debugInfo.profile.stack_depth;
+ 		int32 imageEvent = debugInfo.profile.image_event;
+ 
+ 		// notify the debugger
+ 		debugInfo.profile.sample_count = 0;
++		debugInfo.profile.dropped_ticks = 0;
+ 
+ 		RELEASE_THREAD_LOCK();
+ 		enable_interrupts();
+@@ -1303,6 +1261,7 @@
+ 		// prepare the message
+ 		debug_profiler_update message;
+ 		message.sample_count = sampleCount;
++		message.dropped_ticks = droppedTicks;
+ 		message.stack_depth = stackDepth;
+ 		message.image_event = imageEvent;
+ 		message.stopped = false;
+@@ -1333,7 +1292,7 @@
+ 	struct thread* thread = thread_get_current_thread();
+ 	thread_debug_info&amp; debugInfo = thread-&gt;debug_info;
+ 
+-	bool flushBuffer;
++	bool flushBuffer = false;
+ 	if (profiling_do_sample(flushBuffer)) {
+ 		if (flushBuffer) {
+ 			// The sample buffer needs to be flushed; we'll have to notify the
+@@ -1355,11 +1314,6 @@
+ void
+ user_debug_thread_unscheduled(struct thread* thread)
+ {
+-	if (thread-&gt;debug_info.profile.disabled &gt; 0) {
+-		ASSERT(thread-&gt;debug_info.profile.installed_timer == NULL);
+-		return;
+-	}
+-
+ 	// if running, cancel the profiling timer
+ 	struct timer* timer = thread-&gt;debug_info.profile.installed_timer;
+ 	if (timer != NULL) {
+@@ -1377,9 +1331,6 @@
+ void
+ user_debug_thread_scheduled(struct thread* thread)
+ {
+-	if (thread-&gt;debug_info.profile.disabled &gt; 0)
+-		return;
+-
+ 	if (thread-&gt;debug_info.profile.samples != NULL
+ 		&amp;&amp; !thread-&gt;debug_info.profile.buffer_full) {
+ 		// install profiling timer
+@@ -2321,7 +2272,12 @@
+ 							threadDebugInfo.profile.samples = (addr_t*)samples;
+ 							threadDebugInfo.profile.max_samples
+ 								= areaInfo.size / sizeof(addr_t);
++							threadDebugInfo.profile.flush_threshold
++								= threadDebugInfo.profile.max_samples
++									* B_DEBUG_PROFILE_BUFFER_FLUSH_THRESHOLD
++									/ 100;
+ 							threadDebugInfo.profile.sample_count = 0;
++							threadDebugInfo.profile.dropped_ticks = 0;
+ 							threadDebugInfo.profile.stack_depth = stackDepth;
+ 							threadDebugInfo.profile.buffer_full = false;
+ 							threadDebugInfo.profile.interval_left = interval;
+@@ -2369,6 +2325,7 @@
+ 				int32 sampleCount = 0;
+ 				int32 stackDepth = 0;
+ 				int32 imageEvent = 0;
++				int32 droppedTicks = 0;
+ 
+ 				// get the thread and detach the profile info
+ 				cpu_status state = disable_interrupts();
+@@ -2382,11 +2339,13 @@
+ 						sampleArea = threadDebugInfo.profile.sample_area;
+ 						samples = threadDebugInfo.profile.samples;
+ 						sampleCount = threadDebugInfo.profile.sample_count;
++						droppedTicks = threadDebugInfo.profile.dropped_ticks;
+ 						stackDepth = threadDebugInfo.profile.stack_depth;
+ 						imageEvent = threadDebugInfo.profile.image_event;
+ 						threadDebugInfo.profile.sample_area = -1;
+ 						threadDebugInfo.profile.samples = NULL;
+ 						threadDebugInfo.profile.buffer_full = false;
++						threadDebugInfo.profile.dropped_ticks = 0;
+ 					} else
+ 						result = B_BAD_VALUE;
+ 				} else
+@@ -2401,6 +2360,7 @@
+ 					reply.profiler_update.image_event = imageEvent;
+ 					reply.profiler_update.stack_depth = stackDepth;
+ 					reply.profiler_update.sample_count = sampleCount;
++					reply.profiler_update.dropped_ticks = droppedTicks;
+ 					reply.profiler_update.stopped = true;
+ 				} else
+ 					reply.profiler_update.origin.thread = result;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012052.html">[Haiku-commits] r27657 - haiku/trunk/src/bin/debug
+</A></li>
+	<LI>Next message: <A HREF="012054.html">[Haiku-commits] r27659 - haiku/trunk/src/bin/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12053">[ date ]</a>
+              <a href="thread.html#12053">[ thread ]</a>
+              <a href="subject.html#12053">[ subject ]</a>
+              <a href="author.html#12053">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

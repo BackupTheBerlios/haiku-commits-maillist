@@ -1,0 +1,209 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20572 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20572%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704050657.l356v8cu024563%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001430.html">
+   <LINK REL="Next"  HREF="001432.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20572 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20572%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704050657.l356v8cu024563%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20572 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr  5 08:57:08 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001430.html">[Haiku-commits] r20571 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+        <LI>Next message: <A HREF="001432.html">[Haiku-commits] r20573 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1431">[ date ]</a>
+              <a href="thread.html#1431">[ thread ]</a>
+              <a href="subject.html#1431">[ subject ]</a>
+              <a href="author.html#1431">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-05 08:56:58 +0200 (Thu, 05 Apr 2007)
+New Revision: 20572
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20572&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20572&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h
+Log:
+fixed another TCP issue: if we were in TIME_WAIT and we received a retransmission or delayed ack, TCP would wrongly bindly immediatly acknowledge.
+
+ * Moved TIME_WAIT and CLOSED handling to common Receive() path that does Sequence checking and further tests.
+ * Moved setting FLAG_NO_RECEIVE to the end of Receive() when FIN is set so we can check for NO_RECEIVE before processing the segment text just after processing FIN.
+ * Added a new action DELETE to be used when in TIME_WAIT and we receive a good RST
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-05 04:24:29 UTC (rev 20571)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-05 06:56:58 UTC (rev 20572)
+@@ -203,6 +203,7 @@
+ 	if (fState &lt;= SYNCHRONIZE_SENT || fState == TIME_WAIT)
+ 		return B_OK;
+ 
++	// we are only interested in the timer, not in changing state
+ 	_EnterTimeWait();
+ 	return B_BUSY;
+ 		// we'll be freed later when the 2MSL timer expires
+@@ -821,13 +822,26 @@
+ 		// is this a valid reset?
+ 		if (fLastAcknowledgeSent &lt;= segment.sequence
+ 			&amp;&amp; tcp_sequence(segment.sequence) &lt; fLastAcknowledgeSent + fReceiveWindow) {
+-			// TODO: close connection depending on state
++			if (fState == SYNCHRONIZE_RECEIVED) {
++				// TODO: if we came from SYN-SENT signal connection refused
++				//       and remove all segments from tx queue
++			} else if (fState == ESTABLISHED || fState == FINISH_SENT
++				|| fState == FINISH_RECEIVED || fState == FINISH_ACKNOWLEDGED) {
++				// TODO: RFC 793 states that on ESTABLISHED, FIN-WAIT{1,2}
++				//       or CLOSE-WAIT &quot;All segment queues should be
++				//       flushed&quot;.
++			}
++
++			if (fState != TIME_WAIT &amp;&amp; fReceiveQueue.Available() &gt; 0) {
++				release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
++					// TODO: real conditional locking needed!
++				gSocketModule-&gt;notify(socket, B_SELECT_READ, 1);
++			} else {
++				return DELETE | DROP;
++			}
++
+ 			fError = ECONNREFUSED;
+ 			fState = CLOSED;
+-
+-			release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+-				// TODO: real conditional locking needed!
+-			gSocketModule-&gt;notify(socket, B_SELECT_READ, fReceiveQueue.Available());
+ 		}
+ 
+ 		return DROP;
+@@ -904,7 +918,8 @@
+ 				// TODO: real conditional locking needed!
+ 			gSocketModule-&gt;notify(socket, B_SELECT_READ, fReceiveQueue.Available());
+ 		}
+-		if (fSendMax &lt; segment.acknowledge)
++
++		if (fSendMax &lt; segment.acknowledge || fState == TIME_WAIT)
+ 			return DROP | IMMEDIATE_ACKNOWLEDGE;
+ 		if (fSendUnacknowledged &gt;= segment.acknowledge) {
+ 			// this is a duplicate acknowledge
+@@ -977,7 +992,6 @@
+ 	if (segment.flags &amp; TCP_FLAG_FINISH) {
+ 		TRACE(&quot;Receive(): peer is finishing connection!&quot;);
+ 		fReceiveNext++;
+-		fFlags |= FLAG_NO_RECEIVE;
+ 
+ 		release_sem_etc(fReceiveLock, 1, B_DO_NOT_RESCHEDULE);
+ 			// TODO: real conditional locking needed!
+@@ -1015,7 +1029,7 @@
+ 	// state machine is done switching states and the data is good.
+ 	// put it in the receive buffer
+ 
+-	if (buffer-&gt;size &gt; 0) {
++	if (buffer-&gt;size &gt; 0 &amp;&amp; (fFlags &amp; FLAG_NO_RECEIVE) == 0) {
+ 		fReceiveQueue.Add(buffer, segment.sequence);
+ 		fReceiveNext += buffer-&gt;size;
+ 		TRACE(&quot;Receive(): adding data, receive next = %lu!&quot;, (uint32)fReceiveNext);
+@@ -1029,6 +1043,9 @@
+ 	if (segment.flags &amp; TCP_FLAG_PUSH)
+ 		fReceiveQueue.SetPushPointer(fReceiveQueue.LastSequence());
+ 
++	if (segment.flags &amp; TCP_FLAG_FINISH)
++		fFlags |= FLAG_NO_RECEIVE;
++
+ 	return action;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp	2007-04-05 04:24:29 UTC (rev 20571)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp	2007-04-05 06:56:58 UTC (rev 20572)
+@@ -555,12 +555,6 @@
+ 		TRACE((&quot;Endpoint %p in state %s\n&quot;, endpoint, name_for_state(endpoint-&gt;State())));
+ 
+ 		switch (endpoint-&gt;State()) {
+-			case TIME_WAIT:
+-				segmentAction |= IMMEDIATE_ACKNOWLEDGE;
+-			case CLOSED:
+-				endpoint-&gt;UpdateTimeWait();
+-				break;
+-
+ 			case LISTEN:
+ 				segmentAction = endpoint-&gt;ListenReceive(segment, buffer);
+ 				break;
+@@ -576,6 +570,8 @@
+ 			case FINISH_SENT:
+ 			case FINISH_ACKNOWLEDGED:
+ 			case CLOSING:
++			case TIME_WAIT:
++			case CLOSED:
+ 				segmentAction = endpoint-&gt;Receive(segment, buffer);
+ 				break;
+ 		}
+@@ -585,6 +581,8 @@
+ 			endpoint-&gt;SendAcknowledge();
+ 		else if (segmentAction &amp; ACKNOWLEDGE)
+ 			endpoint-&gt;DelayedAcknowledge();
++		else if (segmentAction &amp; DELETE)
++			gSocketModule-&gt;delete_socket(endpoint-&gt;socket);
+ 	} else if ((segment.flags &amp; TCP_FLAG_RESET) == 0)
+ 		segmentAction = DROP | RESET;
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h	2007-04-05 04:24:29 UTC (rev 20571)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h	2007-04-05 06:56:58 UTC (rev 20572)
+@@ -153,6 +153,7 @@
+ 	RESET		= 0x02,
+ 	ACKNOWLEDGE	= 0x04,
+ 	IMMEDIATE_ACKNOWLEDGE = 0x08,
++	DELETE		= 0x10,
+ };
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001430.html">[Haiku-commits] r20571 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+	<LI>Next message: <A HREF="001432.html">[Haiku-commits] r20573 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1431">[ date ]</a>
+              <a href="thread.html#1431">[ thread ]</a>
+              <a href="subject.html#1431">[ subject ]</a>
+              <a href="author.html#1431">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

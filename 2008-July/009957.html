@@ -1,0 +1,294 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26213 -	haiku/trunk/src/add-ons/kernel/file_systems/ext2
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26213%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/ext2&In-Reply-To=%3C200807020915.m629F4o9005852%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009955.html">
+   <LINK REL="Next"  HREF="009959.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26213 -	haiku/trunk/src/add-ons/kernel/file_systems/ext2</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26213%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/ext2&In-Reply-To=%3C200807020915.m629F4o9005852%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26213 -	haiku/trunk/src/add-ons/kernel/file_systems/ext2">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Jul  2 11:15:04 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009955.html">[Haiku-commits] r26212 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="009959.html">[Haiku-commits] r26213 - haiku/trunk/src/add-ons/kernel/file_systems/ext2
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9957">[ date ]</a>
+              <a href="thread.html#9957">[ thread ]</a>
+              <a href="subject.html#9957">[ subject ]</a>
+              <a href="author.html#9957">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-07-02 11:15:04 +0200 (Wed, 02 Jul 2008)
+New Revision: 26213
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26213&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26213&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/ext2/DirectoryIterator.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/ext2/Inode.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/ext2/Volume.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/ext2/Volume.h
+   haiku/trunk/src/add-ons/kernel/file_systems/ext2/ext2.h
+   haiku/trunk/src/add-ons/kernel/file_systems/ext2/kernel_interface.cpp
+Log:
+* Fixed wrong group block offset computation: the
+  ext2_super_block::first_data_block must be used; the superblock offset
+  doesn't matter if the block size is greater than 2KB.
+* Fixed block access beyond the 4GB limit - we need to cast the block to
+  a 64 bit type in ext2_get_file_map() before shifting it.
+* Tested with various larger ext3 disks, and everything seems to work fine.
+* Added some optional debug output.
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/ext2/DirectoryIterator.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/ext2/DirectoryIterator.cpp	2008-07-02 00:59:32 UTC (rev 26212)
++++ haiku/trunk/src/add-ons/kernel/file_systems/ext2/DirectoryIterator.cpp	2008-07-02 09:15:04 UTC (rev 26213)
+@@ -11,6 +11,14 @@
+ #include &quot;Inode.h&quot;
+ 
+ 
++//#define TRACE_EXT2
++#ifdef TRACE_EXT2
++#	define TRACE(x...) dprintf(&quot;\33[34mext2:\33[0m &quot; x)
++#else
++#	define TRACE(x...) ;
++#endif
++
++
+ DirectoryIterator::DirectoryIterator(Inode* inode)
+ 	:
+ 	fInode(inode),
+@@ -24,7 +32,7 @@
+ }
+ 
+ 
+-status_t	
++status_t
+ DirectoryIterator::GetNext(char* name, size_t* _nameLength, ino_t* _id)
+ {
+ 	if (fOffset + sizeof(ext2_dir_entry) &gt;= fInode-&gt;Size())
+@@ -48,6 +56,10 @@
+ 		fOffset += entry.Length();
+ 	}
+ 
++	TRACE(&quot;offset %Ld: entry ino %lu, length %u, name length %u, type %u\n&quot;,
++		fOffset, entry.InodeID(), entry.Length(), entry.NameLength(),
++		entry.FileType());
++
+ 	// read name
+ 
+ 	size_t length = entry.NameLength();
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/ext2/Inode.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/ext2/Inode.cpp	2008-07-02 00:59:32 UTC (rev 26212)
++++ haiku/trunk/src/add-ons/kernel/file_systems/ext2/Inode.cpp	2008-07-02 09:15:04 UTC (rev 26213)
+@@ -11,6 +11,14 @@
+ #include &quot;CachedBlock.h&quot;
+ 
+ 
++//#define TRACE_EXT2
++#ifdef TRACE_EXT2
++#	define TRACE(x...) dprintf(&quot;\33[34mext2:\33[0m &quot; x)
++#else
++#	define TRACE(x...) ;
++#endif
++
++
+ Inode::Inode(Volume* volume, ino_t id)
+ 	:
+ 	fVolume(volume),
+@@ -23,6 +31,7 @@
+ 
+ 	uint32 block;
+ 	if (volume-&gt;GetInodeBlock(id, block) == B_OK) {
++		TRACE(&quot;inode %Ld at block %lu\n&quot;, ID(), block);
+ 		ext2_inode* inodes = (ext2_inode*)block_cache_get(volume-&gt;BlockCache(),
+ 			block);
+ 		if (inodes != NULL)
+@@ -150,7 +159,7 @@
+ 		return B_ERROR;
+ 	}
+ 
+-	//dprintf(&quot;FindBlock(offset %Ld): %lu\n&quot;, offset, block);
++	TRACE(&quot;inode %Ld: FindBlock(offset %Ld): %lu\n&quot;, ID(), offset, block);
+ 	return B_OK;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/ext2/Volume.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/ext2/Volume.cpp	2008-07-02 00:59:32 UTC (rev 26212)
++++ haiku/trunk/src/add-ons/kernel/file_systems/ext2/Volume.cpp	2008-07-02 09:15:04 UTC (rev 26213)
+@@ -20,6 +20,14 @@
+ #include &quot;Inode.h&quot;
+ 
+ 
++//#define TRACE_EXT2
++#ifdef TRACE_EXT2
++#	define TRACE(x...) dprintf(&quot;\33[34mext2:\33[0m &quot; x)
++#else
++#	define TRACE(x...) ;
++#endif
++
++
+ class DeviceOpener {
+ 	public:
+ 		DeviceOpener(int fd, int mode);
+@@ -268,13 +276,20 @@
+ 	// initialize short hands to the super block (to save byte swapping)
+ 	fBlockShift = fSuperBlock.BlockShift();
+ 	fBlockSize = 1UL &lt;&lt; fSuperBlock.BlockShift();
++	fFirstDataBlock = fSuperBlock.FirstDataBlock();
+ 
+-	fNumGroups = (fSuperBlock.NumBlocks() - fSuperBlock.FirstDataBlock() - 1)
++	fNumGroups = (fSuperBlock.NumBlocks() - fFirstDataBlock - 1)
+ 		/ fSuperBlock.BlocksPerGroup() + 1;
+ 	fGroupsPerBlock = fBlockSize / sizeof(ext2_block_group);
+ 
++	TRACE(&quot;block size %ld, num groups %ld, groups per block %ld, first %lu\n&quot;,
++		fBlockSize, fNumGroups, fGroupsPerBlock, fFirstDataBlock);
++	TRACE(&quot;features %lx, incompatible features %lx, read-only features %lx\n&quot;,
++		fSuperBlock.CompatibleFeatures(), fSuperBlock.IncompatibleFeatures(),
++		fSuperBlock.ReadOnlyFeatures());
++
+ 	uint32 blockCount = (fNumGroups + fGroupsPerBlock - 1) / fGroupsPerBlock;
+-	
++
+ 	fGroupBlocks = (ext2_block_group**)malloc(blockCount * sizeof(void*));
+ 	if (fGroupBlocks == NULL)
+ 		return B_NO_MEMORY;
+@@ -298,8 +313,9 @@
+ 		// all went fine
+ 		opener.Keep();
+ 		return B_OK;
+-	} else
+-		dprintf(&quot;ext2: could not create root node: get_vnode() failed!\n&quot;);
++	} else {
++		TRACE(&quot;could not create root node: get_vnode() failed!\n&quot;);
++	}
+ 
+ 	return status;
+ }
+@@ -344,7 +360,7 @@
+ 	if ((fSuperBlock.IncompatibleFeatures()
+ 			&amp; EXT2_INCOMPATIBLE_FEATURE_META_GROUP) == 0
+ 		|| blockIndex &lt; fSuperBlock.FirstMetaBlockGroup())
+-		return EXT2_SUPER_BLOCK_OFFSET + fBlockSize * (1 + blockIndex);
++		return (fFirstDataBlock + blockIndex + 1) &lt;&lt; fBlockShift;
+ 
+ 	panic(&quot;meta block&quot;);
+ 	return 0;
+@@ -380,6 +396,9 @@
+ 		}
+ 
+ 		fGroupBlocks[blockIndex] = groupBlock;
++
++		TRACE(&quot;group [%ld]: inode table %ld\n&quot;, index,
++			(fGroupBlocks[blockIndex] + index % fGroupsPerBlock)-&gt;InodeTable());
+ 	}
+ 
+ 	*_group = fGroupBlocks[blockIndex] + index % fGroupsPerBlock;
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/ext2/Volume.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/ext2/Volume.h	2008-07-02 00:59:32 UTC (rev 26212)
++++ haiku/trunk/src/add-ons/kernel/file_systems/ext2/Volume.h	2008-07-02 09:15:04 UTC (rev 26213)
+@@ -62,6 +62,7 @@
+ 	uint32				fFlags;
+ 	uint32				fBlockSize;
+ 	uint32				fBlockShift;
++	uint32				fFirstDataBlock;
+ 	uint32				fNumGroups;
+ 	uint32				fGroupsPerBlock;
+ 	ext2_block_group**	fGroupBlocks;
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/ext2/ext2.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/ext2/ext2.h	2008-07-02 00:59:32 UTC (rev 26212)
++++ haiku/trunk/src/add-ons/kernel/file_systems/ext2/ext2.h	2008-07-02 09:15:04 UTC (rev 26213)
+@@ -45,7 +45,7 @@
+ 	uint16	block_group;
+ 	uint32	compatible_features;
+ 	uint32	incompatible_features;
+-	uint32	readonly_features;
++	uint32	read_only_features;
+ 	uint8	uuid[16];
+ 	char	name[16];
+ 	char	last_mount_point[64];
+@@ -53,7 +53,7 @@
+ 	uint8	preallocated_blocks;
+ 	uint8	preallocated_directory_blocks;
+ 	uint16	_padding;
+-	
++
+ 	// journaling ext3 support
+ 	uint8	journal_uuid[16];
+ 	uint32	journal_inode;
+@@ -85,7 +85,7 @@
+ 	uint32 CompatibleFeatures() const
+ 		{ return B_LENDIAN_TO_HOST_INT32(compatible_features); }
+ 	uint32 ReadOnlyFeatures() const
+-		{ return B_LENDIAN_TO_HOST_INT32(readonly_features); }
++		{ return B_LENDIAN_TO_HOST_INT32(read_only_features); }
+ 	uint32 IncompatibleFeatures() const
+ 		{ return B_LENDIAN_TO_HOST_INT32(incompatible_features); }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/ext2/kernel_interface.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/ext2/kernel_interface.cpp	2008-07-02 00:59:32 UTC (rev 26212)
++++ haiku/trunk/src/add-ons/kernel/file_systems/ext2/kernel_interface.cpp	2008-07-02 09:15:04 UTC (rev 26213)
+@@ -257,7 +257,7 @@
+ 		if (status != B_OK)
+ 			return status;
+ 
+-		off_t blockOffset = block &lt;&lt; volume-&gt;BlockShift();
++		off_t blockOffset = (off_t)block &lt;&lt; volume-&gt;BlockShift();
+ 		uint32 blockLength = volume-&gt;BlockSize();
+ 
+ 		if (index &gt; 0 &amp;&amp; vecs[index - 1].offset == blockOffset - blockLength) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009955.html">[Haiku-commits] r26212 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="009959.html">[Haiku-commits] r26213 - haiku/trunk/src/add-ons/kernel/file_systems/ext2
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9957">[ date ]</a>
+              <a href="thread.html#9957">[ thread ]</a>
+              <a href="subject.html#9957">[ subject ]</a>
+              <a href="author.html#9957">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

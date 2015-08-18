@@ -1,0 +1,263 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27074 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27074%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200808200809.m7K89J7f006231%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011117.html">
+   <LINK REL="Next"  HREF="011119.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27074 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27074%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200808200809.m7K89J7f006231%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27074 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Aug 20 10:09:19 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011117.html">[Haiku-commits] r27073 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+        <LI>Next message: <A HREF="011119.html">[Haiku-commits] r27075 -	haiku/trunk/src/add-ons/kernel/bus_managers/ide
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11118">[ date ]</a>
+              <a href="thread.html#11118">[ thread ]</a>
+              <a href="subject.html#11118">[ subject ]</a>
+              <a href="author.html#11118">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-08-20 10:09:18 +0200 (Wed, 20 Aug 2008)
+New Revision: 27074
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27074&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27074&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/block_cache.cpp
+Log:
+* Changed the way how a cache is destructed: now, it is removed from the
+  global cache list before locking it. This allows to get rid of the
+  block_cache::deleting field, as well as simplifies some code.
+* This also fixes a possible deadlock I recently introduced (on destruction,
+  the locking order was wrong).
+* Now uses an anonymous condition variable instead.
+* Moved the block_cache initialization code into a dedicated method that will
+  now also fail in case the low resource handler couldn't be registered (as
+  pointed out by Salvatore).
+
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-08-20 01:51:23 UTC (rev 27073)
++++ haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-08-20 08:09:18 UTC (rev 27074)
+@@ -115,12 +115,11 @@
+ 
+ 	NotificationList pending_notifications;
+ 	ConditionVariable condition_variable;
+-	bool			deleting;
+ 
+ 	block_cache(int fd, off_t numBlocks, size_t blockSize, bool readOnly);
+ 	~block_cache();
+ 
+-	status_t InitCheck();
++	status_t Init();
+ 
+ 	void RemoveUnusedBlocks(int32 maxAccessed = LONG_MAX,
+ 		int32 count = LONG_MAX);
+@@ -767,68 +766,50 @@
+ 	next_transaction_id(1),
+ 	last_transaction(NULL),
+ 	transaction_hash(NULL),
++	buffer_cache(NULL),
+ 	num_dirty_blocks(0),
+-	read_only(readOnly),
+-	deleting(false)
++	read_only(readOnly)
+ {
+-	condition_variable.Publish(this, &quot;cache transaction sync&quot;);
+-
+-	buffer_cache = create_object_cache_etc(&quot;block cache buffers&quot;, blockSize,
+-		8, 0, CACHE_LARGE_SLAB, NULL, NULL, NULL, NULL);
+-	if (buffer_cache == NULL)
+-		return;
+-
+-	hash = hash_init(1024, offsetof(cached_block, next), &amp;cached_block::Compare,
+-		&amp;cached_block::Hash);
+-	if (hash == NULL)
+-		return;
+-
+-	transaction_hash = hash_init(16, offsetof(cache_transaction, next),
+-		&amp;transaction_compare, &amp;::transaction_hash);
+-	if (transaction_hash == NULL)
+-		return;
+-
+-	mutex_init(&amp;lock, &quot;block cache&quot;);
+-
+-	register_low_resource_handler(&amp;block_cache::LowMemoryHandler, this,
+-		B_KERNEL_RESOURCE_PAGES | B_KERNEL_RESOURCE_MEMORY, 0);
+-
+-	MutexLocker _(sCachesLock);
+-	sCaches.Add(this);
+ }
+ 
+ 
+ /*! Should be called with the cache's lock held. */
+ block_cache::~block_cache()
+ {
+-	deleting = true;
++	unregister_low_resource_handler(&amp;block_cache::LowMemoryHandler, this);
+ 
+-	if (InitCheck() == B_OK) {
+-		mutex_lock(&amp;sCachesLock);
+-		sCaches.Remove(this);
+-		mutex_unlock(&amp;sCachesLock);
+-
+-		unregister_low_resource_handler(&amp;block_cache::LowMemoryHandler, this);
+-
+-		mutex_destroy(&amp;lock);
+-	}
+-
+-	condition_variable.Unpublish();
+-
+ 	hash_uninit(transaction_hash);
+ 	hash_uninit(hash);
+ 
+ 	delete_object_cache(buffer_cache);
++
++	mutex_destroy(&amp;lock);
+ }
+ 
+ 
+ status_t
+-block_cache::InitCheck()
++block_cache::Init()
+ {
+-	if (buffer_cache == NULL || hash == NULL || transaction_hash == NULL)
++	condition_variable.Init(this, &quot;cache transaction sync&quot;);
++	mutex_init(&amp;lock, &quot;block cache&quot;);
++
++	buffer_cache = create_object_cache_etc(&quot;block cache buffers&quot;, block_size,
++		8, 0, CACHE_LARGE_SLAB, NULL, NULL, NULL, NULL);
++	if (buffer_cache == NULL)
+ 		return B_NO_MEMORY;
+ 
+-	return B_OK;
++	hash = hash_init(1024, offsetof(cached_block, next), &amp;cached_block::Compare,
++		&amp;cached_block::Hash);
++	if (hash == NULL)
++		return B_NO_MEMORY;
++
++	transaction_hash = hash_init(16, offsetof(cache_transaction, next),
++		&amp;transaction_compare, &amp;::transaction_hash);
++	if (transaction_hash == NULL)
++		return B_NO_MEMORY;
++
++	return register_low_resource_handler(&amp;block_cache::LowMemoryHandler, this,
++		B_KERNEL_RESOURCE_PAGES | B_KERNEL_RESOURCE_MEMORY, 0);
+ }
+ 
+ 
+@@ -1617,23 +1598,11 @@
+ 		cache = sCaches.Head();
+ 
+ 	while (cache != NULL) {
+-		while (cache != NULL &amp;&amp; cache-&gt;deleting) {
+-			cache = sCaches.GetNext(cache);
+-		}
++		cache = sCaches.GetNext(cache);
+ 		if (cache == NULL)
+ 			break;
+ 
+-		status_t status = mutex_lock(&amp;cache-&gt;lock);
+-		if (status != B_OK) {
+-			// can only happen if the cache is being deleted right now
+-			continue;
+-		}
+-
+-		if (cache-&gt;deleting) {
+-			mutex_unlock(&amp;cache-&gt;lock);
+-			continue;
+-		}
+-
++		mutex_lock(&amp;cache-&gt;lock);
+ 		break;
+ 	}
+ 
+@@ -1649,7 +1618,7 @@
+ 	Every two seconds, it will also write back up to 64 blocks per cache.
+ */
+ static status_t
+-block_notifier_and_writer(void *)
++block_notifier_and_writer(void */*data*/)
+ {
+ 	const bigtime_t kTimeout = 2000000LL;
+ 	bigtime_t timeout = kTimeout;
+@@ -1762,7 +1731,7 @@
+ 		cache);
+ 
+ 	ConditionVariableEntry entry;
+-	entry.Add(cache);
++	cache-&gt;condition_variable.Add(&amp;entry);
+ 
+ 	add_notification(cache, &amp;notification, TRANSACTION_WRITTEN, false);
+ 
+@@ -2364,6 +2333,10 @@
+ 	if (allowWrites)
+ 		block_cache_sync(cache);
+ 
++	mutex_lock(&amp;sCachesLock);
++	sCaches.Remove(cache);
++	mutex_unlock(&amp;sCachesLock);
++
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 
+ 	// free all blocks
+@@ -2396,11 +2369,14 @@
+ 	if (cache == NULL)
+ 		return NULL;
+ 
+-	if (cache-&gt;InitCheck() != B_OK) {
++	if (cache-&gt;Init() != B_OK) {
+ 		delete cache;
+ 		return NULL;
+ 	}
+ 
++	MutexLocker _(sCachesLock);
++	sCaches.Add(cache);
++
+ 	return cache;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011117.html">[Haiku-commits] r27073 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+	<LI>Next message: <A HREF="011119.html">[Haiku-commits] r27075 -	haiku/trunk/src/add-ons/kernel/bus_managers/ide
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11118">[ date ]</a>
+              <a href="thread.html#11118">[ thread ]</a>
+              <a href="subject.html#11118">[ subject ]</a>
+              <a href="author.html#11118">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

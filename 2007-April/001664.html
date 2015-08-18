@@ -1,0 +1,367 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20734 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20734%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704170555.l3H5tD3P030764%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001663.html">
+   <LINK REL="Next"  HREF="001665.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20734 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20734%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704170555.l3H5tD3P030764%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20734 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Tue Apr 17 07:55:13 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001663.html">[Haiku-commits] r20733 - haiku/trunk/src/servers/registrar
+</A></li>
+        <LI>Next message: <A HREF="001665.html">[Haiku-commits] r20735 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1664">[ date ]</a>
+              <a href="thread.html#1664">[ thread ]</a>
+              <a href="subject.html#1664">[ subject ]</a>
+              <a href="author.html#1664">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-17 07:55:03 +0200 (Tue, 17 Apr 2007)
+New Revision: 20734
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20734&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20734&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+Log:
+implemented TCP's slow start and congestion avoidance.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-17 05:39:33 UTC (rev 20733)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-17 05:55:03 UTC (rev 20734)
+@@ -116,6 +116,14 @@
+ }
+ 
+ 
++static inline bool
++is_writable(tcp_state state)
++{
++	return state == SYNCHRONIZE_SENT || state == SYNCHRONIZE_RECEIVED
++		|| state == ESTABLISHED || state == FINISH_RECEIVED;
++}
++
++
+ WaitList::WaitList(const char *name)
+ {
+ 	fSem = create_sem(0, name);
+@@ -180,6 +188,8 @@
+ 	fReceiveQueue(socket-&gt;receive.buffer_size),
+ 	fRoundTripTime(TCP_INITIAL_RTT),
+ 	fReceivedTSval(0),
++	fCongestionWindow(0),
++	fSlowStartThreshold(0),
+ 	fState(CLOSED),
+ 	fFlags(FLAG_OPTION_WINDOW_SCALE | FLAG_OPTION_TIMESTAMP),
+ 	fError(B_OK),
+@@ -479,11 +489,11 @@
+ status_t
+ TCPEndpoint::SendData(net_buffer *buffer)
+ {
+-	TRACE(&quot;SendData(buffer %p, size %lu, flags %lx)&quot;,
+-		  buffer, buffer-&gt;size, buffer-&gt;flags);
+-
+ 	RecursiveLocker lock(fLock);
+ 
++	TRACE(&quot;SendData(buffer %p, size %lu, flags %lx) [total %lu bytes]&quot;,
++		  buffer, buffer-&gt;size, buffer-&gt;flags, fSendQueue.Size());
++
+ 	if (fState == CLOSED)
+ 		return ENOTCONN;
+ 	else if (fState == LISTEN) {
+@@ -510,6 +520,8 @@
+ 		fSendQueue.Add(buffer);
+ 	}
+ 
++	TRACE(&quot;  SendData(): %lu bytes used.&quot;, fSendQueue.Used());
++
+ 	if (fState == ESTABLISHED || fState == FINISH_RECEIVED)
+ 		_SendQueued();
+ 
+@@ -524,12 +536,10 @@
+ 
+ 	ssize_t available;
+ 
+-	if (fState == FINISH_SENT || fState == FINISH_ACKNOWLEDGED
+-		|| fState == CLOSING || fState == WAIT_FOR_FINISH_ACKNOWLEDGE
+-		|| fState == TIME_WAIT || fState == LISTEN || fState == CLOSED)
++	if (is_writable(fState))
++		available = fSendQueue.Free();
++	else
+ 		available = EPIPE;
+-	else
+-		available = fSendQueue.Free();
+ 
+ 	TRACE(&quot;SendAvailable(): %li&quot;, available);
+ 	return available;
+@@ -603,8 +613,7 @@
+ 		}
+ 	}
+ 
+-	TRACE(&quot;  ReadData(): read %lu bytes, %lu are available.&quot;,
+-		  numBytes, fReceiveQueue.Available());
++	TRACE(&quot;  ReadData(): %lu are available.&quot;, fReceiveQueue.Available());
+ 
+ 	if (numBytes &lt; fReceiveQueue.Available())
+ 		fReceiveList.Signal();
+@@ -745,8 +754,11 @@
+ 	if (_PrepareSendPath((sockaddr *)&amp;socket-&gt;peer) &lt; B_OK)
+ 		return DROP;
+ 
+-	_PrepareReceivePath(parent, segment);
++	fOptions = parent-&gt;fOptions;
++	fAcceptSemaphore = parent-&gt;fAcceptSemaphore;
+ 
++	_PrepareReceivePath(segment);
++
+ 	// send SYN+ACK
+ 	if (_SendQueued() &lt; B_OK)
+ 		return DROP;
+@@ -777,7 +789,8 @@
+ 	if ((segment.flags &amp; TCP_FLAG_SYNCHRONIZE) == 0)
+ 		return DROP;
+ 
+-	_PrepareReceivePath(NULL, segment);
++	fSendUnacknowledged = segment.acknowledge;
++	_PrepareReceivePath(segment);
+ 
+ 	if (segment.flags &amp; TCP_FLAG_ACKNOWLEDGE) {
+ 		_MarkEstablished();
+@@ -859,21 +872,11 @@
+ 				TRACE(&quot;Receive(): header prediction send!&quot;);
+ 				// and it only acknowledges outstanding data
+ 
+-				// TODO: update RTT estimators
++				_Acknowledged(segment.acknowledge);
+ 
+-				fSendQueue.RemoveUntil(segment.acknowledge);
+-				fSendUnacknowledged = segment.acknowledge;
+-
+ 				// stop retransmit timer
+ 				gStackModule-&gt;cancel_timer(&amp;fRetransmitTimer);
+ 
+-				// notify threads waiting on the socket to become writable again
+-				fSendList.Signal();
+-					// TODO: real conditional locking needed!
+-				gSocketModule-&gt;notify(socket, B_SELECT_WRITE, fSendWindow);
+-
+-				// if there is data left to be send, send it now
+-				_SendQueued();
+ 				return DROP;
+ 			}
+ 		} else if (segment.acknowledge == fSendUnacknowledged
+@@ -1017,7 +1020,12 @@
+ 		sendWindow = 1;
+ 	}
+ 
+-	int32 length = min_c(available, sendWindow) - (fSendNext - fSendUnacknowledged);
++	if (fCongestionWindow &gt; 0)
++		sendWindow = min_c(sendWindow, fCongestionWindow);
++
++	int32 length = min_c(available, sendWindow)
++		- (fSendNext - fSendUnacknowledged);
++
+ 	if (length &lt; 0) {
+ 		// either the window shrank, or we sent a still unacknowledged FIN 
+ 		length = 0;
+@@ -1091,9 +1099,10 @@
+ 			buffer, buffer-&gt;size, AddressString(Domain(),
+ 			(sockaddr *)&amp;buffer-&gt;source, true).Data(), AddressString(Domain(),
+ 			(sockaddr *)&amp;buffer-&gt;destination, true).Data());
+-		TRACE(&quot;             flags 0x%x, seq %lu, ack %lu, rwnd %hu&quot;,
+-			  segment.flags, segment.sequence, segment.acknowledge,
+-			  segment.advertised_window);
++		TRACE(&quot;             flags 0x%x, seq %lu, ack %lu, rwnd %hu, cwnd %lu&quot;
++			  &quot;, ssthresh %lu&quot;, segment.flags, segment.sequence,
++			  segment.acknowledge, segment.advertised_window,
++			  fCongestionWindow, fSlowStartThreshold);
+ 
+ 		status = add_tcp_header(AddressModule(), segment, buffer);
+ 		if (status != B_OK) {
+@@ -1342,12 +1351,8 @@
+ 					gStackModule-&gt;set_timer(&amp;fRetransmitTimer, 1000000LL);
+ 			}
+ 
+-			fSendUnacknowledged = segment.acknowledge;
+-			fSendQueue.RemoveUntil(segment.acknowledge);
++			_Acknowledged(segment.acknowledge);
+ 
+-			if (fSendNext &lt; fSendUnacknowledged)
+-				fSendNext = fSendUnacknowledged;
+-
+ 			if (segment.acknowledge &gt; fSendQueue.LastSequence()
+ 					&amp;&amp; fState &gt; ESTABLISHED) {
+ 				TRACE(&quot;Receive(): FIN has been acknowledged!&quot;);
+@@ -1496,24 +1501,16 @@
+ 
+ 
+ void
+-TCPEndpoint::_PrepareReceivePath(TCPEndpoint *parent,
+-	tcp_segment_header &amp;segment)
++TCPEndpoint::_PrepareReceivePath(tcp_segment_header &amp;segment)
+ {
+ 	fInitialReceiveSequence = segment.sequence;
+ 
+ 	// count the received SYN
+ 	segment.sequence++;
+ 
+-	if (parent == NULL)
+-		fSendUnacknowledged = segment.acknowledge;
+ 	fReceiveNext = segment.sequence;
+ 	fReceiveQueue.SetInitialSequence(segment.sequence);
+ 
+-	if (parent) {
+-		fOptions = parent-&gt;fOptions;
+-		fAcceptSemaphore = parent-&gt;fAcceptSemaphore;
+-	}
+-
+ 	if ((fOptions &amp; TCP_NOOPT) == 0) {
+ 		if (segment.max_segment_size &gt; 0)
+ 			fSendMaxSegmentSize = segment.max_segment_size;
+@@ -1531,6 +1528,9 @@
+ 		else
+ 			fFlags &amp;= ~FLAG_OPTION_TIMESTAMP;
+ 	}
++
++	fCongestionWindow = 2 * fSendMaxSegmentSize;
++	fSlowStartThreshold = (uint32)segment.advertised_window &lt;&lt; fSendWindowShift;
+ }
+ 
+ 
+@@ -1571,6 +1571,61 @@
+ }
+ 
+ 
++void
++TCPEndpoint::_Acknowledged(tcp_sequence acknowledge)
++{
++	size_t previouslyUsed = fSendQueue.Used();
++
++	fSendQueue.RemoveUntil(acknowledge);
++	fSendUnacknowledged = acknowledge;
++
++	if (fSendNext &lt; fSendUnacknowledged)
++		fSendNext = fSendUnacknowledged;
++
++	// TODO: update RTT estimators
++
++	if (fSendQueue.Used() &lt; previouslyUsed) {
++		// this ACK acknowledged data
++
++		if (is_writable(fState)) {
++			// notify threads waiting on the socket to become writable again
++			fSendList.Signal();
++			gSocketModule-&gt;notify(socket, B_SELECT_WRITE, fSendQueue.Used());
++		}
++
++		if (fCongestionWindow &lt; fSlowStartThreshold)
++			fCongestionWindow += fSendMaxSegmentSize;
++	}
++
++	if (fCongestionWindow &gt;= fSlowStartThreshold) {
++		uint32 increment = fSendMaxSegmentSize * fSendMaxSegmentSize;
++
++		if (increment &lt; fCongestionWindow)
++			increment = 1;
++		else
++			increment /= fCongestionWindow;
++
++		fCongestionWindow += increment;
++	}
++
++	// if there is data left to be send, send it now
++	_SendQueued();
++}
++
++
++void
++TCPEndpoint::_Retransmit()
++{
++	fSendNext = fSendUnacknowledged;
++	_SendQueued();
++	fSendNext = fSendMax;
++
++	fSlowStartThreshold = max_c((fSendMax - fSendUnacknowledged) / 2,
++		2 * fSendMaxSegmentSize);
++	fCongestionWindow = fSendMaxSegmentSize;
++}
++
++
+ //	#pragma mark - timer
+ 
+ 
+@@ -1583,9 +1638,7 @@
+ 	if (!locker.IsLocked())
+ 		return;
+ 
+-	endpoint-&gt;fSendNext = endpoint-&gt;fSendUnacknowledged;
+-	endpoint-&gt;_SendQueued();
+-	endpoint-&gt;fSendNext = endpoint-&gt;fSendMax;
++	endpoint-&gt;_Retransmit();
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-17 05:39:33 UTC (rev 20733)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-17 05:55:03 UTC (rev 20734)
+@@ -102,9 +102,10 @@
+ 		void _MarkEstablished();
+ 		status_t _WaitForEstablished(RecursiveLocker &amp;lock, bigtime_t timeout);
+ 		void _AddData(tcp_segment_header &amp;segment, net_buffer *buffer);
+-		void _PrepareReceivePath(TCPEndpoint *parent,
+-			tcp_segment_header &amp;segment);
++		void _PrepareReceivePath(tcp_segment_header &amp;segment);
+ 		status_t _PrepareSendPath(const sockaddr *peer);
++		void _Acknowledged(tcp_sequence acknowledge);
++		void _Retransmit();
+ 
+ 		static void _TimeWaitTimer(net_timer *timer, void *data);
+ 		static void _RetransmitTimer(net_timer *timer, void *data);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001663.html">[Haiku-commits] r20733 - haiku/trunk/src/servers/registrar
+</A></li>
+	<LI>Next message: <A HREF="001665.html">[Haiku-commits] r20735 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1664">[ date ]</a>
+              <a href="thread.html#1664">[ thread ]</a>
+              <a href="subject.html#1664">[ subject ]</a>
+              <a href="author.html#1664">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

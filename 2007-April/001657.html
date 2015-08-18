@@ -1,0 +1,690 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20727 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20727%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704161833.l3GIXH23024578%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001646.html">
+   <LINK REL="Next"  HREF="001658.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20727 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20727%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200704161833.l3GIXH23024578%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20727 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Mon Apr 16 20:33:17 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001646.html">[Haiku-commits] r20726 -	haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp
+</A></li>
+        <LI>Next message: <A HREF="001658.html">[Haiku-commits] r20728 - in haiku/trunk: headers/private/media	src/kits/support src/servers/media src/servers/media_addon
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1657">[ date ]</a>
+              <a href="thread.html#1657">[ thread ]</a>
+              <a href="subject.html#1657">[ subject ]</a>
+              <a href="author.html#1657">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-16 20:32:49 +0200 (Mon, 16 Apr 2007)
+New Revision: 20727
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20727&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20727&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h
+Log:
+assorted TCP fixes.
+
+ - fixed the locking for spawned connections and accept()s.
+ - return EMSGSIZE if the user is trying to write more data than the send buffer can hold.
+ - fixed a crash when receiving a RST while the connection is being closed.
+ - don't wake up readers when the connection gets established.
+ - endpoint managers lock must be recursive to properly work with spawn'ed sockets.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h	2007-04-16 15:27:13 UTC (rev 20726)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/BufferQueue.h	2007-04-16 18:32:49 UTC (rev 20727)
+@@ -45,6 +45,7 @@
+ 
+ 		size_t Used() const { return fNumBytes; }
+ 		size_t Free() const { return fMaxBytes - fNumBytes; }
++		size_t Size() const { return fMaxBytes; }
+ 
+ 		bool IsContiguous() const { return fNumBytes == fContiguousBytes; }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-16 15:27:13 UTC (rev 20726)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2007-04-16 18:32:49 UTC (rev 20727)
+@@ -256,6 +256,7 @@
+ TCPEndpoint::Close()
+ {
+ 	TRACE(&quot;Close()&quot;);
++
+ 	RecursiveLocker lock(fLock);
+ 
+ 	if (fState == LISTEN)
+@@ -270,8 +271,6 @@
+ 	if (status != B_OK)
+ 		return status;
+ 
+-	TRACE(&quot;Close() after Shutdown()&quot;);
+-
+ 	if (socket-&gt;options &amp; SO_LINGER) {
+ 		TRACE(&quot;Close(): Lingering for %i secs&quot;, socket-&gt;linger);
+ 
+@@ -299,6 +298,8 @@
+ {
+ 	TRACE(&quot;Free()&quot;);
+ 
++	RecursiveLocker _(fLock);
++
+ 	if (fState &lt;= SYNCHRONIZE_SENT || fState == TIME_WAIT)
+ 		return B_OK;
+ 
+@@ -319,7 +320,7 @@
+ 	TRACE(&quot;Connect() on address %s&quot;,
+ 		AddressString(Domain(), address, true).Data());
+ 
+-	RecursiveLocker locker(&amp;fLock);
++	RecursiveLocker locker(fLock);
+ 
+ 	// Can only call connect() from CLOSED or LISTEN states
+ 	// otherwise endpoint is considered already connected
+@@ -391,11 +392,8 @@
+ 		return EINPROGRESS;
+ 	}
+ 
+-	while (status == B_OK &amp;&amp; fState != ESTABLISHED)
+-		status = fSendList.Wait(locker, absolute_timeout(timeout));
+-
++	status = _WaitForEstablished(locker, absolute_timeout(timeout));
+ 	TRACE(&quot;  Connect(): Connection complete: %s&quot;, strerror(status));
+-
+ 	return posix_error(status);
+ }
+ 
+@@ -405,15 +403,20 @@
+ {
+ 	TRACE(&quot;Accept()&quot;);
+ 
++	RecursiveLocker locker(fLock);
++
+ 	status_t status;
+ 	bigtime_t timeout = absolute_timeout(socket-&gt;receive.timeout);
+ 
+ 	do {
+-		status = acquire_sem_etc(fAcceptSemaphore, 1, B_ABSOLUTE_TIMEOUT |
+-			B_CAN_INTERRUPT, timeout);
++		locker.Unlock();
++
++		status = acquire_sem_etc(fAcceptSemaphore, 1, B_ABSOLUTE_TIMEOUT
++			| B_CAN_INTERRUPT, timeout);
+ 		if (status &lt; B_OK)
+ 			return status;
+ 
++		locker.Lock();
+ 		status = gSocketModule-&gt;dequeue_connected(socket, _acceptedSocket);
+ 		if (status == B_OK)
+ 			TRACE(&quot;  Accept() returning %p&quot;, (*_acceptedSocket)-&gt;first_protocol);
+@@ -429,11 +432,11 @@
+ 	if (address == NULL)
+ 		return B_BAD_VALUE;
+ 
++	RecursiveLocker lock(fLock);
++
+ 	TRACE(&quot;Bind() on address %s&quot;,
+ 		  AddressString(Domain(), address, true).Data());
+ 
+-	RecursiveLocker lock(fLock);
+-
+ 	if (fState != CLOSED)
+ 		return EISCONN;
+ 
+@@ -478,6 +481,9 @@
+ 		return EDESTADDRREQ;
+ 
+ 	fAcceptSemaphore = create_sem(0, &quot;tcp accept&quot;);
++	if (fAcceptSemaphore &lt; B_OK)
++		return ENOBUFS;
++
+ 	fState = LISTEN;
+ 	return B_OK;
+ }
+@@ -524,6 +530,9 @@
+ 	}
+ 
+ 	if (buffer-&gt;size &gt; 0) {
++		if (buffer-&gt;size &gt; fSendQueue.Size())
++			return EMSGSIZE;
++
+ 		bigtime_t timeout = absolute_timeout(socket-&gt;send.timeout);
+ 
+ 		while (fSendQueue.Free() &lt; buffer-&gt;size) {
+@@ -579,12 +588,9 @@
+ 		if (flags &amp; MSG_DONTWAIT)
+ 			return B_WOULD_BLOCK;
+ 
+-		while (fState != ESTABLISHED) {
+-			// we need to wait until the connection becomes established
+-			status_t status = fSendList.Wait(locker, timeout);
+-			if (status &lt; B_OK)
+-				return posix_error(status);
+-		}
++		status_t status = _WaitForEstablished(locker, timeout);
++		if (status &lt; B_OK)
++			return posix_error(status);
+ 	}
+ 
+ 	size_t dataNeeded = socket-&gt;receive.low_water_mark;
+@@ -727,10 +733,9 @@
+ 
+ 
+ int32
+-TCPEndpoint::ListenReceive(tcp_segment_header &amp;segment, net_buffer *buffer)
++TCPEndpoint::_ListenReceive(tcp_segment_header &amp;segment, net_buffer *buffer)
+ {
+-	TRACE(&quot;ListenReceive(): packet %p (%lu bytes) with flags 0x%x, seq %lu, ack %lu!&quot;,
+-		  buffer, buffer-&gt;size, segment.flags, segment.sequence, segment.acknowledge);
++	TRACE(&quot;ListenReceive()&quot;);
+ 
+ 	// Essentially, we accept only TCP_FLAG_SYNCHRONIZE in this state,
+ 	// but the error behaviour differs
+@@ -753,60 +758,71 @@
+ 	AddressModule()-&gt;set_to((sockaddr *)&amp;newSocket-&gt;peer,
+ 		(sockaddr *)&amp;buffer-&gt;source);
+ 
+-	TCPEndpoint *endpoint = (TCPEndpoint *)newSocket-&gt;first_protocol;
++	return ((TCPEndpoint *)newSocket-&gt;first_protocol)-&gt;Spawn(this, segment, buffer);
++}
+ 
+-	endpoint-&gt;fSpawned = true;
+ 
++int32
++TCPEndpoint::Spawn(TCPEndpoint *parent, tcp_segment_header &amp;segment,
++	net_buffer *buffer)
++{
++	RecursiveLocker _(fLock);
++
++	fState = SYNCHRONIZE_RECEIVED;
++	fManager = parent-&gt;fManager;
++
++	TRACE(&quot;Spawn()&quot;);
++
++	fSpawned = true;
++
++	sockaddr *local = (sockaddr *)&amp;socket-&gt;address;
++	sockaddr *peer = (sockaddr *)&amp;socket-&gt;peer;
++
+ 	// TODO: proper error handling!
+ 
+-	endpoint-&gt;fRoute = gDatalinkModule-&gt;get_route(Domain(),
+-		(sockaddr *)&amp;newSocket-&gt;peer);
+-	if (endpoint-&gt;fRoute == NULL)
++	fRoute = gDatalinkModule-&gt;get_route(Domain(), peer);
++	if (fRoute == NULL)
+ 		return DROP;
+ 
+-	if (fManager-&gt;SetConnection(endpoint, (sockaddr *)&amp;buffer-&gt;destination,
+-			(sockaddr *)&amp;buffer-&gt;source, NULL) &lt; B_OK)
++	if (fManager-&gt;SetConnection(this, local, peer, NULL) &lt; B_OK)
+ 		return DROP;
+ 
+-	endpoint-&gt;fInitialReceiveSequence = segment.sequence;
+-	endpoint-&gt;fReceiveQueue.SetInitialSequence(segment.sequence + 1);
+-	endpoint-&gt;fState = SYNCHRONIZE_RECEIVED;
+-	endpoint-&gt;fAcceptSemaphore = fAcceptSemaphore;
+-	endpoint-&gt;fReceiveMaxSegmentSize = _GetMSS((sockaddr *)&amp;newSocket-&gt;peer);
++	fInitialReceiveSequence = segment.sequence;
++	fReceiveQueue.SetInitialSequence(segment.sequence + 1);
++	fAcceptSemaphore = parent-&gt;fAcceptSemaphore;
++	fReceiveMaxSegmentSize = _GetMSS(peer);
+ 		// 40 bytes for IP and TCP header without any options
+ 		// TODO: make this depending on the RTF_LOCAL flag?
+-	endpoint-&gt;fReceiveNext = segment.sequence + 1;
++	fReceiveNext = segment.sequence + 1;
+ 		// account for the extra sequence number for the synchronization
+ 
+-	endpoint-&gt;fInitialSendSequence = system_time() &gt;&gt; 4;
+-	endpoint-&gt;fSendNext = endpoint-&gt;fInitialSendSequence;
+-	endpoint-&gt;fSendUnacknowledged = endpoint-&gt;fSendNext;
+-	endpoint-&gt;fSendMax = endpoint-&gt;fSendNext;
++	fInitialSendSequence = system_time() &gt;&gt; 4;
++	fSendNext = fInitialSendSequence;
++	fSendUnacknowledged = fSendNext;
++	fSendMax = fSendNext;
+ 
+ 	// set options
+-	if ((fOptions &amp; TCP_NOOPT) == 0) {
++	if ((parent-&gt;fOptions &amp; TCP_NOOPT) == 0) {
+ 		if (segment.max_segment_size &gt; 0)
+-			endpoint-&gt;fSendMaxSegmentSize = segment.max_segment_size;
++			fSendMaxSegmentSize = segment.max_segment_size;
+ 		else
+-			endpoint-&gt;fReceiveMaxSegmentSize = TCP_DEFAULT_MAX_SEGMENT_SIZE;
++			fReceiveMaxSegmentSize = TCP_DEFAULT_MAX_SEGMENT_SIZE;
+ 		if (segment.has_window_shift) {
+-			endpoint-&gt;fFlags |= FLAG_OPTION_WINDOW_SHIFT;
+-			endpoint-&gt;fSendWindowShift = segment.window_shift;
++			fFlags |= FLAG_OPTION_WINDOW_SHIFT;
++			fSendWindowShift = segment.window_shift;
+ 		} else {
+-			endpoint-&gt;fFlags &amp;= ~FLAG_OPTION_WINDOW_SHIFT;
+-			endpoint-&gt;fReceiveWindowShift = 0;
++			fFlags &amp;= ~FLAG_OPTION_WINDOW_SHIFT;
++			fReceiveWindowShift = 0;
+ 		}
+ 	}
+ 
+-	TRACE(&quot;  ListenReceive() created new endpoint %p&quot;, endpoint);
++	_UpdateTimestamps(segment, 0, false);
+ 
+-	endpoint-&gt;_UpdateTimestamps(segment, 0, false);
+-
+ 	// send SYN+ACK
+-	status_t status = endpoint-&gt;_SendQueued();
++	status_t status = _SendQueued();
+ 
+-	endpoint-&gt;fInitialSendSequence = endpoint-&gt;fSendNext;
+-	endpoint-&gt;fSendQueue.SetInitialSequence(endpoint-&gt;fSendNext);
++	fInitialSendSequence = fSendNext;
++	fSendQueue.SetInitialSequence(fSendNext);
+ 
+ 	if (status &lt; B_OK)
+ 		return DROP;
+@@ -814,16 +830,14 @@
+ 	segment.flags &amp;= ~TCP_FLAG_SYNCHRONIZE;
+ 		// we handled this flag now, it must not be set for further processing
+ 
+-	return endpoint-&gt;_Receive(segment, buffer);
+-		// TODO: here, the ack/delayed ack call will be made on the parent socket!
++	return _Receive(segment, buffer);
+ }
+ 
+ 
+ int32
+-TCPEndpoint::SynchronizeSentReceive(tcp_segment_header &amp;segment, net_buffer *buffer)
++TCPEndpoint::_SynchronizeSentReceive(tcp_segment_header &amp;segment, net_buffer *buffer)
+ {
+-	TRACE(&quot;SynchronizeSentReceive(): packet %p (%lu bytes) with flags 0x%x, seq %lu, ack %lu!&quot;,
+-		buffer, buffer-&gt;size, segment.flags, segment.sequence, segment.acknowledge);
++	TRACE(&quot;SynchronizeSentReceive()&quot;);
+ 
+ 	if ((segment.flags &amp; TCP_FLAG_ACKNOWLEDGE) != 0
+ 		&amp;&amp; (fInitialSendSequence &gt;= segment.acknowledge
+@@ -859,16 +873,7 @@
+ 	}
+ 
+ 	if (segment.flags &amp; TCP_FLAG_ACKNOWLEDGE) {
+-		// the connection has been established
+-		fState = ESTABLISHED;
+-
+-		if (socket-&gt;parent != NULL) {
+-			gSocketModule-&gt;set_connected(socket);
+-			release_sem_etc(fAcceptSemaphore, 1, B_DO_NOT_RESCHEDULE);
+-		}
+-
+-		fSendList.Signal();
+-		_NotifyReader();
++		_MarkEstablished();
+ 	} else {
+ 		// simultaneous open
+ 		fState = SYNCHRONIZE_RECEIVED;
+@@ -884,13 +889,50 @@
+ 
+ 
+ int32
+-TCPEndpoint::Receive(tcp_segment_header &amp;segment, net_buffer *buffer)
++TCPEndpoint::SegmentReceived(tcp_segment_header &amp;segment, net_buffer *buffer)
+ {
+-	TRACE(&quot;Receive(): packet %p (%lu bytes) with flags 0x%x, seq %lu, ack %lu!&quot;,
+-		buffer, buffer-&gt;size, segment.flags, segment.sequence, segment.acknowledge);
++	RecursiveLocker locker(fLock);
+ 
+-	// TODO: rethink locking!
++	TRACE(&quot;SegmentReceived(): packet %p (%lu bytes) with flags 0x%x, seq %lu, &quot;
++		&quot;ack %lu&quot;, buffer, buffer-&gt;size, segment.flags, segment.sequence,
++		segment.acknowledge);
+ 
++	int32 segmentAction = DROP;
++
++	switch (fState) {
++		case LISTEN:
++			segmentAction = _ListenReceive(segment, buffer);
++			break;
++
++		case SYNCHRONIZE_SENT:
++			segmentAction = _SynchronizeSentReceive(segment, buffer);
++			break;
++
++		case SYNCHRONIZE_RECEIVED:
++		case ESTABLISHED:
++		case FINISH_RECEIVED:
++		case WAIT_FOR_FINISH_ACKNOWLEDGE:
++		case FINISH_SENT:
++		case FINISH_ACKNOWLEDGED:
++		case CLOSING:
++		case TIME_WAIT:
++		case CLOSED:
++			segmentAction = _SegmentReceived(segment, buffer);
++			break;
++	}
++
++	// process acknowledge action as asked for by the *Receive() method
++	if (segmentAction &amp; IMMEDIATE_ACKNOWLEDGE)
++		SendAcknowledge();
++	else if (segmentAction &amp; ACKNOWLEDGE)
++		DelayedAcknowledge();
++
++	return segmentAction;
++}
++
++int32
++TCPEndpoint::_SegmentReceived(tcp_segment_header &amp;segment, net_buffer *buffer)
++{
+ 	uint32 advertisedWindow = (uint32)segment.advertised_window &lt;&lt; fSendWindowShift;
+ 
+ 	// First, handle the most common case for uni-directional data transfer
+@@ -1287,23 +1329,15 @@
+ 		if (fLastAcknowledgeSent &lt;= segment.sequence
+ 			&amp;&amp; tcp_sequence(segment.sequence)
+ 				&lt; (fLastAcknowledgeSent + fReceiveWindow)) {
+-			if (fState == SYNCHRONIZE_RECEIVED) {
+-				// TODO: if we came from SYN-SENT signal connection refused
+-				//       and remove all segments from tx queue
+-			} else if (fState == ESTABLISHED || fState == FINISH_SENT
+-				|| fState == FINISH_RECEIVED || fState == FINISH_ACKNOWLEDGED) {
+-				// TODO: RFC 793 states that on ESTABLISHED, FIN-WAIT{1,2}
+-				//       or CLOSE-WAIT &quot;All segment queues should be
+-				//       flushed&quot;.
+-			}
++			if (fState == SYNCHRONIZE_RECEIVED)
++				fError = ECONNREFUSED;
++			else if (fState == CLOSING || fState == TIME_WAIT
++					|| fState == WAIT_FOR_FINISH_ACKNOWLEDGE)
++				fError = ENOTCONN;
++			else
++				fError = ECONNRESET;
+ 
+-			if (fState != TIME_WAIT &amp;&amp; fReceiveQueue.Available() &gt; 0) {
+-				_NotifyReader();
+-			} else {
+-				return DELETE | DROP;
+-			}
+-
+-			fError = ECONNREFUSED;
++			_NotifyReader();
+ 			fState = CLOSED;
+ 		}
+ 
+@@ -1371,15 +1405,7 @@
+ 		// process acknowledged data
+ 		if (fState == SYNCHRONIZE_RECEIVED) {
+ 			// TODO: window scaling!
+-			if (socket-&gt;parent != NULL) {
+-				gSocketModule-&gt;set_connected(socket);
+-				release_sem_etc(fAcceptSemaphore, 1, B_DO_NOT_RESCHEDULE);
+-			}
+-
+-			fState = ESTABLISHED;
+-
+-			fSendList.Signal();
+-			_NotifyReader();
++			_MarkEstablished();
+ 		}
+ 
+ 		if (fSendMax &lt; segment.acknowledge || fState == TIME_WAIT)
+@@ -1536,6 +1562,33 @@
+ }
+ 
+ 
++void
++TCPEndpoint::_MarkEstablished()
++{
++	fState = ESTABLISHED;
++
++	if (socket-&gt;parent != NULL) {
++		gSocketModule-&gt;set_connected(socket);
++		release_sem_etc(fAcceptSemaphore, 1, B_DO_NOT_RESCHEDULE);
++	}
++
++	fSendList.Signal();
++}
++
++
++status_t
++TCPEndpoint::_WaitForEstablished(RecursiveLocker &amp;locker, bigtime_t timeout)
++{
++	while (fState != ESTABLISHED) {
++		status_t status = fSendList.Wait(locker, timeout);
++		if (status &lt; B_OK)
++			return status;
++	}
++
++	return B_OK;
++}
++
++
+ //	#pragma mark - timer
+ 
+ 
+@@ -1544,7 +1597,7 @@
+ {
+ 	TCPEndpoint *endpoint = (TCPEndpoint *)data;
+ 
+-	RecursiveLocker locker(endpoint-&gt;Lock());
++	RecursiveLocker locker(endpoint-&gt;fLock);
+ 	if (!locker.IsLocked())
+ 		return;
+ 
+@@ -1559,7 +1612,7 @@
+ {
+ 	TCPEndpoint *endpoint = (TCPEndpoint *)data;
+ 
+-	RecursiveLocker locker(endpoint-&gt;Lock());
++	RecursiveLocker locker(endpoint-&gt;fLock);
+ 	if (!locker.IsLocked())
+ 		return;
+ 
+@@ -1572,7 +1625,7 @@
+ {
+ 	TCPEndpoint *endpoint = (TCPEndpoint *)data;
+ 
+-	RecursiveLocker locker(endpoint-&gt;Lock());
++	RecursiveLocker locker(endpoint-&gt;fLock);
+ 	if (!locker.IsLocked())
+ 		return;
+ 
+@@ -1585,7 +1638,7 @@
+ {
+ 	TCPEndpoint *endpoint = (TCPEndpoint *)data;
+ 
+-	if (recursive_lock_lock(&amp;endpoint-&gt;Lock()) &lt; B_OK)
++	if (recursive_lock_lock(&amp;endpoint-&gt;fLock) &lt; B_OK)
+ 		return;
+ 
+ 	endpoint-&gt;DeleteSocket();
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-16 15:27:13 UTC (rev 20726)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2007-04-16 18:32:49 UTC (rev 20727)
+@@ -45,8 +45,6 @@
+ 
+ 		status_t InitCheck() const;
+ 
+-		recursive_lock &amp;Lock() { return fLock; }
+-
+ 		status_t Open();
+ 		status_t Close();
+ 		status_t Free();
+@@ -69,10 +67,10 @@
+ 		status_t DelayedAcknowledge();
+ 		status_t SendAcknowledge();
+ 		status_t UpdateTimeWait();
+-		int32 ListenReceive(tcp_segment_header&amp; segment, net_buffer *buffer);
+-		int32 SynchronizeSentReceive(tcp_segment_header&amp; segment,
++
++		int32 SegmentReceived(tcp_segment_header&amp; segment, net_buffer *buffer);
++		int32 Spawn(TCPEndpoint *parent, tcp_segment_header&amp; segment,
+ 			net_buffer *buffer);
+-		int32 Receive(tcp_segment_header&amp; segment, net_buffer *buffer);
+ 
+ 		net_domain *Domain() const
+ 			{ return socket-&gt;first_protocol-&gt;module-&gt;get_domain(
+@@ -94,9 +92,15 @@
+ 		ssize_t _AvailableData() const;
+ 		void _NotifyReader();
+ 		bool _ShouldReceive() const;
++		int32 _ListenReceive(tcp_segment_header&amp; segment, net_buffer *buffer);
++		int32 _SynchronizeSentReceive(tcp_segment_header&amp; segment,
++			net_buffer *buffer);
++		int32 _SegmentReceived(tcp_segment_header&amp; segment, net_buffer *buffer);
+ 		int32 _Receive(tcp_segment_header&amp; segment, net_buffer *buffer);
+ 		void _UpdateTimestamps(tcp_segment_header&amp; segment,
+ 			size_t segmentLength, bool checkSequence);
++		void _MarkEstablished();
++		status_t _WaitForEstablished(RecursiveLocker &amp;lock, bigtime_t timeout);
+ 
+ 		static void _TimeWaitTimer(net_timer *timer, void *data);
+ 		static void _RetransmitTimer(net_timer *timer, void *data);
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp	2007-04-16 15:27:13 UTC (rev 20726)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.cpp	2007-04-16 18:32:49 UTC (rev 20727)
+@@ -53,7 +53,7 @@
+ //      protocol cookie, so we don't have to go through the list
+ //      for each segment.
+ typedef DoublyLinkedList&lt;EndpointManager&gt; EndpointManagerList;
+-static benaphore sEndpointManagersLock;
++static recursive_lock sEndpointManagersLock;
+ static EndpointManagerList sEndpointManagers;
+ 
+ 
+@@ -536,7 +536,7 @@
+ 	bufferHeader.Remove(headerLength);
+ 		// we no longer need to keep the header around
+ 
+-	BenaphoreLocker _(sEndpointManagersLock);
++	RecursiveLocker _(sEndpointManagersLock);
+ 
+ 	EndpointManager *endpointManager = endpoint_manager_for(domain);
+ 	if (endpointManager == NULL)
+@@ -547,40 +547,9 @@
+ 
+ 	TCPEndpoint *endpoint = endpointManager-&gt;FindConnection(
+ 		(sockaddr *)&amp;buffer-&gt;destination, (sockaddr *)&amp;buffer-&gt;source);
+-	if (endpoint != NULL) {
+-		RecursiveLocker locker(endpoint-&gt;Lock());
+-		TRACE((&quot;Endpoint %p in state %s\n&quot;, endpoint, name_for_state(endpoint-&gt;State())));
+-
+-		switch (endpoint-&gt;State()) {
+-			case LISTEN:
+-				segmentAction = endpoint-&gt;ListenReceive(segment, buffer);
+-				break;
+-
+-			case SYNCHRONIZE_SENT:
+-				segmentAction = endpoint-&gt;SynchronizeSentReceive(segment, buffer);
+-				break;
+-
+-			case SYNCHRONIZE_RECEIVED:
+-			case ESTABLISHED:
+-			case FINISH_RECEIVED:
+-			case WAIT_FOR_FINISH_ACKNOWLEDGE:
+-			case FINISH_SENT:
+-			case FINISH_ACKNOWLEDGED:
+-			case CLOSING:
+-			case TIME_WAIT:
+-			case CLOSED:
+-				segmentAction = endpoint-&gt;Receive(segment, buffer);
+-				break;
+-		}
+-
+-		// process acknowledge action as asked for by the *Receive() method
+-		if (segmentAction &amp; IMMEDIATE_ACKNOWLEDGE)
+-			endpoint-&gt;SendAcknowledge();
+-		else if (segmentAction &amp; ACKNOWLEDGE)
+-			endpoint-&gt;DelayedAcknowledge();
+-		else if (segmentAction &amp; DELETE)
+-			endpoint-&gt;DeleteSocket();
+-	} else if ((segment.flags &amp; TCP_FLAG_RESET) == 0)
++	if (endpoint != NULL)
++		segmentAction = endpoint-&gt;SegmentReceived(segment, buffer);
++	else if ((segment.flags &amp; TCP_FLAG_RESET) == 0)
+ 		segmentAction = DROP | RESET;
+ 
+ 	if (segmentAction &amp; RESET) {
+@@ -615,7 +584,7 @@
+ static status_t
+ tcp_init()
+ {
+-	status_t status = benaphore_init(&amp;sEndpointManagersLock,
++	status_t status = recursive_lock_init(&amp;sEndpointManagersLock,
+ 		&quot;endpoint managers lock&quot;);
+ 
+ 	if (status &lt; B_OK)
+@@ -647,7 +616,7 @@
+ static status_t
+ tcp_uninit()
+ {
+-	benaphore_destroy(&amp;sEndpointManagersLock);
++	recursive_lock_destroy(&amp;sEndpointManagersLock);
+ 	return B_OK;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h	2007-04-16 15:27:13 UTC (rev 20726)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/tcp.h	2007-04-16 18:32:49 UTC (rev 20727)
+@@ -165,7 +165,6 @@
+ 	RESET		= 0x02,
+ 	ACKNOWLEDGE	= 0x04,
+ 	IMMEDIATE_ACKNOWLEDGE = 0x08,
+-	DELETE		= 0x10,
+ };
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001646.html">[Haiku-commits] r20726 -	haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp
+</A></li>
+	<LI>Next message: <A HREF="001658.html">[Haiku-commits] r20728 - in haiku/trunk: headers/private/media	src/kits/support src/servers/media src/servers/media_addon
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1657">[ date ]</a>
+              <a href="thread.html#1657">[ thread ]</a>
+              <a href="subject.html#1657">[ subject ]</a>
+              <a href="author.html#1657">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

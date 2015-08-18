@@ -1,0 +1,171 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32156 - haiku/trunk/src/servers/media
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32156%20-%20haiku/trunk/src/servers/media&In-Reply-To=%3C200908061001.n76A1Lp0012707%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018858.html">
+   <LINK REL="Next"  HREF="018851.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32156 - haiku/trunk/src/servers/media</H1>
+    <B>axeld at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32156%20-%20haiku/trunk/src/servers/media&In-Reply-To=%3C200908061001.n76A1Lp0012707%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32156 - haiku/trunk/src/servers/media">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug  6 12:01:21 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018858.html">[Haiku-commits] r32155 - haiku/trunk/src/servers/media
+</A></li>
+        <LI>Next message: <A HREF="018851.html">[Haiku-commits] r32156 - haiku/trunk/src/servers/media
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18846">[ date ]</a>
+              <a href="thread.html#18846">[ thread ]</a>
+              <a href="subject.html#18846">[ subject ]</a>
+              <a href="author.html#18846">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-08-06 12:01:20 +0200 (Thu, 06 Aug 2009)
+New Revision: 32156
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32156&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32156&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/media/BufferManager.cpp
+   haiku/trunk/src/servers/media/BufferManager.h
+Log:
+* The media server now clones each buffer area only once - before, you could
+  only add a very limited amount of buffers part of the frame buffer, for
+  example, as that one is usually a very large area.
+* This could prevent all sorts of media buffers to be cloned on certain
+  conditions (and could also cause a MediaPlayer fallback to bitmap mode for
+  no apparent reason).
+
+
+Modified: haiku/trunk/src/servers/media/BufferManager.cpp
+===================================================================
+--- haiku/trunk/src/servers/media/BufferManager.cpp	2009-08-06 09:45:04 UTC (rev 32155)
++++ haiku/trunk/src/servers/media/BufferManager.cpp	2009-08-06 10:01:20 UTC (rev 32156)
+@@ -182,10 +182,32 @@
+ area_id
+ BufferManager::_CloneArea(area_id area)
+ {
++	clone_info* info;
++	if (fCloneInfoMap.Get(area, info)) {
++		// we have already cloned this particular area
++		TRACE(&quot;BufferManager::_CloneArea() area %ld has already been cloned &quot;
++			&quot;(id %ld)\n&quot;, area, info-&gt;clone);
++
++		info-&gt;ref_count++;
++		return info-&gt;clone;
++	}
++
+ 	void* address;
+ 	area_id clonedArea = clone_area(&quot;media_server cloned buffer&quot;, &amp;address,
+ 		B_ANY_ADDRESS, B_READ_AREA | B_WRITE_AREA, area);
+-	
++
++	TRACE(&quot;BufferManager::_CloneArea() cloned area %ld, clone id %ld\n&quot;,
++		area, clonedArea);
++
++	if (clonedArea &gt;= 0) {
++		clone_info info;
++		info.clone = clonedArea;
++		info.ref_count = 1;
++
++		fCloneInfoMap.Put(area, info);
++		fSourceInfoMap.Put(clonedArea, area);
++	}
++
+ 	return clonedArea;
+ }
+ 
+@@ -193,5 +215,24 @@
+ void
+ BufferManager::_ReleaseClonedArea(area_id clone)
+ {
+-	delete_area(clone);
++	area_id source = fSourceInfoMap.Get(clone);
++
++	clone_info* info;
++	if (!fCloneInfoMap.Get(source, info)) {
++		ERROR(&quot;BufferManager::_ReleaseClonedArea(): could not find clone info &quot;
++			&quot;for id %ld (clone %ld)\n&quot;, source, clone);
++		return;
++	}
++
++	if (--info-&gt;ref_count == 0) {
++		TRACE(&quot;BufferManager::_ReleaseClonedArea(): delete cloned area %ld &quot;
++			&quot;(source %ld)\n&quot;, clone, source);
++
++		fSourceInfoMap.Remove(clone);
++		fCloneInfoMap.Remove(source);
++		delete_area(clone);
++	} else {
++		TRACE(&quot;BufferManager::_ReleaseClonedArea(): released cloned area %ld &quot;
++			&quot;(source %ld)\n&quot;, clone, source);
++	}
+ }
+
+Modified: haiku/trunk/src/servers/media/BufferManager.h
+===================================================================
+--- haiku/trunk/src/servers/media/BufferManager.h	2009-08-06 09:45:04 UTC (rev 32155)
++++ haiku/trunk/src/servers/media/BufferManager.h	2009-08-06 10:01:20 UTC (rev 32156)
+@@ -44,7 +44,6 @@
+ 
+ private:
+ 	struct clone_info {
+-		area_id				source;
+ 		area_id				clone;
+ 		vint32				ref_count;
+ 	};
+@@ -98,6 +97,7 @@
+ 
+ 	typedef HashMap&lt;id_hash&lt;media_buffer_id&gt;, buffer_info&gt; BufferInfoMap;
+ 	typedef HashMap&lt;id_hash&lt;area_id&gt;, clone_info&gt; CloneInfoMap;
++	typedef HashMap&lt;id_hash&lt;area_id&gt;, area_id&gt; SourceInfoMap;
+ 
+ 			_shared_buffer_list* fSharedBufferList;
+ 			area_id			fSharedBufferListID;
+@@ -105,5 +105,6 @@
+ 			BLocker			fLocker;
+ 			BufferInfoMap	fBufferInfoMap;
+ 			CloneInfoMap	fCloneInfoMap;
++			SourceInfoMap	fSourceInfoMap;
+ };
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018858.html">[Haiku-commits] r32155 - haiku/trunk/src/servers/media
+</A></li>
+	<LI>Next message: <A HREF="018851.html">[Haiku-commits] r32156 - haiku/trunk/src/servers/media
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18846">[ date ]</a>
+              <a href="thread.html#18846">[ thread ]</a>
+              <a href="subject.html#18846">[ subject ]</a>
+              <a href="author.html#18846">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,226 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r19699 -	haiku/trunk/src/add-ons/input_server/filters/screensaver
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19699%20-%0A%09haiku/trunk/src/add-ons/input_server/filters/screensaver&In-Reply-To=%3C200701041529.l04FTqxP007748%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000047.html">
+   <LINK REL="Next"  HREF="000049.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r19699 -	haiku/trunk/src/add-ons/input_server/filters/screensaver</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19699%20-%0A%09haiku/trunk/src/add-ons/input_server/filters/screensaver&In-Reply-To=%3C200701041529.l04FTqxP007748%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r19699 -	haiku/trunk/src/add-ons/input_server/filters/screensaver">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Jan  4 16:29:52 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000047.html">[Haiku-commits] r19698 - haiku/trunk/src/preferences/screensaver
+</A></li>
+        <LI>Next message: <A HREF="000049.html">[Haiku-commits] r19700 - haiku/trunk/src/preferences/screensaver
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#48">[ date ]</a>
+              <a href="thread.html#48">[ thread ]</a>
+              <a href="subject.html#48">[ subject ]</a>
+              <a href="author.html#48">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-01-04 16:29:52 +0100 (Thu, 04 Jan 2007)
+New Revision: 19699
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=19699&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=19699&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/input_server/filters/screensaver/ScreenSaverFilter.cpp
+   haiku/trunk/src/add-ons/input_server/filters/screensaver/ScreenSaverFilter.h
+Log:
+* fEnabled is now maintained correctly, so that a screen blanker is now also quit
+  by _Banish() (never happened before).
+* Instead of sending a new message for every mouse move in a corner, we now keep
+  one BMessageRunner around and only update its interval; we now also check the
+  time with no events in CheckCornerInvoke() - this both makes sure that the screen
+  is not blanked while there is still user activity.
+* The screen saver never worked if you didn't set the never-blank corner to something.
+
+
+Modified: haiku/trunk/src/add-ons/input_server/filters/screensaver/ScreenSaverFilter.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/input_server/filters/screensaver/ScreenSaverFilter.cpp	2007-01-04 14:27:05 UTC (rev 19698)
++++ haiku/trunk/src/add-ons/input_server/filters/screensaver/ScreenSaverFilter.cpp	2007-01-04 15:29:52 UTC (rev 19699)
+@@ -20,11 +20,15 @@
+ 
+ #include &lt;Debug.h&gt;
+ 
++#include &lt;new&gt;
++
+ #define CALLED() SERIAL_PRINT((&quot;%s\n&quot;, __PRETTY_FUNCTION__))
+ 
+ 
+ static const int32 kNeverBlankCornerSize = 10;
+ static const int32 kBlankCornerSize = 5;
++static const bigtime_t kCornerDelay = 1000000LL;
++	// one second
+ 
+ static const int32 kMsgCheckTime = 'SSCT';
+ static const int32 kMsgCornerInvoke = 'Scin';
+@@ -38,7 +42,7 @@
+ BInputServerFilter*
+ instantiate_input_filter()
+ {
+-	return new ScreenSaverFilter();
++	return new (std::nothrow) ScreenSaverFilter();
+ }
+ 
+ 
+@@ -105,11 +109,15 @@
+ 	fEnabled(false),
+ 	fFrameNum(0),
+ 	fRunner(NULL),
++	fCornerRunner(NULL),
+ 	fWatchingDirectory(false), 
+ 	fWatchingFile(false)
+ {
+ 	CALLED();
+-	fController = new ScreenSaverController(this);
++	fController = new (std::nothrow) ScreenSaverController(this);
++	if (fController == NULL)
++		return;
++
+ 	fController-&gt;Run();
+ 
+ 	ReloadSettings();
+@@ -119,6 +127,7 @@
+ 
+ ScreenSaverFilter::~ScreenSaverFilter()
+ {
++	delete fCornerRunner;
+ 	delete fRunner;
+ 
+ 	if (fWatchingFile || fWatchingDirectory)
+@@ -169,13 +178,15 @@
+ ScreenSaverFilter::_Invoke()
+ {
+ 	CALLED();
+-	if (fCurrentCorner == fNeverBlankCorner || fEnabled
++	if (fCurrentCorner == fNeverBlankCorner &amp;&amp; fNeverBlankCorner != NO_CORNER
+ 		|| fSettings.TimeFlags() == SAVER_DISABLED
++		|| fEnabled
+ 		|| be_roster-&gt;IsRunning(SCREEN_BLANKER_SIG))
+ 		return;
+ 
+ 	SERIAL_PRINT((&quot;we run screenblanker\n&quot;));
+-	be_roster-&gt;Launch(SCREEN_BLANKER_SIG);
++	if (be_roster-&gt;Launch(SCREEN_BLANKER_SIG) == B_OK)
++		fEnabled = true;
+ }
+ 
+ 
+@@ -192,6 +203,10 @@
+ 		return;
+ 	}
+ 
++	delete fCornerRunner;
++	delete fRunner;
++	fRunner = fCornerRunner = NULL;
++
+ 	fSettings.Load();
+ 
+ 	fBlankCorner = fSettings.BlankCorner();
+@@ -199,10 +214,15 @@
+ 	fBlankTime = fSnoozeTime = fSettings.BlankTime();
+ 	CheckTime();
+ 
+-	delete fRunner;
++	if (fBlankCorner != NO_CORNER || fNeverBlankCorner != NO_CORNER) {
++		BMessage invoke(kMsgCornerInvoke);
++		fCornerRunner = new (std::nothrow) BMessageRunner(fController,
++			&amp;invoke, B_INFINITE_TIMEOUT);
++			// will be reset in Filter()
++	}
+ 
+ 	BMessage check(kMsgCheckTime);
+-	fRunner = new BMessageRunner(fController, &amp;check, fSnoozeTime);
++	fRunner = new (std::nothrow) BMessageRunner(fController, &amp;check, fSnoozeTime);
+ 	if (fRunner-&gt;InitCheck() != B_OK) {
+ 		SERIAL_PRINT((&quot;fRunner init failed\n&quot;));
+ 	}
+@@ -221,6 +241,7 @@
+ 	// Don't care if it fails
+ 	BMessenger blankerMessenger(SCREEN_BLANKER_SIG, -1, NULL);
+ 	blankerMessenger.SendMessage(B_QUIT_REQUESTED);
++	fEnabled = false;
+ }
+ 
+ 
+@@ -252,7 +273,10 @@
+ void
+ ScreenSaverFilter::CheckCornerInvoke()
+ {
+-	if (fCurrentCorner == fBlankCorner)
++	bigtime_t inactivity = system_time() - fLastEventTime;
++
++	if (fCurrentCorner == fBlankCorner &amp;&amp; fBlankCorner != NO_CORNER
++		&amp;&amp; inactivity &gt;= kCornerDelay)
+ 		_Invoke();
+ }
+ 
+@@ -320,9 +344,8 @@
+ 			if (fBlankRect.Contains(where)) {
+ 				fCurrentCorner = fBlankCorner;
+ 
+-				// start screen blanker after one second
+-				BMessage invoke(kMsgCornerInvoke);
+-				if (BMessageRunner::StartSending(fController, &amp;invoke, 1000000ULL, 1) != B_OK)
++				// start screen blanker after one second of inactivity
++				if (fCornerRunner-&gt;SetInterval(kCornerDelay) != B_OK)
+ 					_Invoke();
+ 				break;
+ 			}
+
+Modified: haiku/trunk/src/add-ons/input_server/filters/screensaver/ScreenSaverFilter.h
+===================================================================
+--- haiku/trunk/src/add-ons/input_server/filters/screensaver/ScreenSaverFilter.h	2007-01-04 14:27:05 UTC (rev 19698)
++++ haiku/trunk/src/add-ons/input_server/filters/screensaver/ScreenSaverFilter.h	2007-01-04 15:29:52 UTC (rev 19699)
+@@ -66,6 +66,7 @@
+ 		ScreenSaverController* fController;
+ 		node_ref		fNodeRef;
+ 		BMessageRunner*	fRunner;
++		BMessageRunner*	fCornerRunner;
+ 		bool			fWatchingDirectory, fWatchingFile;
+ };
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000047.html">[Haiku-commits] r19698 - haiku/trunk/src/preferences/screensaver
+</A></li>
+	<LI>Next message: <A HREF="000049.html">[Haiku-commits] r19700 - haiku/trunk/src/preferences/screensaver
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#48">[ date ]</a>
+              <a href="thread.html#48">[ thread ]</a>
+              <a href="subject.html#48">[ subject ]</a>
+              <a href="author.html#48">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

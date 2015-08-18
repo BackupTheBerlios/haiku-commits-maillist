@@ -1,0 +1,282 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20941 - haiku/trunk/src/apps/terminal
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20941%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200704302122.l3ULMRKu018349%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001966.html">
+   
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20941 - haiku/trunk/src/apps/terminal</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20941%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200704302122.l3ULMRKu018349%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20941 - haiku/trunk/src/apps/terminal">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Apr 30 23:22:27 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001966.html">[Haiku-commits] r20940 - in haiku/trunk: headers/os/interface	src/kits/interface
+</A></li>
+        
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1967">[ date ]</a>
+              <a href="thread.html#1967">[ thread ]</a>
+              <a href="subject.html#1967">[ subject ]</a>
+              <a href="author.html#1967">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-04-30 23:22:26 +0200 (Mon, 30 Apr 2007)
+New Revision: 20941
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20941&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20941&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/terminal/TermApp.cpp
+   haiku/trunk/src/apps/terminal/TermApp.h
+Log:
+* Implemented the Terminal-ID search using a BClipboard and the new atomicity
+  feature of BClipboard::Commit().
+* The file based version is now only used when the Terminal is built for BeOS.
+
+
+Modified: haiku/trunk/src/apps/terminal/TermApp.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermApp.cpp	2007-04-30 19:49:43 UTC (rev 20940)
++++ haiku/trunk/src/apps/terminal/TermApp.cpp	2007-04-30 21:22:26 UTC (rev 20941)
+@@ -17,6 +17,7 @@
+ #include &quot;TermConst.h&quot;
+ 
+ #include &lt;Alert.h&gt;
++#include &lt;Clipboard.h&gt;
+ #include &lt;NodeInfo.h&gt;
+ #include &lt;Path.h&gt;
+ #include &lt;Roster.h&gt;
+@@ -428,7 +429,76 @@
+ }
+ 
+ 
++/*!
++	Checks if all teams that have an ID-to-team mapping in the message
++	are still running.
++	The IDs for teams that are gone will be made available again, and
++	their mapping is removed from the message.
++*/
+ void
++TermApp::_SanitizeIDs(BMessage* data, uint8* windows, ssize_t length)
++{
++	BList teams;
++	be_roster-&gt;GetAppList(TERM_SIGNATURE, &amp;teams);
++
++	for (int32 i = 0; i &lt; length; i++) {
++		if (!windows[i])
++			continue;
++
++		BString id(&quot;id-&quot;);
++		id &lt;&lt; i;
++
++		team_id team;
++		if (data-&gt;FindInt32(id.String(), &amp;team) != B_OK)
++			continue;
++
++		if (!teams.HasItem((void*)team)) {
++			windows[i] = false;
++			data-&gt;RemoveName(id.String());
++		}
++	}
++}
++
++
++/*!
++	Removes the current fWindowNumber (ID) from the supplied array, or
++	finds a free ID in it, and sets fWindowNumber accordingly.
++*/
++bool
++TermApp::_UpdateIDs(bool set, uint8* windows, ssize_t maxLength,
++	ssize_t* _length)
++{
++	ssize_t length = *_length;
++
++	if (set) {
++		int32 i;
++		for (i = 0; i &lt; length; i++) {
++			if (!windows[i]) {
++				windows[i] = true;
++				fWindowNumber = i + 1;
++				break;
++			}
++		}
++
++		if (i == length) {
++			if (length &gt;= maxLength)
++				return false;
++
++			windows[length] = true;
++			length++;
++			fWindowNumber = length;
++		}
++	} else {
++		// update information and write it back
++		windows[fWindowNumber - 1] = false;
++	}
++
++	*_length = length;
++	return true;
++}
++
++
++void
+ TermApp::_UpdateRegistration(bool set)
+ {
+ 	if (set)
+@@ -436,6 +506,56 @@
+ 	else if (fWindowNumber &lt; 0)
+ 		return;
+ 
++#ifdef __HAIKU__
++	// use BClipboard - it supports atomic access in Haiku
++	BClipboard clipboard(TERM_SIGNATURE);
++
++	while (true) {
++		if (!clipboard.Lock())
++			return;
++
++		BMessage* data = clipboard.Data();
++
++		const uint8* windowsData;
++		uint8 windows[512];
++		ssize_t length;
++		if (data-&gt;FindData(&quot;ids&quot;, B_RAW_TYPE,
++				(const void**)&amp;windowsData, &amp;length) != B_OK)
++			length = 0;
++
++		if (length &gt; (ssize_t)sizeof(windows))
++			length = sizeof(windows);
++		if (length &gt; 0)
++			memcpy(windows, windowsData, length);
++
++		_SanitizeIDs(data, windows, length);
++
++		status_t status = B_OK;
++		if (_UpdateIDs(set, windows, sizeof(windows), &amp;length)) {
++			// add/remove our ID-to-team mapping
++			BString id(&quot;id-&quot;);
++			id &lt;&lt; fWindowNumber;
++
++			if (set)
++				data-&gt;AddInt32(id.String(), Team());
++			else
++				data-&gt;RemoveName(id.String());
++
++			data-&gt;RemoveName(&quot;ids&quot;);
++			//if (data-&gt;ReplaceData(&quot;ids&quot;, B_RAW_TYPE, windows, length) != B_OK)
++			data-&gt;AddData(&quot;ids&quot;, B_RAW_TYPE, windows, length);
++
++			status = clipboard.Commit(true);
++		}
++
++		clipboard.Unlock();
++
++		if (status == B_OK)
++			break;
++	}
++#else	// !__HAIKU__
++	// use a file to store the IDs - unfortunately, locking
++	// doesn't work on BeOS either here
+ 	int fd = open(&quot;/tmp/terminal_ids&quot;, O_RDWR | O_CREAT);
+ 	if (fd &lt; 0)
+ 		return;
+@@ -447,41 +567,21 @@
+ 	lock.l_len = -1;
+ 	fcntl(fd, F_SETLKW, &amp;lock);
+ 
+-	uint8 windows[256];
++	uint8 windows[512];
+ 	ssize_t length = read_pos(fd, 0, windows, sizeof(windows));
+ 	if (length &lt; 0) {
+ 		close(fd);
+ 		return;
+ 	}
++
+ 	if (length &gt; (ssize_t)sizeof(windows))
+ 		length = sizeof(windows);
+ 
+-	if (set) {
+-		int32 i;
+-		for (i = 0; i &lt; length; i++) {
+-			if (!windows[i]) {
+-				windows[i] = true;
+-				fWindowNumber = i + 1;
+-				break;
+-			}
+-		}
+-		if (i == length) {
+-			if (length &gt;= (ssize_t)sizeof(windows)) {
+-				close(fd);
+-				return;
+-			}
++	if (_UpdateIDs(set, windows, sizeof(windows), &amp;length))
++		write_pos(fd, 0, windows, length);
+ 
+-			windows[length] = true;
+-			length++;
+-			fWindowNumber = length;
+-		}
+-	} else {
+-		// update information and write it back
+-		windows[fWindowNumber - 1] = false;
+-	}
+-
+-	write_pos(fd, 0, windows, length);
+ 	close(fd);
++#endif	// !__HAIKU__
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/apps/terminal/TermApp.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermApp.h	2007-04-30 19:49:43 UTC (rev 20940)
++++ haiku/trunk/src/apps/terminal/TermApp.h	2007-04-30 21:22:26 UTC (rev 20941)
+@@ -62,6 +62,9 @@
+ 		void _SwitchTerm();
+ 		void _ActivateTermWindow(team_id id);
+ 		bool _IsMinimized(team_id id);
++		void _SanitizeIDs(BMessage* data, uint8* windows, ssize_t length);
++		bool _UpdateIDs(bool set, uint8* windows, ssize_t maxLength,
++			ssize_t* _length);
+ 		void _UpdateRegistration(bool set);
+ 		void _UnregisterTerminal();
+ 		void _RegisterTerminal();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001966.html">[Haiku-commits] r20940 - in haiku/trunk: headers/os/interface	src/kits/interface
+</A></li>
+	
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1967">[ date ]</a>
+              <a href="thread.html#1967">[ thread ]</a>
+              <a href="subject.html#1967">[ subject ]</a>
+              <a href="author.html#1967">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

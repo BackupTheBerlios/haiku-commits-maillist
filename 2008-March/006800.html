@@ -1,0 +1,182 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24381 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24381%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200803122249.m2CMngKI001281%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006799.html">
+   <LINK REL="Next"  HREF="006801.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24381 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24381%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/bfs&In-Reply-To=%3C200803122249.m2CMngKI001281%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24381 -	haiku/trunk/src/add-ons/kernel/file_systems/bfs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Mar 12 23:49:42 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006799.html">[Haiku-commits] r24380 - haiku/trunk/src/servers/bluetooth
+</A></li>
+        <LI>Next message: <A HREF="006801.html">[Haiku-commits] r24382 - haiku/trunk/src/kits/media
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6800">[ date ]</a>
+              <a href="thread.html#6800">[ thread ]</a>
+              <a href="subject.html#6800">[ subject ]</a>
+              <a href="author.html#6800">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-03-12 23:49:41 +0100 (Wed, 12 Mar 2008)
+New Revision: 24381
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24381&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24381&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.h
+Log:
+The log replay code now checks if a super block is valid before the current
+one gets overwritten; if the log contains invalid data, it will no longer
+render the whole disk unreadable. This should have helped to prevent bug #1911
+(but of course the problem that there is invalid data in the log in the first
+place remains).
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2008-03-12 21:52:49 UTC (rev 24380)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Journal.cpp	2008-03-12 22:49:41 UTC (rev 24381)
+@@ -419,12 +419,22 @@
+ 			if (data == NULL)
+ 				RETURN_ERROR(B_IO_ERROR);
+ 
+-			ssize_t written = write_pos(fVolume-&gt;Device(),
+-				offset + (i * blockSize), data, blockSize);
++			// TODO: eventually check other well known offsets, like the
++			// root and index dirs
++			if (offset == 0) {
++				// This log entry writes over the super block - check if
++				// it's valid!
++				if (Volume::CheckSuperBlock(data) != B_OK)
++					RETURN_ERROR(B_BAD_DATA);
++			}
++
++			ssize_t written = write_pos(fVolume-&gt;Device(), offset, data,
++				blockSize);
+ 			if (written != blockSize)
+ 				RETURN_ERROR(B_IO_ERROR);
+ 
+ 			blockNumber = (blockNumber + 1) % fLogSize;
++			offset += blockSize;
+ 			count++;
+ 		}
+ 	}
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.cpp	2008-03-12 21:52:49 UTC (rev 24380)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.cpp	2008-03-12 22:49:41 UTC (rev 24381)
+@@ -558,25 +558,42 @@
+ //	#pragma mark - Disk scanning and initialization
+ 
+ 
+-status_t
++/*static*/ status_t
++Volume::CheckSuperBlock(const uint8* data, uint32* _offset)
++{
++	disk_super_block* superBlock = (disk_super_block*)(data + 512);
++	if (superBlock-&gt;IsValid()) {
++		if (_offset != NULL)
++			*_offset = 512;
++		return B_OK;
++	}
++
++#ifndef BFS_LITTLE_ENDIAN_ONLY
++	// For PPC, the super block might be located at offset 0
++	superBlock = (disk_super_block*)data;
++	if (superBlock-&gt;IsValid()) {
++		if (_offset != NULL)
++			*_offset = 0;
++		return B_OK;
++	}
++#endif
++
++	return B_BAD_VALUE;
++}
++
++
++/*static*/ status_t
+ Volume::Identify(int fd, disk_super_block *superBlock)
+ {
+-	char buffer[1024];
++	uint8 buffer[1024];
+ 	if (read_pos(fd, 0, buffer, sizeof(buffer)) != sizeof(buffer))
+ 		return B_IO_ERROR;
+ 
+-	memcpy(superBlock, buffer + 512, sizeof(disk_super_block));
+-	if (!superBlock-&gt;IsValid()) {
+-#ifndef BFS_LITTLE_ENDIAN_ONLY
+-		// For PPC, the super block might be located at offset 0
+-		memcpy(superBlock, buffer, sizeof(disk_super_block));
+-		if (!superBlock-&gt;IsValid())
+-			return B_BAD_VALUE;
+-#else
++	uint32 offset;
++	if (CheckSuperBlock(buffer, &amp;offset) != B_OK)
+ 		return B_BAD_VALUE;
+-#endif
+-	}
+ 
++	memcpy(superBlock, buffer + offset, sizeof(disk_super_block));
+ 	return B_OK;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.h	2008-03-12 21:52:49 UTC (rev 24380)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Volume.h	2008-03-12 22:49:41 UTC (rev 24381)
+@@ -102,6 +102,8 @@
+ 
+ 		uint32				GetUniqueID();
+ 
++		static status_t		CheckSuperBlock(const uint8* data,
++								uint32* _offset = NULL);
+ 		static status_t		Identify(int fd, disk_super_block *superBlock);
+ 
+ 	protected:
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006799.html">[Haiku-commits] r24380 - haiku/trunk/src/servers/bluetooth
+</A></li>
+	<LI>Next message: <A HREF="006801.html">[Haiku-commits] r24382 - haiku/trunk/src/kits/media
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6800">[ date ]</a>
+              <a href="thread.html#6800">[ thread ]</a>
+              <a href="subject.html#6800">[ subject ]</a>
+              <a href="author.html#6800">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

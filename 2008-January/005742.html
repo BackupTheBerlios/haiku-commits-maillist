@@ -1,0 +1,174 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23721 - haiku/trunk/src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23721%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200801241514.m0OFEBRI008424%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005741.html">
+   <LINK REL="Next"  HREF="005753.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23721 - haiku/trunk/src/system/kernel</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23721%20-%20haiku/trunk/src/system/kernel&In-Reply-To=%3C200801241514.m0OFEBRI008424%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23721 - haiku/trunk/src/system/kernel">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Thu Jan 24 16:14:11 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005741.html">[Haiku-commits] r23720 -	haiku/trunk/src/add-ons/opengl/mesa_software_renderer
+</A></li>
+        <LI>Next message: <A HREF="005753.html">[Haiku-commits] r23721 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5742">[ date ]</a>
+              <a href="thread.html#5742">[ thread ]</a>
+              <a href="subject.html#5742">[ subject ]</a>
+              <a href="author.html#5742">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-01-24 16:14:10 +0100 (Thu, 24 Jan 2008)
+New Revision: 23721
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23721&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23721&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/scheduler.cpp
+Log:
+Implement a workaround for a concurency issue on SMP systems:
+A thread that just missed a semaphore and put itself into the sems notify
+queue could be enqueued into the run queue by release_sem_etc() of another
+CPU before the CPU running the thread had a chance to reschedule it. Therefore
+there is a timeframe where a thread can be running on one CPU and already be
+in the run queue again. In this case no other CPU may schedule this thread
+because then it would overwrite the threads' CPU pointer which kills the rest
+of the scheduler logic, smp_get_current_cpu() and everything that depends on
+that (like the kernel debugger). The more CPUs you have the easier this could
+happen, up to the point where it was always triggered during boot on my quad
+core system. The system would freeze and you could not enter the kernel
+debugger, because two CPUs thought they were the same and disabled each other
+through SMP communication. This makes booting my system stable and might fix
+the occasional hang on boot for other SMP systems with only 2 CPUs/cores.
+I've put a ToDo comment that details this above the workaround. Maybe we
+should fix this in another way. Reviews, comments and suggestions welcome ;-)
+
+Modified: haiku/trunk/src/system/kernel/scheduler.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/scheduler.cpp	2008-01-24 15:00:46 UTC (rev 23720)
++++ haiku/trunk/src/system/kernel/scheduler.cpp	2008-01-24 15:14:10 UTC (rev 23721)
+@@ -183,37 +183,59 @@
+ 			nextThread = nextThread-&gt;queue_next;
+ 		}
+ 	} else {
+-		// select next thread from the run queue
+-		while (nextThread &amp;&amp; nextThread-&gt;priority &gt; B_IDLE_PRIORITY) {
++		while (nextThread) {
++			// select next thread from the run queue
++			while (nextThread &amp;&amp; nextThread-&gt;priority &gt; B_IDLE_PRIORITY) {
+ #if 0
+-			if (oldThread == nextThread &amp;&amp; nextThread-&gt;was_yielded) {
+-				// ignore threads that called thread_yield() once
+-				nextThread-&gt;was_yielded = false;
+-				prevThread = nextThread;
+-				nextThread = nextThread-&gt;queue_next;
+-			}
++				if (oldThread == nextThread &amp;&amp; nextThread-&gt;was_yielded) {
++					// ignore threads that called thread_yield() once
++					nextThread-&gt;was_yielded = false;
++					prevThread = nextThread;
++					nextThread = nextThread-&gt;queue_next;
++				}
+ #endif
+ 
+-			// always extract real time threads
+-			if (nextThread-&gt;priority &gt;= B_FIRST_REAL_TIME_PRIORITY)
+-				break;
++				// always extract real time threads
++				if (nextThread-&gt;priority &gt;= B_FIRST_REAL_TIME_PRIORITY)
++					break;
+ 
+-			// never skip last non-idle normal thread
+-			if (nextThread-&gt;queue_next &amp;&amp; nextThread-&gt;queue_next-&gt;priority == B_IDLE_PRIORITY)
+-				break;
++				// never skip last non-idle normal thread
++				if (nextThread-&gt;queue_next &amp;&amp; nextThread-&gt;queue_next-&gt;priority == B_IDLE_PRIORITY)
++					break;
+ 
+-			// skip normal threads sometimes (roughly 20%)
+-			if (_rand() &gt; 0x1a00)
+-				break;
++				// skip normal threads sometimes (roughly 20%)
++				if (_rand() &gt; 0x1a00)
++					break;
+ 
+-			// skip until next lower priority
+-			int32 priority = nextThread-&gt;priority;
+-			do {
++				// skip until next lower priority
++				int32 priority = nextThread-&gt;priority;
++				do {
++					prevThread = nextThread;
++					nextThread = nextThread-&gt;queue_next;
++				} while (nextThread-&gt;queue_next != NULL
++					&amp;&amp; priority == nextThread-&gt;queue_next-&gt;priority
++					&amp;&amp; nextThread-&gt;queue_next-&gt;priority &gt; B_IDLE_PRIORITY);
++			}
++
++			if (nextThread-&gt;cpu
++				&amp;&amp; nextThread-&gt;cpu-&gt;cpu_num != oldThread-&gt;cpu-&gt;cpu_num) {
++				// ToDo: This thread is still running on another CPU. The
++				// thread just missed a semaphore, put itself into the notify
++				// queue but was not yet rescheduled. During this time frame
++				// release_sem_etc() was called for said semaphore and put the
++				// thread into the run queue to notify it.
++				// Therefore it is now _still_ running on one CPU and _already_
++				// part of the run queue again. We have to skip this thread
++				// here because otherwise we would overwrite the thread-&gt;cpu
++				// pointer with the current CPU which would make both CPUs
++				// &quot;think&quot; they are the same one and kill off the scheduler
++				// logic in here as well as all calls to smp_get_current_cpu().
+ 				prevThread = nextThread;
+ 				nextThread = nextThread-&gt;queue_next;
+-			} while (nextThread-&gt;queue_next != NULL
+-				&amp;&amp; priority == nextThread-&gt;queue_next-&gt;priority
+-				&amp;&amp; nextThread-&gt;queue_next-&gt;priority &gt; B_IDLE_PRIORITY);
++				continue;
++			}
++
++			break;
+ 		}
+ 	}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005741.html">[Haiku-commits] r23720 -	haiku/trunk/src/add-ons/opengl/mesa_software_renderer
+</A></li>
+	<LI>Next message: <A HREF="005753.html">[Haiku-commits] r23721 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5742">[ date ]</a>
+              <a href="thread.html#5742">[ thread ]</a>
+              <a href="subject.html#5742">[ subject ]</a>
+              <a href="author.html#5742">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

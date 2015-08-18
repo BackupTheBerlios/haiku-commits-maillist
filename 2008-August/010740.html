@@ -1,0 +1,275 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26750 - in haiku/trunk: build/config_headers	src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26750%20-%20in%20haiku/trunk%3A%20build/config_headers%0A%09src/system/kernel/fs&In-Reply-To=%3C200808030148.m731mIEG000581%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010739.html">
+   <LINK REL="Next"  HREF="010741.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26750 - in haiku/trunk: build/config_headers	src/system/kernel/fs</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26750%20-%20in%20haiku/trunk%3A%20build/config_headers%0A%09src/system/kernel/fs&In-Reply-To=%3C200808030148.m731mIEG000581%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26750 - in haiku/trunk: build/config_headers	src/system/kernel/fs">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Aug  3 03:48:18 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010739.html">[Haiku-commits] r26749 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+        <LI>Next message: <A HREF="010741.html">[Haiku-commits] r26751 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10740">[ date ]</a>
+              <a href="thread.html#10740">[ thread ]</a>
+              <a href="subject.html#10740">[ subject ]</a>
+              <a href="author.html#10740">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-03 03:48:10 +0200 (Sun, 03 Aug 2008)
+New Revision: 26750
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26750&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26750&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/build/config_headers/tracing_config.h
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+Log:
+* Added tracing for vfs_{read,write}_pages).
+* {read,write}_pages() use vfs_{read,write}_pages() now, instead of
+  invoking the FS {read,write}_pages() hooks.
+
+
+Modified: haiku/trunk/build/config_headers/tracing_config.h
+===================================================================
+--- haiku/trunk/build/config_headers/tracing_config.h	2008-08-03 01:40:57 UTC (rev 26749)
++++ haiku/trunk/build/config_headers/tracing_config.h	2008-08-03 01:48:10 UTC (rev 26750)
+@@ -38,6 +38,7 @@
+ #define TCP_TRACING								0
+ #define TEAM_TRACING							0
+ #define USER_MALLOC_TRACING						0
++#define VFS_PAGES_IO_TRACING					0
+ #define VM_CACHE_TRACING						0
+ #define WAIT_FOR_OBJECTS_TRACING				0
+ 
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-08-03 01:40:57 UTC (rev 26749)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-08-03 01:48:10 UTC (rev 26750)
+@@ -43,6 +43,7 @@
+ #include &lt;low_resource_manager.h&gt;
+ #include &lt;syscalls.h&gt;
+ #include &lt;syscall_restart.h&gt;
++#include &lt;tracing.h&gt;
+ #include &lt;util/AutoLock.h&gt;
+ #include &lt;util/atomic.h&gt;
+ #include &lt;vfs.h&gt;
+@@ -496,6 +497,109 @@
+ };
+ 
+ 
++#if VFS_PAGES_IO_TRACING
++
++namespace VFSPagesIOTracing {
++
++class PagesIOTraceEntry : public AbstractTraceEntry {
++protected:
++	PagesIOTraceEntry(struct vnode* vnode, void* cookie, off_t pos,
++		const iovec* vecs, uint32 count, uint32 flags, size_t bytesRequested,
++		status_t status, size_t bytesTransferred)
++		:
++		fVnode(vnode),
++		fMountID(vnode-&gt;mount-&gt;id),
++		fNodeID(vnode-&gt;id),
++		fCookie(cookie),
++		fPos(pos),
++		fCount(count),
++		fFlags(flags),
++		fBytesRequested(bytesRequested),
++		fStatus(status),
++		fBytesTransferred(bytesTransferred)
++	{
++		fVecs = (iovec*)alloc_tracing_buffer_memcpy(vecs, sizeof(iovec) * count,
++			false);
++	}
++
++	void AddDump(TraceOutput&amp; out, const char* mode)
++	{
++		out.Print(&quot;vfs pages io %5s: vnode: %p (%ld, %lld), cookie: %p, &quot;
++			&quot;pos: %lld, size: %lu, vecs: {&quot;, mode, fVnode, fMountID, fNodeID,
++			fCookie, fPos, fBytesRequested);
++
++		if (fVecs != NULL) {
++			for (uint32 i = 0; i &lt; fCount; i++) {
++				if (i &gt; 0)
++					out.Print(&quot;, &quot;);
++				out.Print(&quot;(%p, %lu)&quot;, fVecs[i].iov_base, fVecs[i].iov_len);
++			}
++		}
++
++		out.Print(&quot;}, flags: %#lx -&gt; status: %#lx, transferred: %lu&quot;,
++			fFlags, fStatus, fBytesTransferred);
++	}
++
++protected:
++	struct vnode*	fVnode;
++	dev_t			fMountID;
++	ino_t			fNodeID;
++	void*			fCookie;
++	off_t			fPos;
++	iovec*			fVecs;
++	uint32			fCount;
++	uint32			fFlags;
++	size_t			fBytesRequested;
++	status_t		fStatus;
++	size_t			fBytesTransferred;
++};
++
++
++class ReadPages : public PagesIOTraceEntry {
++public:
++	ReadPages(struct vnode* vnode, void* cookie, off_t pos,
++		const iovec* vecs, uint32 count, uint32 flags, size_t bytesRequested,
++		status_t status, size_t bytesTransferred)
++		:
++		PagesIOTraceEntry(vnode, cookie, pos, vecs, count, flags,
++			bytesRequested, status, bytesTransferred)
++	{
++		Initialized();
++	}
++
++	virtual void AddDump(TraceOutput&amp; out)
++	{
++		PagesIOTraceEntry::AddDump(out, &quot;read&quot;);
++	}
++};
++
++
++class WritePages : public PagesIOTraceEntry {
++public:
++	WritePages(struct vnode* vnode, void* cookie, off_t pos,
++		const iovec* vecs, uint32 count, uint32 flags, size_t bytesRequested,
++		status_t status, size_t bytesTransferred)
++		:
++		PagesIOTraceEntry(vnode, cookie, pos, vecs, count, flags,
++			bytesRequested, status, bytesTransferred)
++	{
++		Initialized();
++	}
++
++	virtual void AddDump(TraceOutput&amp; out)
++	{
++		PagesIOTraceEntry::AddDump(out, &quot;write&quot;);
++	}
++};
++
++}	// namespace VFSPagesIOTracing
++
++#	define TPIO(x) new(std::nothrow) VFSPagesIOTracing::x;
++#else
++#	define TPIO(x) ;
++#endif	// VFS_PAGES_IO_TRACING
++
++
+ static int
+ mount_compare(void *_m, const void *_key)
+ {
+@@ -3321,8 +3425,8 @@
+ 	if (descriptor == NULL)
+ 		return B_FILE_ERROR;
+ 
+-	status_t status = FS_CALL(vnode, read_pages, descriptor-&gt;cookie, pos, vecs,
+-		count, _numBytes);
++	status_t status = vfs_read_pages(vnode, descriptor-&gt;cookie, pos, vecs,
++		count, 0, _numBytes);
+ 
+ 	put_fd(descriptor);
+ 	return status;
+@@ -3340,8 +3444,8 @@
+ 	if (descriptor == NULL)
+ 		return B_FILE_ERROR;
+ 
+-	status_t status = FS_CALL(vnode, write_pages, descriptor-&gt;cookie, pos, vecs,
+-		count, _numBytes);
++	status_t status = vfs_write_pages(vnode, descriptor-&gt;cookie, pos, vecs,
++		count, 0, _numBytes);
+ 
+ 	put_fd(descriptor);
+ 	return status;
+@@ -3923,6 +4027,10 @@
+ 	FUNCTION((&quot;vfs_read_pages: vnode %p, vecs %p, pos %Ld\n&quot;, vnode, vecs,
+ 		pos));
+ 
++#if VFS_PAGES_IO_TRACING
++	size_t bytesRequested = *_numBytes;
++#endif
++
+ 	IORequest request;
+ 	status_t status = request.Init(pos, vecs, count, *_numBytes, false, flags);
+ 	if (status == B_OK) {
+@@ -3932,6 +4040,9 @@
+ 		*_numBytes = request.TransferredBytes();
+ 	}
+ 
++	TPIO(ReadPages(vnode, cookie, pos, vecs, count, flags, bytesRequested,
++		status, *_numBytes));
++
+ 	return status;
+ }
+ 
+@@ -3943,6 +4054,10 @@
+ 	FUNCTION((&quot;vfs_write_pages: vnode %p, vecs %p, pos %Ld\n&quot;, vnode, vecs,
+ 		pos));
+ 
++#if VFS_PAGES_IO_TRACING
++	size_t bytesRequested = *_numBytes;
++#endif
++
+ 	IORequest request;
+ 	status_t status = request.Init(pos, vecs, count, *_numBytes, true, flags);
+ 	if (status == B_OK) {
+@@ -3952,6 +4067,9 @@
+ 		*_numBytes = request.TransferredBytes();
+ 	}
+ 
++	TPIO(WritePages(vnode, cookie, pos, vecs, count, flags, bytesRequested,
++		status, *_numBytes));
++
+ 	return status;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010739.html">[Haiku-commits] r26749 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+	<LI>Next message: <A HREF="010741.html">[Haiku-commits] r26751 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10740">[ date ]</a>
+              <a href="thread.html#10740">[ thread ]</a>
+              <a href="subject.html#10740">[ subject ]</a>
+              <a href="author.html#10740">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

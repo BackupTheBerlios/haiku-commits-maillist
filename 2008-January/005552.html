@@ -1,0 +1,535 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23567 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23567%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200801162043.m0GKhDKJ021657%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005551.html">
+   <LINK REL="Next"  HREF="005557.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23567 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23567%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200801162043.m0GKhDKJ021657%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23567 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Jan 16 21:43:13 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005551.html">[Haiku-commits] r23566 - haiku/trunk/src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="005557.html">[Haiku-commits] r23568 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5552">[ date ]</a>
+              <a href="thread.html#5552">[ thread ]</a>
+              <a href="subject.html#5552">[ subject ]</a>
+              <a href="author.html#5552">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-01-16 21:43:12 +0100 (Wed, 16 Jan 2008)
+New Revision: 23567
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23567&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23567&amp;view=rev</A>
+
+Removed:
+   haiku/trunk/src/system/kernel/cache/block_allocator.cpp
+Modified:
+   haiku/trunk/src/system/kernel/cache/Jamfile
+   haiku/trunk/src/system/kernel/cache/block_cache.cpp
+   haiku/trunk/src/system/kernel/cache/block_cache_private.h
+Log:
+* Replaced my block allocator code in favour of Hugo's slab allocator
+  (so we can't allocate more physical pages than virtual address space
+  anymore, but so what?).
+* Used the new CACHE_LARGE_SLAB flag as a temporary work-around; else
+  the slab would easily create several thousands of areas, which our
+  area code (and kernel heap) can't really handle that well (gets 
+  awfully slow).
+* Block caches with the same size could share the same slab, but we
+  don't do that yet.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/Jamfile	2008-01-16 20:39:00 UTC (rev 23566)
++++ haiku/trunk/src/system/kernel/cache/Jamfile	2008-01-16 20:43:12 UTC (rev 23567)
+@@ -1,7 +1,6 @@
+ SubDir HAIKU_TOP src system kernel cache ;
+ 
+ KernelMergeObject kernel_cache.o :
+-	block_allocator.cpp
+ 	block_cache.cpp
+ 	file_cache.cpp
+ 	file_map.cpp
+
+Deleted: haiku/trunk/src/system/kernel/cache/block_allocator.cpp
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-01-16 20:39:00 UTC (rev 23566)
++++ haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-01-16 20:43:12 UTC (rev 23567)
+@@ -195,6 +195,7 @@
+ static DoublyLinkedList&lt;block_cache&gt; sCaches;
+ static mutex sCachesLock;
+ #endif
++static object_cache *sBlockCache;
+ 
+ 
+ //	#pragma mark - private transaction
+@@ -311,7 +312,6 @@
+ 	next_transaction_id(1),
+ 	last_transaction(NULL),
+ 	transaction_hash(NULL),
+-	ranges_hash(NULL),
+ 	read_only(readOnly)
+ {
+ #ifdef DEBUG_BLOCK_CACHE
+@@ -320,6 +320,11 @@
+ 	mutex_unlock(&amp;sCachesLock);
+ #endif
+ 
++	buffer_cache = create_object_cache_etc(&quot;block cache buffers&quot;, blockSize,
++		8, 0, CACHE_LARGE_SLAB, NULL, NULL, NULL, NULL);
++	if (buffer_cache == NULL)
++		return;
++
+ 	hash = hash_init(32, 0, &amp;cached_block::Compare, &amp;cached_block::Hash);
+ 	if (hash == NULL)
+ 		return;
+@@ -329,18 +334,9 @@
+ 	if (transaction_hash == NULL)
+ 		return;
+ 
+-	ranges_hash = hash_init(16, 0, &amp;block_range::Compare, &amp;block_range::Hash);
+-	if (ranges_hash == NULL)
+-		return;
+-
+ 	if (benaphore_init(&amp;lock, &quot;block cache&quot;) &lt; B_OK)
+ 		return;
+ 
+-	chunk_size = max_c(blockSize, B_PAGE_SIZE);
+-	chunks_per_range = kBlockRangeSize / chunk_size;
+-	range_mask = (1UL &lt;&lt; chunks_per_range) - 1;
+-	chunk_mask = (1UL &lt;&lt; (chunk_size / blockSize)) - 1;
+-
+ 	register_low_memory_handler(&amp;block_cache::LowMemoryHandler, this, 0);
+ }
+ 
+@@ -357,9 +353,10 @@
+ 
+ 	benaphore_destroy(&amp;lock);
+ 
+-	hash_uninit(ranges_hash);
+ 	hash_uninit(transaction_hash);
+ 	hash_uninit(hash);
++
++	delete_object_cache(buffer_cache);
+ }
+ 
+ 
+@@ -369,83 +366,31 @@
+ 	if (lock.sem &lt; B_OK)
+ 		return lock.sem;
+ 
+-	if (hash == NULL || transaction_hash == NULL || ranges_hash == NULL)
++	if (buffer_cache == NULL || hash == NULL || transaction_hash == NULL)
+ 		return B_NO_MEMORY;
+ 
+ 	return B_OK;
+ }
+ 
+ 
+-block_range *
+-block_cache::GetFreeRange()
+-{
+-	if (!free_ranges.IsEmpty())
+-		return free_ranges.First();
+-
+-	// we need to allocate a new range
+-	block_range *range;
+-	if (block_range::New(this, &amp;range) != B_OK) {
+-		RemoveUnusedBlocks(2, 50);
+-
+-		if (!free_ranges.IsEmpty())
+-			return free_ranges.First();
+-
+-		RemoveUnusedBlocks(LONG_MAX, 50);
+-
+-		if (!free_ranges.IsEmpty())
+-			return free_ranges.First();
+-
+-		// TODO: We also need to free ranges from other caches to get a free one
+-		// (if not, an active volume might have stolen all free ranges already)
+-		return NULL;
+-	}
+-
+-	return range;
+-}
+-
+-
+-block_range *
+-block_cache::GetRange(void *address)
+-{
+-	return (block_range *)hash_lookup(ranges_hash, address);
+-}
+-
+-
+ void
+-block_cache::Free(void *address)
++block_cache::Free(void *buffer)
+ {
+-	if (address == NULL)
+-		return;
+-
+-	block_range *range = GetRange(address);
+-	if (range == NULL)
+-		panic(&quot;no range for address %p\n&quot;, address);
+-
+-	ASSERT(range != NULL);
+-	range-&gt;Free(this, address);
+-
+-	if (range-&gt;Unused(this))
+-		block_range::Delete(this, range);
++	object_cache_free(buffer_cache, buffer);
+ }
+ 
+ 
+ void *
+ block_cache::Allocate()
+ {
+-	block_range *range = GetFreeRange();
+-	if (range == NULL)
+-		return NULL;
+-
+-	return range-&gt;Allocate(this);
++	return object_cache_alloc(buffer_cache, 0);
+ }
+ 
+ 
+ void
+ block_cache::FreeBlock(cached_block *block)
+ {
+-	block_range *range = GetRange(block-&gt;current_data);
+-	ASSERT(range != NULL);
+-	range-&gt;Free(this, block);
++	Free(block-&gt;current_data);
+ 
+ 	if (block-&gt;original_data != NULL || block-&gt;parent_data != NULL) {
+ 		panic(&quot;block_cache::FreeBlock(): %p, %p\n&quot;, block-&gt;original_data,
+@@ -456,10 +401,7 @@
+ 	Free(block-&gt;compare);
+ #endif
+ 
+-	if (range-&gt;Unused(this))
+-		block_range::Delete(this, range);
+-
+-	delete block;
++	object_cache_free(sBlockCache, block);
+ }
+ 
+ 
+@@ -477,6 +419,14 @@
+ 		// remove block from lists
+ 		iterator.Remove();
+ 		hash_remove(hash, block);
++
++		// TODO: see if parent/compare data is handled correctly here!
++		if (block-&gt;parent_data != NULL
++			&amp;&amp; block-&gt;parent_data != block-&gt;original_data)
++			Free(block-&gt;parent_data);
++		if (block-&gt;original_data != NULL)
++			Free(block-&gt;original_data);
++
+ 		return block;
+ 	}
+ 
+@@ -488,15 +438,7 @@
+ cached_block *
+ block_cache::NewBlock(off_t blockNumber)
+ {
+-	cached_block *block = new(nothrow) cached_block;
+-	if (block != NULL) {
+-		block_range *range = GetFreeRange();
+-		if (range == NULL) {
+-			delete block;
+-			block = NULL;
+-		} else
+-			range-&gt;Allocate(this, block);
+-	}
++	cached_block *block = (cached_block *)object_cache_alloc(sBlockCache, 0);
+ 	if (block == NULL) {
+ 		dprintf(&quot;block allocation failed, unused list is %sempty.\n&quot;,
+ 			unused_blocks.IsEmpty() ? &quot;&quot; : &quot;not &quot;);
+@@ -509,6 +451,12 @@
+ 		}
+ 	}
+ 
++	block-&gt;current_data = Allocate();
++	if (block-&gt;current_data == NULL) {
++		object_cache_free(sBlockCache, block);
++		return NULL;
++	}
++
+ 	block-&gt;block_number = blockNumber;
+ 	block-&gt;ref_count = 0;
+ 	block-&gt;accessed = 0;
+@@ -701,23 +649,6 @@
+ 
+ 		hash_insert(cache-&gt;hash, block);
+ 		*_allocated = true;
+-	} else {
+-		// TODO: currently, the data is always mapped in
+-/*
+-		if (block-&gt;ref_count == 0 &amp;&amp; block-&gt;current_data != NULL) {
+-			// see if the old block can be resurrected
+-			block-&gt;current_data = cache-&gt;allocator-&gt;Acquire(block-&gt;current_data);
+-		}
+-
+-		if (block-&gt;current_data == NULL) {
+-			// there is no block yet, but we need one
+-			block-&gt;current_data = cache-&gt;allocator-&gt;Get();
+-			if (block-&gt;current_data == NULL)
+-				return NULL;
+-
+-			*_allocated = true;
+-		}
+-*/
+ 	}
+ 
+ 	if (*_allocated &amp;&amp; readBlock) {
+@@ -938,8 +869,6 @@
+ 				kprintf(&quot; is-dirty&quot;);
+ 			if (block-&gt;unused)
+ 				kprintf(&quot; unused&quot;);
+-			if (block-&gt;unmapped)
+-				kprintf(&quot; unmapped&quot;);
+ 			kprintf(&quot;\n&quot;);
+ 			if (block-&gt;transaction != NULL) {
+ 				kprintf(&quot; transaction:   %p (%ld)\n&quot;, block-&gt;transaction,
+@@ -965,10 +894,6 @@
+ 	kprintf(&quot; max_blocks: %Ld\n&quot;, cache-&gt;max_blocks);
+ 	kprintf(&quot; block_size: %lu\n&quot;, cache-&gt;block_size);
+ 	kprintf(&quot; next_transaction_id: %ld\n&quot;, cache-&gt;next_transaction_id);
+-	kprintf(&quot; chunks_per_range: %lu\n&quot;, cache-&gt;chunks_per_range);
+-	kprintf(&quot; chunks_size: %lu\n&quot;, cache-&gt;chunk_size);
+-	kprintf(&quot; range_mask: %lu\n&quot;, cache-&gt;range_mask);
+-	kprintf(&quot; chunks_mask: %lu\n&quot;, cache-&gt;chunk_mask);
+ 
+ 	if (showBlocks) {
+ 		kprintf(&quot; blocks:\n&quot;);
+@@ -984,13 +909,13 @@
+ 	cached_block *block;
+ 	while ((block = (cached_block *)hash_next(cache-&gt;hash, &amp;iterator)) != NULL) {
+ 		if (showBlocks) {
+-			kprintf(&quot;%08lx %9Ld %08lx %08lx %08lx %5ld %6ld %c%c%c%c%c %08lx &quot;
++			kprintf(&quot;%08lx %9Ld %08lx %08lx %08lx %5ld %6ld %c%c%c%c %08lx &quot;
+ 				&quot;%08lx\n&quot;, (addr_t)block, block-&gt;block_number,
+ 				(addr_t)block-&gt;current_data, (addr_t)block-&gt;original_data,
+ 				(addr_t)block-&gt;parent_data, block-&gt;ref_count, block-&gt;accessed,
+ 				block-&gt;busy ? 'B' : '-', block-&gt;is_writing ? 'W' : '-',
+ 				block-&gt;is_dirty ? 'B' : '-', block-&gt;unused ? 'U' : '-',
+-				block-&gt;unmapped ? 'M' : '-', (addr_t)block-&gt;transaction,
++				(addr_t)block-&gt;transaction,
+ 				(addr_t)block-&gt;previous_transaction);
+ 		}
+ 
+@@ -1026,6 +951,11 @@
+ extern &quot;C&quot; status_t
+ block_cache_init(void)
+ {
++	sBlockCache = create_object_cache_etc(&quot;cached blocks&quot;, sizeof(cached_block),
++		8, 0, CACHE_LARGE_SLAB, NULL, NULL, NULL, NULL);
++	if (sBlockCache == NULL)
++		return B_ERROR;
++
+ #ifdef DEBUG_BLOCK_CACHE
+ 	mutex_init(&amp;sCachesLock, &quot;block caches&quot;);
+ 	new (&amp;sCaches) DoublyLinkedList&lt;block_cache&gt;;
+@@ -1035,7 +965,7 @@
+ 	add_debugger_command(&quot;block_cache&quot;, &amp;dump_cache, &quot;dumps a specific block cache&quot;);
+ #endif
+ 
+-	return init_block_allocator();
++	return B_OK;
+ }
+ 
+ 
+@@ -1498,7 +1428,6 @@
+ 
+ 
+ //	#pragma mark - public block cache API
+-//	public interface
+ 
+ 
+ extern &quot;C&quot; void
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache_private.h
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache_private.h	2008-01-16 20:39:00 UTC (rev 23566)
++++ haiku/trunk/src/system/kernel/cache/block_cache_private.h	2008-01-16 20:43:12 UTC (rev 23567)
+@@ -7,6 +7,7 @@
+ 
+ 
+ #include &lt;lock.h&gt;
++#include &lt;slab/Slab.h&gt;
+ #include &lt;util/DoublyLinkedList.h&gt;
+ 
+ struct hash_table;
+@@ -16,25 +17,16 @@
+ #define DEBUG_CHANGED
+ 
+ 
+-static const size_t kBlockAddressSize = 128 * 1024 * 1024;	// 128 MB
+-static const size_t kBlockRangeSize = 64 * 1024;			// 64 kB
+-static const size_t kBlockRangeShift = 16;
+-static const size_t kNumBlockRangePages = kBlockRangeSize / B_PAGE_SIZE;
+-
+ struct cache_transaction;
+ struct cached_block;
+-struct block_chunk;
+ struct block_cache;
+-struct block_range;
+ typedef DoublyLinkedListLink&lt;cached_block&gt; block_link;
+-typedef DoublyLinkedListLink&lt;block_range&gt; range_link;
+ 
+ 
+ struct cached_block {
+ 	cached_block	*next;			// next in hash
+ 	cached_block	*transaction_next;
+ 	block_link		link;
+-	cached_block	*chunk_next;
+ 	off_t			block_number;
+ 	void			*current_data;
+ 	void			*original_data;
+@@ -48,7 +40,6 @@
+ 	bool			is_writing : 1;
+ 	bool			is_dirty : 1;
+ 	bool			unused : 1;
+-	bool			unmapped : 1;
+ 	cache_transaction *transaction;
+ 	cache_transaction *previous_transaction;
+ 
+@@ -60,43 +51,6 @@
+ 	DoublyLinkedListMemberGetLink&lt;cached_block,
+ 		&amp;cached_block::link&gt; &gt; block_list;
+ 
+-struct block_chunk {
+-	cached_block	*blocks;
+-	bool			mapped;
+-	uint16			used_mask;		// min chunk size is 4096 bytes; min block size is 256 bytes
+-};
+-
+-struct block_range {
+-	block_range		*next;			// next in hash
+-	range_link		link;
+-	addr_t			base;
+-	uint32			used_mask;
+-	vm_page			*pages[kNumBlockRangePages];
+-	block_chunk		chunks[0];
+-
+-	static status_t New(block_cache *cache, block_range **_range);
+-	static void Delete(block_cache *cache, block_range *range);
+-
+-	status_t Allocate(block_cache *cache, cached_block *block);
+-	void Free(block_cache *cache, cached_block *block);
+-
+-	void *Allocate(block_cache *cache, block_chunk **_chunk = NULL);
+-	void Free(block_cache *cache, void *address);
+-
+-	uint32 BlockIndex(block_cache *cache, void *address);
+-	uint32 ChunkIndex(block_cache *cache, void *address);
+-	block_chunk *Chunk(block_cache *cache, void *address);
+-
+-	bool Unused(const block_cache *cache) const;
+-
+-	static int Compare(void *_blockRange, const void *_address);
+-	static uint32 Hash(void *_blockRange, const void *_address, uint32 range);
+-};
+-
+-typedef DoublyLinkedList&lt;block_range,
+-	DoublyLinkedListMemberGetLink&lt;block_range,
+-		&amp;block_range::link&gt; &gt; range_list;
+-
+ struct block_cache : DoublyLinkedListLinkImpl&lt;block_cache&gt; {
+ 	hash_table	*hash;
+ 	benaphore	lock;
+@@ -107,13 +61,7 @@
+ 	cache_transaction *last_transaction;
+ 	hash_table	*transaction_hash;
+ 
+-	hash_table	*ranges_hash;
+-	range_list	free_ranges;
+-	uint32		chunks_per_range;
+-	size_t		chunk_size;
+-	uint32		range_mask;
+-	uint32		chunk_mask;
+-	block_list	unmapped_blocks;
++	object_cache *buffer_cache;
+ 	block_list	unused_blocks;
+ 
+ 	bool		read_only;
+@@ -123,13 +71,11 @@
+ 
+ 	status_t InitCheck();
+ 
+-	block_range *GetFreeRange();
+-	block_range *GetRange(void *address);
+ 	void RemoveUnusedBlocks(int32 maxAccessed = LONG_MAX,
+ 		int32 count = LONG_MAX);
+ 	void FreeBlock(cached_block *block);
+ 	cached_block *NewBlock(off_t blockNumber);
+-	void Free(void *address);
++	void Free(void *buffer);
+ 	void *Allocate();
+ 
+ 	static void LowMemoryHandler(void *data, int32 level);
+@@ -138,15 +84,4 @@
+ 	cached_block *_GetUnusedBlock();
+ };
+ 
+-
+-#ifdef __cplusplus
+-extern &quot;C&quot; {
+-#endif
+-
+-status_t init_block_allocator();
+-
+-#ifdef __cplusplus
+-}
+-#endif
+-
+ #endif	/* BLOCK_CACHE_PRIVATE_H */
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005551.html">[Haiku-commits] r23566 - haiku/trunk/src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="005557.html">[Haiku-commits] r23568 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5552">[ date ]</a>
+              <a href="thread.html#5552">[ thread ]</a>
+              <a href="subject.html#5552">[ subject ]</a>
+              <a href="author.html#5552">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

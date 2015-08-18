@@ -1,0 +1,872 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r19968 - in haiku/trunk: headers/os/app	headers/private/app src/kits/app src/kits/interface
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19968%20-%20in%20haiku/trunk%3A%20headers/os/app%0A%09headers/private/app%20src/kits/app%20src/kits/interface&In-Reply-To=%3C200701261359.l0QDxvfd025859%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000465.html">
+   <LINK REL="Next"  HREF="000472.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r19968 - in haiku/trunk: headers/os/app	headers/private/app src/kits/app src/kits/interface</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19968%20-%20in%20haiku/trunk%3A%20headers/os/app%0A%09headers/private/app%20src/kits/app%20src/kits/interface&In-Reply-To=%3C200701261359.l0QDxvfd025859%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r19968 - in haiku/trunk: headers/os/app	headers/private/app src/kits/app src/kits/interface">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Jan 26 14:59:57 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000465.html">[Haiku-commits] r19967 -	haiku/trunk/src/add-ons/kernel/file_systems/nfs
+</A></li>
+        <LI>Next message: <A HREF="000472.html">[Haiku-commits] r19968 - in haiku/trunk: headers/os/app headers/private/app src/kits/app src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#466">[ date ]</a>
+              <a href="thread.html#466">[ thread ]</a>
+              <a href="subject.html#466">[ subject ]</a>
+              <a href="author.html#466">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-01-26 14:59:56 +0100 (Fri, 26 Jan 2007)
+New Revision: 19968
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=19968&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=19968&amp;view=rev</A>
+
+Added:
+   haiku/trunk/headers/private/app/DirectMessageTarget.h
+   haiku/trunk/src/kits/app/DirectMessageTarget.cpp
+Modified:
+   haiku/trunk/headers/os/app/Looper.h
+   haiku/trunk/headers/os/app/Message.h
+   haiku/trunk/headers/private/app/MessagePrivate.h
+   haiku/trunk/headers/private/app/TokenSpace.h
+   haiku/trunk/src/kits/app/Handler.cpp
+   haiku/trunk/src/kits/app/InitTerminateLibBe.cpp
+   haiku/trunk/src/kits/app/Jamfile
+   haiku/trunk/src/kits/app/Looper.cpp
+   haiku/trunk/src/kits/app/Message.cpp
+   haiku/trunk/src/kits/app/Messenger.cpp
+   haiku/trunk/src/kits/app/TokenSpace.cpp
+   haiku/trunk/src/kits/interface/Window.cpp
+Log:
+Implemented direct message passing for local targets; this fixes a deadlock
+with PostMessage() in case the message queue is full.
+Some notes:
+* for synchronous replies, we don't use this mechanism yet, but it could be
+  extended to do that as well.
+* the code looks so complicated because we need a way to access the looper's
+  queue without locking it (to prevent deadlocks); like Dano's solution, I've
+  abused BTokenSpace to store a BDirectMessageTarget with a BHandler.
+* we also need to decouple the lifetime of a looper's queue from its target,
+  as we cannot lock the looper, and therefore, can't guarantee it stays valid
+  as long as we're accessing it outside of BLooper.
+* init_clipboard() now needs to be done after the global constructors have
+  been called - since sending messages now needs gDefaultTokens to be initialized.
+  Since this is done per image, it shouldn't cause any troubles, though.
+* some minor cleanup, removed unused _msg_cache_cleanup_() and friends.
+
+
+Modified: haiku/trunk/headers/os/app/Looper.h
+===================================================================
+--- haiku/trunk/headers/os/app/Looper.h	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/headers/os/app/Looper.h	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -18,6 +18,7 @@
+ class BMessage;
+ class BMessageQueue;
+ namespace BPrivate {
++	class BDirectMessageTarget;
+ 	class BLooperList;
+ }
+ 
+@@ -150,7 +151,7 @@
+ 			BHandler*		resolve_specifier(BHandler* target, BMessage* msg);
+ 			void			UnlockFully();
+ 
+-			BMessageQueue*	fQueue;
++			BPrivate::BDirectMessageTarget* fDirectTarget;
+ 			BMessage*		fLastMessage;
+ 			port_id			fMsgPort;
+ 			int32			fAtomicCount;
+
+Modified: haiku/trunk/headers/os/app/Message.h
+===================================================================
+--- haiku/trunk/headers/os/app/Message.h	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/headers/os/app/Message.h	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2005, Haiku Inc. All Rights Reserved.
++ * Copyright 2005-2007, Haiku Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -22,13 +22,8 @@
+ class BHandler;
+ class BString;
+ 
+-// Private or reserved ---------------------------------------------------------
+-extern &quot;C&quot; void		_msg_cache_cleanup_();
+-extern &quot;C&quot; int		_init_message_();
+-extern &quot;C&quot; int		_delete_message_();
+-//------------------------------------------------------------------------------
+ 
+-// Name lengths and Scripting specifiers ---------------------------------------
++// Name lengths and Scripting specifiers
+ #define B_FIELD_NAME_LENGTH			255
+ #define B_PROPERTY_NAME_LENGTH		255
+ 
+@@ -57,7 +52,7 @@
+ 
+ 		BMessage		&amp;operator=(const BMessage &amp;other);
+ 
+-// Statistics and misc info
++		// Statistics and misc info
+ 		status_t		GetInfo(type_code typeRequested, int32 index,
+ 							char **nameFound, type_code *typeFound,
+ 							int32 *countFound = NULL) const;
+@@ -74,7 +69,7 @@
+ 
+ 		status_t		Rename(const char *oldEntry, const char *newEntry);
+ 
+-// Delivery info
++		// Delivery info
+ 		bool			WasDelivered() const;
+ 		bool			IsSourceWaiting() const;
+ 		bool			IsSourceRemote() const;
+@@ -83,7 +78,7 @@
+ 		bool			WasDropped() const;
+ 		BPoint			DropPoint(BPoint *offset = NULL) const;
+ 
+-// Replying
++		// Replying
+ 		status_t		SendReply(uint32 command, BHandler *replyTo = NULL);
+ 		status_t		SendReply(BMessage *reply, BHandler *replyTo = NULL,
+ 							bigtime_t timeout = B_INFINITE_TIMEOUT);
+@@ -95,14 +90,14 @@
+ 							bigtime_t sendTimeout = B_INFINITE_TIMEOUT,
+ 							bigtime_t replyTimeout = B_INFINITE_TIMEOUT);
+ 
+-// Flattening data
++		// Flattening data
+ 		ssize_t			FlattenedSize() const;
+ 		status_t		Flatten(char *buffer, ssize_t size) const;
+ 		status_t		Flatten(BDataIO *stream, ssize_t *size = NULL) const;
+ 		status_t		Unflatten(const char *flatBuffer);
+ 		status_t		Unflatten(BDataIO *stream);
+ 
+-// Specifiers (scripting)
++		// Specifiers (scripting)
+ 		status_t		AddSpecifier(const char *property);
+ 		status_t		AddSpecifier(const char *property, int32 index);
+ 		status_t		AddSpecifier(const char *property, int32 index, int32 range);
+@@ -116,7 +111,7 @@
+ 		bool			HasSpecifiers() const;
+ 		status_t		PopSpecifier();
+ 
+-// Adding data
++		// Adding data
+ 		status_t		AddRect(const char *name, BRect aRect);
+ 		status_t		AddPoint(const char *name, BPoint aPoint);
+ 		status_t		AddString(const char *name, const char *aString);
+@@ -138,12 +133,12 @@
+ 							const void *data, ssize_t numBytes,
+ 							bool isFixedSize = true, int32 count = 1);
+ 
+-// Removing data
++		// Removing data
+ 		status_t		RemoveData(const char *name, int32 index = 0);
+ 		status_t		RemoveName(const char *name);
+ 		status_t		MakeEmpty();
+ 
+-// Finding data
++		// Finding data
+ 		status_t		FindRect(const char *name, BRect *rect) const;
+ 		status_t		FindRect(const char *name, int32 index, BRect *rect) const;
+ 		status_t		FindPoint(const char *name, BPoint *point) const;
+@@ -181,7 +176,7 @@
+ 		status_t		FindData(const char *name, type_code type, int32 index,
+ 							const void **data, ssize_t *numBytes) const;
+ 
+-// Replacing data
++		// Replacing data
+ 		status_t		ReplaceRect(const char *name, BRect aRect);
+ 		status_t		ReplaceRect(const char *name, int32 index, BRect aRect);
+ 		status_t		ReplacePoint(const char *name, BPoint aPoint);
+@@ -223,7 +218,7 @@
+ 		void			*operator new(size_t, void *pointer);
+ 		void			operator delete(void *pointer, size_t size);
+ 
+-// Private, reserved, or obsolete ----------------------------------------------
++		// Private, reserved, or obsolete
+ 		bool			HasRect(const char *, int32 n = 0) const;
+ 		bool			HasPoint(const char *, int32 n = 0) const;
+ 		bool			HasString(const char *, int32 n = 0) const;
+@@ -303,8 +298,9 @@
+ 		virtual	void	_ReservedMessage2();
+ 		virtual	void	_ReservedMessage3();
+ 
+-		status_t		_SendMessage(port_id port, int32 token, bigtime_t timeout,
+-							bool replyRequired, BMessenger &amp;replyTo) const;
++		status_t		_SendMessage(port_id port, team_id portOwner, int32 token,
++							bigtime_t timeout, bool replyRequired,
++							BMessenger &amp;replyTo) const;
+ 		status_t		_SendMessage(port_id port, team_id portOwner,
+ 							int32 token, BMessage *reply, bigtime_t sendTimeout,
+ 							bigtime_t replyTimeout) const;
+
+Added: haiku/trunk/headers/private/app/DirectMessageTarget.h
+===================================================================
+--- haiku/trunk/headers/private/app/DirectMessageTarget.h	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/headers/private/app/DirectMessageTarget.h	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -0,0 +1,38 @@
++/*
++ * Copyright 2007, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ *
++ * Authors:
++ *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
++ */
++#ifndef _DIRECT_MESSAGE_TARGET_H
++#define _DIRECT_MESSAGE_TARGET_H
++
++
++#include &lt;MessageQueue.h&gt;
++
++
++namespace BPrivate {
++
++class BDirectMessageTarget {
++	public:
++		BDirectMessageTarget();
++		~BDirectMessageTarget();
++
++		bool AddMessage(BMessage* message);
++
++		void Close();
++		void Acquire();
++		void Release();
++
++		BMessageQueue* Queue() { return &fQueue; }
++
++	private:
++		int32			fReferenceCount;
++		BMessageQueue	fQueue;
++		bool			fClosed;
++};
++
++}	// namespace BPrivate
++
++#endif	// _DIRECT_MESSAGE_TARGET_H
+
+Modified: haiku/trunk/headers/private/app/MessagePrivate.h
+===================================================================
+--- haiku/trunk/headers/private/app/MessagePrivate.h	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/headers/private/app/MessagePrivate.h	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2005, Haiku Inc. All rights reserved.
++ * Copyright 2005-2007, Haiku Inc. All rights reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -200,10 +200,10 @@
+ 		}
+ 
+ 		status_t
+-		SendMessage(port_id port, int32 token, bigtime_t timeout,
+-			bool replyRequired, BMessenger &amp;replyTo) const
++		SendMessage(port_id port, team_id portOwner, int32 token,
++			bigtime_t timeout, bool replyRequired, BMessenger &amp;replyTo) const
+ 		{
+-			return fMessage-&gt;_SendMessage(port, token,
++			return fMessage-&gt;_SendMessage(port, portOwner, token,
+ 				timeout, replyRequired, replyTo);
+ 		}
+ 
+
+Modified: haiku/trunk/headers/private/app/TokenSpace.h
+===================================================================
+--- haiku/trunk/headers/private/app/TokenSpace.h	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/headers/private/app/TokenSpace.h	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2006, Haiku.
++ * Copyright 2001-2007, Haiku.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -10,14 +10,14 @@
+ #define _TOKEN_SPACE_H
+ 
+ 
+-#include &lt;map&gt;
+-#include &lt;stack&gt;
+-
+ #include &lt;BeBuild.h&gt;
+ #include &lt;Locker.h&gt;
+ #include &lt;SupportDefs.h&gt;
+ 
++#include &lt;map&gt;
++#include &lt;stack&gt;
+ 
++
+ // token types as specified in targets
+ #define B_PREFERRED_TOKEN	-2		/* A little bird told me about this one */
+ #define B_NULL_TOKEN		-1
+@@ -30,6 +30,9 @@
+ 
+ namespace BPrivate {
+ 
++class BDirectMessageTarget;
++
++
+ class BTokenSpace : public BLocker {
+ 	public:
+ 		BTokenSpace();
+@@ -40,12 +43,16 @@
+ 
+ 		bool		RemoveToken(int32 token);
+ 		bool		CheckToken(int32 token, int16 type) const;
+-		status_t	GetToken(int32 token, int16 type, void** object) const;
++		status_t	GetToken(int32 token, int16 type, void** _object) const;
+ 
++		status_t	SetHandlerTarget(int32 token, BDirectMessageTarget* target);
++		status_t	AcquireHandlerTarget(int32 token, BDirectMessageTarget** _target);
++
+ 	private:
+ 		struct token_info {
+ 			int16	type;
+ 			void*	object;
++			BDirectMessageTarget* target;
+ 		};
+ 		typedef std::map&lt;int32, token_info&gt; TokenMap;
+ 
+
+Added: haiku/trunk/src/kits/app/DirectMessageTarget.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/DirectMessageTarget.cpp	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/src/kits/app/DirectMessageTarget.cpp	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -0,0 +1,63 @@
++/*
++ * Copyright 2007, Haiku, Inc.
++ * Distributed under the terms of the MIT License.
++ *
++ * Authors:
++ *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
++ */
++
++
++#include &lt;DirectMessageTarget.h&gt;
++
++
++namespace BPrivate {
++
++
++BDirectMessageTarget::BDirectMessageTarget()
++	:
++	fReferenceCount(1),
++	fClosed(false)
++{
++}
++
++
++BDirectMessageTarget::~BDirectMessageTarget()
++{
++}
++
++
++bool
++BDirectMessageTarget::AddMessage(BMessage* message)
++{
++	if (fClosed) {
++		delete message;
++		return false;
++	}
++
++	fQueue.AddMessage(message);
++	return true;
++}
++
++
++void
++BDirectMessageTarget::Close()
++{
++	fClosed = true;
++}
++
++
++void
++BDirectMessageTarget::Acquire()
++{
++	atomic_add(&amp;fReferenceCount, 1);
++}
++
++
++void
++BDirectMessageTarget::Release()
++{
++	if (atomic_add(&amp;fReferenceCount, -1) == 1)
++		delete this;
++}
++
++}	// namespace BPrivate
+
+Modified: haiku/trunk/src/kits/app/Handler.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/Handler.cpp	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/src/kits/app/Handler.cpp	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -596,7 +596,8 @@
+ BHandler::SetLooper(BLooper *looper)
+ {
+ 	fLooper = looper;
+-	
++	gDefaultTokens.SetHandlerTarget(fToken, looper ? looper-&gt;fDirectTarget : NULL);
++
+ 	if (fFilters) {
+ 		for (int32 i = 0; i &lt; fFilters-&gt;CountItems(); i++)
+ 			static_cast&lt;BMessageFilter *&gt;(fFilters-&gt;ItemAtFast(i))-&gt;SetLooper(looper);
+
+Modified: haiku/trunk/src/kits/app/InitTerminateLibBe.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/InitTerminateLibBe.cpp	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/src/kits/app/InitTerminateLibBe.cpp	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -29,13 +29,24 @@
+ 
+ 	BMessage::Private::StaticInit();
+ 	BRoster::Private::InitBeRoster();
+-	BPrivate::init_clipboard();
+ 
+ 	DBG(OUT(&quot;initialize_before() done\n&quot;));
+ }
+ 
+ 
+ extern &quot;C&quot; void
++initialize_after()
++{
++	DBG(OUT(&quot;initialize_after()\n&quot;));
++
++	BPrivate::init_clipboard();
++		// needs to send a message, and that requires gDefaultTokens to be initialized
++
++	DBG(OUT(&quot;initialize_after() done\n&quot;));
++}
++
++
++extern &quot;C&quot; void
+ terminate_after()
+ {
+ 	DBG(OUT(&quot;terminate_after()\n&quot;));
+
+Modified: haiku/trunk/src/kits/app/Jamfile
+===================================================================
+--- haiku/trunk/src/kits/app/Jamfile	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/src/kits/app/Jamfile	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -32,6 +32,7 @@
+ 	Clipboard.cpp
+ 	dano_message.cpp
+ 	DesktopLink.cpp
++	DirectMessageTarget.cpp
+ 	Handler.cpp
+ 	InitTerminateLibBe.cpp
+ 	Invoker.cpp
+
+Modified: haiku/trunk/src/kits/app/Looper.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/Looper.cpp	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/src/kits/app/Looper.cpp	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -12,6 +12,7 @@
+ /*!	BLooper class spawns a thread that runs a message loop. */
+ 
+ #include &lt;AppMisc.h&gt;
++#include &lt;DirectMessageTarget.h&gt;
+ #include &lt;LooperList.h&gt;
+ #include &lt;MessagePrivate.h&gt;
+ #include &lt;ObjectLocker.h&gt;
+@@ -130,8 +131,10 @@
+ 
+ 	// Clear the queue so our call to IsMessageWaiting() below doesn't give
+ 	// us bogus info
++	fDirectTarget-&gt;Close();
++
+ 	BMessage *message;
+-	while ((message = fQueue-&gt;NextMessage()) != NULL) {
++	while ((message = fDirectTarget-&gt;Queue()-&gt;NextMessage()) != NULL) {
+ 		delete message;
+ 			// msg will automagically post generic reply
+ 	}
+@@ -141,7 +144,7 @@
+ 			// msg will automagically post generic reply
+ 	} while (IsMessageWaiting());
+ 
+-	delete fQueue;
++	fDirectTarget-&gt;Release();
+ 	delete_port(fMsgPort);
+ 
+ 	// Clean up our filters
+@@ -294,7 +297,7 @@
+ BMessageQueue*
+ BLooper::MessageQueue() const
+ {
+-	return fQueue;
++	return fDirectTarget-&gt;Queue();
+ }
+ 
+ 
+@@ -303,7 +306,7 @@
+ {
+ 	AssertLocked();
+ 
+-	if (!fQueue-&gt;IsEmpty())
++	if (!fDirectTarget-&gt;Queue()-&gt;IsEmpty())
+ 		return true;
+ 
+ 	int32 count;
+@@ -933,7 +936,7 @@
+ {
+ 	fOwner = B_ERROR;
+ 	fRunCalled = false;
+-	fQueue = new BMessageQueue();
++	fDirectTarget = new (std::nothrow) BPrivate::BDirectMessageTarget();
+ 	fCommonFilters = NULL;
+ 	fLastMessage = NULL;
+ 	fPreferred = NULL;
+@@ -970,7 +973,7 @@
+ 
+ 	// wakeup looper when being called from other threads if necessary
+ 	if (find_thread(NULL) != Thread()
+-		&amp;&amp; fQueue-&gt;IsNextMessage(message) &amp;&amp; port_count(fMsgPort) &lt;= 0) {
++		&amp;&amp; fDirectTarget-&gt;Queue()-&gt;IsNextMessage(message) &amp;&amp; port_count(fMsgPort) &lt;= 0) {
+ 		// there is currently no message waiting, and we need to wakeup the looper
+ 		write_port_etc(fMsgPort, 0, NULL, 0, B_RELATIVE_TIMEOUT, 0);
+ 	}
+@@ -984,7 +987,7 @@
+ 	// Others may want to peek into our message queue, so the preferred
+ 	// handler must be set correctly already if no token was given
+ 
+-	fQueue-&gt;AddMessage(msg);
++	fDirectTarget-&gt;Queue()-&gt;AddMessage(msg);
+ }
+ 
+ 
+@@ -1122,7 +1125,7 @@
+ 		while (!fTerminating &amp;&amp; dispatchNextMessage) {
+ 			PRINT((&quot;LOOPER: inner loop\n&quot;));
+ 			// Get next message from queue (assign to fLastMessage)
+-			fLastMessage = fQueue-&gt;NextMessage();
++			fLastMessage = fDirectTarget-&gt;Queue()-&gt;NextMessage();
+ 
+ 			Lock();
+ 
+
+Modified: haiku/trunk/src/kits/app/Message.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/Message.cpp	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/src/kits/app/Message.cpp	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2005-2006, Haiku Inc. All rights reserved.
++ * Copyright 2005-2007, Haiku Inc. All rights reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -14,18 +14,21 @@
+ #include &lt;MessagePrivate.h&gt;
+ #include &lt;MessageUtils.h&gt;
+ 
++#include &lt;DirectMessageTarget.h&gt;
++#include &lt;MessengerPrivate.h&gt;
++#include &lt;TokenSpace.h&gt;
++#include &lt;util/KMessage.h&gt;
++
+ #include &lt;Application.h&gt;
+ #include &lt;AppMisc.h&gt;
+ #include &lt;BlockCache.h&gt;
+ #include &lt;Entry.h&gt;
++#include &lt;MessageQueue.h&gt;
+ #include &lt;Messenger.h&gt;
+-#include &lt;MessengerPrivate.h&gt;
+ #include &lt;Path.h&gt;
+ #include &lt;Point.h&gt;
+ #include &lt;Rect.h&gt;
+ #include &lt;String.h&gt;
+-#include &lt;TokenSpace.h&gt;
+-#include &lt;util/KMessage.h&gt;
+ 
+ #include &lt;ctype.h&gt;
+ #include &lt;malloc.h&gt;
+@@ -1837,8 +1840,8 @@
+ 
+ 
+ status_t
+-BMessage::_SendMessage(port_id port, int32 token, bigtime_t timeout,
+-	bool replyRequired, BMessenger &amp;replyTo) const
++BMessage::_SendMessage(port_id port, team_id portOwner, int32 token,
++	bigtime_t timeout, bool replyRequired, BMessenger &amp;replyTo) const
+ {
+ 	DEBUG_FUNCTION_ENTER;
+ 	ssize_t size = 0;
+@@ -1846,7 +1849,24 @@
+ 	message_header *header = NULL;
+ 	status_t result;
+ 
+-	if (/*fHeader-&gt;fields_size + fHeader-&gt;data_size &gt; B_PAGE_SIZE*/false) {
++	BPrivate::BDirectMessageTarget* direct = NULL;
++	BMessage* copy = NULL;
++	if (portOwner == BPrivate::current_team())
++		BPrivate::gDefaultTokens.AcquireHandlerTarget(token, &amp;direct);
++
++	if (direct != NULL) {
++		// We have a direct local message target - we can just enqueue the message
++		// in its message queue. This will also prevent possible deadlocks when the
++		// queue is full.
++		copy = new BMessage(*this);
++		if (copy != NULL) {
++			header = copy-&gt;fHeader;
++			result = B_OK;
++		} else {
++			direct-&gt;Release();
++			result = B_NO_MEMORY;
++		}
++	} else if (/*fHeader-&gt;fields_size + fHeader-&gt;data_size &gt; B_PAGE_SIZE*/false) {
+ 		result = _FlattenToArea(&amp;header);
+ 		buffer = (char *)header;
+ 		size = sizeof(message_header);
+@@ -1892,11 +1912,23 @@
+ 	header-&gt;reply_target = replyToPrivate.Token();
+ 	header-&gt;flags |= MESSAGE_FLAG_WAS_DELIVERED;
+ 
+-	do {
+-		result = write_port_etc(port, kPortMessageCode, (void *)buffer, size,
+-			B_RELATIVE_TIMEOUT, timeout);
+-	} while (result == B_INTERRUPTED);
++	if (direct != NULL) {
++		// this is a local message transmission
++		direct-&gt;AddMessage(copy);
+ 
++		if (direct-&gt;Queue()-&gt;IsNextMessage(copy) &amp;&amp; port_count(port) &lt;= 0) {
++			// there is currently no message waiting, and we need to wakeup the looper
++			write_port_etc(port, 0, NULL, 0, B_RELATIVE_TIMEOUT, 0);
++		}
++
++		direct-&gt;Release();
++	} else {
++		do {
++			result = write_port_etc(port, kPortMessageCode, (void *)buffer, size,
++				B_RELATIVE_TIMEOUT, timeout);
++		} while (result == B_INTERRUPTED);
++	}
++
+ 	if (result == B_OK &amp;&amp; IsSourceWaiting()) {
+ 		// the forwarded message will handle the reply - we must not do
+ 		// this anymore
+@@ -1908,6 +1940,9 @@
+ }
+ 
+ 
++/*!
++	Sends a message and waits synchronously for a reply.
++*/
+ status_t
+ BMessage::_SendMessage(port_id port, team_id portOwner, int32 token,
+ 	BMessage *reply, bigtime_t sendTimeout, bigtime_t replyTimeout) const
+@@ -1961,7 +1996,9 @@
+ 		BMessenger replyTarget;
+ 		BMessenger::Private(replyTarget).SetTo(team, replyPort,
+ 			B_PREFERRED_TOKEN);
+-		result = _SendMessage(port, token, sendTimeout, true, replyTarget);
++		// TODO: replying could also use a BDirectMessageTarget like mechanism for local targets
++		result = _SendMessage(port, -1, token, sendTimeout, true,
++			replyTarget);
+ 	}
+ 
+ 	if (result &lt; B_OK)
+
+Modified: haiku/trunk/src/kits/app/Messenger.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/Messenger.cpp	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/src/kits/app/Messenger.cpp	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -327,7 +327,7 @@
+ 	if (!message)
+ 		return B_BAD_VALUE;
+ 
+-	return BMessage::Private(message).SendMessage(fPort, fHandlerToken,
++	return BMessage::Private(message).SendMessage(fPort, fTeam, fHandlerToken,
+ 		timeout, false, replyTo);
+ }
+ 
+
+Modified: haiku/trunk/src/kits/app/TokenSpace.cpp
+===================================================================
+--- haiku/trunk/src/kits/app/TokenSpace.cpp	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/src/kits/app/TokenSpace.cpp	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2001-2006, Haiku.
++ * Copyright 2001-2007, Haiku.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -8,14 +8,12 @@
+  */
+ 
+ 
+-#include &lt;map&gt;
+-#include &lt;stack&gt;
++#include &lt;DirectMessageTarget.h&gt;
++#include &lt;TokenSpace.h&gt;
+ 
+ #include &lt;Autolock.h&gt;
+ 
+-#include &quot;TokenSpace.h&quot;
+ 
+-
+ namespace BPrivate {
+ 
+ BTokenSpace gDefaultTokens;
+@@ -39,7 +37,7 @@
+ {
+ 	BAutolock locker(this);
+ 
+-	token_info tokenInfo = { type, object };
++	token_info tokenInfo = { type, object, NULL };
+ 	int32 token = fTokenCount++;
+ 
+ 	fTokenMap[token] = tokenInfo;
+@@ -59,7 +57,7 @@
+ {
+ 	BAutolock locker(this);
+ 
+-	token_info tokenInfo = { type, object };
++	token_info tokenInfo = { type, object, NULL };
+ 	fTokenMap[token] = tokenInfo;
+ 
+ 	// this makes sure SetToken() plays more or less nice with NewToken()
+@@ -101,13 +99,12 @@
+ status_t
+ BTokenSpace::GetToken(int32 token, int16 type, void** _object) const
+ {
+-	BAutolock locker(const_cast&lt;BTokenSpace&amp;&gt;(*this));
+-
+ 	if (token &lt; 1)
+ 		return B_ENTRY_NOT_FOUND;
+ 
++	BAutolock locker(const_cast&lt;BTokenSpace&amp;&gt;(*this));
++
+ 	TokenMap::const_iterator iterator = fTokenMap.find(token);
+-
+ 	if (iterator == fTokenMap.end() || iterator-&gt;second.type != type)
+ 		return B_ENTRY_NOT_FOUND;
+ 
+@@ -115,4 +112,47 @@
+ 	return B_OK;
+ }
+ 
++
++status_t
++BTokenSpace::SetHandlerTarget(int32 token, BDirectMessageTarget* target)
++{
++	if (token &lt; 1)
++		return B_ENTRY_NOT_FOUND;
++
++	BAutolock locker(const_cast&lt;BTokenSpace&amp;&gt;(*this));
++
++	TokenMap::iterator iterator = fTokenMap.find(token);
++	if (iterator == fTokenMap.end() || iterator-&gt;second.type != B_HANDLER_TOKEN)
++		return B_ENTRY_NOT_FOUND;
++
++	if (iterator-&gt;second.target != NULL)
++		iterator-&gt;second.target-&gt;Release();
++
++	iterator-&gt;second.target = target;
++	if (target != NULL)
++		target-&gt;Acquire();
++
++	return B_OK;
++}
++
++
++status_t
++BTokenSpace::AcquireHandlerTarget(int32 token, BDirectMessageTarget** _target)
++{
++	if (token &lt; 1)
++		return B_ENTRY_NOT_FOUND;
++
++	BAutolock locker(const_cast&lt;BTokenSpace&amp;&gt;(*this));
++
++	TokenMap::const_iterator iterator = fTokenMap.find(token);
++	if (iterator == fTokenMap.end() || iterator-&gt;second.type != B_HANDLER_TOKEN)
++		return B_ENTRY_NOT_FOUND;
++
++	if (iterator-&gt;second.target != NULL)
++		iterator-&gt;second.target-&gt;Acquire();
++
++	*_target = iterator-&gt;second.target;
++	return B_OK;
++}
++
+ }	// namespace BPrivate
+
+Modified: haiku/trunk/src/kits/interface/Window.cpp
+===================================================================
+--- haiku/trunk/src/kits/interface/Window.cpp	2007-01-26 13:33:53 UTC (rev 19967)
++++ haiku/trunk/src/kits/interface/Window.cpp	2007-01-26 13:59:56 UTC (rev 19968)
+@@ -25,6 +25,7 @@
+ #include &lt;input_globals.h&gt;
+ #include &lt;AppMisc.h&gt;
+ #include &lt;ApplicationPrivate.h&gt;
++#include &lt;DirectMessageTarget.h&gt;
+ #include &lt;InputServerTypes.h&gt;
+ #include &lt;MenuPrivate.h&gt;
+ #include &lt;MessagePrivate.h&gt;
+@@ -2488,7 +2489,7 @@
+ 	for (int32 i = 0; i &lt; count; i++) {
+ 		BMessage *message = MessageFromPort(0);
+ 		if (message != NULL)
+-			fQueue-&gt;AddMessage(message);
++			fDirectTarget-&gt;Queue()-&gt;AddMessage(message);
+ 	}
+ }
+ 
+@@ -2536,8 +2537,8 @@
+ 
+ 		bool dispatchNextMessage = true;
+ 		while (!fTerminating &amp;&amp; dispatchNextMessage) {
+-			//	Get next message from queue (assign to fLastMessage)
+-			fLastMessage = fQueue-&gt;NextMessage();
++			// Get next message from queue (assign to fLastMessage)
++			fLastMessage = fDirectTarget-&gt;Queue()-&gt;NextMessage();
+ 
+ 			// Lock the looper
+ 			if (!Lock())
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000465.html">[Haiku-commits] r19967 -	haiku/trunk/src/add-ons/kernel/file_systems/nfs
+</A></li>
+	<LI>Next message: <A HREF="000472.html">[Haiku-commits] r19968 - in haiku/trunk: headers/os/app headers/private/app src/kits/app src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#466">[ date ]</a>
+              <a href="thread.html#466">[ thread ]</a>
+              <a href="subject.html#466">[ subject ]</a>
+              <a href="author.html#466">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,317 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20834 -	haiku/trunk/src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20834%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200704260605.l3Q65WqA012172%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001824.html">
+   <LINK REL="Next"  HREF="001826.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20834 -	haiku/trunk/src/add-ons/kernel/network/stack</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20834%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200704260605.l3Q65WqA012172%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20834 -	haiku/trunk/src/add-ons/kernel/network/stack">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 26 08:05:32 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001824.html">[Haiku-commits] r20833 - in haiku/trunk:	headers/private/kernel/slab headers/private/kernel/util	src/system/kernel/slab
+</A></li>
+        <LI>Next message: <A HREF="001826.html">[Haiku-commits] r20835 - haiku/trunk/headers/private/kernel/slab
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1825">[ date ]</a>
+              <a href="thread.html#1825">[ thread ]</a>
+              <a href="subject.html#1825">[ subject ]</a>
+              <a href="author.html#1825">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-26 08:05:23 +0200 (Thu, 26 Apr 2007)
+New Revision: 20834
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20834&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20834&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/stack.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/stack_private.h
+Log:
+net_buffer is the first user of the new slab allocator, let's see how it goes.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp	2007-04-26 06:05:08 UTC (rev 20833)
++++ haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp	2007-04-26 06:05:23 UTC (rev 20834)
+@@ -10,10 +10,12 @@
+ #include &quot;utility.h&quot;
+ 
+ #include &lt;net_buffer.h&gt;
++#include &lt;slab/Slab.h&gt;
+ #include &lt;util/list.h&gt;
+ 
+ #include &lt;ByteOrder.h&gt;
+ #include &lt;KernelExport.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ 
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+@@ -63,6 +65,17 @@
+ };
+ 
+ 
++typedef MergedLinkCacheStrategy&lt;AreaBackend&gt; AreaMergedCacheStrategy;
++typedef HashCacheStrategy&lt;AreaBackend&gt; AreaHashCacheStrategy;
++
++typedef Cache&lt;AreaMergedCacheStrategy&gt; NetBufferCache;
++typedef Cache&lt;AreaHashCacheStrategy&gt; DataNodeCache;
++
++static NetBufferCache *sNetBufferCache;
++static DataNodeCache *sDataNodeCache;
++static benaphore sCachesLock;
++
++
+ static status_t append_data(net_buffer *buffer, const void *data, size_t size);
+ static status_t trim_data(net_buffer *_buffer, size_t newSize);
+ static status_t remove_header(net_buffer *_buffer, size_t bytes);
+@@ -87,11 +100,43 @@
+ #endif
+ 
+ 
++static inline data_header *
++allocate_data_header()
++{
++	BenaphoreLocker _(sCachesLock);
++	return (data_header *)sDataNodeCache-&gt;AllocateObject(CACHE_DONT_SLEEP);
++}
++
++
++static inline net_buffer_private *
++allocate_net_buffer()
++{
++	BenaphoreLocker _(sCachesLock);
++	return (net_buffer_private *)sNetBufferCache-&gt;AllocateObject(
++		CACHE_DONT_SLEEP);
++}
++
++
++static inline void
++free_data_header(data_header *header)
++{
++	BenaphoreLocker _(sCachesLock);
++	sDataNodeCache-&gt;ReturnObject(header);
++}
++
++
++static inline void
++free_net_buffer(net_buffer_private *buffer)
++{
++	BenaphoreLocker _(sCachesLock);
++	sNetBufferCache-&gt;ReturnObject(buffer);
++}
++
++
+ static data_header *
+ create_data_header(size_t headerSpace)
+ {
+-	// TODO: don't use malloc!
+-	data_header *header = (data_header *)malloc(BUFFER_SIZE);
++	data_header *header = allocate_data_header();
+ 	if (header == NULL)
+ 		return NULL;
+ 
+@@ -115,7 +160,7 @@
+ 		return;
+ 
+ 	TRACE((&quot;  free header %p\n&quot;, header));
+-	free(header);
++	free_data_header(header);
+ }
+ 
+ 
+@@ -275,8 +320,7 @@
+ static net_buffer *
+ create_buffer(size_t headerSpace)
+ {
+-	net_buffer_private *buffer = (net_buffer_private *)malloc(
+-		sizeof(struct net_buffer_private));
++	net_buffer_private *buffer = allocate_net_buffer();
+ 	if (buffer == NULL)
+ 		return NULL;
+ 
+@@ -284,7 +328,7 @@
+ 
+ 	data_header *header = create_data_header(headerSpace);
+ 	if (header == NULL) {
+-		free(buffer);
++		free_net_buffer(buffer);
+ 		return NULL;
+ 	}
+ 
+@@ -318,7 +362,7 @@
+ 		remove_data_node(node);
+ 	}
+ 
+-	free(buffer);
++	free_net_buffer(buffer);
+ }
+ 
+ 
+@@ -380,14 +424,13 @@
+ 
+ 	TRACE((&quot;clone_buffer(buffer %p)\n&quot;, buffer));
+ 
+-	net_buffer_private *clone = (net_buffer_private *)malloc(
+-		sizeof(struct net_buffer_private));
++	net_buffer_private *clone = allocate_net_buffer();
+ 	if (clone == NULL)
+ 		return NULL;
+ 
+ 	data_node *sourceNode = (data_node *)list_get_first_item(&amp;buffer-&gt;buffers);
+ 	if (sourceNode == NULL) {
+-		free(clone);
++		free_net_buffer(clone);
+ 		return NULL;
+ 	}
+ 
+@@ -428,7 +471,7 @@
+ 			// There was not enough space left for another node in this buffer
+ 			// TODO: handle this case!
+ 			panic(&quot;clone buffer hits size limit... (fix me)&quot;);
+-			free(clone);
++			free_net_buffer(clone);
+ 			return NULL;
+ 		}
+ 	}
+@@ -1136,6 +1179,49 @@
+ }
+ 
+ 
++status_t
++init_net_buffers()
++{
++	// TODO improve our code a bit so we can add constructors
++	//		and keep around half-constructed buffers in the slab
++
++	status_t status = benaphore_init(&amp;sCachesLock, &quot;net buffer cache lock&quot;);
++	if (status &lt; B_OK)
++		return status;
++
++	sNetBufferCache = new (std::nothrow) NetBufferCache(&quot;net buffer cache&quot;,
++		sizeof(net_buffer_private), 8, NULL, NULL, NULL);
++	if (sNetBufferCache == NULL) {
++		benaphore_destroy(&amp;sCachesLock);
++		return B_NO_MEMORY;
++	}
++
++	sDataNodeCache = new (std::nothrow) DataNodeCache(&quot;data node cache&quot;,
++		BUFFER_SIZE, 0, NULL, NULL, NULL);
++	if (sDataNodeCache == NULL) {
++		benaphore_destroy(&amp;sCachesLock);
++		delete sNetBufferCache;
++		return B_NO_MEMORY;
++	}
++
++	return B_OK;
++}
++
++
++status_t
++uninit_net_buffers()
++{
++	benaphore_lock(&amp;sCachesLock);
++
++	delete sNetBufferCache;
++	delete sDataNodeCache;
++
++	benaphore_destroy(&amp;sCachesLock);
++
++	return B_OK;
++}
++
++
+ static status_t
+ std_ops(int32 op, ...)
+ {
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/stack.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/stack.cpp	2007-04-26 06:05:08 UTC (rev 20833)
++++ haiku/trunk/src/add-ons/kernel/network/stack/stack.cpp	2007-04-26 06:05:23 UTC (rev 20834)
+@@ -785,6 +785,10 @@
+ 		goto err8;
+ 	}
+ 
++	status = init_net_buffers();
++	if (status &lt; B_OK)
++		goto err9;
++
+ 	sInitialized = true;
+ 
+ 	link_init();
+@@ -802,6 +806,8 @@
+ 
+ 	return B_OK;
+ 
++err9:
++	hash_uninit(sReceivingProtocolChains);
+ err8:
+ 	hash_uninit(sDatalinkProtocolChains);
+ err7:
+@@ -831,6 +837,8 @@
+ 	uninit_interfaces();
+ 	uninit_domains();
+ 
++	uninit_net_buffers();
++
+ 	benaphore_destroy(&amp;sChainLock);
+ 	benaphore_destroy(&amp;sInitializeChainLock);
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/stack_private.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/stack_private.h	2007-04-26 06:05:08 UTC (rev 20833)
++++ haiku/trunk/src/add-ons/kernel/network/stack/stack_private.h	2007-04-26 06:05:23 UTC (rev 20834)
+@@ -33,4 +33,8 @@
+ status_t get_domain_datalink_protocols(net_interface *interface);
+ status_t put_domain_datalink_protocols(net_interface *interface);
+ 
++// net_buffer.cpp
++status_t init_net_buffers();
++status_t uninit_net_buffers();
++
+ #endif	// STACK_PRIVATE_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001824.html">[Haiku-commits] r20833 - in haiku/trunk:	headers/private/kernel/slab headers/private/kernel/util	src/system/kernel/slab
+</A></li>
+	<LI>Next message: <A HREF="001826.html">[Haiku-commits] r20835 - haiku/trunk/headers/private/kernel/slab
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1825">[ date ]</a>
+              <a href="thread.html#1825">[ thread ]</a>
+              <a href="subject.html#1825">[ subject ]</a>
+              <a href="author.html#1825">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

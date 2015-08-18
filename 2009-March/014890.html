@@ -1,0 +1,197 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29554 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29554%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on&In-Reply-To=%3C200903160321.n2G3L57U024019%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014889.html">
+   <LINK REL="Next"  HREF="014891.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29554 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29554%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on&In-Reply-To=%3C200903160321.n2G3L57U024019%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29554 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Mar 16 04:21:05 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014889.html">[Haiku-commits] r29553 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/haiku
+</A></li>
+        <LI>Next message: <A HREF="014891.html">[Haiku-commits] r29555 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14890">[ date ]</a>
+              <a href="thread.html#14890">[ thread ]</a>
+              <a href="subject.html#14890">[ subject ]</a>
+              <a href="author.html#14890">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-03-16 04:21:04 +0100 (Mon, 16 Mar 2009)
+New Revision: 29554
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29554&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29554&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.h
+Log:
+ReadVNode(): We need to create the VNode object before sending the request
+to userland, since typically the file cache for the node is created there
+and our FileCacheCreate() method requires and existing VNode object.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp	2009-03-16 03:18:16 UTC (rev 29553)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.cpp	2009-03-16 03:21:04 UTC (rev 29554)
+@@ -51,13 +51,15 @@
+ 	void*	clientNode;
+ 	void*	fileCache;
+ 	int32	useCount;
++	bool	valid;
+ 
+ 	VNode(ino_t id, void* clientNode)
+ 		:
+ 		id(id),
+ 		clientNode(clientNode),
+ 		fileCache(NULL),
+-		useCount(0)
++		useCount(0),
++		valid(true)
+ 	{
+ 	}
+ 
+@@ -955,27 +957,36 @@
+ 	request-&gt;vnid = vnid;
+ 	request-&gt;reenter = reenter;
+ 
++	// add the uninitialized node to our map
++	VNode* vnode = new(std::nothrow) VNode(vnid, NULL);
++	if (vnode == NULL)
++		RETURN_ERROR(B_NO_MEMORY);
++	vnode-&gt;valid = false;
++
++	MutexLocker locker(fLock);
++	fVNodes-&gt;Insert(vnode);
++	locker.Unlock();
++
+ 	// send the request
+ 	KernelRequestHandler handler(this, READ_VNODE_REPLY);
+ 	ReadVNodeReply* reply;
+ 	error = _SendRequest(port, &amp;allocator, &amp;handler, (Request**)&amp;reply);
+-	if (error != B_OK)
++	if (error != B_OK) {
++		_RemoveInvalidVNode(vnid);
+ 		return error;
++	}
+ 	RequestReleaser requestReleaser(port, reply);
+ 
+ 	// process the reply
+-	if (reply-&gt;error != B_OK)
++	if (reply-&gt;error != B_OK) {
++		_RemoveInvalidVNode(vnid);
+ 		return reply-&gt;error;
+-
+-	// everything went fine so far -- add the node to our map
+-	VNode* vnode = new(std::nothrow) VNode(vnid, reply-&gt;node);
+-	if (vnode == NULL) {
+-		WriteVNode(reply-&gt;node, reenter);
+-		RETURN_ERROR(B_NO_MEMORY);
+ 	}
+ 
+-	MutexLocker lock(fLock);
+-	fVNodes-&gt;Insert(vnode);
++	// everything went fine -- mark the node valid
++	locker.Lock();
++	vnode-&gt;clientNode = reply-&gt;node;
++	vnode-&gt;valid = true;
+ 
+ 	*_node = vnode;
+ 	*type = reply-&gt;type;
+@@ -4227,6 +4238,7 @@
+ //PRINT((&quot;_IncrementVNodeCount(%Ld): count: %ld, fVNodeCountMap size: %ld\n&quot;, vnid, *count, fVNodeCountMap-&gt;Size()));
+ }
+ 
++
+ // _DecrementVNodeCount
+ void
+ Volume::_DecrementVNodeCount(ino_t vnid)
+@@ -4247,6 +4259,31 @@
+ //PRINT((&quot;_DecrementVNodeCount(%Ld): count: %ld, fVNodeCountMap size: %ld\n&quot;, vnid, tmpCount, fVNodeCountMap-&gt;Size()));
+ }
+ 
++
++// _RemoveInvalidVNode
++void
++Volume::_RemoveInvalidVNode(ino_t vnid)
++{
++	MutexLocker locker(fLock);
++
++	VNode* vnode = fVNodes-&gt;Lookup(vnid);
++	if (vnode == NULL) {
++		ERROR((&quot;Volume::_RemoveInvalidVNode(): Node with ID %lld not known!\n&quot;,
++			vnid));
++		return;
++	}
++
++	fVNodes-&gt;Remove(vnode);
++	locker.Unlock();
++
++	// release all references acquired so far
++	for (; vnode-&gt;useCount &gt; 0; vnode-&gt;useCount--)
++		put_vnode(fFSVolume, vnid);
++
++	delete vnode;
++}
++
++
+ // _InternalIOCtl
+ status_t
+ Volume::_InternalIOCtl(userlandfs_ioctl* buffer, int32 bufferSize)
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.h	2009-03-16 03:18:16 UTC (rev 29553)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/Volume.h	2009-03-16 03:21:04 UTC (rev 29554)
+@@ -257,6 +257,7 @@
+ 
+ 			void				_IncrementVNodeCount(ino_t vnid);
+ 			void				_DecrementVNodeCount(ino_t vnid);
++			void				_RemoveInvalidVNode(ino_t vnid);
+ 
+ 			status_t			_InternalIOCtl(userlandfs_ioctl* buffer,
+ 									int32 bufferSize);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014889.html">[Haiku-commits] r29553 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/server/haiku
+</A></li>
+	<LI>Next message: <A HREF="014891.html">[Haiku-commits] r29555 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14890">[ date ]</a>
+              <a href="thread.html#14890">[ thread ]</a>
+              <a href="subject.html#14890">[ subject ]</a>
+              <a href="author.html#14890">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

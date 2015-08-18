@@ -1,0 +1,325 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27966 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27966%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/cache%20src/system/kernel/vm&In-Reply-To=%3C200810110730.m9B7UtCk001623%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012558.html">
+   <LINK REL="Next"  HREF="012560.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27966 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/vm</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27966%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/cache%20src/system/kernel/vm&In-Reply-To=%3C200810110730.m9B7UtCk001623%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27966 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Oct 11 09:30:55 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012558.html">[Haiku-commits] r27965 - in haiku/trunk: build/jam	src/add-ons/media/media-add-ons	src/add-ons/media/media-add-ons/firewire_dv
+</A></li>
+        <LI>Next message: <A HREF="012560.html">[Haiku-commits] r27967 - haiku/trunk/src/apps/codycam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12559">[ date ]</a>
+              <a href="thread.html#12559">[ thread ]</a>
+              <a href="subject.html#12559">[ subject ]</a>
+              <a href="author.html#12559">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-10-11 09:30:44 +0200 (Sat, 11 Oct 2008)
+New Revision: 27966
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27966&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27966&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/cache/vnode_store.cpp
+   haiku/trunk/src/system/kernel/cache/vnode_store.h
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h
+   haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.cpp
+   haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.h
+   haiku/trunk/src/system/kernel/vm/VMDeviceCache.cpp
+   haiku/trunk/src/system/kernel/vm/VMDeviceCache.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+Log:
+* Added &quot;flags&quot; parameter to VMCache::Read().
+* Use the new VMCache::Read() flags parameter to directly read into the
+  physical page in the page fault handler instead of mapping it first.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -213,7 +213,7 @@
+ 	virtual	bool		HasPage(off_t offset);
+ 
+ 	virtual	status_t	Read(off_t offset, const iovec *vecs, size_t count,
+-							size_t *_numBytes);
++							uint32 flags, size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+ 							uint32 flags, size_t *_numBytes);
+ 	virtual	status_t	WriteAsync(off_t offset, const iovec* vecs,
+
+Modified: haiku/trunk/src/system/kernel/cache/vnode_store.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/vnode_store.cpp	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/src/system/kernel/cache/vnode_store.cpp	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -11,8 +11,35 @@
+ 
+ #include &lt;file_cache.h&gt;
+ #include &lt;vfs.h&gt;
++#include &lt;vm.h&gt;
+ 
++#include &quot;io_requests.h&quot;
+ 
++
++static inline status_t
++memset_physical(addr_t address, int value, size_t length)
++{
++	while (length &gt; 0) {
++		addr_t pageOffset = address % B_PAGE_SIZE;
++		addr_t virtualAddress;
++		status_t error = vm_get_physical_page(address - pageOffset,
++			&amp;virtualAddress, 0);
++		if (error != B_OK)
++			return error;
++
++		size_t toSet = min_c(length, B_PAGE_SIZE - pageOffset);
++		memset((void*)(virtualAddress + pageOffset), value, toSet);
++
++		vm_put_physical_page(virtualAddress);
++
++		length -= toSet;
++		address += toSet;
++	}
++
++	return B_OK;
++}
++
++
+ status_t
+ VMVnodeCache::Init(struct vnode *vnode)
+ {
+@@ -41,12 +68,12 @@
+ 
+ status_t
+ VMVnodeCache::Read(off_t offset, const iovec *vecs, size_t count,
+-	size_t *_numBytes)
++	uint32 flags, size_t *_numBytes)
+ {
+ 	size_t bytesUntouched = *_numBytes;
+ 
+ 	status_t status = vfs_read_pages(fVnode, NULL, offset, vecs, count,
+-		0, _numBytes);
++		flags, _numBytes);
+ 
+ 	bytesUntouched -= *_numBytes;
+ 
+@@ -61,9 +88,12 @@
+ 	for (int32 i = count; i-- &gt; 0 &amp;&amp; bytesUntouched != 0;) {
+ 		size_t length = min_c(bytesUntouched, vecs[i].iov_len);
+ 
+-		// ToDo: will have to map the pages in later (when we switch to physical pages)
+-		memset((void *)((addr_t)vecs[i].iov_base + vecs[i].iov_len - length),
+-			0, length);
++		addr_t address = (addr_t)vecs[i].iov_base + vecs[i].iov_len - length;
++		if ((flags &amp; B_PHYSICAL_IO_REQUEST) != 0)
++			memset_physical(address, 0, length);
++		else
++			memset((void*)address, 0, length);
++
+ 		bytesUntouched -= length;
+ 	}
+ 
+
+Modified: haiku/trunk/src/system/kernel/cache/vnode_store.h
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/vnode_store.h	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/src/system/kernel/cache/vnode_store.h	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -20,7 +20,7 @@
+ 	virtual	bool		HasPage(off_t offset);
+ 
+ 	virtual	status_t	Read(off_t offset, const iovec *vecs, size_t count,
+-							size_t *_numBytes);
++							uint32 flags, size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+ 							uint32 flags, size_t *_numBytes);
+ 	virtual	status_t	WriteAsync(off_t offset, const iovec* vecs,
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -496,7 +496,7 @@
+ 
+ status_t
+ VMAnonymousCache::Read(off_t offset, const iovec *vecs, size_t count,
+-	size_t *_numBytes)
++	uint32 flags, size_t *_numBytes)
+ {
+ 	off_t pageIndex = offset &gt;&gt; PAGE_SHIFT;
+ 
+@@ -517,7 +517,7 @@
+ 			* B_PAGE_SIZE;
+ 
+ 		status_t status = vfs_read_pages(swapFile-&gt;vnode, swapFile-&gt;cookie, pos,
+-			vecs + i, j - i, 0, _numBytes);
++			vecs + i, j - i, flags, _numBytes);
+ 		if (status != B_OK)
+ 			return status;
+ 	}
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -39,7 +39,7 @@
+ 	virtual	bool		HasPage(off_t offset);
+ 
+ 	virtual	status_t	Read(off_t offset, const iovec *vecs, size_t count,
+-							size_t *_numBytes);
++							uint32 flags, size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+ 							uint32 flags, size_t *_numBytes);
+ 	virtual	status_t	WriteAsync(off_t offset, const iovec* vecs,
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.cpp	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.cpp	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -96,7 +96,7 @@
+ 
+ status_t
+ VMAnonymousNoSwapCache::Read(off_t offset, const iovec *vecs, size_t count,
+-	size_t *_numBytes)
++	uint32 flags, size_t *_numBytes)
+ {
+ 	panic(&quot;anonymous_store: read called. Invalid!\n&quot;);
+ 	return B_ERROR;
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.h
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.h	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousNoSwapCache.h	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -23,7 +23,7 @@
+ 	virtual	bool		HasPage(off_t offset);
+ 
+ 	virtual	status_t	Read(off_t offset, const iovec *vecs, size_t count,
+-							size_t *_numBytes);
++							uint32 flags, size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+ 							uint32 flags, size_t *_numBytes);
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/VMDeviceCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMDeviceCache.cpp	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/src/system/kernel/vm/VMDeviceCache.cpp	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -27,7 +27,7 @@
+ 
+ status_t
+ VMDeviceCache::Read(off_t offset, const iovec *vecs, size_t count,
+-	size_t *_numBytes)
++	uint32 flags, size_t *_numBytes)
+ {
+ 	panic(&quot;device_store: read called. Invalid!\n&quot;);
+ 	return B_ERROR;
+
+Modified: haiku/trunk/src/system/kernel/vm/VMDeviceCache.h
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMDeviceCache.h	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/src/system/kernel/vm/VMDeviceCache.h	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -19,7 +19,7 @@
+ 	virtual	bool		HasPage(off_t offset);
+ 
+ 	virtual	status_t	Read(off_t offset, const iovec *vecs, size_t count,
+-							size_t *_numBytes);
++							uint32 flags, size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+ 							uint32 flags, size_t *_numBytes);
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -45,6 +45,7 @@
+ #include &lt;vm_priv.h&gt;
+ 
+ #include &quot;VMAnonymousCache.h&quot;
++#include &quot;io_requests.h&quot;
+ 
+ 
+ //#define TRACE_VM
+@@ -4438,16 +4439,13 @@
+ 
+ 			// get a virtual address for the page
+ 			iovec vec;
+-			map-&gt;ops-&gt;get_physical_page(
+-				page-&gt;physical_page_number * B_PAGE_SIZE,
+-				(addr_t *)&amp;vec.iov_base, PHYSICAL_PAGE_CAN_WAIT);
++			vec.iov_base = (void*)(page-&gt;physical_page_number * B_PAGE_SIZE);
+ 			size_t bytesRead = vec.iov_len = B_PAGE_SIZE;
+ 
+ 			// read it in
+-			status_t status = cache-&gt;Read(cacheOffset, &amp;vec, 1, &amp;bytesRead);
++			status_t status = cache-&gt;Read(cacheOffset, &amp;vec, 1,
++				B_PHYSICAL_IO_REQUEST, &amp;bytesRead);
+ 
+-			map-&gt;ops-&gt;put_physical_page((addr_t)vec.iov_base);
+-
+ 			cache-&gt;Lock();
+ 
+ 			if (status &lt; B_OK) {
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-10-11 04:52:20 UTC (rev 27965)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2008-10-11 07:30:44 UTC (rev 27966)
+@@ -861,7 +861,8 @@
+ 
+ 
+ status_t
+-VMCache::Read(off_t offset, const iovec *vecs, size_t count, size_t *_numBytes)
++VMCache::Read(off_t offset, const iovec *vecs, size_t count, uint32 flags,
++	size_t *_numBytes)
+ {
+ 	return B_ERROR;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012558.html">[Haiku-commits] r27965 - in haiku/trunk: build/jam	src/add-ons/media/media-add-ons	src/add-ons/media/media-add-ons/firewire_dv
+</A></li>
+	<LI>Next message: <A HREF="012560.html">[Haiku-commits] r27967 - haiku/trunk/src/apps/codycam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12559">[ date ]</a>
+              <a href="thread.html#12559">[ thread ]</a>
+              <a href="subject.html#12559">[ subject ]</a>
+              <a href="author.html#12559">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,170 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23580 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23580%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200801170821.m0H8Lnjr019505%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005570.html">
+   <LINK REL="Next"  HREF="005572.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23580 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23580%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200801170821.m0H8Lnjr019505%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23580 - haiku/trunk/src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Jan 17 09:21:49 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005570.html">[Haiku-commits] r23579 -	haiku/trunk/src/add-ons/kernel/drivers/graphics/nvidia
+</A></li>
+        <LI>Next message: <A HREF="005572.html">[Haiku-commits] r23581 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5571">[ date ]</a>
+              <a href="thread.html#5571">[ thread ]</a>
+              <a href="subject.html#5571">[ subject ]</a>
+              <a href="author.html#5571">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-01-17 09:21:48 +0100 (Thu, 17 Jan 2008)
+New Revision: 23580
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23580&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23580&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* Fixed a deadlock (and resolved TODO): we need to make all pages unbusy again
+  before releasing our cache reference. Otherwise removing a vnode (triggered
+  by releasing the cache in our thread) could need pages we still own.
+* Put the caches and pages into a union to save stack space; they are not
+  needed at the same time.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2008-01-17 08:15:50 UTC (rev 23579)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2008-01-17 08:21:48 UTC (rev 23580)
+@@ -461,6 +461,7 @@
+ 	kprintf(&quot;state:           %s\n&quot;, page_state_to_string(page-&gt;state));
+ 	kprintf(&quot;wired_count:     %d\n&quot;, page-&gt;wired_count);
+ 	kprintf(&quot;usage_count:     %d\n&quot;, page-&gt;usage_count);
++	kprintf(&quot;busy_writing:    %d\n&quot;, page-&gt;busy_writing);
+ 	#ifdef DEBUG_PAGE_QUEUE
+ 		kprintf(&quot;queue:           %p\n&quot;, page-&gt;queue);
+ 	#endif
+@@ -924,7 +925,10 @@
+ 
+ 		const uint32 kNumPages = 32;
+ 		ConditionVariable&lt;vm_page&gt; busyConditions[kNumPages];
+-		vm_page *pages[kNumPages];
++		union {
++			vm_page *pages[kNumPages];
++			vm_cache *caches[kNumPages];
++		} u;
+ 		uint32 numPages = 0;
+ 
+ 		// TODO: once the I/O scheduler is there, we should write
+@@ -972,7 +976,7 @@
+ 			//dprintf(&quot;write page %p, cache %p (%ld)\n&quot;, page, page-&gt;cache, page-&gt;cache-&gt;ref_count);
+ 			vm_clear_map_flags(page, PAGE_MODIFIED);
+ 			vm_cache_acquire_ref(cache);
+-			pages[numPages++] = page;
++			u.pages[numPages++] = page;
+ 		}
+ 
+ 		if (numPages == 0)
+@@ -983,42 +987,47 @@
+ 		// TODO: put this as requests into the I/O scheduler
+ 		status_t writeStatus[kNumPages];
+ 		for (uint32 i = 0; i &lt; numPages; i++) {
+-			writeStatus[i] = write_page(pages[i], false);
++			writeStatus[i] = write_page(u.pages[i], false);
+ 		}
+ 
+ 		// mark pages depending on whether they could be written or not
+ 
+ 		for (uint32 i = 0; i &lt; numPages; i++) {
+-			vm_cache *cache = pages[i]-&gt;cache;
++			vm_cache *cache = u.pages[i]-&gt;cache;
+ 			mutex_lock(&amp;cache-&gt;lock);
+ 
+ 			if (writeStatus[i] == B_OK) {
+ 				// put it into the active queue
+ 				InterruptsSpinLocker locker(sPageLock);
+-				move_page_to_active_or_inactive_queue(pages[i], true);
+-				pages[i]-&gt;busy_writing = false;
++				move_page_to_active_or_inactive_queue(u.pages[i], true);
++				u.pages[i]-&gt;busy_writing = false;
+ 			} else {
+ 				// We don't have to put the PAGE_MODIFIED bit back, as it's
+ 				// still in the modified pages list.
+ 				{
+ 					InterruptsSpinLocker locker(sPageLock);
+-					pages[i]-&gt;state = PAGE_STATE_MODIFIED;
+-					enqueue_page(&amp;sModifiedPageQueue, pages[i]);
++					u.pages[i]-&gt;state = PAGE_STATE_MODIFIED;
++					enqueue_page(&amp;sModifiedPageQueue, u.pages[i]);
+ 				}
+-				if (!pages[i]-&gt;busy_writing) {
++				if (!u.pages[i]-&gt;busy_writing) {
+ 					// someone has cleared the busy_writing flag which tells
+ 					// us our page has gone invalid
+-					vm_cache_remove_page(cache, pages[i]);
++					vm_cache_remove_page(cache, u.pages[i]);
+ 				} else
+-					pages[i]-&gt;busy_writing = false;
++					u.pages[i]-&gt;busy_writing = false;
+ 			}
+ 
+ 			busyConditions[i].Unpublish();
+ 
++			u.caches[i] = cache;
+ 			mutex_unlock(&amp;cache-&gt;lock);
+-			// TODO: we need to release the cache references after all
+-			// pages are made unbusy again - otherwise releasing a vnode
+-			// could deadlock.
++		}
++
++		for (uint32 i = 0; i &lt; numPages; i++) {
++			vm_cache *cache = u.caches[i];
++
++			// We release the cache references after all pages were made
++			// unbusy again - otherwise releasing a vnode could deadlock.
+ 			if (cache-&gt;store-&gt;ops-&gt;release_ref != NULL)
+ 				cache-&gt;store-&gt;ops-&gt;release_ref(cache-&gt;store);
+ 			vm_cache_release_ref(cache);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005570.html">[Haiku-commits] r23579 -	haiku/trunk/src/add-ons/kernel/drivers/graphics/nvidia
+</A></li>
+	<LI>Next message: <A HREF="005572.html">[Haiku-commits] r23581 -	haiku/trunk/src/system/boot/platform/atari_m68k
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5571">[ date ]</a>
+              <a href="thread.html#5571">[ thread ]</a>
+              <a href="subject.html#5571">[ subject ]</a>
+              <a href="author.html#5571">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,233 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27182 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27182%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808232341.m7NNfjeS005316%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011289.html">
+   <LINK REL="Next"  HREF="011293.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27182 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27182%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808232341.m7NNfjeS005316%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27182 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Aug 24 01:41:45 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011289.html">[Haiku-commits] r27181 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="011293.html">[Haiku-commits] r27183 - haiku/trunk/src/servers/input
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11290">[ date ]</a>
+              <a href="thread.html#11290">[ thread ]</a>
+              <a href="subject.html#11290">[ subject ]</a>
+              <a href="author.html#11290">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-24 01:41:44 +0200 (Sun, 24 Aug 2008)
+New Revision: 27182
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27182&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27182&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+Log:
+Added optional debug facility (can be enabled by defining
+TRACK_PAGE_USAGE_STATS): The page daemon tracks the distribution of page
+usage counts. Can be printed using the &quot;page_usage&quot; command.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2008-08-23 23:38:59 UTC (rev 27181)
++++ haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2008-08-23 23:41:44 UTC (rev 27182)
+@@ -8,6 +8,8 @@
+ 
+ #include &lt;signal.h&gt;
+ 
++#include &lt;algorithm&gt;
++
+ #include &lt;OS.h&gt;
+ 
+ #include &lt;vm.h&gt;
+@@ -17,6 +19,9 @@
+ #include &quot;VMAnonymousCache.h&quot;
+ 
+ 
++//#define TRACK_PAGE_USAGE_STATS	1
++
++
+ const static uint32 kMinScanPagesCount = 512;
+ const static uint32 kMaxScanPagesCount = 8192;
+ const static bigtime_t kMinScanWaitInterval = 50000LL;		// 50 ms
+@@ -26,7 +31,15 @@
+ static sem_id sPageDaemonSem;
+ static uint32 sNumPages;
+ 
++#ifdef TRACK_PAGE_USAGE_STATS
++static page_num_t sPageUsageArrays[512];
++static page_num_t* sPageUsage = sPageUsageArrays;
++static page_num_t sPageUsagePageCount;
++static page_num_t* sNextPageUsage = sPageUsageArrays + 256;
++static page_num_t sNextPageUsagePageCount;
++#endif
+ 
++
+ PageCacheLocker::PageCacheLocker(vm_page* page, bool dontWait)
+ 	:
+ 	fPage(NULL)
+@@ -90,7 +103,68 @@
+ //	#pragma mark -
+ 
+ 
++#ifdef TRACK_PAGE_USAGE_STATS
++
+ static void
++track_page_usage(vm_page* page)
++{
++	if (page-&gt;wired_count == 0) {
++		sNextPageUsage[(int32)page-&gt;usage_count + 128]++;
++		sNextPageUsagePageCount++;
++	}
++}
++
++
++static void
++update_page_usage_stats()
++{
++	std::swap(sPageUsage, sNextPageUsage);
++	sPageUsagePageCount = sNextPageUsagePageCount;
++
++	memset(sNextPageUsage, 0, sizeof(page_num_t) * 256);
++	sNextPageUsagePageCount = 0;
++
++	// compute average
++	if (sPageUsagePageCount &gt; 0) {
++		int64 sum = 0;
++		for (int32 i = 0; i &lt; 256; i++)
++			sum += (int64)sPageUsage[i] * (i - 128);
++
++		dprintf(&quot;average page usage: %f (%lu pages)\n&quot;,
++			(float)sum / sPageUsagePageCount, sPageUsagePageCount);
++	}
++}
++
++
++static int
++dump_page_usage_stats(int argc, char** argv)
++{
++	kprintf(&quot;distribution of page usage counts (%lu pages):&quot;,
++		sPageUsagePageCount);
++
++	int64 sum = 0;
++	for (int32 i = 0; i &lt; 256; i++) {
++		if (i % 8 == 0)
++			kprintf(&quot;\n%4ld:&quot;, i - 128);
++
++		int64 count = sPageUsage[i];
++		sum += count * (i - 128);
++
++		kprintf(&quot;  %9llu&quot;, count);
++	}
++
++	kprintf(&quot;\n\n&quot;);
++
++	kprintf(&quot;average usage count: %f\n&quot;,
++		sPageUsagePageCount &gt; 0 ? (float)sum / sPageUsagePageCount : 0);
++
++	return 0;
++}
++
++#endif
++
++
++static void
+ clear_page_activation(int32 index)
+ {
+ 	vm_page *page = vm_page_at_index(index);
+@@ -128,12 +202,20 @@
+ 		} else if (page-&gt;usage_count &lt; 127)
+ 			page-&gt;usage_count++;
+ 
++#ifdef TRACK_PAGE_USAGE_STATS
++		track_page_usage(page);
++#endif
++
+ 		return false;
+ 	}
+ 
+ 	if (page-&gt;usage_count &gt; -128)
+ 		page-&gt;usage_count--;
+ 
++#ifdef TRACK_PAGE_USAGE_STATS
++		track_page_usage(page);
++#endif
++
+ 	if (page-&gt;usage_count &lt; 0) {
+ 		uint32 flags;
+ 		vm_remove_all_page_mappings(page, &amp;flags);
+@@ -216,8 +298,12 @@
+ 		for (uint32 i = 0; i &lt; scanPagesCount &amp;&amp; leftToFree &gt; 0; i++) {
+ 			if (clearPage == 0)
+ 				dprintf(&quot;clear through\n&quot;);
+-			if (checkPage == 0)
++			if (checkPage == 0) {
+ 				dprintf(&quot;check through\n&quot;);
++#ifdef TRACK_PAGE_USAGE_STATS
++				update_page_usage_stats();
++#endif
++			}
+ 			clear_page_activation(clearPage);
+ 
+ 			if (check_page_activation(checkPage))
+@@ -261,6 +347,14 @@
+ status_t
+ vm_daemon_init()
+ {
++#ifdef TRACK_PAGE_USAGE_STATS
++	add_debugger_command_etc(&quot;page_usage&quot;, &amp;dump_page_usage_stats,
++		&quot;Dumps statistics about page usage counts&quot;,
++		&quot;\n&quot;
++		&quot;Dumps statistics about page usage counts.\n&quot;,
++		B_KDEBUG_DONT_PARSE_ARGUMENTS);
++#endif
++
+ 	sPageDaemonSem = create_sem(0, &quot;page daemon&quot;);
+ 
+ 	sNumPages = vm_page_num_pages();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011289.html">[Haiku-commits] r27181 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="011293.html">[Haiku-commits] r27183 - haiku/trunk/src/servers/input
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11290">[ date ]</a>
+              <a href="thread.html#11290">[ thread ]</a>
+              <a href="subject.html#11290">[ subject ]</a>
+              <a href="author.html#11290">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

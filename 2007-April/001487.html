@@ -1,0 +1,983 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20614 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20614%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/stack&In-Reply-To=%3C200704080916.l389G6pK010206%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001485.html">
+   <LINK REL="Next"  HREF="001488.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20614 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20614%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/stack&In-Reply-To=%3C200704080916.l389G6pK010206%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20614 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/stack">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Sun Apr  8 11:16:06 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001485.html">[Haiku-commits] r20613 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+        <LI>Next message: <A HREF="001488.html">[Haiku-commits] r20615 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1487">[ date ]</a>
+              <a href="thread.html#1487">[ thread ]</a>
+              <a href="subject.html#1487">[ subject ]</a>
+              <a href="author.html#1487">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-08 11:15:52 +0200 (Sun, 08 Apr 2007)
+New Revision: 20614
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20614&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20614&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/net/net_stack.h
+   haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h
+   haiku/trunk/src/add-ons/kernel/network/stack/link.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/utility.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/utility.h
+Log:
+Prepared net_device_monitor to accept device removal events.
+
+ - Introduced public net_device_monitor.
+ - Changed the link protocol to maintain a lock per instance instead of inside the FIFO. Now all of the link instance data is protected.
+ - Adapted the link protocol to use net_device_monitor.
+ - Introduced a private Fifo class which doesn't maintain it's own lock.
+  - Maybe we should add something like a public net_protocol_implementation which maintains a fifo and a benaphore? With the fifo using the structure's lock instead of maintaining it's own.
+
+
+Modified: haiku/trunk/headers/private/net/net_stack.h
+===================================================================
+--- haiku/trunk/headers/private/net/net_stack.h	2007-04-08 05:50:49 UTC (rev 20613)
++++ haiku/trunk/headers/private/net/net_stack.h	2007-04-08 09:15:52 UTC (rev 20614)
+@@ -37,6 +37,21 @@
+ typedef int32 (*net_deframe_func)(struct net_device *device, struct net_buffer *buffer);
+ typedef status_t (*net_receive_func)(void *cookie, struct net_buffer *buffer);
+ 
++enum {
++	B_DEVICE_GOING_UP = 1,
++	B_DEVICE_GOING_DOWN,
++	B_DEVICE_BEING_REMOVED,
++};
++
++struct net_device_monitor {
++	struct list_link link;
++	void *cookie;
++
++	status_t (*receive)(struct net_device_monitor *monitor,
++		struct net_buffer *buffer);
++	void (*event)(struct net_device_monitor *monitor, int32 event);
++};
++
+ struct net_stack_module_info {
+ 	module_info info;
+ 
+@@ -68,9 +83,9 @@
+ 	status_t (*unregister_device_handler)(struct net_device *device, int32 type);
+ 
+ 	status_t (*register_device_monitor)(struct net_device *device,
+-					net_receive_func receiveFunc, void *cookie);
++		struct net_device_monitor *monitor);
+ 	status_t (*unregister_device_monitor)(struct net_device *device,
+-					net_receive_func receiveFunc, void *cookie);
++		struct net_device_monitor *monitor);
+ 
+ 	status_t (*device_link_changed)(struct net_device *device);
+ 	status_t (*device_removed)(struct net_device *device);
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp	2007-04-08 05:50:49 UTC (rev 20613)
++++ haiku/trunk/src/add-ons/kernel/network/stack/datalink.cpp	2007-04-08 09:15:52 UTC (rev 20614)
+@@ -60,7 +60,7 @@
+ 				= interface-&gt;monitor_funcs.GetIterator();
+ 			while (iterator.HasNext()) {
+ 				net_device_monitor *monitor = iterator.Next();
+-				monitor-&gt;func(monitor-&gt;cookie, buffer);
++				monitor-&gt;receive(monitor, buffer);
+ 			}
+ 
+ 			int32 type = interface-&gt;deframe_func(device, buffer);
+@@ -478,7 +478,7 @@
+ 		interface-&gt;device_interface-&gt;monitor_funcs.GetIterator();
+ 	while (iterator.HasNext()) {
+ 		net_device_monitor *monitor = iterator.Next();
+-		monitor-&gt;func(monitor-&gt;cookie, buffer);
++		monitor-&gt;receive(monitor, buffer);
+ 	}
+ 
+ 	return protocol-&gt;device_module-&gt;send_data(protocol-&gt;device, buffer);
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp	2007-04-08 05:50:49 UTC (rev 20613)
++++ haiku/trunk/src/add-ons/kernel/network/stack/interfaces.cpp	2007-04-08 09:15:52 UTC (rev 20614)
+@@ -593,9 +593,11 @@
+ 
+ 
+ status_t
+-register_device_monitor(struct net_device *device,
+-	net_receive_func receiveFunc, void *cookie)
++register_device_monitor(net_device *device, net_device_monitor *monitor)
+ {
++	if (monitor-&gt;receive == NULL || monitor-&gt;event == NULL)
++		return B_BAD_VALUE;
++
+ 	BenaphoreLocker locker(sInterfaceLock);
+ 
+ 	// find device interface for this device
+@@ -604,23 +606,13 @@
+ 		return ENODEV;
+ 
+ 	BenaphoreLocker _(interface-&gt;rx_lock);
+-
+-	// Add new monitor
+-
+-	net_device_monitor *monitor = new (std::nothrow) net_device_monitor;
+-	if (monitor == NULL)
+-		return B_NO_MEMORY;
+-
+-	monitor-&gt;func = receiveFunc;
+-	monitor-&gt;cookie = cookie;
+ 	interface-&gt;monitor_funcs.Add(monitor);
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-unregister_device_monitor(struct net_device *device,
+-	net_receive_func receiveFunc, void *cookie)
++unregister_device_monitor(net_device *device, net_device_monitor *monitor)
+ {
+ 	BenaphoreLocker locker(sInterfaceLock);
+ 
+@@ -635,12 +627,8 @@
+ 
+ 	DeviceMonitorList::Iterator iterator = interface-&gt;monitor_funcs.GetIterator();
+ 	while (iterator.HasNext()) {
+-		net_device_monitor *monitor = iterator.Next();
+-
+-		if (monitor-&gt;cookie == cookie &amp;&amp; monitor-&gt;func == receiveFunc) {
+-			// found it
++		if (iterator.Next() == monitor) {
+ 			iterator.Remove();
+-			delete monitor;
+ 			return B_OK;
+ 		}
+ 	}
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h	2007-04-08 05:50:49 UTC (rev 20613)
++++ haiku/trunk/src/add-ons/kernel/network/stack/interfaces.h	2007-04-08 09:15:52 UTC (rev 20614)
+@@ -21,14 +21,11 @@
+ 	void				*cookie;
+ };
+ 
+-struct net_device_monitor : public DoublyLinkedListLinkImpl&lt;net_device_monitor&gt; {
+-	net_receive_func	func;
+-	void				*cookie;
+-};
+-
+ typedef DoublyLinkedList&lt;net_device_handler&gt; DeviceHandlerList;
+-typedef DoublyLinkedList&lt;net_device_monitor&gt; DeviceMonitorList;
+ 
++typedef DoublyLinkedList&lt;net_device_monitor,
++	DoublyLinkedListCLink&lt;net_device_monitor&gt; &gt; DeviceMonitorList;
++
+ struct net_device_interface : DoublyLinkedListLinkImpl&lt;net_device_interface&gt; {
+ 	//struct list_link	link;
+ 	const char			*name;
+@@ -93,9 +90,9 @@
+ 	net_receive_func receiveFunc, void *cookie);
+ status_t unregister_device_handler(struct net_device *device, int32 type);
+ status_t register_device_monitor(struct net_device *device,
+-	net_receive_func receiveFunc, void *cookie);
++	struct net_device_monitor *monitor);
+ status_t unregister_device_monitor(struct net_device *device,
+-	net_receive_func receiveFunc, void *cookie);
++	struct net_device_monitor *monitor);
+ status_t device_link_changed(net_device *device);
+ status_t device_removed(net_device *device);
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/link.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/link.cpp	2007-04-08 05:50:49 UTC (rev 20613)
++++ haiku/trunk/src/add-ons/kernel/network/stack/link.cpp	2007-04-08 09:15:52 UTC (rev 20614)
+@@ -16,6 +16,9 @@
+ 
+ #include &lt;net_device.h&gt;
+ 
++#include &lt;lock.h&gt;
++#include &lt;util/AutoLock.h&gt;
++
+ #include &lt;KernelExport.h&gt;
+ 
+ #include &lt;net/if_types.h&gt;
+@@ -25,61 +28,196 @@
+ #include &lt;sys/sockio.h&gt;
+ 
+ 
+-struct link_protocol : net_protocol {
+-	net_fifo	fifo;
+-	char		registered_interface[IF_NAMESIZE];
+-	bool		registered_monitor;
++class LinkProtocol : public net_protocol {
++public:
++	LinkProtocol();
++	~LinkProtocol();
++
++	status_t InitCheck() const;
++
++	status_t StartMonitoring(const char *);
++	status_t StopMonitoring();
++
++	ssize_t ReadData(size_t numBytes, uint32 flags, net_buffer **_buffer);
++	ssize_t ReadAvail() const;
++
++private:
++	status_t _Enqueue(net_buffer *buffer);
++	status_t _Unregister();
++
++	mutable benaphore	fLock;
++	Fifo				fFifo;
++
++	net_device_monitor	fMonitor;
++	net_device_interface *fMonitoredDevice;
++
++	static status_t _MonitorData(net_device_monitor *monitor, net_buffer *buffer);
++	static void _MonitorEvent(net_device_monitor *monitor, int32 event);
+ };
+ 
+ 
+ struct net_domain *sDomain;
+ 
+ 
+-static status_t
+-link_monitor_data(void *cookie, net_buffer *packet)
++LinkProtocol::LinkProtocol()
++	: fFifo(&quot;packet monitor fifo&quot;, 65536)
+ {
+-	link_protocol *protocol = (link_protocol *)cookie;
++	benaphore_init(&amp;fLock, &quot;packet monitor lock&quot;);
+ 
+-	return fifo_socket_enqueue_buffer(&amp;protocol-&gt;fifo, protocol-&gt;socket,
+-						B_SELECT_READ, packet);
++	fMonitor.cookie = this;
++	fMonitor.receive = _MonitorData;
++	fMonitor.event = _MonitorEvent;
++	fMonitoredDevice = NULL;
+ }
+ 
+ 
++LinkProtocol::~LinkProtocol()
++{
++	if (fMonitoredDevice) {
++		unregister_device_monitor(fMonitoredDevice-&gt;device, &amp;fMonitor);
++		put_device_interface(fMonitoredDevice);
++	}
++
++	benaphore_destroy(&amp;fLock);
++}
++
++
++status_t
++LinkProtocol::InitCheck() const
++{
++	return fLock.sem &gt;= 0 &amp;&amp; fFifo.InitCheck();
++}
++
++
++status_t
++LinkProtocol::StartMonitoring(const char *deviceName)
++{
++	BenaphoreLocker _(fLock);
++
++	if (fMonitoredDevice)
++		return B_BUSY;
++
++	net_device_interface *interface = get_device_interface(deviceName);
++	if (interface == NULL)
++		return ENODEV;
++
++	status_t status = register_device_monitor(interface-&gt;device, &amp;fMonitor);
++	if (status &lt; B_OK) {
++		put_device_interface(interface);
++		return status;
++	}
++
++	fMonitoredDevice = interface;
++	return B_OK;
++}
++
++
++status_t
++LinkProtocol::StopMonitoring()
++{
++	BenaphoreLocker _(fLock);
++
++	// TODO compare our device with the supplied device name?
++	return _Unregister();
++}
++
++
++ssize_t
++LinkProtocol::ReadData(size_t numBytes, uint32 flags, net_buffer **_buffer)
++{
++	BenaphoreLocker _(fLock);
++
++	if (fMonitoredDevice == NULL) {
++		if (fFifo.current_bytes == 0)
++			return ENODEV;
++	}
++
++	net_buffer *buffer;
++	status_t status = fFifo.Dequeue(&amp;fLock, flags, socket-&gt;receive.timeout,
++		&amp;buffer);
++	if (status &lt; B_OK)
++		return status;
++
++	*_buffer = buffer;
++	return B_OK;
++}
++
++
++ssize_t
++LinkProtocol::ReadAvail() const
++{
++	BenaphoreLocker _(fLock);
++	if (fMonitoredDevice == NULL)
++		return ECONNRESET;
++	return fFifo.current_bytes;
++}
++
++
++status_t
++LinkProtocol::_Unregister()
++{
++	if (fMonitoredDevice == NULL)
++		return B_BAD_VALUE;
++
++	status_t status = unregister_device_monitor(fMonitoredDevice-&gt;device,
++		&amp;fMonitor);
++	put_device_interface(fMonitoredDevice);
++	fMonitoredDevice = NULL;
++
++	return status;
++}
++
++
++status_t
++LinkProtocol::_Enqueue(net_buffer *buffer)
++{
++	BenaphoreLocker _(fLock);
++	return fFifo.EnqueueAndNotify(buffer, socket, B_SELECT_READ);
++}
++
++
++status_t
++LinkProtocol::_MonitorData(net_device_monitor *monitor, net_buffer *packet)
++{
++	return ((LinkProtocol *)monitor-&gt;cookie)-&gt;_Enqueue(packet);
++}
++
++
++void
++LinkProtocol::_MonitorEvent(net_device_monitor *monitor, int32 event)
++{
++	LinkProtocol *protocol = (LinkProtocol *)monitor-&gt;cookie;
++
++	// We currently maintain the monitor while the device is down
++	if (event == B_DEVICE_BEING_REMOVED) {
++		BenaphoreLocker _(protocol-&gt;fLock);
++
++		protocol-&gt;_Unregister();
++		notify_socket(protocol-&gt;socket, B_SELECT_READ, ECONNRESET);
++	}
++}
++
++
+ //	#pragma mark -
+ 
+ 
+ net_protocol *
+ link_init_protocol(net_socket *socket)
+ {
+-	link_protocol *protocol = new (std::nothrow) link_protocol;
+-	if (protocol == NULL)
+-		return NULL;
+-
+-	if (init_fifo(&amp;protocol-&gt;fifo, &quot;packet monitor socket&quot;, 65536) &lt; B_OK) {
++	LinkProtocol *protocol = new (std::nothrow) LinkProtocol();
++	if (protocol &amp;&amp; protocol-&gt;InitCheck() &lt; B_OK) {
+ 		delete protocol;
+ 		return NULL;
+ 	}
+ 
+-	protocol-&gt;registered_monitor = false;
+ 	return protocol;
+ }
+ 
+ 
+ status_t
+-link_uninit_protocol(net_protocol *_protocol)
++link_uninit_protocol(net_protocol *protocol)
+ {
+-	link_protocol *protocol = (link_protocol *)_protocol;
+-
+-	if (protocol-&gt;registered_monitor) {
+-		net_device_interface *interface = get_device_interface(protocol-&gt;registered_interface);
+-		if (interface != NULL) {
+-			unregister_device_monitor(interface-&gt;device, link_monitor_data, protocol);
+-			put_device_interface(interface);
+-		}
+-	}
+-
+-	uninit_fifo(&amp;protocol-&gt;fifo);
+-	delete protocol;
++	delete (LinkProtocol *)protocol;
+ 	return B_OK;
+ }
+ 
+@@ -123,8 +261,10 @@
+ link_control(net_protocol *_protocol, int level, int option, void *value,
+ 	size_t *_length)
+ {
+-	link_protocol *protocol = (link_protocol *)_protocol;
++	LinkProtocol *protocol = (LinkProtocol *)_protocol;
+ 
++	// TODO All of this common functionality should be elsewhere
++
+ 	switch (option) {
+ 		case SIOCGIFINDEX:
+ 		{
+@@ -203,58 +343,15 @@
+ 
+ 		case SIOCSPACKETCAP:
+ 		{
+-			// start packet monitoring
+-
+-			if (protocol-&gt;registered_monitor)
+-				return B_BUSY;
+-
+ 			struct ifreq request;
+ 			if (user_memcpy(&amp;request, value, IF_NAMESIZE) &lt; B_OK)
+ 				return B_BAD_ADDRESS;
+ 
+-			net_device_interface *interface = get_device_interface(request.ifr_name);
+-			status_t status;
+-			if (interface != NULL) {
+-				status = register_device_monitor(interface-&gt;device,
+-					link_monitor_data, protocol);
+-				if (status == B_OK) {
+-					// we're now registered
+-					strlcpy(protocol-&gt;registered_interface, request.ifr_name, IF_NAMESIZE);
+-					protocol-&gt;registered_monitor = true;
+-				}
+-				put_device_interface(interface);
+-			} else
+-				status = ENODEV;
+-
+-			return status;
++			return protocol-&gt;StartMonitoring(request.ifr_name);
+ 		}
+ 
+ 		case SIOCCPACKETCAP:
+-		{
+-			// stop packet monitoring
+-
+-			if (!protocol-&gt;registered_monitor)
+-				return B_BAD_VALUE;
+-
+-			struct ifreq request;
+-			if (user_memcpy(&amp;request, value, IF_NAMESIZE) &lt; B_OK)
+-				return B_BAD_ADDRESS;
+-
+-			net_device_interface *interface = get_device_interface(request.ifr_name);
+-			status_t status;
+-			if (interface != NULL) {
+-				status = unregister_device_monitor(interface-&gt;device,
+-					link_monitor_data, protocol);
+-				if (status == B_OK) {
+-					// we're now no longer registered
+-					protocol-&gt;registered_monitor = false;
+-				}
+-				put_device_interface(interface);
+-			} else
+-				status = ENODEV;
+-
+-			return status;
+-		}
++			return protocol-&gt;StopMonitoring();
+ 	}
+ 
+ 	return datalink_control(sDomain, option, value, _length);
+@@ -313,29 +410,17 @@
+ 
+ 
+ status_t
+-link_read_data(net_protocol *_protocol, size_t numBytes, uint32 flags,
++link_read_data(net_protocol *protocol, size_t numBytes, uint32 flags,
+ 	net_buffer **_buffer)
+ {
+-	link_protocol *protocol = (link_protocol *)_protocol;
+-
+-	dprintf(&quot;link_read is waiting for data...\n&quot;);
+-
+-	net_buffer *buffer;
+-	status_t status = fifo_dequeue_buffer(&amp;protocol-&gt;fifo,
+-		flags, protocol-&gt;socket-&gt;receive.timeout, &amp;buffer);
+-	if (status &lt; B_OK)
+-		return status;
+-
+-	*_buffer = buffer;
+-	return B_OK;
++	return ((LinkProtocol *)protocol)-&gt;ReadData(numBytes, flags, _buffer);
+ }
+ 
+ 
+ ssize_t
+-link_read_avail(net_protocol *_protocol)
++link_read_avail(net_protocol *protocol)
+ {
+-	link_protocol *protocol = (link_protocol *)_protocol;
+-	return protocol-&gt;fifo.current_bytes;
++	return ((LinkProtocol *)protocol)-&gt;ReadAvail();
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/utility.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/utility.cpp	2007-04-08 05:50:49 UTC (rev 20613)
++++ haiku/trunk/src/add-ons/kernel/network/stack/utility.cpp	2007-04-08 09:15:52 UTC (rev 20614)
+@@ -24,6 +24,126 @@
+ static bigtime_t sTimerTimeout;
+ 
+ 
++template&lt;typename FifoType&gt; static inline status_t
++base_fifo_init(FifoType *fifo, const char *name, size_t maxBytes)
++{
++	fifo-&gt;notify = create_sem(1, name);
++	fifo-&gt;max_bytes = maxBytes;
++	fifo-&gt;current_bytes = 0;
++	fifo-&gt;waiting = 0;
++	list_init(&amp;fifo-&gt;buffers);
++
++	return fifo-&gt;notify;
++}
++
++
++template&lt;typename FifoType&gt; static inline status_t
++base_fifo_enqueue_buffer(FifoType *fifo, net_buffer *buffer)
++{
++	if (fifo-&gt;max_bytes &gt; 0 &amp;&amp; fifo-&gt;current_bytes + buffer-&gt;size &gt; fifo-&gt;max_bytes)
++		return ENOBUFS;
++
++	list_add_item(&amp;fifo-&gt;buffers, buffer);
++	fifo-&gt;current_bytes += buffer-&gt;size;
++
++	if (fifo-&gt;waiting &gt; 0) {
++		fifo-&gt;waiting--;
++		release_sem_etc(fifo-&gt;notify, 1, B_DO_NOT_RESCHEDULE);
++			// we still hold the benaphore lock, so it makes no sense
++			// to reschedule after having released the sync semaphore
++	}
++
++	return B_OK;
++}
++
++
++/*!
++	Gets the first buffer from the FIFO. If there is no buffer, it
++	will wait depending on the \a flags and \a timeout.
++	The following flags are supported (the rest is ignored):
++		MSG_DONTWAIT - ignores the timeout and never wait for a buffer; if your
++			socket is O_NONBLOCK, you should specify this flag. A \a timeout of
++			zero is equivalent to this flag, though.
++		MSG_PEEK - returns a clone of the buffer and keep the original
++			in the FIFO.
++*/
++template&lt;typename FifoType&gt; static inline ssize_t
++base_fifo_dequeue_buffer(FifoType *fifo, benaphore *lock, uint32 flags,
++	bigtime_t timeout, net_buffer **_buffer)
++{
++	// this function is called with `lock' held.
++	bool dontWait = (flags &amp; MSG_DONTWAIT) != 0 || timeout == 0;
++	status_t status;
++
++	while (true) {
++		net_buffer *buffer = (net_buffer *)list_get_first_item(&amp;fifo-&gt;buffers);
++		if (buffer != NULL) {
++			if ((flags &amp; MSG_PEEK) != 0) {
++				// we need to clone the buffer for inspection; we can't give a
++				// handle to a buffer that we're still using
++				buffer = gNetBufferModule.clone(buffer, false);
++				if (buffer == NULL) {
++					status = B_NO_MEMORY;
++					break;
++				}
++			} else {
++				list_remove_item(&amp;fifo-&gt;buffers, buffer);
++				fifo-&gt;current_bytes -= buffer-&gt;size;
++			}
++
++			*_buffer = buffer;
++			status = B_OK;
++			break;
++		}
++
++		if (!dontWait)
++			fifo-&gt;waiting++;
++
++		// we need to wait until a new buffer becomes available
++		benaphore_unlock(lock);
++
++		if (dontWait)
++			return B_WOULD_BLOCK;
++
++		status = acquire_sem_etc(fifo-&gt;notify, 1,
++			B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, timeout);
++		if (status &lt; B_OK)
++			return status;
++
++		// try again
++		benaphore_lock(lock);
++	}
++
++	if ((flags &amp; MSG_PEEK) != 0 &amp;&amp; fifo-&gt;waiting &gt; 0) {
++		// another thread is waiting for data, since we didn't eat the
++		// buffer, it gets it
++		fifo-&gt;waiting--;
++		release_sem_etc(fifo-&gt;notify, 1, B_DO_NOT_RESCHEDULE);
++	}
++
++	return status;
++}
++
++
++template&lt;typename FifoType&gt; static inline status_t
++base_fifo_clear(FifoType *fifo)
++{
++	while (true) {
++		net_buffer *buffer = (net_buffer *)list_remove_head_item(&amp;fifo-&gt;buffers);
++		if (buffer == NULL)
++			break;
++
++		gNetBufferModule.free(buffer);
++	}
++
++	fifo-&gt;current_bytes = 0;
++	return B_OK;
++}
++
++
++//	#pragma mark -
++
++
+ void *
+ UserBuffer::Copy(void *source, size_t length)
+ {
+@@ -101,150 +221,111 @@
+ //	#pragma mark - FIFOs
+ 
+ 
+-status_t
+-init_fifo(net_fifo *fifo, const char *name, size_t maxBytes)
++Fifo::Fifo(const char *name, size_t maxBytes)
+ {
+-	status_t status = benaphore_init(&amp;fifo-&gt;lock, name);
+-	if (status &lt; B_OK)
+-		return status;
++	base_fifo_init(this, name, maxBytes);
++}
+ 
+-	fifo-&gt;notify = create_sem(1, name);
+-	if (fifo-&gt;notify &lt; B_OK) {
+-		benaphore_destroy(&amp;fifo-&gt;lock);
+-		return fifo-&gt;notify;
+-	}
+ 
+-	fifo-&gt;max_bytes = maxBytes;
+-	fifo-&gt;current_bytes = 0;
+-	fifo-&gt;waiting = 0;
++Fifo::~Fifo()
++{
++	Clear();
++	delete_sem(notify);
++}
+ 
+-	list_init(&amp;fifo-&gt;buffers);
+ 
+-	return B_OK;
++status_t
++Fifo::InitCheck() const
++{
++	return !(notify &lt; B_OK);
+ }
+ 
+ 
+-void
+-uninit_fifo(net_fifo *fifo)
++status_t
++Fifo::Enqueue(net_buffer *buffer)
+ {
+-	clear_fifo(fifo);
+-
+-	benaphore_destroy(&amp;fifo-&gt;lock);
+-	delete_sem(fifo-&gt;notify);
++	return base_fifo_enqueue_buffer(this, buffer);
+ }
+ 
+ 
+-static status_t
+-_fifo_enqueue_buffer(net_fifo *fifo, net_buffer *buffer)
++status_t
++Fifo::EnqueueAndNotify(net_buffer *_buffer, net_socket *socket, uint8 event)
+ {
+-	if (fifo-&gt;max_bytes &gt; 0 &amp;&amp; fifo-&gt;current_bytes + buffer-&gt;size &gt; fifo-&gt;max_bytes)
+-		return ENOBUFS;
++	net_buffer *buffer = gNetBufferModule.clone(_buffer, false);
++	if (buffer == NULL)
++		return B_NO_MEMORY;
+ 
+-	list_add_item(&amp;fifo-&gt;buffers, buffer);
+-	fifo-&gt;current_bytes += buffer-&gt;size;
++	status_t status = Enqueue(buffer);
++	if (status &lt; B_OK)
++		gNetBufferModule.free(buffer);
++	else
++		notify_socket(socket, event, current_bytes);
+ 
+-	if (fifo-&gt;waiting &gt; 0) {
+-		fifo-&gt;waiting--;
+-		release_sem_etc(fifo-&gt;notify, 1, B_DO_NOT_RESCHEDULE);
+-			// we still hold the benaphore lock, so it makes no sense
+-			// to reschedule after having released the sync semaphore
+-	}
+-
+-	return B_OK;
++	return status;
+ }
+ 
+-status_t
+-fifo_enqueue_buffer(net_fifo *fifo, net_buffer *buffer)
++
++ssize_t
++Fifo::Dequeue(benaphore *lock, uint32 flags, bigtime_t timeout,
++	net_buffer **_buffer)
+ {
+-	BenaphoreLocker locker(fifo-&gt;lock);
+-	return _fifo_enqueue_buffer(fifo, buffer);
++	return base_fifo_dequeue_buffer(this, lock, flags, timeout, _buffer);
+ }
+ 
+ 
+-/*!
+-	Gets the first buffer from the FIFO. If there is no buffer, it
+-	will wait depending on the \a flags and \a timeout.
+-	The following flags are supported (the rest is ignored):
+-		MSG_DONTWAIT - ignores the timeout and never wait for a buffer; if your
+-			socket is O_NONBLOCK, you should specify this flag. A \a timeout of
+-			zero is equivalent to this flag, though.
+-		MSG_PEEK - returns a clone of the buffer and keep the original
+-			in the FIFO.
+-*/
+ ssize_t
+-fifo_dequeue_buffer(net_fifo *fifo, uint32 flags, bigtime_t timeout,
+-	net_buffer **_buffer)
++Fifo::Clear()
+ {
+-	benaphore_lock(&amp;fifo-&gt;lock);
+-	bool dontWait = (flags &amp; MSG_DONTWAIT) != 0 || timeout == 0;
+-	status_t status;
++	return base_fifo_clear(this);
++}
+ 
+-	while (true) {
+-		net_buffer *buffer = (net_buffer *)list_get_first_item(&amp;fifo-&gt;buffers);
+-		if (buffer != NULL) {
+-			if ((flags &amp; MSG_PEEK) != 0) {
+-				// we need to clone the buffer for inspection; we can't give a
+-				// handle to a buffer that we're still using
+-				buffer = gNetBufferModule.clone(buffer, false);
+-				if (buffer == NULL) {
+-					status = B_NO_MEMORY;
+-					break;
+-				}
+-			} else {
+-				list_remove_item(&amp;fifo-&gt;buffers, buffer);
+-				fifo-&gt;current_bytes -= buffer-&gt;size;
+-			}
+ 
+-			*_buffer = buffer;
+-			status = B_OK;
+-			break;
+-		}
++status_t
++init_fifo(net_fifo *fifo, const char *name, size_t maxBytes)
++{
++	status_t status = benaphore_init(&amp;fifo-&gt;lock, name);
++	if (status &lt; B_OK)
++		return status;
+ 
+-		if (!dontWait)
+-			fifo-&gt;waiting++;
++	status = base_fifo_init(fifo, name, maxBytes);
++	if (status &lt; B_OK)
++		benaphore_destroy(&amp;fifo-&gt;lock);
+ 
+-		// we need to wait until a new buffer becomes available
+-		benaphore_unlock(&amp;fifo-&gt;lock);
++	return status;
++}
+ 
+-		if (dontWait)
+-			return B_WOULD_BLOCK;
+ 
+-		status = acquire_sem_etc(fifo-&gt;notify, 1,
+-			B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, timeout);
+-		if (status &lt; B_OK)
+-			return status;
++void
++uninit_fifo(net_fifo *fifo)
++{
++	clear_fifo(fifo);
+ 
+-		// try again
+-		benaphore_lock(&amp;fifo-&gt;lock);
+-	}
++	benaphore_destroy(&amp;fifo-&gt;lock);
++	delete_sem(fifo-&gt;notify);
++}
+ 
+-	if ((flags &amp; MSG_PEEK) != 0 &amp;&amp; fifo-&gt;waiting &gt; 0) {
+-		// another thread is waiting for data, since we didn't eat the
+-		// buffer, it gets it
+-		fifo-&gt;waiting--;
+-		release_sem_etc(fifo-&gt;notify, 1, B_DO_NOT_RESCHEDULE);
+-	}
+ 
+-	benaphore_unlock(&amp;fifo-&gt;lock);
+-	return status;
++status_t
++fifo_enqueue_buffer(net_fifo *fifo, net_buffer *buffer)
++{
++	BenaphoreLocker locker(fifo-&gt;lock);
++	return base_fifo_enqueue_buffer(fifo, buffer);
+ }
+ 
+ 
++ssize_t fifo_dequeue_buffer(net_fifo *fifo, uint32 flags, bigtime_t timeout,
++	struct net_buffer **_buffer)
++{
++	BenaphoreLocker locker(fifo-&gt;lock);
++	return base_fifo_dequeue_buffer(fifo, &amp;fifo-&gt;lock, flags, timeout, _buffer);
++}
++
++
+ status_t
+ clear_fifo(net_fifo *fifo)
+ {
+ 	BenaphoreLocker locker(fifo-&gt;lock);
+-
+-	while (true) {
+-		net_buffer *buffer = (net_buffer *)list_remove_head_item(&amp;fifo-&gt;buffers);
+-		if (buffer == NULL)
+-			break;
+-
+-		gNetBufferModule.free(buffer);
+-	}
+-
+-	fifo-&gt;current_bytes = 0;
+-	return B_OK;
++	return base_fifo_clear(fifo);
+ }
+ 
+ 
+@@ -258,7 +339,7 @@
+ 
+ 	BenaphoreLocker locker(fifo-&gt;lock);
+ 
+-	status_t status = _fifo_enqueue_buffer(fifo, buffer);
++	status_t status = base_fifo_enqueue_buffer(fifo, buffer);
+ 	if (status &lt; B_OK)
+ 		gNetBufferModule.free(buffer);
+ 	else
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/utility.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/utility.h	2007-04-08 05:50:49 UTC (rev 20613)
++++ haiku/trunk/src/add-ons/kernel/network/stack/utility.h	2007-04-08 09:15:52 UTC (rev 20614)
+@@ -26,6 +26,33 @@
+ };
+ 
+ 
++// internal Fifo class which doesn't maintain it's own lock
++class Fifo {
++public:
++	Fifo(const char *name, size_t maxBytes);
++	~Fifo();
++
++	status_t InitCheck() const;
++
++	status_t Enqueue(net_buffer *buffer);
++	status_t EnqueueAndNotify(net_buffer *_buffer, net_socket *socket, uint8 event);
++
++	ssize_t Dequeue(benaphore *lock, uint32 flags, bigtime_t timeout,
++		net_buffer **_buffer);
++	status_t Clear();
++
++	bool IsEmpty() const { return current_bytes == 0; }
++
++//private:
++	// these field names are kept so we can use templatized
++	// functions together with net_fifo
++	sem_id		notify;
++	int32		waiting;
++	size_t		max_bytes;
++	size_t		current_bytes;
++	struct list	buffers;
++};
++
+ inline
+ UserBuffer::UserBuffer(void *buffer, size_t size)
+ 	: fBuffer((uint8 *)buffer), fBufferSize(size),
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001485.html">[Haiku-commits] r20613 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+	<LI>Next message: <A HREF="001488.html">[Haiku-commits] r20615 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1487">[ date ]</a>
+              <a href="thread.html#1487">[ thread ]</a>
+              <a href="subject.html#1487">[ subject ]</a>
+              <a href="author.html#1487">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

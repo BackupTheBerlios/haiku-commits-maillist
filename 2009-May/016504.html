@@ -1,0 +1,189 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30632 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30632%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200905051013.n45ADtQU004893%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016503.html">
+   <LINK REL="Next"  HREF="016505.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30632 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30632%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200905051013.n45ADtQU004893%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30632 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue May  5 12:13:55 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016503.html">[Haiku-commits] r30631 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="016505.html">[Haiku-commits] r30633 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16504">[ date ]</a>
+              <a href="thread.html#16504">[ thread ]</a>
+              <a href="subject.html#16504">[ subject ]</a>
+              <a href="author.html#16504">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-05-05 12:13:55 +0200 (Tue, 05 May 2009)
+New Revision: 30632
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30632&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30632&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+Log:
+* Since PrecacheIO is used as asynchronous callback object, we must not access
+  it anymore after having called vfs_asynchronous_read_pages().
+* Now, Prepare() does all the preparation work, and ReadAsync() does the actual
+  work - this must be called without having the cache locked. This also fixes
+  another bug where the callback would be deleted twice in case the I/O request
+  failed.
+* This fixes bug #3847.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2009-05-05 10:05:11 UTC (rev 30631)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2009-05-05 10:13:55 UTC (rev 30632)
+@@ -75,8 +75,8 @@
+ 									size_t size);
+ 								~PrecacheIO();
+ 
+-			status_t			Init();
+-			status_t			Start();
++			status_t			Prepare();
++			void				ReadAsync();
+ 
+ 	virtual	void				IOFinished(status_t status,
+ 									bool partialTransfer,
+@@ -90,6 +90,7 @@
+ 			ConditionVariable*	fBusyConditions;
+ 			iovec*				fVecs;
+ 			off_t				fOffset;
++			uint32				fVecCount;
+ 			size_t				fSize;
+ };
+ 
+@@ -116,6 +117,7 @@
+ 	fBusyConditions(NULL),
+ 	fVecs(NULL),
+ 	fOffset(offset),
++	fVecCount(0),
+ 	fSize(size)
+ {
+ 	fPageCount = (size + B_PAGE_SIZE - 1) / B_PAGE_SIZE;
+@@ -133,7 +135,7 @@
+ 
+ 
+ status_t
+-PrecacheIO::Init()
++PrecacheIO::Prepare()
+ {
+ 	if (fPageCount == 0)
+ 		return B_BAD_VALUE;
+@@ -150,18 +152,7 @@
+ 	if (fVecs == NULL)
+ 		return B_NO_MEMORY;
+ 
+-	return B_OK;
+-}
+-
+-
+-/*!	Cache has to be locked when calling this method, but it will be temporarily
+-    unlocked during execution.
+-*/
+-status_t
+-PrecacheIO::Start()
+-{
+ 	// allocate pages for the cache and mark them busy
+-	uint32 vecCount = 0;
+ 	uint32 i = 0;
+ 	for (size_t pos = 0; pos &lt; fSize; pos += B_PAGE_SIZE) {
+ 		vm_page* page = vm_page_allocate_page(PAGE_STATE_FREE, true);
+@@ -171,7 +162,7 @@
+ 		fBusyConditions[i].Publish(page, &quot;page&quot;);
+ 		fCache-&gt;InsertPage(page, fOffset + pos);
+ 
+-		add_to_iovec(fVecs, vecCount, fPageCount,
++		add_to_iovec(fVecs, fVecCount, fPageCount,
+ 			page-&gt;physical_page_number * B_PAGE_SIZE, B_PAGE_SIZE);
+ 		fPages[i++] = page;
+ 	}
+@@ -186,14 +177,17 @@
+ 		return B_NO_MEMORY;
+ 	}
+ 
+-	fCache-&gt;Unlock();
++	return B_OK;
++}
+ 
+-	status_t status = vfs_asynchronous_read_pages(fRef-&gt;vnode, NULL, fOffset,
+-		fVecs, vecCount, fSize, B_PHYSICAL_IO_REQUEST, this);
+ 
+-	fCache-&gt;Lock();
+-
+-	return status;
++void
++PrecacheIO::ReadAsync()
++{
++	// This object is going to be deleted after the I/O request has been
++	// fulfilled
++	vfs_asynchronous_read_pages(fRef-&gt;vnode, NULL, fOffset, fVecs, fVecCount,
++		fSize, B_PHYSICAL_IO_REQUEST, this);
+ }
+ 
+ 
+@@ -952,11 +946,16 @@
+ 			// read the part before the current page (or the end of the request)
+ 			PrecacheIO* io
+ 				= new(std::nothrow) PrecacheIO(ref, lastOffset, bytesToRead);
+-			if (io == NULL || io-&gt;Init() != B_OK || io-&gt;Start() != B_OK) {
++			if (io == NULL || io-&gt;Prepare() != B_OK) {
+ 				delete io;
+ 				break;
+ 			}
+ 
++			// we must not have the cache locked during I/O
++			cache-&gt;Unlock();
++			io-&gt;ReadAsync();
++			cache-&gt;Lock();
++
+ 			bytesToRead = 0;
+ 		}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016503.html">[Haiku-commits] r30631 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="016505.html">[Haiku-commits] r30633 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16504">[ date ]</a>
+              <a href="thread.html#16504">[ thread ]</a>
+              <a href="subject.html#16504">[ subject ]</a>
+              <a href="author.html#16504">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

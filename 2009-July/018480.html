@@ -1,0 +1,544 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31936 - haiku/trunk/src/servers/media
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31936%20-%20haiku/trunk/src/servers/media&In-Reply-To=%3C200907291914.n6TJE7t1019822%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018479.html">
+   <LINK REL="Next"  HREF="018481.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31936 - haiku/trunk/src/servers/media</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31936%20-%20haiku/trunk/src/servers/media&In-Reply-To=%3C200907291914.n6TJE7t1019822%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31936 - haiku/trunk/src/servers/media">stippi at mail.berlios.de
+       </A><BR>
+    <I>Wed Jul 29 21:14:07 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018479.html">[Haiku-commits] r31935 - haiku/trunk/src/add-ons/tracker/zipomatic
+</A></li>
+        <LI>Next message: <A HREF="018481.html">[Haiku-commits] r31937 - in haiku/trunk/src/add-ons:	disk_systems/bfs kernel/file_systems/bfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18480">[ date ]</a>
+              <a href="thread.html#18480">[ thread ]</a>
+              <a href="subject.html#18480">[ subject ]</a>
+              <a href="author.html#18480">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2009-07-29 21:14:04 +0200 (Wed, 29 Jul 2009)
+New Revision: 31936
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31936&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31936&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/media/AddOnManager.cpp
+   haiku/trunk/src/servers/media/AddOnManager.h
+   haiku/trunk/src/servers/media/media_server.cpp
+Log:
+In theory, I added management of WriterPlugins and EncoderPlugins. When looking
+at media_file_format.id, I wonder if this could work without having to get an
+entry_ref from the server for a WriterPlugin, added TODOs to this effect.
+
+
+Modified: haiku/trunk/src/servers/media/AddOnManager.cpp
+===================================================================
+--- haiku/trunk/src/servers/media/AddOnManager.cpp	2009-07-29 19:13:29 UTC (rev 31935)
++++ haiku/trunk/src/servers/media/AddOnManager.cpp	2009-07-29 19:14:04 UTC (rev 31936)
+@@ -5,6 +5,7 @@
+  * Authors:
+  *		Marcus Overhagen
+  *		Axel D&#246;rfler
++ *		Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;
+  */
+ 
+ 
+@@ -13,20 +14,21 @@
+ #include &lt;stdio.h&gt;
+ #include &lt;string.h&gt;
+ 
++#include &lt;Autolock.h&gt;
++#include &lt;Directory.h&gt;
++#include &lt;Entry.h&gt;
+ #include &lt;FindDirectory.h&gt;
++#include &lt;image.h&gt;
+ #include &lt;Path.h&gt;
+-#include &lt;Entry.h&gt;
+-#include &lt;Directory.h&gt;
+-#include &lt;Autolock.h&gt;
+-#include &lt;image.h&gt;
+ 
+ #include &lt;safemode_defs.h&gt;
+ #include &lt;syscalls.h&gt;
+ 
++#include &quot;debug.h&quot;
++#include &quot;media_server.h&quot;
++
+ #include &quot;FormatManager.h&quot;
+ #include &quot;MetaFormat.h&quot;
+-#include &quot;media_server.h&quot;
+-#include &quot;debug.h&quot;
+ 
+ 
+ //	#pragma mark - ImageLoader
+@@ -60,7 +62,8 @@
+ 
+ AddOnManager::AddOnManager()
+ 	:
+- 	fLock(&quot;add-on manager&quot;)
++ 	fLock(&quot;add-on manager&quot;),
++ 	fNextWriterFormatFamilyID(0)
+ {
+ }
+ 
+@@ -73,7 +76,7 @@
+ void
+ AddOnManager::LoadState()
+ {
+-	RegisterAddOns();
++	_RegisterAddOns();
+ }
+ 
+ 
+@@ -90,8 +93,9 @@
+ 	if ((format.type == B_MEDIA_ENCODED_VIDEO
+ 			|| format.type == B_MEDIA_ENCODED_AUDIO
+ 			|| format.type == B_MEDIA_MULTISTREAM)
+-		&amp;&amp; format.Encoding() == 0)
++		&amp;&amp; format.Encoding() == 0) {
+ 		return B_MEDIA_BAD_FORMAT;
++	}
+ 	if (format.type == B_MEDIA_NO_TYPE || format.type == B_MEDIA_UNKNOWN_TYPE)
+ 		return B_MEDIA_BAD_FORMAT;
+ 
+@@ -137,8 +141,77 @@
+ 
+ 
+ status_t
+-AddOnManager::RegisterAddOn(BEntry&amp; entry)
++AddOnManager::GetEncoderForFormat(xfer_entry_ref* _encoderRef,
++	const media_format&amp; format)
+ {
++	if ((format.type == B_MEDIA_ENCODED_VIDEO
++			|| format.type == B_MEDIA_ENCODED_AUDIO
++			|| format.type == B_MEDIA_MULTISTREAM)
++		&amp;&amp; format.Encoding() == 0) {
++		return B_MEDIA_BAD_FORMAT;
++	}
++	if (format.type == B_MEDIA_NO_TYPE || format.type == B_MEDIA_UNKNOWN_TYPE)
++		return B_MEDIA_BAD_FORMAT;
++
++	BAutolock locker(fLock);
++
++	printf(&quot;AddOnManager::GetEncoderForFormat: searching encoder for encoding &quot;
++		&quot;%ld\n&quot;, format.Encoding());
++
++	encoder_info* info;
++	for (fEncoderList.Rewind(); fEncoderList.GetNext(&amp;info);) {
++		media_format* encoderFormat;
++		for (info-&gt;formats.Rewind(); info-&gt;formats.GetNext(&amp;encoderFormat);) {
++			// check if the encoder matches the supplied format
++			if (!encoderFormat-&gt;Matches(&amp;format))
++				continue;
++
++			printf(&quot;AddOnManager::GetEncoderForFormat: found encoder %s for &quot;
++				&quot;encoding %ld\n&quot;, info-&gt;ref.name, encoderFormat-&gt;Encoding());
++
++			*_encoderRef = info-&gt;ref;
++			return B_OK;
++		}
++	}
++	return B_ENTRY_NOT_FOUND;	
++}
++									
++
++status_t
++AddOnManager::GetWriter(xfer_entry_ref* _ref, const media_file_format&amp; format)
++{
++	BAutolock locker(fLock);
++
++	writer_info* info;
++	for (fWriterList.Rewind(); fWriterList.GetNext(&amp;info);) {
++		media_file_format* fileFormat;
++		for (info-&gt;fileFormats.Rewind();
++				info-&gt;fileFormats.GetNext(&amp;fileFormat);) {
++			// Check if the writer matches the supplied file format
++			// TODO: There must be a trick here which makes all this
++			// much simpler and probably lets us create a Writer client
++			// side...
++			if (fileFormat-&gt;id.internal_id != format.id.internal_id)
++				continue;
++
++			printf(&quot;AddOnManager::GetWriter: found writer %s for &quot;
++				&quot;file format %s\n&quot;, info-&gt;ref.name, format.pretty_name);
++
++			*_ref = info-&gt;ref;
++			return B_OK;
++		}
++	}
++
++	return B_ERROR;
++}
++
++
++// #pragma mark -
++
++
++status_t
++AddOnManager::_RegisterAddOn(BEntry&amp; entry)
++{
+ 	BPath path(&amp;entry);
+ 
+ 	entry_ref ref;
+@@ -146,7 +219,7 @@
+ 	if (status &lt; B_OK)
+ 		return status;
+ 
+-	printf(&quot;AddOnManager::RegisterAddOn(): trying to load \&quot;%s\&quot;\n&quot;,
++	printf(&quot;AddOnManager::_RegisterAddOn(): trying to load \&quot;%s\&quot;\n&quot;,
+ 		path.Path());
+ 
+ 	ImageLoader loader(path);
+@@ -157,28 +230,36 @@
+ 
+ 	if (get_image_symbol(loader.Image(), &quot;instantiate_plugin&quot;,
+ 			B_SYMBOL_TYPE_TEXT, (void**)&amp;instantiate_plugin_func) &lt; B_OK) {
+-		printf(&quot;AddOnManager::RegisterAddOn(): can't find instantiate_plugin &quot;
++		printf(&quot;AddOnManager::_RegisterAddOn(): can't find instantiate_plugin &quot;
+ 			&quot;in \&quot;%s\&quot;\n&quot;, path.Path());
+ 		return B_BAD_TYPE;
+ 	}
+ 
+ 	MediaPlugin* plugin = (*instantiate_plugin_func)();
+ 	if (plugin == NULL) {
+-		printf(&quot;AddOnManager::RegisterAddOn(): instantiate_plugin in \&quot;%s\&quot; &quot;
++		printf(&quot;AddOnManager::_RegisterAddOn(): instantiate_plugin in \&quot;%s\&quot; &quot;
+ 			&quot;returned NULL\n&quot;, path.Path());
+ 		return B_ERROR;
+ 	}
+ 
+-	// ToDo: remove any old formats describing this add-on!!
++	// TODO: Remove any old formats describing this add-on!!
+ 
+ 	ReaderPlugin* reader = dynamic_cast&lt;ReaderPlugin*&gt;(plugin);
+ 	if (reader != NULL)
+-		RegisterReader(reader, ref);
++		_RegisterReader(reader, ref);
+ 
+ 	DecoderPlugin* decoder = dynamic_cast&lt;DecoderPlugin*&gt;(plugin);
+ 	if (decoder != NULL)
+-		RegisterDecoder(decoder, ref);
++		_RegisterDecoder(decoder, ref);
+ 
++	WriterPlugin* writer = dynamic_cast&lt;WriterPlugin*&gt;(plugin);
++	if (writer != NULL)
++		_RegisterWriter(writer, ref);
++
++	EncoderPlugin* encoder = dynamic_cast&lt;EncoderPlugin*&gt;(plugin);
++	if (encoder != NULL)
++		_RegisterEncoder(encoder, ref);
++
+ 	delete plugin;
+ 	
+ 	return B_OK;
+@@ -186,7 +267,7 @@
+ 
+ 
+ void
+-AddOnManager::RegisterAddOns()
++AddOnManager::_RegisterAddOns()
+ {
+ 	class CodecHandler : public AddOnMonitorHandler {
+ 	private:
+@@ -209,7 +290,7 @@
+ 				entryInfo-&gt;dir_nref.node, entryInfo-&gt;name, &amp;ref);
+ 			BEntry entry(&amp;ref, false);
+ 			if (entry.InitCheck() == B_OK)
+-				fManager-&gt;RegisterAddOn(entry);
++				fManager-&gt;_RegisterAddOn(entry);
+ 		}
+ 
+ 		virtual void AddOnDisabled(const add_on_entry_info* entryInfo)
+@@ -261,7 +342,7 @@
+ 
+ 
+ void
+-AddOnManager::RegisterReader(ReaderPlugin* reader, const entry_ref&amp; ref)
++AddOnManager::_RegisterReader(ReaderPlugin* reader, const entry_ref&amp; ref)
+ {
+ 	BAutolock locker(fLock);
+ 
+@@ -273,7 +354,7 @@
+ 		}
+ 	}
+ 
+-	printf(&quot;AddOnManager::RegisterReader, name %s\n&quot;, ref.name);
++	printf(&quot;AddOnManager::_RegisterReader, name %s\n&quot;, ref.name);
+ 
+ 	reader_info info;
+ 	info.ref = ref;
+@@ -283,7 +364,7 @@
+ 
+ 
+ void
+-AddOnManager::RegisterDecoder(DecoderPlugin* plugin, const entry_ref&amp; ref)
++AddOnManager::_RegisterDecoder(DecoderPlugin* plugin, const entry_ref&amp; ref)
+ {
+ 	BAutolock locker(fLock);
+ 
+@@ -295,22 +376,96 @@
+ 		}
+ 	}
+ 
+-	printf(&quot;AddOnManager::RegisterDecoder, name %s\n&quot;, ref.name);
++	printf(&quot;AddOnManager::_RegisterDecoder, name %s\n&quot;, ref.name);
+ 
+ 	decoder_info info;
+ 	info.ref = ref;
+ 
+ 	media_format* formats = 0;
+ 	size_t count = 0;
+-	if (plugin-&gt;GetSupportedFormats(&amp;formats,&amp;count) != B_OK) {
+-		printf(&quot;AddOnManager::RegisterDecoder(): plugin-&gt;GetSupportedFormats&quot;
++	if (plugin-&gt;GetSupportedFormats(&amp;formats, &amp;count) != B_OK) {
++		printf(&quot;AddOnManager::_RegisterDecoder(): plugin-&gt;GetSupportedFormats&quot;
+ 			&quot;(...) failed!\n&quot;);
+ 		return;
+ 	}
+-	for (uint i = 0 ; i &lt; count ; i++) {
++	for (uint i = 0 ; i &lt; count ; i++)
+ 		info.formats.Insert(formats[i]);
+-	}
++
+ 	fDecoderList.Insert(info);
+ }
+ 
+ 
++void
++AddOnManager::_RegisterWriter(WriterPlugin* writer, const entry_ref&amp; ref)
++{
++	BAutolock locker(fLock);
++
++	writer_info* pinfo;
++	for (fWriterList.Rewind(); fWriterList.GetNext(&amp;pinfo);) {
++		if (!strcmp(pinfo-&gt;ref.name, ref.name)) {
++			// we already know this writer
++			return;
++		}
++	}
++
++	printf(&quot;AddOnManager::_RegisterWriter, name %s\n&quot;, ref.name);
++
++	writer_info info;
++	info.ref = ref;
++
++	// Get list of support media_file_formats...
++	media_file_format* fileFormats = NULL;
++	size_t count = 0;
++	if (writer-&gt;GetSupportedFileFormats(&amp;fileFormats, &amp;count) != B_OK) {
++		printf(&quot;AddOnManager::_RegisterWriter(): &quot;
++			&quot;plugin-&gt;GetSupportedFileFormats(...) failed!\n&quot;);
++		return;
++	}
++	for (uint i = 0 ; i &lt; count ; i++) {
++		// Generate a proper ID before inserting this format, this encodes
++		// the specific plugin in the media_file_format.
++		media_file_format fileFormat = fileFormats[i];
++		fileFormat.id.node = ref.directory;
++		fileFormat.id.device = ref.device;
++		fileFormat.id.internal_id = fNextWriterFormatFamilyID++;
++
++		info.fileFormats.Insert(fileFormat);
++	}
++
++	fWriterList.Insert(info);
++}
++
++
++void
++AddOnManager::_RegisterEncoder(EncoderPlugin* plugin, const entry_ref&amp; ref)
++{
++	BAutolock locker(fLock);
++
++	encoder_info* pinfo;
++	for (fEncoderList.Rewind(); fEncoderList.GetNext(&amp;pinfo);) {
++		if (!strcmp(pinfo-&gt;ref.name, ref.name)) {
++			// we already know this encoder
++			return;
++		}
++	}
++
++	printf(&quot;AddOnManager::_RegisterEncoder, name %s\n&quot;, ref.name);
++
++	encoder_info info;
++	info.ref = ref;
++
++	// Get list of support media_formats...
++	media_format* formats = NULL;
++	size_t count = 0;
++	if (plugin-&gt;GetSupportedFormats(&amp;formats, &amp;count) != B_OK) {
++		printf(&quot;AddOnManager::_RegisterEncoder(): plugin-&gt;GetSupportedFormats&quot;
++			&quot;(...) failed!\n&quot;);
++		return;
++	}
++	for (uint i = 0 ; i &lt; count ; i++)
++		info.formats.Insert(formats[i]);
++
++	fEncoderList.Insert(info);
++}
++
++
+
+Modified: haiku/trunk/src/servers/media/AddOnManager.h
+===================================================================
+--- haiku/trunk/src/servers/media/AddOnManager.h	2009-07-29 19:13:29 UTC (rev 31935)
++++ haiku/trunk/src/servers/media/AddOnManager.h	2009-07-29 19:14:04 UTC (rev 31936)
+@@ -5,6 +5,7 @@
+  * Authors:
+  *		Marcus Overhagen
+  *		Axel D&#246;rfler
++ *		Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;
+  */
+ #ifndef _ADD_ON_MANAGER_H
+ #define _ADD_ON_MANAGER_H
+@@ -15,13 +16,15 @@
+ */
+ 
+ 
+-#include &quot;ReaderPlugin.h&quot;
+-#include &quot;DecoderPlugin.h&quot;
+ #include &quot;DataExchange.h&quot;
+ #include &quot;TList.h&quot;
+ 
+ #include &quot;AddOnMonitor.h&quot;
+ #include &quot;AddOnMonitorHandler.h&quot;
++#include &quot;DecoderPlugin.h&quot;
++#include &quot;EncoderPlugin.h&quot;
++#include &quot;ReaderPlugin.h&quot;
++#include &quot;WriterPlugin.h&quot;
+ 
+ 
+ class AddOnManager {
+@@ -38,21 +41,33 @@
+ 			status_t			GetReaders(xfer_entry_ref* _ref,
+ 									int32* _count, int32 maxCount);
+ 
++			status_t			GetEncoderForFormat(xfer_entry_ref* _ref,
++									const media_format&amp; format);
++
++			status_t			GetWriter(xfer_entry_ref* _ref,
++									const media_file_format&amp; format);
++
+ private:
+-			status_t			RegisterAddOn(BEntry&amp; entry);
+-			void				RegisterAddOns();
++			status_t			_RegisterAddOn(BEntry&amp; entry);
++			void				_RegisterAddOns();
+ 
+-			void				RegisterReader(ReaderPlugin* reader,
++			void				_RegisterReader(ReaderPlugin* reader,
+ 									const entry_ref&amp; ref);
+-			void				RegisterDecoder(DecoderPlugin* decoder,
++			void				_RegisterDecoder(DecoderPlugin* decoder,
+ 									const entry_ref&amp; ref);
+ 
++			void				_RegisterWriter(WriterPlugin* writer,
++									const entry_ref&amp; ref);
++			void				_RegisterEncoder(EncoderPlugin* encoder,
++									const entry_ref&amp; ref);
++
+ private:
+ 			struct reader_info {
+ 				entry_ref ref;
+ 			};
+ 			struct writer_info {
+ 				entry_ref ref;
++				List&lt;media_file_format&gt; fileFormats;
+ 			};
+ 			struct decoder_info {
+ 				entry_ref ref;
+@@ -60,6 +75,7 @@
+ 			};
+ 			struct encoder_info {
+ 				entry_ref ref;
++				List&lt;media_format&gt; formats;
+ 			};
+ 
+ 			BLocker				fLock;
+@@ -68,7 +84,7 @@
+ 			List&lt;decoder_info&gt;	fDecoderList;
+ 			List&lt;encoder_info&gt;	fEncoderList;
+ 
+-			decoder_info*		fCurrentDecoder;
++			uint32				fNextWriterFormatFamilyID;
+ 
+ 			AddOnMonitorHandler* fHandler;
+ 			AddOnMonitor*		fAddOnMonitor;
+
+Modified: haiku/trunk/src/servers/media/media_server.cpp
+===================================================================
+--- haiku/trunk/src/servers/media/media_server.cpp	2009-07-29 19:13:29 UTC (rev 31935)
++++ haiku/trunk/src/servers/media/media_server.cpp	2009-07-29 19:14:04 UTC (rev 31936)
+@@ -886,6 +886,28 @@
+ 			break;
+ 		}
+ 
++		case SERVER_GET_WRITER_FOR_FORMAT_FAMILY:
++		{
++			const server_get_writer_request *request
++				= reinterpret_cast&lt;const server_get_writer_request *&gt;(data);
++			server_get_writer_reply reply;
++			rv = gAddOnManager-&gt;GetWriter(&amp;reply.ref, request-&gt;file_format);
++			request-&gt;SendReply(rv, &amp;reply, sizeof(reply));
++			break;
++		}
++
++		case SERVER_GET_ENCODER_FOR_FORMAT:
++		{
++			const server_get_encoder_for_format_request *request
++				= reinterpret_cast&lt;
++					const server_get_encoder_for_format_request *&gt;(data);
++			server_get_encoder_for_format_reply reply;
++			rv = gAddOnManager-&gt;GetEncoderForFormat(&amp;reply.ref,
++				request-&gt;format);
++			request-&gt;SendReply(rv, &amp;reply, sizeof(reply));
++			break;
++		}
++
+ 		default:
+ 			printf(&quot;media_server: received unknown message code %#08lx\n&quot;,
+ 				code);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018479.html">[Haiku-commits] r31935 - haiku/trunk/src/add-ons/tracker/zipomatic
+</A></li>
+	<LI>Next message: <A HREF="018481.html">[Haiku-commits] r31937 - in haiku/trunk/src/add-ons:	disk_systems/bfs kernel/file_systems/bfs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18480">[ date ]</a>
+              <a href="thread.html#18480">[ thread ]</a>
+              <a href="subject.html#18480">[ subject ]</a>
+              <a href="author.html#18480">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

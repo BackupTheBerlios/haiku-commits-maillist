@@ -1,0 +1,225 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27077 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27077%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808201144.m7KBiOAH017693%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011120.html">
+   <LINK REL="Next"  HREF="011122.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27077 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27077%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808201144.m7KBiOAH017693%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27077 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Aug 20 13:44:24 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011120.html">[Haiku-commits] r27076 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+        <LI>Next message: <A HREF="011122.html">[Haiku-commits] r27078 -	haiku/trunk/src/add-ons/kernel/file_systems/udf
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11121">[ date ]</a>
+              <a href="thread.html#11121">[ thread ]</a>
+              <a href="subject.html#11121">[ subject ]</a>
+              <a href="author.html#11121">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-20 13:44:23 +0200 (Wed, 20 Aug 2008)
+New Revision: 27077
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27077&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27077&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h
+Log:
+Implemented (a simple) WriteAsync(), i.e. swap pages are now written
+asynchronously, too.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-20 08:32:44 UTC (rev 27076)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-20 11:44:23 UTC (rev 27077)
+@@ -33,7 +33,9 @@
+ #include &lt;vm_page.h&gt;
+ #include &lt;vm_priv.h&gt;
+ 
++#include &quot;io_requests.h&quot;
+ 
++
+ #if	ENABLE_SWAP_SUPPORT
+ 
+ //#define TRACE_STORE
+@@ -315,6 +317,51 @@
+ // #pragma mark -
+ 
+ 
++class VMAnonymousCache::WriteCallback : public StackableAsyncIOCallback {
++public:
++	WriteCallback(VMAnonymousCache* cache, AsyncIOCallback* callback)
++		:
++		StackableAsyncIOCallback(callback),
++		fCache(cache)
++	{
++	}
++
++	void SetTo(page_num_t pageIndex, swap_addr_t slotIndex, bool newSlot)
++	{
++		fPageIndex = pageIndex;
++		fSlotIndex = slotIndex;
++		fNewSlot = newSlot;
++	}
++
++	virtual void IOFinished(status_t status, bool partialTransfer,
++		size_t bytesTransferred)
++	{
++		if (fNewSlot) {
++			if (status == B_OK) {
++				fCache-&gt;_SwapBlockBuild(fPageIndex, fSlotIndex, 1);
++			} else {
++				AutoLocker&lt;VMCache&gt; locker(fCache);
++				fCache-&gt;fAllocatedSwapSize -= B_PAGE_SIZE;
++				locker.Unlock();
++
++				swap_slot_dealloc(fSlotIndex, 1);
++			}
++		}
++
++		fNextCallback-&gt;IOFinished(status, partialTransfer, bytesTransferred);
++	}
++
++private:
++	VMAnonymousCache*	fCache;
++	page_num_t			fPageIndex;
++	swap_addr_t			fSlotIndex;
++	bool				fNewSlot;
++};
++
++
++// #pragma mark -
++
++
+ VMAnonymousCache::~VMAnonymousCache()
+ {
+ 	// free allocated swap space and swap block
+@@ -468,6 +515,59 @@
+ 
+ 
+ status_t
++VMAnonymousCache::WriteAsync(off_t offset, const iovec* vecs, size_t count,
++	size_t numBytes, uint32 flags, AsyncIOCallback* _callback)
++{
++	// TODO: Currently this method is only used for single pages. Either make
++	// more flexible use of it or change the interface!
++	// This implementation relies on the current usage!
++	ASSERT(count == 1);
++	ASSERT(numBytes &lt;= B_PAGE_SIZE);
++
++	page_num_t pageIndex = offset &gt;&gt; PAGE_SHIFT;
++	swap_addr_t slotIndex = _SwapBlockGetAddress(pageIndex);
++	bool newSlot = slotIndex == SWAP_SLOT_NONE;
++
++	// If the page doesn't have any swap space yet, allocate it.
++	if (newSlot) {
++		AutoLocker&lt;VMCache&gt; locker(this);
++		if (fAllocatedSwapSize + B_PAGE_SIZE &gt; fCommittedSwapSize)
++			return B_ERROR;
++
++		fAllocatedSwapSize += B_PAGE_SIZE;
++
++		slotIndex = swap_slot_alloc(1);
++	}
++
++	// create our callback
++	WriteCallback* callback = (flags &amp; B_VIP_IO_REQUEST != 0)
++ 		? new(vip_io_alloc) WriteCallback(this, _callback)
++		: new(std::nothrow) WriteCallback(this, _callback);
++	if (callback == NULL) {
++		if (newSlot) {
++			AutoLocker&lt;VMCache&gt; locker(this);
++			fAllocatedSwapSize -= B_PAGE_SIZE;
++			locker.Unlock();
++
++			swap_slot_dealloc(slotIndex, 1);
++		}
++		return B_NO_MEMORY;
++	}
++// TODO: If the page already had swap space assigned, we don't need an own
++// callback.
++
++	callback-&gt;SetTo(pageIndex, slotIndex, newSlot);
++
++	// write the page asynchrounously
++	swap_file* swapFile = find_swap_file(slotIndex);
++	off_t pos = (slotIndex - swapFile-&gt;first_slot) * B_PAGE_SIZE;
++
++	return vfs_asynchronous_write_pages(swapFile-&gt;vnode, NULL, pos, vecs, 1,
++		numBytes, flags, callback);
++}
++
++
++status_t
+ VMAnonymousCache::Fault(struct vm_address_space *aspace, off_t offset)
+ {
+ 	if (fCanOvercommit) {
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h	2008-08-20 08:32:44 UTC (rev 27076)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h	2008-08-20 11:44:23 UTC (rev 27077)
+@@ -40,12 +40,18 @@
+ 							size_t *_numBytes);
+ 	virtual	status_t	Write(off_t offset, const iovec *vecs, size_t count,
+ 							uint32 flags, size_t *_numBytes);
++	virtual	status_t	WriteAsync(off_t offset, const iovec* vecs,
++							size_t count, size_t numBytes, uint32 flags,
++							AsyncIOCallback* callback);
+ 
+ 	virtual	status_t	Fault(struct vm_address_space *aspace, off_t offset);
+ 
+ 	virtual	void		MergeStore(VMCache* source);
+ 
+ private:
++			class WriteCallback;
++			friend class WriteCallback;
++
+ 			void		_SwapBlockBuild(off_t pageIndex,
+ 							swap_addr_t slotIndex, uint32 count);
+ 			void        _SwapBlockFree(off_t pageIndex, uint32 count);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011120.html">[Haiku-commits] r27076 -	haiku/trunk/src/add-ons/kernel/file_systems/cdda
+</A></li>
+	<LI>Next message: <A HREF="011122.html">[Haiku-commits] r27078 -	haiku/trunk/src/add-ons/kernel/file_systems/udf
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11121">[ date ]</a>
+              <a href="thread.html#11121">[ thread ]</a>
+              <a href="subject.html#11121">[ subject ]</a>
+              <a href="author.html#11121">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

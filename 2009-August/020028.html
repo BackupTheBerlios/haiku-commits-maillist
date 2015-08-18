@@ -1,0 +1,149 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32733 - haiku/trunk/src/apps/terminal
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32733%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200908270215.n7R2FMqf017731%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020027.html">
+   <LINK REL="Next"  HREF="020059.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32733 - haiku/trunk/src/apps/terminal</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32733%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200908270215.n7R2FMqf017731%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32733 - haiku/trunk/src/apps/terminal">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug 27 04:15:22 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020027.html">[Haiku-commits] r32732 -	haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk
+</A></li>
+        <LI>Next message: <A HREF="020059.html">[Haiku-commits] r32733 - haiku/trunk/src/apps/terminal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20028">[ date ]</a>
+              <a href="thread.html#20028">[ thread ]</a>
+              <a href="subject.html#20028">[ subject ]</a>
+              <a href="author.html#20028">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-08-27 04:15:20 +0200 (Thu, 27 Aug 2009)
+New Revision: 32733
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32733&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32733&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/terminal/TermParse.cpp
+   haiku/trunk/src/apps/terminal/TermParse.h
+Log:
+mmlr+anevilyak:
+Unconditionally release the reader sem when the previous buffer size was 0
+instead of testing for fParserWaiting as there is a race condition between
+setting it to true in the parser thread and checking for it in the reader
+thread so a release_sem() could be missed causing #4343. To reduce the possible
+side effect of needlessly looping through acquire_sem() for too many
+unconditionally released sems, we eat them in the parser thread once we're sure
+we can't miss an event because of that. Also added a TODO about a memcpy()
+optimization as pointed out by Rene.
++alphabranch
+
+
+Modified: haiku/trunk/src/apps/terminal/TermParse.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermParse.cpp	2009-08-27 01:41:07 UTC (rev 32732)
++++ haiku/trunk/src/apps/terminal/TermParse.cpp	2009-08-27 02:15:20 UTC (rev 32733)
+@@ -74,7 +74,6 @@
+ 	fReadBufferSize(0),
+ 	fParserBufferSize(0),
+ 	fParserBufferOffset(0),
+-	fParserWaiting(false),
+ 	fBuffer(NULL),
+ 	fQuitting(true)
+ {
+@@ -252,7 +251,7 @@
+ 			memcpy(fReadBuffer + readPos, buf, nread);
+ 
+ 		bufferSize = atomic_add(&amp;fReadBufferSize, nread);
+-		if (bufferSize == 0 &amp;&amp; fParserWaiting)
++		if (bufferSize == 0)
+ 			release_sem(fReaderSem);
+ 
+ 		bufferSize += nread;
+@@ -1012,17 +1011,18 @@
+ 
+ 	// wait for new input from pty
+ 	if (fReadBufferSize == 0) {
+-		fParserWaiting = true;
+-
+ 		status_t status = B_OK;
+ 		while (fReadBufferSize == 0 &amp;&amp; status == B_OK) {
+ 			do {
+ 				status = acquire_sem(fReaderSem);
+ 			} while (status == B_INTERRUPTED);
++
++			// eat any sems that were released unconditionally
++			int32 semCount;
++			if (get_sem_count(fReaderSem, &amp;semCount) == B_OK &amp;&amp; semCount &gt; 0)
++				acquire_sem_etc(fReaderSem, semCount, B_RELATIVE_TIMEOUT, 0);
+ 		}
+ 
+-		fParserWaiting = false;
+-
+ 		if (status &lt; B_OK) {
+ 			fBuffer-&gt;Lock();
+ 			return status;
+@@ -1034,6 +1034,8 @@
+ 		toRead = ESC_PARSER_BUFFER_SIZE;
+ 
+ 	for (int32 i = 0; i &lt; toRead; i++) {
++		// TODO: This could be optimized using memcpy instead and
++		// calculating space left as in the PtyReader().
+ 		fParserBuffer[i] = fReadBuffer[fBufferPosition];
+ 		fBufferPosition = (fBufferPosition + 1) % READ_BUF_SIZE;
+ 	}
+
+Modified: haiku/trunk/src/apps/terminal/TermParse.h
+===================================================================
+--- haiku/trunk/src/apps/terminal/TermParse.h	2009-08-27 01:41:07 UTC (rev 32732)
++++ haiku/trunk/src/apps/terminal/TermParse.h	2009-08-27 02:15:20 UTC (rev 32733)
+@@ -93,7 +93,6 @@
+ 	uchar fParserBuffer[ESC_PARSER_BUFFER_SIZE];
+ 	int32 fParserBufferSize;
+ 	int32 fParserBufferOffset;
+-	volatile bool fParserWaiting;
+ 	
+ 	int fLockFlag;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020027.html">[Haiku-commits] r32732 -	haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk
+</A></li>
+	<LI>Next message: <A HREF="020059.html">[Haiku-commits] r32733 - haiku/trunk/src/apps/terminal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20028">[ date ]</a>
+              <a href="thread.html#20028">[ thread ]</a>
+              <a href="subject.html#20028">[ subject ]</a>
+              <a href="author.html#20028">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

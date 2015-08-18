@@ -1,0 +1,199 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29603 -	haiku/trunk/src/system/kernel/device_manager
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29603%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200903182259.n2IMxp3o031951%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014964.html">
+   <LINK REL="Next"  HREF="014966.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29603 -	haiku/trunk/src/system/kernel/device_manager</H1>
+    <B>korli at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29603%20-%0A%09haiku/trunk/src/system/kernel/device_manager&In-Reply-To=%3C200903182259.n2IMxp3o031951%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29603 -	haiku/trunk/src/system/kernel/device_manager">korli at mail.berlios.de
+       </A><BR>
+    <I>Wed Mar 18 23:59:51 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014964.html">[Haiku-commits] r29602 - in haiku/trunk:	headers/private/userlandfs/shared	src/add-ons/kernel/file_systems/userlandfs/server	src/add-ons/kernel/file_systems/userlandfs/server/haiku	src/system/kernel/cache	src/tests/add-ons/kernel/file_systems/userlandfs/r5/src/test/ramfs	src/tests/add-ons/kernel/kernelland_emu
+</A></li>
+        <LI>Next message: <A HREF="014966.html">[Haiku-commits] r29603 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14965">[ date ]</a>
+              <a href="thread.html#14965">[ thread ]</a>
+              <a href="subject.html#14965">[ subject ]</a>
+              <a href="author.html#14965">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: korli
+Date: 2009-03-18 23:59:50 +0100 (Wed, 18 Mar 2009)
+New Revision: 29603
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29603&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29603&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp
+Log:
+* proposition to fix a deadlock between kernel daemon and package installer install thread (bug #3447)
+to manage this, avoid locking the main sLock in notification handling methods. Instead fill up two lists which will be emptied later by the kernel daemon thread.
+
+
+Modified: haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp	2009-03-18 22:43:47 UTC (rev 29602)
++++ haiku/trunk/src/system/kernel/device_manager/legacy_drivers.cpp	2009-03-18 22:59:50 UTC (rev 29603)
+@@ -185,6 +185,8 @@
+ static DriverWatcher sDriverWatcher;
+ static int32 sDriverEvents;
+ static DoublyLinkedList&lt;path_entry&gt; sDriversToAdd;
++static DoublyLinkedList&lt;path_entry&gt; sDriversToRemove;
++static mutex sDriversListLock = MUTEX_INITIALIZER(&quot;driversList&quot;);
+ static DirectoryWatcher sDirectoryWatcher;
+ static DirectoryNodeHash sDirectoryNodeHash;
+ static recursive_lock sLock;
+@@ -620,16 +622,33 @@
+ 	// something happened, let's see what it was
+ 
+ 	RecursiveLocker locker(sLock);
++	MutexLocker _(sDriversListLock);
+ 
+ 	while (true) {
+ 		path_entry* path = sDriversToAdd.RemoveHead();
+ 		if (path == NULL)
+ 			break;
+ 
+-		legacy_driver_add(path-&gt;path);
++		legacy_driver* driver = (legacy_driver*)hash_lookup(sDriverHash,
++			get_leaf(path-&gt;path));
++		if (driver == NULL)
++			legacy_driver_add(path-&gt;path);
++		else if (get_priority(path-&gt;path) &gt;= driver-&gt;priority)
++			driver-&gt;binary_updated = true;
+ 		delete path;
+ 	}
++	while (true) {
++		path_entry* path = sDriversToRemove.RemoveHead();
++		if (path == NULL)
++			break;
+ 
++		legacy_driver* driver = (legacy_driver*)hash_lookup(sDriverHash,
++			get_leaf(path-&gt;path));
++		if (driver != NULL &amp;&amp; get_priority(path-&gt;path) &gt;= driver-&gt;priority)
++			driver-&gt;binary_updated = true;
++		delete path;
++	}
++
+ 	hash_iterator iterator;
+ 	hash_open(sDriverHash, &amp;iterator);
+ 	legacy_driver *driver;
+@@ -648,51 +667,6 @@
+ }
+ 
+ 
+-static void
+-driver_added(const char* path)
+-{
+-	int32 priority = get_priority(path);
+-	RecursiveLocker locker(sLock);
+-
+-	legacy_driver* driver = (legacy_driver*)hash_lookup(sDriverHash,
+-		get_leaf(path));
+-
+-	if (driver == NULL) {
+-		// Add the driver to our list
+-		path_entry* entry = new(std::nothrow) path_entry;
+-		if (entry == NULL)
+-			return;
+-
+-		strlcpy(entry-&gt;path, path, sizeof(entry-&gt;path));
+-		sDriversToAdd.Add(entry);
+-	} else {
+-		// Update the driver if it is affected by the new entry
+-		if (priority &lt; driver-&gt;priority)
+-			return;
+-
+-		driver-&gt;binary_updated = true;
+-	}
+-
+-	atomic_add(&amp;sDriverEvents, 1);
+-}
+-
+-
+-static void
+-driver_removed(const char* path)
+-{
+-	int32 priority = get_priority(path);
+-	RecursiveLocker locker(sLock);
+-
+-	legacy_driver* driver = (legacy_driver*)hash_lookup(sDriverHash,
+-		get_leaf(path));
+-	if (driver == NULL || priority &lt; driver-&gt;priority)
+-		return;
+-
+-	driver-&gt;binary_updated = true;
+-	atomic_add(&amp;sDriverEvents, 1);
+-}
+-
+-
+ //	#pragma mark - DriverWatcher
+ 
+ 
+@@ -974,14 +948,22 @@
+ 	dprintf(&quot;driver \&quot;%s\&quot; %s\n&quot;, path.Leaf(),
+ 		opcode == B_ENTRY_CREATED ? &quot;added&quot; : &quot;removed&quot;);
+ 
++	path_entry* entry = new(std::nothrow) path_entry;
++	if (entry == NULL)
++		return;
++
++	strlcpy(entry-&gt;path, path.Path(), sizeof(entry-&gt;path));
++	MutexLocker _(sDriversListLock);
++
+ 	switch (opcode) {
+ 		case B_ENTRY_CREATED:
+-			driver_added(path.Path());
++			sDriversToAdd.Add(entry);
+ 			break;
+ 		case B_ENTRY_REMOVED:
+-			driver_removed(path.Path());
++			sDriversToRemove.Add(entry);
+ 			break;
+ 	}
++	atomic_add(&amp;sDriverEvents, 1);
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014964.html">[Haiku-commits] r29602 - in haiku/trunk:	headers/private/userlandfs/shared	src/add-ons/kernel/file_systems/userlandfs/server	src/add-ons/kernel/file_systems/userlandfs/server/haiku	src/system/kernel/cache	src/tests/add-ons/kernel/file_systems/userlandfs/r5/src/test/ramfs	src/tests/add-ons/kernel/kernelland_emu
+</A></li>
+	<LI>Next message: <A HREF="014966.html">[Haiku-commits] r29603 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14965">[ date ]</a>
+              <a href="thread.html#14965">[ thread ]</a>
+              <a href="subject.html#14965">[ subject ]</a>
+              <a href="author.html#14965">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

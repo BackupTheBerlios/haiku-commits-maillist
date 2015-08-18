@@ -1,0 +1,706 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20477 - haiku/trunk/src/tests/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20477%20-%20haiku/trunk/src/tests/system/kernel/cache&In-Reply-To=%3C200703310955.l2V9tWVF001147%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001292.html">
+   <LINK REL="Next"  HREF="001298.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20477 - haiku/trunk/src/tests/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20477%20-%20haiku/trunk/src/tests/system/kernel/cache&In-Reply-To=%3C200703310955.l2V9tWVF001147%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20477 - haiku/trunk/src/tests/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sat Mar 31 11:55:32 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001292.html">[Haiku-commits] r20476 - haiku/trunk/src/system/kernel/cache
+</A></li>
+        <LI>Next message: <A HREF="001298.html">[Haiku-commits] r20478 -	haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1293">[ date ]</a>
+              <a href="thread.html#1293">[ thread ]</a>
+              <a href="subject.html#1293">[ subject ]</a>
+              <a href="author.html#1293">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-03-31 11:55:32 +0200 (Sat, 31 Mar 2007)
+New Revision: 20477
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20477&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20477&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/tests/system/kernel/cache/pages_io_test.cpp
+Modified:
+   haiku/trunk/src/tests/system/kernel/cache/Jamfile
+Log:
+Added small test for the pages_io() function (and the file_map class as well).
+
+
+Modified: haiku/trunk/src/tests/system/kernel/cache/Jamfile
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/cache/Jamfile	2007-03-31 09:54:56 UTC (rev 20476)
++++ haiku/trunk/src/tests/system/kernel/cache/Jamfile	2007-03-31 09:55:32 UTC (rev 20477)
+@@ -18,3 +18,7 @@
+ 	khash.c
+ 	: libkernelland_emu.so ;
+ 
++SimpleTest pages_io_test :
++	pages_io_test.cpp
++	;
++
+
+Added: haiku/trunk/src/tests/system/kernel/cache/pages_io_test.cpp
+===================================================================
+--- haiku/trunk/src/tests/system/kernel/cache/pages_io_test.cpp	2007-03-31 09:54:56 UTC (rev 20476)
++++ haiku/trunk/src/tests/system/kernel/cache/pages_io_test.cpp	2007-03-31 09:55:32 UTC (rev 20477)
+@@ -0,0 +1,613 @@
++#include &lt;OS.h&gt;
++#include &lt;fs_interface.h&gt;
++
++#include &lt;stdarg.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;sys/uio.h&gt;
++
++#define TRACE_FILE_CACHE
++#define TRACE(x) printf x
++#define dprintf printf
++
++// maximum number of iovecs per request
++#define MAX_IO_VECS			64	// 256 kB
++#define MAX_FILE_IO_VECS	32
++#define MAX_TEMP_IO_VECS	8
++
++#define CACHED_FILE_EXTENTS	2
++	// must be smaller than MAX_FILE_IO_VECS
++	// ToDo: find out how much of these are typically used
++
++struct vm_cache_ref;
++
++struct file_extent {
++	off_t			offset;
++	file_io_vec		disk;
++};
++
++struct file_map {
++	file_map();
++	~file_map();
++
++	file_extent *operator[](uint32 index);
++	file_extent *ExtentAt(uint32 index);
++	status_t Add(file_io_vec *vecs, size_t vecCount, off_t &amp;lastOffset);
++	void Free();
++
++	union {
++		file_extent	direct[CACHED_FILE_EXTENTS];
++		file_extent	*array;
++	};
++	size_t			count;
++};
++
++struct file_cache_ref {
++	vm_cache_ref	*cache;
++	void			*vnode;
++	void			*device;
++	void			*cookie;
++	file_map		map;
++};
++
++
++file_io_vec gFileVecs[MAX_FILE_IO_VECS];
++size_t gFileVecCount;
++off_t gFileSize;
++
++
++file_map::file_map()
++{
++	array = NULL;
++	count = 0;
++}
++
++
++file_map::~file_map()
++{
++	Free();
++}
++
++
++file_extent *
++file_map::operator[](uint32 index)
++{
++	return ExtentAt(index);
++}
++
++
++file_extent *
++file_map::ExtentAt(uint32 index)
++{
++	if (index &gt;= count)
++		return NULL;
++
++	if (count &gt; CACHED_FILE_EXTENTS)
++		return &amp;array[index];
++
++	return &amp;direct[index];
++}
++
++
++status_t
++file_map::Add(file_io_vec *vecs, size_t vecCount, off_t &amp;lastOffset)
++{
++	TRACE((&quot;file_map::Add(vecCount = %ld)\n&quot;, vecCount));
++
++	off_t offset = 0;
++
++	if (vecCount &lt;= CACHED_FILE_EXTENTS &amp;&amp; count == 0) {
++		// just use the reserved area in the file_cache_ref structure
++	} else {
++		// TODO: once we can invalidate only parts of the file map,
++		//	we might need to copy the previously cached file extends
++		//	from the direct range
++		file_extent *newMap = (file_extent *)realloc(array,
++			(count + vecCount) * sizeof(file_extent));
++		if (newMap == NULL)
++			return B_NO_MEMORY;
++
++		array = newMap;
++
++		if (count != 0) {
++			file_extent *extent = ExtentAt(count - 1);
++			offset = extent-&gt;offset + extent-&gt;disk.length;
++		}
++	}
++
++	int32 start = count;
++	count += vecCount;
++
++	for (uint32 i = 0; i &lt; vecCount; i++) {
++		file_extent *extent = ExtentAt(start + i);
++
++		extent-&gt;offset = offset;
++		extent-&gt;disk = vecs[i];
++
++		offset += extent-&gt;disk.length;
++	}
++
++#ifdef TRACE_FILE_CACHE
++	for (uint32 i = 0; i &lt; count; i++) {
++		file_extent *extent = ExtentAt(i);
++		dprintf(&quot;  [%ld] extend offset %Ld, disk offset %Ld, length %Ld\n&quot;,
++			i, extent-&gt;offset, extent-&gt;disk.offset, extent-&gt;disk.length);
++	}
++#endif
++
++	lastOffset = offset;
++	return B_OK;
++}
++
++
++void
++file_map::Free()
++{
++	if (count &gt; CACHED_FILE_EXTENTS)
++		free(array);
++
++	array = NULL;
++	count = 0;
++}
++
++
++//	#pragma mark -
++
++
++void
++set_vecs(iovec *vecs, size_t *_count, ...)
++{
++	uint32 base = 0;
++	size_t count = 0;
++
++	va_list args;
++	va_start(args, _count);
++
++	while (count &lt; MAX_IO_VECS) {
++		int32 length = va_arg(args, int32);
++		if (length &lt; 0)
++			break;
++
++		vecs[count].iov_base = (void *)base;
++		vecs[count].iov_len = length;
++
++		base += length;
++		count++;
++	}
++
++	va_end(args);
++	*_count = count;
++}
++
++
++void
++set_file_map(int32 base, int32 length, ...)
++{
++	gFileVecs[0].offset = base;
++	gFileVecs[0].length = length;
++
++	gFileSize = length;
++	gFileVecCount = 1;
++
++	va_list args;
++	va_start(args, length);
++
++	while (gFileVecCount &lt; MAX_FILE_IO_VECS) {
++		off_t offset = va_arg(args, int32);
++		if (offset &lt; 0)
++			break;
++
++		length = va_arg(args, int32);
++
++		gFileVecs[gFileVecCount].offset = offset;
++		gFileVecs[gFileVecCount].length = length;
++
++		gFileSize += length;
++		gFileVecCount++;
++	}
++
++	va_end(args);
++}
++
++
++status_t
++find_map_base(off_t offset, off_t &amp;diskOffset, off_t &amp;diskLength,
++	off_t &amp;fileOffset)
++{
++	fileOffset = 0;
++
++	for (uint32 i = 0; i &lt; gFileVecCount; i++) {
++		if (offset &lt; gFileVecs[i].length) {
++			diskOffset = gFileVecs[i].offset;
++			diskLength = gFileVecs[i].length;
++			return B_OK;
++		}
++
++		fileOffset += gFileVecs[i].length;
++		offset -= gFileVecs[i].length;
++	}
++
++	return B_ENTRY_NOT_FOUND;
++}
++
++
++//	#pragma mark - VFS functions
++
++
++static status_t
++vfs_get_file_map(void *vnode, off_t offset, size_t size, file_io_vec *vecs,
++	size_t *_count)
++{
++	off_t diskOffset, diskLength, fileOffset;
++	size_t max = *_count;
++	uint32 index = 0;
++
++	while (true) {
++		status_t status = find_map_base(offset, diskOffset, diskLength, fileOffset);
++		//status_t status = inode-&gt;FindBlockRun(offset, run, fileOffset);
++		if (status != B_OK)
++			return status;
++
++		vecs[index].offset = diskOffset + offset - fileOffset;
++		vecs[index].length = diskLength - offset + fileOffset;
++		offset += vecs[index].length;
++
++		// are we already done?
++		if (size &lt;= vecs[index].length
++			|| offset &gt;= gFileSize) {
++			if (offset &gt; gFileSize) {
++				// make sure the extent ends with the last official file
++				// block (without taking any preallocations into account)
++				vecs[index].length = gFileSize - fileOffset;
++			}
++			*_count = index + 1;
++			return B_OK;
++		}
++
++		size -= vecs[index].length;
++		index++;
++
++		if (index &gt;= max) {
++			// we're out of file_io_vecs; let's bail out
++			*_count = index;
++			return B_BUFFER_OVERFLOW;
++		}
++	}
++}
++
++
++static status_t
++vfs_read_pages(void *device, void *cookie, off_t offset,
++	const iovec *vecs, size_t count, size_t *bytes, bool kernel)
++{
++	printf(&quot;read offset %Ld, length %lu\n&quot;, offset, *bytes);
++	for (uint32 i = 0; i &lt; count; i++) {
++		printf(&quot;  [%lu] base %lu, length %lu\n&quot;,
++			i, (uint32)vecs[i].iov_base, vecs[i].iov_len);
++	}
++	return B_OK;
++}
++
++
++static status_t
++vfs_write_pages(void *device, void *cookie, off_t offset,
++	const iovec *vecs, size_t count, size_t *bytes, bool kernel)
++{
++	printf(&quot;write offset %Ld, length %lu\n&quot;, offset, *bytes);
++	for (uint32 i = 0; i &lt; count; i++) {
++		printf(&quot;  [%lu] base %lu, length %lu\n&quot;,
++			i, (uint32)vecs[i].iov_base, vecs[i].iov_len);
++	}
++	return B_OK;
++}
++
++
++//	#pragma mark - file_cache.cpp copies
++
++
++static file_extent *
++find_file_extent(file_cache_ref *ref, off_t offset, uint32 *_index)
++{
++	// TODO: do binary search
++
++	for (uint32 index = 0; index &lt; ref-&gt;map.count; index++) {
++		file_extent *extent = ref-&gt;map[index];
++
++		if (extent-&gt;offset &lt;= offset
++			&amp;&amp; extent-&gt;offset + extent-&gt;disk.length &gt; offset) {
++			if (_index)
++				*_index = index;
++			return extent;
++		}
++	}
++
++	return NULL;
++}
++
++
++static status_t
++get_file_map(file_cache_ref *ref, off_t offset, size_t size,
++	file_io_vec *vecs, size_t *_count)
++{
++	size_t maxVecs = *_count;
++	status_t status = B_OK;
++
++	if (ref-&gt;map.count == 0) {
++		// we don't yet have the map of this file, so let's grab it
++		// (ordered by offset, so that we can do a binary search on them)
++
++		//mutex_lock(&amp;ref-&gt;cache-&gt;lock);
++
++		// the file map could have been requested in the mean time
++		if (ref-&gt;map.count == 0) {
++			size_t vecCount = maxVecs;
++			off_t mapOffset = 0;
++
++			while (true) {
++				status = vfs_get_file_map(ref-&gt;vnode, mapOffset, ~0UL, vecs, &amp;vecCount);
++				if (status &lt; B_OK &amp;&amp; status != B_BUFFER_OVERFLOW) {
++					//mutex_unlock(&amp;ref-&gt;cache-&gt;lock);
++					return status;
++				}
++
++				status_t addStatus = ref-&gt;map.Add(vecs, vecCount, mapOffset);
++				if (addStatus != B_OK) {
++					// only clobber the status in case of failure
++					status = addStatus;
++				}
++
++				if (status != B_BUFFER_OVERFLOW)
++					break;
++
++				// when we are here, the map has been stored in the array, and
++				// the array size was still too small to cover the whole file
++				vecCount = maxVecs;
++			}
++		}
++
++		//mutex_unlock(&amp;ref-&gt;cache-&gt;lock);
++	}
++
++	if (status != B_OK) {
++		// We must invalidate the (part of the) map we already
++		// have, as we cannot know if it's complete or not
++		ref-&gt;map.Free();
++		return status;
++	}
++
++	// We now have cached the map of this file, we now need to
++	// translate it for the requested access.
++
++	uint32 index;
++	file_extent *fileExtent = find_file_extent(ref, offset, &amp;index);
++	if (fileExtent == NULL) {
++		// access outside file bounds? But that's not our problem
++		*_count = 0;
++		return B_OK;
++	}
++
++	offset -= fileExtent-&gt;offset;
++	vecs[0].offset = fileExtent-&gt;disk.offset + offset;
++	vecs[0].length = fileExtent-&gt;disk.length - offset;
++
++	if (vecs[0].length &gt;= size || index &gt;= ref-&gt;map.count - 1) {
++		*_count = 1;
++		return B_OK;
++	}
++
++	// copy the rest of the vecs
++
++	size -= vecs[0].length;
++
++	for (index = 1; index &lt; ref-&gt;map.count;) {
++		fileExtent++;
++
++		vecs[index] = fileExtent-&gt;disk;
++		index++;
++
++		if (index &gt;= maxVecs) {
++			*_count = index;
++			return B_BUFFER_OVERFLOW;
++		}
++
++		if (size &lt;= fileExtent-&gt;disk.length)
++			break;
++
++		size -= fileExtent-&gt;disk.length;
++	}
++
++	*_count = index;
++	return B_OK;
++}
++
++
++/*!
++	Does the dirty work of translating the request into actual disk offsets
++	and reads to or writes from the supplied iovecs as specified by \a doWrite.
++*/
++static status_t
++pages_io(file_cache_ref *ref, off_t offset, const iovec *vecs, size_t count,
++	size_t *_numBytes, bool doWrite)
++{
++	TRACE((&quot;pages_io: ref = %p, offset = %Ld, size = %lu, vecCount = %lu, %s\n&quot;, ref, offset,
++		*_numBytes, count, doWrite ? &quot;write&quot; : &quot;read&quot;));
++
++	// translate the iovecs into direct device accesses
++	file_io_vec fileVecs[MAX_FILE_IO_VECS];
++	size_t fileVecCount = MAX_FILE_IO_VECS;
++	size_t numBytes = *_numBytes;
++
++	status_t status = get_file_map(ref, offset, numBytes, fileVecs,
++		&amp;fileVecCount);
++	if (status &lt; B_OK) {
++		TRACE((&quot;get_file_map(offset = %Ld, numBytes = %lu) failed\n&quot;, offset,
++			numBytes));
++		return status;
++	}
++
++	// TODO: handle array overflow gracefully!
++
++#ifdef TRACE_FILE_CACHE
++	dprintf(&quot;got %lu file vecs for %Ld:%lu:\n&quot;, fileVecCount, offset, numBytes);
++	for (size_t i = 0; i &lt; fileVecCount; i++) {
++		dprintf(&quot;  [%lu] offset = %Ld, size = %Ld\n&quot;,
++			i, fileVecs[i].offset, fileVecs[i].length);
++	}
++#endif
++
++	if (fileVecCount == 0) {
++		// There are no file vecs at this offset, so we're obviously trying
++		// to access the file outside of its bounds
++		TRACE((&quot;pages_io: access outside of vnode %p at offset %Ld\n&quot;,
++			ref-&gt;vnode, offset));
++		return B_BAD_VALUE;
++	}
++
++	uint32 fileVecIndex;
++	size_t size;
++
++	if (!doWrite) {
++		// now directly read the data from the device
++		// the first file_io_vec can be read directly
++
++		size = fileVecs[0].length;
++		if (size &gt; numBytes)
++			size = numBytes;
++
++		status = vfs_read_pages(ref-&gt;device, ref-&gt;cookie, fileVecs[0].offset, vecs,
++			count, &amp;size, false);
++		if (status &lt; B_OK)
++			return status;
++
++		// TODO: this is a work-around for buggy device drivers!
++		//	When our own drivers honour the length, we can:
++		//	a) also use this direct I/O for writes (otherwise, it would
++		//	   overwrite precious data)
++		//	b) panic if the term below is true (at least for writes)
++		if (size &gt; fileVecs[0].length) {
++			//dprintf(&quot;warning: device driver %p doesn't respect total length in read_pages() call!\n&quot;, ref-&gt;device);
++			size = fileVecs[0].length;
++		}
++
++		//ASSERT(size &lt;= fileVecs[0].length);
++
++		// If the file portion was contiguous, we're already done now
++		if (size == numBytes)
++			return B_OK;
++
++		// if we reached the end of the file, we can return as well
++		if (size != fileVecs[0].length) {
++			*_numBytes = size;
++			return B_OK;
++		}
++
++		fileVecIndex = 1;
++	} else {
++		fileVecIndex = 0;
++		size = 0;
++	}
++
++	// Too bad, let's process the rest of the file_io_vecs
++
++	size_t totalSize = size;
++
++	// first, find out where we have to continue in our iovecs
++	uint32 i = 0;
++	for (; i &lt; count; i++) {
++		if (size &lt; vecs[i].iov_len)
++			break;
++
++		size -= vecs[i].iov_len;
++	}
++
++	size_t vecOffset = size;
++	size_t bytesLeft = numBytes - size;
++
++	for (; fileVecIndex &lt; fileVecCount; fileVecIndex++) {
++		file_io_vec &amp;fileVec = fileVecs[fileVecIndex];
++		off_t fileOffset = fileVec.offset;
++		off_t fileLeft = fileVec.length;
++
++		fileLeft = min_c(fileVec.length, bytesLeft);
++
++printf(&quot;FILE VEC [%lu] length %Ld\n&quot;, fileVecIndex, fileLeft);
++		while (fileLeft &gt; 0) {
++			iovec tempVecs[MAX_TEMP_IO_VECS];
++			uint32 tempCount = 1;
++
++			size = min_c(vecs[i].iov_len - vecOffset, fileLeft);
++
++			tempVecs[0].iov_base = (void *)((addr_t)vecs[i].iov_base + vecOffset);
++			tempVecs[0].iov_len = size;
++
++			if (size &gt;= fileLeft)
++				vecOffset += size;
++			else
++				vecOffset = 0;
++
++			while (size &lt; fileLeft &amp;&amp; ++i &lt; count
++				&amp;&amp; tempCount &lt; MAX_TEMP_IO_VECS) {
++			TRACE((&quot;fill vec %ld, offset = %lu, size = %lu\n&quot;, i, vecOffset, size));
++				tempVecs[tempCount].iov_base = vecs[i].iov_base;
++
++				// is this iovec larger than the file_io_vec?
++				if (vecs[i].iov_len + size &gt; fileLeft) {
++					size += tempVecs[tempCount].iov_len
++						= vecOffset = fileLeft - size;
++					tempCount++;
++					break;
++				}
++
++				size += tempVecs[tempCount].iov_len = vecs[i].iov_len;
++				tempCount++;
++			}
++
++			size_t bytes = size;
++			if (doWrite) {
++				status = vfs_write_pages(ref-&gt;device, ref-&gt;cookie, fileOffset,
++					tempVecs, tempCount, &amp;bytes, false);
++			} else {
++				status = vfs_read_pages(ref-&gt;device, ref-&gt;cookie, fileOffset,
++					tempVecs, tempCount, &amp;bytes, false);
++			}
++			if (status &lt; B_OK)
++				return status;
++
++			totalSize += size;
++			bytesLeft -= size;
++			fileOffset += size;
++			fileLeft -= size;
++			printf(&quot;-&gt; file left = %Lu\n&quot;, fileLeft);
++
++			if (size != bytes) {
++				// there are no more bytes, let's bail out
++				*_numBytes = totalSize;
++				return B_OK;
++			}
++		}
++	}
++
++	return B_OK;
++}
++
++
++//	#pragma mark -
++
++
++int
++main(int argc, char **argv)
++{
++	file_cache_ref ref;
++	iovec vecs[MAX_IO_VECS];
++	size_t count = 1;
++	size_t numBytes = 10000;
++	off_t offset = 4999;
++
++	set_vecs(vecs, &amp;count, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 4096, 8192, 16384, 4096, 4096, -1);
++	set_file_map(0, 2000, 5000, 3000, 10000, 800, 11000, 20, 12000, 30, 13000, 70, 14000, 100, 15000, 30000, -1);
++
++	pages_io(&amp;ref, offset, vecs, count, &amp;numBytes, false);
++
++	return 0;
++}
++
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001292.html">[Haiku-commits] r20476 - haiku/trunk/src/system/kernel/cache
+</A></li>
+	<LI>Next message: <A HREF="001298.html">[Haiku-commits] r20478 -	haiku/trunk/src/add-ons/kernel/drivers/ports/usb_serial
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1293">[ date ]</a>
+              <a href="thread.html#1293">[ thread ]</a>
+              <a href="subject.html#1293">[ subject ]</a>
+              <a href="author.html#1293">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

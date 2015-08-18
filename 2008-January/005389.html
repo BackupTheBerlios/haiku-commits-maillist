@@ -1,0 +1,328 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23425 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23425%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200801112313.m0BNDSnn000181%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005492.html">
+   <LINK REL="Next"  HREF="005390.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23425 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata</H1>
+    <B>marcusoverhagen at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23425%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/ata&In-Reply-To=%3C200801112313.m0BNDSnn000181%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23425 -	haiku/trunk/src/add-ons/kernel/bus_managers/ata">marcusoverhagen at mail.berlios.de
+       </A><BR>
+    <I>Sat Jan 12 00:13:28 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005492.html">[Haiku-commits] r23424 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="005390.html">[Haiku-commits] r23426 - haiku/trunk/3rdparty/mmu_man/themes
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5389">[ date ]</a>
+              <a href="thread.html#5389">[ thread ]</a>
+              <a href="subject.html#5389">[ subject ]</a>
+              <a href="author.html#5389">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: marcusoverhagen
+Date: 2008-01-12 00:13:27 +0100 (Sat, 12 Jan 2008)
+New Revision: 23425
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23425&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23425&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata.c
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.c
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/ide_internal.h
+   haiku/trunk/src/add-ons/kernel/bus_managers/ata/pio.c
+Log:
+Implemented PIO transfers again. Haiku starts in vmware now with this stack.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata.c	2008-01-11 23:12:41 UTC (rev 23424)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata.c	2008-01-11 23:13:27 UTC (rev 23425)
+@@ -18,6 +18,11 @@
+ #define TRACE dprintf
+ #define FLOW dprintf
+ 
++
++static void ata_exec_dma_transfer(ata_request *request);
++static void	ata_exec_pio_transfer(ata_request *request);
++
++
+ void
+ ata_select_device(ide_bus_info *bus, int device)
+ {
+@@ -29,16 +34,10 @@
+ 	tf.chs.mode = ide_mode_lba;
+ 	tf.chs.device = device ? 1 : 0;
+ 
+-//	if (ata_wait_idle(bus) != B_OK)
+-//		FLOW(&quot;ata_select_device step 1 bus not idle\n&quot;);
+-
+ 	bus-&gt;controller-&gt;write_command_block_regs(bus-&gt;channel_cookie, &amp;tf, ide_mask_device_head);
+ 	bus-&gt;controller-&gt;get_altstatus(bus-&gt;channel_cookie); // flush posted writes
+ 	spin(1); // wait 400 nsec
+ 
+-//	if (ata_wait_idle(bus) != B_OK)
+-//		FLOW(&quot;ata_select_device step 2 bus not idle\n&quot;);
+-
+ 	// for debugging only
+ 	bus-&gt;controller-&gt;read_command_block_regs(bus-&gt;channel_cookie, &amp;tf, ide_mask_device_head);
+ 	if (tf.chs.device != device)
+@@ -756,7 +755,7 @@
+ 
+ void
+ ata_exec_read_write(ide_device_info *device, ata_request *request,
+-	uint64 pos, size_t length, bool write)
++	uint64 address, size_t sectorCount, bool write)
+ {
+ 	ide_bus_info *bus = device-&gt;bus;
+ 	ata_flags flags = 0;
+@@ -769,19 +768,18 @@
+ 	if (request-&gt;uses_dma) {
+ 		if (!prepare_dma(device, request)) {
+ 			// fall back to PIO on error
+-
+ 			request-&gt;uses_dma = false;
+ 		}
+ 	}
+ 
+ 	if (!request-&gt;uses_dma) {
+ 		prep_PIO_transfer(device, request);
+-		device-&gt;left_blocks = length;
++		device-&gt;left_blocks = sectorCount;
+ 	}
+ 
+ 	// compose command
+-	if (!create_rw_taskfile(device, request, pos, length, write))
+-		goto err_setup;
++	if (!create_rw_taskfile(device, request, address, sectorCount, write))
++		goto error;
+ 
+ 	// if no timeout is specified, use standard
+ 	timeout = request-&gt;ccb-&gt;timeout &gt; 0 ? request-&gt;ccb-&gt;timeout * 1000 : IDE_STD_TIMEOUT;
+@@ -791,42 +789,80 @@
+ 	if (request-&gt;uses_dma)
+ 		flags |= ATA_DMA_TRANSFER;
+ 	if (ata_send_command(device, request, flags, timeout) != B_OK) 
+-		goto err_send;
++		goto error;
+ 
++	// this could be executed in a DPC to improve performance
+ 	if (request-&gt;uses_dma) {
+-
+-		start_dma_wait_no_lock(device, request);
++		ata_exec_dma_transfer(request);
+ 	} else {
+-		// on PIO read, we start with waiting, on PIO write we can
+-		// transmit data immediately; we let the service thread do
+-		// the writing, so the caller can issue the next command 
+-		// immediately (this optimisation really pays on SMP systems
+-		// only)
+-		SHOW_FLOW0(3, &quot;Ready for PIO&quot;);
+-		if (request-&gt;is_write) {
+-			SHOW_FLOW0(3, &quot;Scheduling write DPC&quot;);
+-			scsi-&gt;schedule_dpc(bus-&gt;scsi_cookie, bus-&gt;irq_dpc, ide_dpc, bus);
+-		}
++		ata_exec_pio_transfer(request);
+ 	}
+-
+ 	return;
+ 
+-err_setup:
+-	// error during setup
++error:
+ 	if (request-&gt;uses_dma)
+ 		abort_dma(device, request);
++	ata_request_finish(request, false);
++}
+ 
+-	ata_request_finish(request, false);
++
++static void
++ata_exec_dma_transfer(ata_request *request)
++{
++	ASSERT(0);
++}
++
++static void
++ata_exec_pio_transfer(ata_request *request)
++{
++	ide_device_info *device = request-&gt;device;
++	ide_bus_info *bus = device-&gt;bus;
++	uint32 timeout = request-&gt;ccb-&gt;timeout &gt; 0 ? 
++		request-&gt;ccb-&gt;timeout * 1000 : IDE_STD_TIMEOUT;
++
++//	FLOW(&quot;ata_exec_pio_transfer\n&quot;);
++
++	FLOW(&quot;ata_exec_pio_transfer: length %d, left_sg_elem %d, cur_sg_elem %d, cur_sg_ofs %d\n&quot;,
++		request-&gt;ccb-&gt;data_length, device-&gt;left_sg_elem, device-&gt;cur_sg_elem, device-&gt;cur_sg_ofs);
++
++	if (ata_wait(bus, ide_status_drq, ide_status_bsy, 0, 4000000) != B_OK) {
++		TRACE(&quot;ata_exec_pio_transfer: wait failed\n&quot;);
++		goto error;
++	}
++
++	while (device-&gt;left_blocks &gt; 0) {
++		if (request-&gt;is_write) {
++			FLOW(&quot;writing 1 block\n&quot;);
++			if (write_PIO_block(request, 512) != B_OK)
++				goto transfer_error;
++		} else {
++			FLOW(&quot;reading 1 block\n&quot;);
++			if (read_PIO_block(request, 512) != B_OK)
++				goto transfer_error;
++		}
++		device-&gt;left_blocks--;
++		FLOW(&quot;%d blocks left\n&quot;, device-&gt;left_blocks);
++	}
++
++	if (ata_wait_for_drqdown(bus) != B_OK) {
++		TRACE(&quot;ata_exec_pio_transfer: ata_wait_for_drqdown failed\n&quot;);
++		goto error;
++	}
++
++	ata_finish_command(device, &amp;request, ATA_WAIT_FINISH | ATA_DRDY_REQUIRED, ide_error_abrt);
++	ata_request_finish(request, false /* resubmit */);
+ 	return;
+-	
+-err_send:
+-	// error during/after send; 
+-	// in this case, the device discards queued ccb automatically
+-	if (request-&gt;uses_dma)
+-		abort_dma(device, request);
+ 
+-//	finish_reset_queue(request);
+-	ata_request_finish(request, false);
++error:
++	TRACE(&quot;ata_exec_pio_transfer: error\n&quot;);
++	ata_request_set_status(request, SCSI_SEQUENCE_FAIL);
++	ata_request_finish(request, false /* resubmit */);
++	return;
++
++transfer_error:
++	TRACE(&quot;ata_exec_pio_transfer: transfer error\n&quot;);
++	ata_request_set_status(request, SCSI_SEQUENCE_FAIL);
++	ata_request_finish(request, false /* resubmit */);
+ }
+ 
+ 
+@@ -1079,7 +1115,7 @@
+ 		return B_ERROR;
+ 	}
+ 
+-	if (ata_wait(bus, ide_status_drq, ide_status_bsy, ATA_CHECK_ERROR_BIT, 4000000) != B_OK) {
++	if (ata_wait(bus, ide_status_drq, ide_status_bsy, 0, 4000000) != B_OK) {
+ 		TRACE(&quot;ata_identify_device: wait failed\n&quot;);
+ 		return B_ERROR;
+ 	}
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.c	2008-01-11 23:12:41 UTC (rev 23424)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ata_request.c	2008-01-11 23:13:27 UTC (rev 23425)
+@@ -139,7 +139,7 @@
+ 	}
+ 
+ 	IDE_LOCK(request-&gt;device-&gt;bus);
+-	ASSERT(request-&gt;device-&gt;bus-&gt;state == ata_state_busy);
++	ASSERT(request-&gt;device-&gt;bus-&gt;state != ata_state_idle);
+ 	ASSERT(request-&gt;device-&gt;bus-&gt;active_device == request-&gt;device);
+ 	ASSERT(request-&gt;device-&gt;requestActive == request);
+ 	ASSERT(request-&gt;device-&gt;requestFree == NULL);
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/ide_internal.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/ide_internal.h	2008-01-11 23:12:41 UTC (rev 23424)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/ide_internal.h	2008-01-11 23:13:27 UTC (rev 23425)
+@@ -208,7 +208,7 @@
+ bool check_rw_error(ide_device_info *device, ata_request *request);
+ bool check_output(ide_device_info *device, bool drdy_required, int error_mask, bool is_write);
+ 
+-void ata_exec_read_write(ide_device_info *device, ata_request *request,	uint64 pos, size_t length, bool write);
++void ata_exec_read_write(ide_device_info *device, ata_request *request, uint64 address, size_t sectorCount, bool write);
+ 
+ void ata_dpc_DMA(ata_request *request);
+ void ata_dpc_PIO(ata_request *request);
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/ata/pio.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/ata/pio.c	2008-01-11 23:12:41 UTC (rev 23424)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/ata/pio.c	2008-01-11 23:13:27 UTC (rev 23425)
+@@ -43,6 +43,7 @@
+ 
+ #include &lt;string.h&gt;
+ 
++#define FLOW dprintf
+ 
+ // internal error code if scatter gather table is too short
+ #define ERR_TOO_BIG	(B_ERRORS_END + 1)
+@@ -157,6 +158,8 @@
+ 			return B_ERROR;
+ 		}
+ 
++		ASSERT((physicalAddress &amp; 4097) == (virtualAddress &amp; 4097));
++
+ 		// if chunks starts in the middle of a page, we have even less then
+ 		// a page left		
+ 		page_left = B_PAGE_SIZE - physicalAddress % B_PAGE_SIZE;
+@@ -184,7 +187,7 @@
+ 
+ 
+ /*! Transfer PIO block from/to buffer */
+-static inline int
++static inline status_t
+ transfer_PIO_block(ide_device_info *device, int length, bool write, int *transferred)
+ {
+ 	// data is usually split up into multiple scatter/gather blocks
+@@ -230,11 +233,9 @@
+ static void
+ write_discard_PIO(ide_device_info *device, int length)
+ {
++	static const uint8 buffer[32] = {};
+ 	ide_bus_info *bus = device-&gt;bus;
+-	uint8 buffer[32];
+ 
+-	memset(buffer, 0, sizeof(buffer));
+-
+ 	// we transmit 32 zero-bytes at once
+ 	// (not very efficient but easy to implement - you get what you deserve
+ 	//  when you don't provide enough buffer)
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005492.html">[Haiku-commits] r23424 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="005390.html">[Haiku-commits] r23426 - haiku/trunk/3rdparty/mmu_man/themes
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5389">[ date ]</a>
+              <a href="thread.html#5389">[ thread ]</a>
+              <a href="subject.html#5389">[ subject ]</a>
+              <a href="author.html#5389">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

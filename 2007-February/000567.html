@@ -1,0 +1,1011 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20028 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20028%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200702011212.l11CCu2F028477%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000565.html">
+   <LINK REL="Next"  HREF="000615.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20028 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20028%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200702011212.l11CCu2F028477%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20028 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Feb  1 13:12:56 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000565.html">[Haiku-commits] r20027 - haiku/trunk/src/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="000615.html">[Haiku-commits] r20028 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#567">[ date ]</a>
+              <a href="thread.html#567">[ thread ]</a>
+              <a href="subject.html#567">[ subject ]</a>
+              <a href="author.html#567">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-02-01 13:12:54 +0100 (Thu, 01 Feb 2007)
+New Revision: 20028
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20028&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20028&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_cache.c
+Log:
+Fixed a couple of issues in our VM:
+* we now always flush the TLBs after having unmapped some pages.
+* vm_soft_fault() could traverse to a source cache while it was being collapsed
+  by vm_cache_remove_consumer() - this is now no longer possible as the latter
+  marks the cache as busy when doing so, and the former now tests this flag and
+  locks the cache (via the new fault_acquire_locked_source() function).
+* if fault_acquire_locked_source() fails with B_BUSY, the current cache is locked
+  again, and tested again for the page - as it might have been moved upwards to it
+  with the destruction of its former source.
+* The cache delivering the page for vm_soft_fault() is now locked until the end;
+  it can no longer go away before having actually mapped the page into the area.
+* This also fixes the issue where pages would get lost as vm_soft_fault() put the
+  page in the active list, no matter if its cache still existed.
+* Also, we now keep a reference of to a cache in case a dummy page is inserted; this
+  makes again sure that it doesn't go away during the execution of vm_soft_fault()
+  (which could even add this page to the free list...).
+* divided vm_soft_fault() into several smaller functions which should make it much
+  more readable.
+* Added a &quot;cache_chain&quot; KDL command that dumps the whole chain until the bottom
+  when giving a pointer to a vm_cache as parameter.
+* now usually call vm_cache_acquire_ref() before map_backing_store(), even though
+  it shouldn't be really needed (I added it for debugging purposes).
+* Some minor cleanup.
+* NOTE: a major problem still persists: when removing a vm_cache, it's possible
+  that some of its pages are still mapped, and there is currently no mechanism
+  to get rid of these mappings! I've added TODO comments into vm_cache.c where
+  appropriate.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2007-02-01 08:21:44 UTC (rev 20027)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2007-02-01 12:12:54 UTC (rev 20028)
+@@ -81,6 +81,7 @@
+ 	uint32				page_count;
+ 	uint32				temporary : 1;
+ 	uint32				scan_skip : 1;
++	uint32				busy : 1;
+ } vm_cache;
+ 
+ // vm area
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-02-01 08:21:44 UTC (rev 20027)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-02-01 12:12:54 UTC (rev 20028)
+@@ -1286,6 +1286,8 @@
+ 		return B_BAD_VALUE;
+ 	}
+ 
++	vm_cache_acquire_ref(sourceArea-&gt;cache_ref);
++
+ 	// ToDo: for now, B_USER_CLONEABLE is disabled, until all drivers
+ 	//	have been adapted. Maybe it should be part of the kernel settings,
+ 	//	anyway (so that old drivers can always work).
+@@ -1309,6 +1311,7 @@
+ 		// one.
+ 		vm_cache_acquire_ref(sourceArea-&gt;cache_ref);
+ 	}
++	vm_cache_release_ref(sourceArea-&gt;cache_ref);
+ 
+ 	vm_put_area(sourceArea);
+ 	vm_put_address_space(addressSpace);
+@@ -1432,9 +1435,10 @@
+ 	// unmap the virtual address space the area occupied. any page faults at this
+ 	// point should fail in vm_area_lookup().
+ 	vm_translation_map *map = &amp;addressSpace-&gt;translation_map;
+-	(*map-&gt;ops-&gt;lock)(map);
+-	(*map-&gt;ops-&gt;unmap)(map, area-&gt;base, area-&gt;base + (area-&gt;size - 1));
+-	(*map-&gt;ops-&gt;unlock)(map);
++	map-&gt;ops-&gt;lock(map);
++	map-&gt;ops-&gt;unmap(map, area-&gt;base, area-&gt;base + (area-&gt;size - 1));
++	map-&gt;ops-&gt;flush(map);
++	map-&gt;ops-&gt;unlock(map);
+ 
+ 	// ToDo: do that only for vnode stores
+ 	vm_cache_write_modified(area-&gt;cache_ref, false);
+@@ -1541,6 +1545,7 @@
+ 	map = &amp;area-&gt;address_space-&gt;translation_map;
+ 	map-&gt;ops-&gt;lock(map);
+ 	map-&gt;ops-&gt;unmap(map, area-&gt;base, area-&gt;base - 1 + area-&gt;size);
++	map-&gt;ops-&gt;flush(map);
+ 
+ 	for (page = lowerCache-&gt;page_list; page; page = page-&gt;cache_next) {
+ 		map-&gt;ops-&gt;map(map, area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT)
+@@ -1595,17 +1600,20 @@
+ 
+ 	// First, create a cache on top of the source area
+ 
++	if (!writableCopy) {
++		// map_backing_store() cannot know it has to acquire a ref to
++		// the store for REGION_NO_PRIVATE_MAP
++		vm_cache_acquire_ref(cacheRef);
++	}
++
+ 	status = map_backing_store(addressSpace, cacheRef, _address,
+ 		source-&gt;cache_offset, source-&gt;size, addressSpec, source-&gt;wiring, protection,
+ 		writableCopy ? REGION_PRIVATE_MAP : REGION_NO_PRIVATE_MAP,
+ 		&amp;target, name);
+-	if (status &lt; B_OK)
++	if (status &lt; B_OK) {
++		if (!writableCopy)
++			vm_cache_release_ref(cacheRef);
+ 		goto err;
+-
+-	if (!writableCopy) {
+-		// map_backing_store() cannot know it has to acquire a ref to
+-		// the store for REGION_NO_PRIVATE_MAP
+-		vm_cache_acquire_ref(cacheRef);
+ 	}
+ 
+ 	// If the source area is writable, we need to move it one layer up as well
+@@ -1927,6 +1935,30 @@
+ 
+ 
+ static int
++dump_cache_chain(int argc, char **argv)
++{
++	if (argc &lt; 2 || strlen(argv[1]) &lt; 2
++		|| argv[1][0] != '0'
++		|| argv[1][1] != 'x') {
++		kprintf(&quot;%s: invalid argument, pass address\n&quot;, argv[0]);
++		return 0;
++	}
++
++	addr_t address = strtoul(argv[1], NULL, 0);
++	if (address == NULL)
++		return 0;
++
++	vm_cache *cache = (vm_cache *)address;
++	while (cache != NULL) {
++		dprintf(&quot;%p  (ref %p)\n&quot;, cache, cache-&gt;ref);
++		cache = cache-&gt;source;
++	}
++
++	return 0;
++}
++
++
++static int
+ dump_cache(int argc, char **argv)
+ {
+ 	vm_cache *cache;
+@@ -2477,6 +2509,7 @@
+ 	add_debugger_command(&quot;area&quot;, &amp;dump_area, &quot;Dump info about a particular area&quot;);
+ 	add_debugger_command(&quot;cache_ref&quot;, &amp;dump_cache, &quot;Dump vm_cache&quot;);
+ 	add_debugger_command(&quot;cache&quot;, &amp;dump_cache, &quot;Dump vm_cache&quot;);
++	add_debugger_command(&quot;cache_chain&quot;, &amp;dump_cache_chain, &quot;Dump vm_cache chain&quot;);
+ 	add_debugger_command(&quot;avail&quot;, &amp;dump_available_memory, &quot;Dump available memory&quot;);
+ 	add_debugger_command(&quot;dl&quot;, &amp;display_mem, &quot;dump memory long words (64-bit)&quot;);
+ 	add_debugger_command(&quot;dw&quot;, &amp;display_mem, &quot;dump memory words (32-bit)&quot;);
+@@ -2557,29 +2590,29 @@
+ 
+ 
+ status_t
+-vm_page_fault(addr_t address, addr_t fault_address, bool is_write, bool is_user, addr_t *newip)
++vm_page_fault(addr_t address, addr_t faultAddress, bool isWrite, bool isUser,
++	addr_t *newIP)
+ {
+-	int err;
++	FTRACE((&quot;vm_page_fault: page fault at 0x%lx, ip 0x%lx\n&quot;, address, faultAddress));
+ 
+-	FTRACE((&quot;vm_page_fault: page fault at 0x%lx, ip 0x%lx\n&quot;, address, fault_address));
++	*newIP = 0;
+ 
+-	*newip = 0;
+-
+-	err = vm_soft_fault(address, is_write, is_user);
+-	if (err &lt; 0) {
++	status_t status = vm_soft_fault(address, isWrite, isUser);
++	if (status &lt; B_OK) {
+ 		dprintf(&quot;vm_page_fault: vm_soft_fault returned error '%s' on fault at 0x%lx, ip 0x%lx, write %d, user %d, thread 0x%lx\n&quot;,
+-			strerror(err), address, fault_address, is_write, is_user, thread_get_current_thread_id());
+-		if (!is_user) {
+-			struct thread *t = thread_get_current_thread();
+-			if (t &amp;&amp; t-&gt;fault_handler != 0) {
++			strerror(status), address, faultAddress, isWrite, isUser,
++			thread_get_current_thread_id());
++		if (!isUser) {
++			struct thread *thread = thread_get_current_thread();
++			if (thread != NULL &amp;&amp; thread-&gt;fault_handler != 0) {
+ 				// this will cause the arch dependant page fault handler to
+ 				// modify the IP on the interrupt frame or whatever to return
+ 				// to this address
+-				*newip = t-&gt;fault_handler;
++				*newIP = thread-&gt;fault_handler;
+ 			} else {
+ 				// unhandled page fault in the kernel
+ 				panic(&quot;vm_page_fault: unhandled page fault in kernel space at 0x%lx, ip 0x%lx\n&quot;,
+-					address, fault_address);
++					address, faultAddress);
+ 			}
+ 		} else {
+ #if 1
+@@ -2588,14 +2621,14 @@
+ 			vm_area *area;
+ 
+ 			acquire_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0, 0);
+-			area = vm_area_lookup(addressSpace, fault_address);
++			area = vm_area_lookup(addressSpace, faultAddress);
+ 
+ 			dprintf(&quot;vm_page_fault: sending team \&quot;%s\&quot; 0x%lx SIGSEGV, ip %#lx (\&quot;%s\&quot; +%#lx)\n&quot;,
+ 				thread_get_current_thread()-&gt;team-&gt;name,
+-				thread_get_current_thread()-&gt;team-&gt;id, fault_address,
+-				area ? area-&gt;name : &quot;???&quot;, fault_address - (area ? area-&gt;base : 0x0));
++				thread_get_current_thread()-&gt;team-&gt;id, faultAddress,
++				area ? area-&gt;name : &quot;???&quot;, faultAddress - (area ? area-&gt;base : 0x0));
+ 
+-// We can print a stack trace of the userland thread here.
++			// We can print a stack trace of the userland thread here.
+ #if 0
+ 			if (area) {
+ 				struct stack_frame {
+@@ -2616,7 +2649,7 @@
+ 
+ 				dprintf(&quot;stack trace:\n&quot;);
+ 				while (status == B_OK) {
+-					dprintf(&quot;  0x%p&quot;, frame.return_address);
++					dprintf(&quot;  %p&quot;, frame.return_address);
+ 					area = vm_area_lookup(addressSpace,
+ 						(addr_t)frame.return_address);
+ 					if (area) {
+@@ -2643,122 +2676,99 @@
+ }
+ 
+ 
+-static status_t
+-vm_soft_fault(addr_t originalAddress, bool isWrite, bool isUser)
++static inline status_t
++fault_acquire_locked_source(vm_cache *cache, vm_cache_ref **_sourceRef)
+ {
+-	vm_address_space *addressSpace;
+-	vm_area *area;
+-	vm_cache_ref *topCacheRef;
+-	off_t cacheOffset;
+-	vm_page dummyPage;
+-	vm_page *page = NULL;
+-	addr_t address;
+-	int32 changeCount;
+-	status_t status;
++retry:
++	vm_cache *source = cache-&gt;source;
++	if (source == NULL)
++		return B_ERROR;
++	if (source-&gt;busy)
++		return B_BUSY;
+ 
+-	FTRACE((&quot;vm_soft_fault: thid 0x%lx address 0x%lx, isWrite %d, isUser %d\n&quot;,
+-		thread_get_current_thread_id(), originalAddress, isWrite, isUser));
++	vm_cache_ref *sourceRef = source-&gt;ref;
++	vm_cache_acquire_ref(sourceRef);
+ 
+-	address = ROUNDOWN(originalAddress, B_PAGE_SIZE);
++	mutex_lock(&amp;sourceRef-&gt;lock);
+ 
+-	if (IS_KERNEL_ADDRESS(address)) {
+-		addressSpace = vm_get_kernel_address_space();
+-	} else if (IS_USER_ADDRESS(address)) {
+-		addressSpace = vm_get_current_user_address_space();
+-		if (addressSpace == NULL) {
+-			if (isUser == false) {
+-				dprintf(&quot;vm_soft_fault: kernel thread accessing invalid user memory!\n&quot;);
+-				return B_BAD_ADDRESS;
+-			} else {
+-				// XXX weird state.
+-				panic(&quot;vm_soft_fault: non kernel thread accessing user memory that doesn't exist!\n&quot;);
+-			}
+-		}
+-	} else {
+-		// the hit was probably in the 64k DMZ between kernel and user space
+-		// this keeps a user space thread from passing a buffer that crosses into kernel space
+-		return B_BAD_ADDRESS;
++	if (sourceRef-&gt;cache != cache-&gt;source || sourceRef-&gt;cache-&gt;busy) {
++		mutex_unlock(&amp;sourceRef-&gt;lock);
++		vm_cache_release_ref(sourceRef);
++		goto retry;
+ 	}
+ 
+-	atomic_add(&amp;addressSpace-&gt;fault_count, 1);
++	*_sourceRef = sourceRef;
++	return B_OK;
++}
+ 
+-	// Get the area the fault was in
+ 
+-	acquire_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0, 0);
+-	area = vm_area_lookup(addressSpace, address);
+-	if (area == NULL) {
+-		release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
+-		vm_put_address_space(addressSpace);
+-		dprintf(&quot;vm_soft_fault: va 0x%lx not covered by area in address space\n&quot;,
+-			originalAddress);
+-		return B_BAD_ADDRESS;
+-	}
++/*!
++	Inserts a busy dummy page into a cache, and makes sure the cache won't go
++	away by grabbing a reference to it.
++*/
++static inline void
++fault_insert_dummy_page(vm_cache_ref *cacheRef, vm_page &amp;dummyPage, off_t cacheOffset)
++{
++	dummyPage.state = PAGE_STATE_BUSY;
++	vm_cache_acquire_ref(cacheRef);
++	vm_cache_insert_page(cacheRef, &amp;dummyPage, cacheOffset);
++}
+ 
+-	// check permissions
+-	if (isUser &amp;&amp; (area-&gt;protection &amp; B_USER_PROTECTION) == 0) {
+-		release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
+-		vm_put_address_space(addressSpace);
+-		dprintf(&quot;user access on kernel area 0x%lx at %p\n&quot;, area-&gt;id, (void *)originalAddress);
+-		return B_PERMISSION_DENIED;
+-	}
+-	if (isWrite &amp;&amp; (area-&gt;protection &amp; (B_WRITE_AREA | (isUser ? 0 : B_KERNEL_WRITE_AREA))) == 0) {
+-		release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
+-		vm_put_address_space(addressSpace);
+-		dprintf(&quot;write access attempted on read-only area 0x%lx at %p\n&quot;,
+-			area-&gt;id, (void *)originalAddress);
+-		return B_PERMISSION_DENIED;
+-	}
+ 
+-	// We have the area, it was a valid access, so let's try to resolve the page fault now.
+-	// At first, the top most cache from the area is investigated
++/*!
++	Removes the busy dummy page from a cache, and releases its reference to
++	the cache.
++*/
++static inline void
++fault_remove_dummy_page(vm_page &amp;dummyPage, bool isLocked)
++{
++	vm_cache_ref *cacheRef = dummyPage.cache-&gt;ref;
++	if (!isLocked)
++		mutex_lock(&amp;cacheRef-&gt;lock);
+ 
+-	topCacheRef = area-&gt;cache_ref;
+-	cacheOffset = address - area-&gt;base + area-&gt;cache_offset;
+-	vm_cache_acquire_ref(topCacheRef);
+-	changeCount = addressSpace-&gt;change_count;
+-	release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
++	vm_cache_remove_page(cacheRef, &amp;dummyPage);
+ 
+-	mutex_lock(&amp;topCacheRef-&gt;lock);
++	if (!isLocked)
++		mutex_unlock(&amp;cacheRef-&gt;lock);
+ 
+-	// See if this cache has a fault handler - this will do all the work for us
+-	if (topCacheRef-&gt;cache-&gt;store-&gt;ops-&gt;fault != NULL) {
+-		// Note, since the page fault is resolved with interrupts enabled, the
+-		// fault handler could be called more than once for the same reason -
+-		// the store must take this into account
+-		status_t status = (*topCacheRef-&gt;cache-&gt;store-&gt;ops-&gt;fault)(topCacheRef-&gt;cache-&gt;store, addressSpace, cacheOffset);
+-		if (status != B_BAD_HANDLER) {
+-			mutex_unlock(&amp;topCacheRef-&gt;lock);
+-			vm_cache_release_ref(topCacheRef);
+-			vm_put_address_space(addressSpace);
+-			return status;
+-		}
+-	}
++	vm_cache_release_ref(cacheRef);
+ 
+-	mutex_unlock(&amp;topCacheRef-&gt;lock);
++	dummyPage.state = PAGE_STATE_INACTIVE;
++}
+ 
+-	// The top most cache has no fault handler, so let's see if the cache or its sources
+-	// already have the page we're searching for (we're going from top to bottom)
+ 
+-	dummyPage.state = PAGE_STATE_INACTIVE;
+-	dummyPage.type = PAGE_TYPE_DUMMY;
++/*!
++	Finds a page at the specified \a cacheOffset in either the \a topCacheRef
++	or in its source chain. Will also page in a missing page in case there is
++	a cache that has the page.
++	If it couldn't find a page, it will return the vm_cache that should get it,
++	otherwise, it will return the vm_cache that contains the cache.
++	It always grabs a reference to the vm_cache that it returns, and also locks it.
++*/
++static inline vm_page *
++fault_find_page(vm_translation_map *map, vm_cache_ref *topCacheRef,
++	off_t cacheOffset, bool isWrite, vm_page &amp;dummyPage, vm_cache_ref **_pageRef)
++{
++	vm_cache_ref *cacheRef = topCacheRef;
++	vm_cache_ref *lastCacheRef = NULL;
++	vm_page *page = NULL;
+ 
+-	vm_cache_ref *lastCacheRef = NULL;
+-	vm_cache_ref *cacheRef = topCacheRef;
+ 	vm_cache_acquire_ref(cacheRef);
+-		// we need to make sure to always hold a ref to the current vm_cache_ref
++	mutex_lock(&amp;cacheRef-&gt;lock);
++		// we release this later in the loop
+ 
+ 	while (cacheRef != NULL) {
+ 		if (lastCacheRef != NULL)
+ 			vm_cache_release_ref(lastCacheRef);
+ 
+-		mutex_lock(&amp;cacheRef-&gt;lock);
++		// we hold the lock of the cacheRef at this point
++
+ 		lastCacheRef = cacheRef;
+ 
+ 		for (;;) {
+ 			page = vm_cache_lookup_page(cacheRef, cacheOffset);
+ 			if (page != NULL &amp;&amp; page-&gt;state != PAGE_STATE_BUSY) {
+ 				vm_page_set_state(page, PAGE_STATE_BUSY);
+-				mutex_unlock(&amp;cacheRef-&gt;lock);
+ 				break;
+ 			}
+ 
+@@ -2779,14 +2789,12 @@
+ 
+ 		// If we're at the top most cache, insert the dummy page here to keep other threads
+ 		// from faulting on the same address and chasing us up the cache chain
+-		if (cacheRef == topCacheRef) {
+-			dummyPage.state = PAGE_STATE_BUSY;
+-			vm_cache_insert_page(cacheRef, &amp;dummyPage, cacheOffset);
+-		}
++		if (cacheRef == topCacheRef)
++			fault_insert_dummy_page(cacheRef, dummyPage, cacheOffset);
+ 
+ 		// see if the vm_store has it
+-		if (cacheRef-&gt;cache-&gt;store-&gt;ops-&gt;has_page != NULL
+-			&amp;&amp; cacheRef-&gt;cache-&gt;store-&gt;ops-&gt;has_page(cacheRef-&gt;cache-&gt;store, cacheOffset)) {
++		vm_store *store = cacheRef-&gt;cache-&gt;store;
++		if (store-&gt;ops-&gt;has_page != NULL &amp;&amp; store-&gt;ops-&gt;has_page(store, cacheOffset)) {
+ 			size_t bytesRead;
+ 			iovec vec;
+ 
+@@ -2801,20 +2809,18 @@
+ 				// we mark that page busy reading, so that the file cache can ignore
+ 				// us in case it works on the very same page
+ 
+-			addressSpace-&gt;translation_map.ops-&gt;get_physical_page(page-&gt;physical_page_number * B_PAGE_SIZE, (addr_t *)&amp;vec.iov_base, PHYSICAL_PAGE_CAN_WAIT);
+-			// ToDo: handle errors here
+-			status = cacheRef-&gt;cache-&gt;store-&gt;ops-&gt;read(cacheRef-&gt;cache-&gt;store,
+-				cacheOffset, &amp;vec, 1, &amp;bytesRead, false);
+-			if (status &lt; B_OK)
+-				panic(&quot;hello, dudes!&quot;);
+-			addressSpace-&gt;translation_map.ops-&gt;put_physical_page((addr_t)vec.iov_base);
++			map-&gt;ops-&gt;get_physical_page(page-&gt;physical_page_number * B_PAGE_SIZE, (addr_t *)&amp;vec.iov_base, PHYSICAL_PAGE_CAN_WAIT);
++			status_t status = store-&gt;ops-&gt;read(store, cacheOffset, &amp;vec, 1, &amp;bytesRead, false);
++			if (status &lt; B_OK) {
++				// TODO: real error handling!
++				panic(&quot;reading from store %p (cacheRef %p) returned: %s!\n&quot;, store, cacheRef, strerror(status));
++			}
++			map-&gt;ops-&gt;put_physical_page((addr_t)vec.iov_base);
+ 
+ 			mutex_lock(&amp;cacheRef-&gt;lock);
+ 
+-			if (cacheRef == topCacheRef) {
+-				vm_cache_remove_page(cacheRef, &amp;dummyPage);
+-				dummyPage.state = PAGE_STATE_INACTIVE;
+-			}
++			if (cacheRef == topCacheRef)
++				fault_remove_dummy_page(dummyPage, true);
+ 
+ 			// We insert the queue_next here, because someone else could have
+ 			// replaced our page
+@@ -2824,16 +2830,22 @@
+ 				// Indeed, the page got replaced by someone else - we can safely
+ 				// throw our page away now
+ 				vm_page_set_state(page, PAGE_STATE_FREE);
++				page = dummyPage.queue_next;
+ 			}
+-			mutex_unlock(&amp;cacheRef-&gt;lock);
+ 			break;
+ 		}
+ 
+ 		vm_cache_ref *nextCacheRef;
+-		if (cacheRef-&gt;cache-&gt;source) {
+-			nextCacheRef = cacheRef-&gt;cache-&gt;source-&gt;ref;
+-			vm_cache_acquire_ref(nextCacheRef);
+-		} else
++		status_t status = fault_acquire_locked_source(cacheRef-&gt;cache, &amp;nextCacheRef);
++		if (status == B_BUSY) {
++			// the source cache is currently in the process of being merged
++			// with his only consumer (cacheRef); since its pages are moved
++			// upwards, too, we try this cache again
++			mutex_unlock(&amp;cacheRef-&gt;lock);
++			mutex_lock(&amp;cacheRef-&gt;lock);
++			lastCacheRef = NULL;
++			continue;
++		} else if (status &lt; B_OK)
+ 			nextCacheRef = NULL;
+ 
+ 		mutex_unlock(&amp;cacheRef-&gt;lock);
+@@ -2843,55 +2855,69 @@
+ 	}
+ 
+ 	if (page == NULL) {
+-		// we still haven't found a page, so we allocate a clean one
+-
+-		if (!cacheRef) {
++		// there was no adequate page, determine the cache for a clean one
++		if (cacheRef == NULL) {
+ 			// We rolled off the end of the cache chain, so we need to decide which
+ 			// cache will get the new page we're about to create.
+-
+ 			cacheRef = isWrite ? topCacheRef : lastCacheRef;
+ 				// Read-only pages come in the deepest cache - only the 
+ 				// top most cache may have direct write access.
++			vm_cache_acquire_ref(cacheRef);
++			mutex_lock(&amp;cacheRef-&gt;lock);
+ 		}
+ 
++		// release the reference of the last vm_cache_ref we still have from the loop above
++		if (lastCacheRef != NULL)
++			vm_cache_release_ref(lastCacheRef);
++	} else {
++		// we still own a reference to the cacheRef
++	}
++
++	*_pageRef = cacheRef;
++	return page;
++}
++
++
++/*!
++	Returns the page that should be mapped into the area that got the fault.
++	It returns the owner of the page in \a sourceRef - it keeps a reference
++	to it, and has also locked it on exit.
++*/
++static inline vm_page *
++fault_get_page(vm_translation_map *map, vm_cache_ref *topCacheRef,
++	off_t cacheOffset, bool isWrite, vm_page &amp;dummyPage, vm_cache_ref **_sourceRef)
++{
++	vm_cache_ref *cacheRef;
++	vm_page *page = fault_find_page(map, topCacheRef, cacheOffset, isWrite,
++		dummyPage, &amp;cacheRef);
++	if (page == NULL) {
++		// we still haven't found a page, so we allocate a clean one
++
+ 		page = vm_page_allocate_page(PAGE_STATE_CLEAR);
+ 		FTRACE((&quot;vm_soft_fault: just allocated page 0x%lx\n&quot;, page-&gt;physical_page_number));
+ 
+ 		// Insert the new page into our cache, and replace it with the dummy page if necessary
+ 
+-		mutex_lock(&amp;cacheRef-&gt;lock);
+-
+ 		// if we inserted a dummy page into this cache, we have to remove it now
+-		if (dummyPage.state == PAGE_STATE_BUSY &amp;&amp; dummyPage.cache == cacheRef-&gt;cache) {
+-			vm_cache_remove_page(cacheRef, &amp;dummyPage);
+-			dummyPage.state = PAGE_STATE_INACTIVE;
+-		}
++		if (dummyPage.state == PAGE_STATE_BUSY &amp;&amp; dummyPage.cache == cacheRef-&gt;cache)
++			fault_remove_dummy_page(dummyPage, true);
+ 
+ 		vm_cache_insert_page(cacheRef, page, cacheOffset);
+-		mutex_unlock(&amp;cacheRef-&gt;lock);
+ 
+ 		if (dummyPage.state == PAGE_STATE_BUSY) {
+ 			// we had inserted the dummy cache in another cache, so let's remove it from there
+-			vm_cache_ref *temp_cache = dummyPage.cache-&gt;ref;
+-			mutex_lock(&amp;temp_cache-&gt;lock);
+-			vm_cache_remove_page(temp_cache, &amp;dummyPage);
+-			mutex_unlock(&amp;temp_cache-&gt;lock);
+-			dummyPage.state = PAGE_STATE_INACTIVE;
++			fault_remove_dummy_page(dummyPage, false);
+ 		}
+ 	}
+ 
+-	// release the reference of the last vm_cache_ref we still have from the loop above
+-	if (lastCacheRef != NULL)
+-		vm_cache_release_ref(lastCacheRef);
+-
+ 	// We now have the page and a cache it belongs to - we now need to make
+ 	// sure that the area's cache can access it, too, and sees the correct data
+ 
+ 	if (page-&gt;cache != topCacheRef-&gt;cache &amp;&amp; isWrite) {
+ 		// now we have a page that has the data we want, but in the wrong cache object
+ 		// so we need to copy it and stick it into the top cache
+-		vm_page *src_page = page;
+-		void *src, *dest;
++		vm_page *sourcePage = page;
++		void *source, *dest;
+ 
+ 		// ToDo: if memory is low, it might be a good idea to steal the page
+ 		//	from our source cache - if possible, that is
+@@ -2900,48 +2926,158 @@
+ 
+ 		// try to get a mapping for the src and dest page so we can copy it
+ 		for (;;) {
+-			(*addressSpace-&gt;translation_map.ops-&gt;get_physical_page)(src_page-&gt;physical_page_number * B_PAGE_SIZE, (addr_t *)&amp;src, PHYSICAL_PAGE_CAN_WAIT);
+-			status = (*addressSpace-&gt;translation_map.ops-&gt;get_physical_page)(page-&gt;physical_page_number * B_PAGE_SIZE, (addr_t *)&amp;dest, PHYSICAL_PAGE_NO_WAIT);
+-			if (status == B_NO_ERROR)
++			map-&gt;ops-&gt;get_physical_page(sourcePage-&gt;physical_page_number * B_PAGE_SIZE,
++				(addr_t *)&amp;source, PHYSICAL_PAGE_CAN_WAIT);
++
++			if (map-&gt;ops-&gt;get_physical_page(page-&gt;physical_page_number * B_PAGE_SIZE,
++					(addr_t *)&amp;dest, PHYSICAL_PAGE_NO_WAIT) == B_OK)
+ 				break;
+ 
+ 			// it couldn't map the second one, so sleep and retry
+ 			// keeps an extremely rare deadlock from occuring
+-			(*addressSpace-&gt;translation_map.ops-&gt;put_physical_page)((addr_t)src);
++			map-&gt;ops-&gt;put_physical_page((addr_t)source);
+ 			snooze(5000);
+ 		}
+ 
+-		memcpy(dest, src, B_PAGE_SIZE);
+-		(*addressSpace-&gt;translation_map.ops-&gt;put_physical_page)((addr_t)src);
+-		(*addressSpace-&gt;translation_map.ops-&gt;put_physical_page)((addr_t)dest);
++		memcpy(dest, source, B_PAGE_SIZE);
++		map-&gt;ops-&gt;put_physical_page((addr_t)source);
++		map-&gt;ops-&gt;put_physical_page((addr_t)dest);
+ 
+-		vm_page_set_state(src_page, PAGE_STATE_ACTIVE);
++		vm_page_set_state(sourcePage, PAGE_STATE_ACTIVE);
+ 
++		mutex_unlock(&amp;cacheRef-&gt;lock);
+ 		mutex_lock(&amp;topCacheRef-&gt;lock);
+ 
+ 		// Insert the new page into our cache, and replace it with the dummy page if necessary
+ 
+ 		// if we inserted a dummy page into this cache, we have to remove it now
+-		if (dummyPage.state == PAGE_STATE_BUSY &amp;&amp; dummyPage.cache == topCacheRef-&gt;cache) {
+-			vm_cache_remove_page(topCacheRef, &amp;dummyPage);
+-			dummyPage.state = PAGE_STATE_INACTIVE;
+-		}
++		if (dummyPage.state == PAGE_STATE_BUSY &amp;&amp; dummyPage.cache == topCacheRef-&gt;cache)
++			fault_remove_dummy_page(dummyPage, true);
+ 
+ 		vm_cache_insert_page(topCacheRef, page, cacheOffset);
+-		mutex_unlock(&amp;topCacheRef-&gt;lock);
+ 
+ 		if (dummyPage.state == PAGE_STATE_BUSY) {
+ 			// we had inserted the dummy cache in another cache, so let's remove it from there
+-			vm_cache_ref *tempRef = dummyPage.cache-&gt;ref;
+-			mutex_lock(&amp;tempRef-&gt;lock);
+-			vm_cache_remove_page(tempRef, &amp;dummyPage);
+-			mutex_unlock(&amp;tempRef-&gt;lock);
+-			dummyPage.state = PAGE_STATE_INACTIVE;
++			fault_remove_dummy_page(dummyPage, false);
+ 		}
++
++		vm_cache_release_ref(cacheRef);
++
++		cacheRef = topCacheRef;
++		vm_cache_acquire_ref(cacheRef);
+ 	}
+ 
+-	status = B_OK;
++	*_sourceRef = cacheRef;
++	return page;
++}
++
++
++static status_t
++vm_soft_fault(addr_t originalAddress, bool isWrite, bool isUser)
++{
++	vm_address_space *addressSpace;
++
++	FTRACE((&quot;vm_soft_fault: thid 0x%lx address 0x%lx, isWrite %d, isUser %d\n&quot;,
++		thread_get_current_thread_id(), originalAddress, isWrite, isUser));
++
++	addr_t address = ROUNDOWN(originalAddress, B_PAGE_SIZE);
++
++	if (IS_KERNEL_ADDRESS(address)) {
++		addressSpace = vm_get_kernel_address_space();
++	} else if (IS_USER_ADDRESS(address)) {
++		addressSpace = vm_get_current_user_address_space();
++		if (addressSpace == NULL) {
++			if (!isUser) {
++				dprintf(&quot;vm_soft_fault: kernel thread accessing invalid user memory!\n&quot;);
++				return B_BAD_ADDRESS;
++			} else {
++				// XXX weird state.
++				panic(&quot;vm_soft_fault: non kernel thread accessing user memory that doesn't exist!\n&quot;);
++			}
++		}
++	} else {
++		// the hit was probably in the 64k DMZ between kernel and user space
++		// this keeps a user space thread from passing a buffer that crosses
++		// into kernel space
++		return B_BAD_ADDRESS;
++	}
++
++	atomic_add(&amp;addressSpace-&gt;fault_count, 1);
++
++	// Get the area the fault was in
++
+ 	acquire_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0, 0);
++
++	vm_area *area = vm_area_lookup(addressSpace, address);
++	if (area == NULL) {
++		release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
++		vm_put_address_space(addressSpace);
++		dprintf(&quot;vm_soft_fault: va 0x%lx not covered by area in address space\n&quot;,
++			originalAddress);
++		return B_BAD_ADDRESS;
++	}
++
++	// check permissions
++	if (isUser &amp;&amp; (area-&gt;protection &amp; B_USER_PROTECTION) == 0) {
++		release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
++		vm_put_address_space(addressSpace);
++		dprintf(&quot;user access on kernel area 0x%lx at %p\n&quot;, area-&gt;id, (void *)originalAddress);
++		return B_PERMISSION_DENIED;
++	}
++	if (isWrite &amp;&amp; (area-&gt;protection &amp; (B_WRITE_AREA | (isUser ? 0 : B_KERNEL_WRITE_AREA))) == 0) {
++		release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
++		vm_put_address_space(addressSpace);
++		dprintf(&quot;write access attempted on read-only area 0x%lx at %p\n&quot;,
++			area-&gt;id, (void *)originalAddress);
++		return B_PERMISSION_DENIED;
++	}
++
++	// We have the area, it was a valid access, so let's try to resolve the page fault now.
++	// At first, the top most cache from the area is investigated
++
++	vm_cache_ref *topCacheRef = area-&gt;cache_ref;
++	off_t cacheOffset = address - area-&gt;base + area-&gt;cache_offset;
++	int32 changeCount = addressSpace-&gt;change_count;
++
++	vm_cache_acquire_ref(topCacheRef);
++	release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
++
++	mutex_lock(&amp;topCacheRef-&gt;lock);
++
++	// See if this cache has a fault handler - this will do all the work for us
++	{
++		vm_store *store = topCacheRef-&gt;cache-&gt;store;
++		if (store-&gt;ops-&gt;fault != NULL) {
++			// Note, since the page fault is resolved with interrupts enabled, the
++			// fault handler could be called more than once for the same reason -
++			// the store must take this into account
++			status_t status = store-&gt;ops-&gt;fault(store, addressSpace, cacheOffset);
++			if (status != B_BAD_HANDLER) {
++				mutex_unlock(&amp;topCacheRef-&gt;lock);
++				vm_cache_release_ref(topCacheRef);
++				vm_put_address_space(addressSpace);
++				return status;
++			}
++		}
++	}
++
++	mutex_unlock(&amp;topCacheRef-&gt;lock);
++
++	// The top most cache has no fault handler, so let's see if the cache or its sources
++	// already have the page we're searching for (we're going from top to bottom)
++
++	vm_translation_map *map = &amp;addressSpace-&gt;translation_map;
++	vm_page dummyPage;
++	dummyPage.state = PAGE_STATE_INACTIVE;
++	dummyPage.type = PAGE_TYPE_DUMMY;
++
++	vm_cache_ref *pageSourceRef;
++	vm_page *page = fault_get_page(map, topCacheRef, cacheOffset, isWrite,
++		dummyPage, &amp;pageSourceRef);
++
++	status_t status = B_OK;
++
++	acquire_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0, 0);
+ 	if (changeCount != addressSpace-&gt;change_count) {
+ 		// something may have changed, see if the address is still valid
+ 		area = vm_area_lookup(addressSpace, address);
+@@ -2963,26 +3099,25 @@
+ 			newProtection &amp;= ~(isUser ? B_WRITE_AREA : B_KERNEL_WRITE_AREA);
+ 
+ 		atomic_add(&amp;page-&gt;ref_count, 1);
+-		(*addressSpace-&gt;translation_map.ops-&gt;lock)(&amp;addressSpace-&gt;translation_map);
+-		(*addressSpace-&gt;translation_map.ops-&gt;map)(&amp;addressSpace-&gt;translation_map, address,
+-			page-&gt;physical_page_number * B_PAGE_SIZE, newProtection);
+-		(*addressSpace-&gt;translation_map.ops-&gt;unlock)(&amp;addressSpace-&gt;translation_map);
++
++		map-&gt;ops-&gt;lock(map);
++		map-&gt;ops-&gt;map(map, address, page-&gt;physical_page_number * B_PAGE_SIZE,
++			newProtection);
++		map-&gt;ops-&gt;unlock(map);
+ 	}
+ 
+ 	release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
+ 
++	vm_page_set_state(page, PAGE_STATE_ACTIVE);
++	mutex_unlock(&amp;pageSourceRef-&gt;lock);
++	vm_cache_release_ref(pageSourceRef);
++
+ 	if (dummyPage.state == PAGE_STATE_BUSY) {
+ 		// We still have the dummy page in the cache - that happens if we didn't need
+ 		// to allocate a new page before, but could use one in another cache
+-		vm_cache_ref *tempRef = dummyPage.cache-&gt;ref;
+-		mutex_lock(&amp;tempRef-&gt;lock);
+-		vm_cache_remove_page(tempRef, &amp;dummyPage);
+-		mutex_unlock(&amp;tempRef-&gt;lock);
+-		dummyPage.state = PAGE_STATE_INACTIVE;
++		fault_remove_dummy_page(dummyPage, false);
+ 	}
+ 
+-	vm_page_set_state(page, PAGE_STATE_ACTIVE);
+-
+ 	vm_cache_release_ref(topCacheRef);
+ 	vm_put_address_space(addressSpace);
+ 
+@@ -3515,6 +3650,7 @@
+ 
+ 			map-&gt;ops-&gt;lock(map);
+ 			map-&gt;ops-&gt;unmap(map, current-&gt;base + newSize, current-&gt;base + oldSize - 1);
++			map-&gt;ops-&gt;flush(map);
+ 			map-&gt;ops-&gt;unlock(map);
+ 		}
+ 	}
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.c	2007-02-01 08:21:44 UTC (rev 20027)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.c	2007-02-01 12:12:54 UTC (rev 20028)
+@@ -108,6 +108,7 @@
+ 	cache-&gt;temporary = 0;
+ 	cache-&gt;scan_skip = 0;
+ 	cache-&gt;page_count = 0;
++	cache-&gt;busy = false;
+ 
+ 	// connect the store to its cache
+ 	cache-&gt;store = store;
+@@ -178,7 +179,29 @@
+ 		// on the initial one (this is vnode specific)
+ 		if (cacheRef-&gt;cache-&gt;store-&gt;ops-&gt;release_ref)
+ 			cacheRef-&gt;cache-&gt;store-&gt;ops-&gt;release_ref(cacheRef-&gt;cache-&gt;store);
+-
++#if 0
++{
++	// count min references to see if everything is okay
++	int32 min = 0;
++	vm_area *a;
++	vm_cache *c;
++	bool locked = false;
++	if (cacheRef-&gt;lock.holder != find_thread(NULL)) {
++		mutex_lock(&amp;cacheRef-&gt;lock);
++		locked = true;
++	}
++	for (a = cacheRef-&gt;areas; a != NULL; a = a-&gt;cache_next)
++		min++;
++	for (c = NULL; (c = list_get_next_item(&amp;cacheRef-&gt;cache-&gt;consumers, c)) != NULL; )
++		min++;
++dprintf(&quot;! %ld release cache_ref %p, ref_count is now %ld (min %ld, called from %p)\n&quot;, find_thread(NULL), cacheRef, cacheRef-&gt;ref_count,
++	min, ((struct stack_frame *)x86_read_ebp())-&gt;return_address);
++	if (cacheRef-&gt;ref_count &lt; min)
++		panic(&quot;cache_ref %p has too little ref_count!!!!&quot;, cacheRef);
++	if (locked)
++		mutex_unlock(&amp;cacheRef-&gt;lock);
++}
++#endif
+ 		return;
+ 	}
+ 
+@@ -205,6 +228,8 @@
+ 		acquire_spinlock(&amp;sPageCacheTableLock);
+ 
+ 		hash_remove(sPageCacheTable, oldPage);
++		oldPage-&gt;cache = NULL;
++		// TODO: we also need to remove all of the page's mappings!
+ 
+ 		release_spinlock(&amp;sPageCacheTableLock);
+ 		restore_interrupts(state);
+@@ -451,6 +476,7 @@
+ 		if (merge) {
+ 			// But since we need to keep the locking order upper-&gt;lower cache, we
+ 			// need to unlock our cache now
++			cache-&gt;busy = true;
+ 			mutex_unlock(&amp;cacheRef-&gt;lock);
+ 
+ 			mutex_lock(&amp;consumerRef-&gt;lock);
+@@ -465,7 +491,9 @@
+ 				|| cache-&gt;consumers.link.next != cache-&gt;consumers.link.prev
+ 				|| consumer != list_get_first_item(&amp;cache-&gt;consumers)) {
+ 				merge = false;
++				cache-&gt;busy = false;
+ 				mutex_unlock(&amp;consumerRef-&gt;lock);
++				vm_cache_release_ref(consumerRef);
+ 			}
+ 		}
+ 
+@@ -480,42 +508,42 @@
+ 
+ 			for (page = cache-&gt;page_list; page != NULL; page = nextPage) {
+ 				nextPage = page-&gt;cache_next;
+-				vm_cache_remove_page(cacheRef, page);
+ 
+ 				if (vm_cache_lookup_page(consumerRef,
+-						(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT) != NULL) {
+-					// the page already is in the consumer cache - this copy is no
+-					// longer needed, and can be freed
+-					vm_page_set_state(page, PAGE_STATE_FREE);
+-					continue;
++						(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT) == NULL) {
++					// the page already is not yet in the consumer cache - move it upwards
++					vm_cache_remove_page(cacheRef, page);
++					vm_cache_insert_page(consumerRef, page,
++						(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+ 				}
+ 
+-				// move the page into the consumer cache
+-				vm_cache_insert_page(consumerRef, page,
+-					(off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++				// TODO: if we'd remove the pages in the cache, we'd also
++				//	need to remove all of their mappings!
+ 			}
+ 
+ 			newSource = cache-&gt;source;
+-			if (newSource != NULL) {
+-				// The remaining consumer has gotten a new source
+-				mutex_lock(&amp;newSource-&gt;ref-&gt;lock);
+ 
+-				list_remove_item(&amp;newSource-&gt;consumers, cache);
+-				list_add_item(&amp;newSource-&gt;consumers, consumer);
+-				consumer-&gt;source = newSource;
+-				cache-&gt;source = NULL;
++			// The remaining consumer has gotten a new source
++			mutex_lock(&amp;newSource-&gt;ref-&gt;lock);
+ 
+-				mutex_unlock(&amp;newSource-&gt;ref-&gt;lock);
++			list_remove_item(&amp;newSource-&gt;consumers, cache);
++			list_add_item(&amp;newSource-&gt;consumers, consumer);
++			consumer-&gt;source = newSource;
++			cache-&gt;source = NULL;
+ 
+-				// Release the other reference to the cache - we take over
+-				// its reference of its source cache; we can do this here
+-				// (with the cacheRef locked) since we own another reference
+-				// from the first consumer we removed
+-				vm_cache_release_ref(cacheRef);
+-			}
++			mutex_unlock(&amp;newSource-&gt;ref-&gt;lock);
++
++			// Release the other reference to the cache - we take over
++			// its reference of its source cache; we can do this here
++			// (with the cacheRef locked) since we own another reference
++			// from the first consumer we removed
++if (cacheRef-&gt;ref_count &lt; 2)
++panic(&quot;cacheRef %p ref count too low!\n&quot;, cacheRef);
++			vm_cache_release_ref(cacheRef);
++
+ 			mutex_unlock(&amp;consumerRef-&gt;lock);
++			vm_cache_release_ref(consumerRef);
+ 		}
+-		vm_cache_release_ref(consumerRef);
+ 	}
+ 
+ 	mutex_unlock(&amp;cacheRef-&gt;lock);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000565.html">[Haiku-commits] r20027 - haiku/trunk/src/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="000615.html">[Haiku-commits] r20028 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#567">[ date ]</a>
+              <a href="thread.html#567">[ thread ]</a>
+              <a href="subject.html#567">[ subject ]</a>
+              <a href="author.html#567">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

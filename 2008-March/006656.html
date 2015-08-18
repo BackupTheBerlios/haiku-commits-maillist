@@ -1,0 +1,574 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24312 - in haiku/trunk: headers/os/support	src/kits/support
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24312%20-%20in%20haiku/trunk%3A%20headers/os/support%0A%09src/kits/support&In-Reply-To=%3C200803081905.m28J5Aec018941%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006669.html">
+   <LINK REL="Next"  HREF="006657.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24312 - in haiku/trunk: headers/os/support	src/kits/support</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24312%20-%20in%20haiku/trunk%3A%20headers/os/support%0A%09src/kits/support&In-Reply-To=%3C200803081905.m28J5Aec018941%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24312 - in haiku/trunk: headers/os/support	src/kits/support">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sat Mar  8 20:05:10 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006669.html">[Haiku-commits] r24311 - haiku/trunk/src/bin/network/ifconfig
+</A></li>
+        <LI>Next message: <A HREF="006657.html">[Haiku-commits] r24312 - in haiku/trunk: headers/os/support src/kits/support
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6656">[ date ]</a>
+              <a href="thread.html#6656">[ thread ]</a>
+              <a href="subject.html#6656">[ subject ]</a>
+              <a href="author.html#6656">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-03-08 20:05:09 +0100 (Sat, 08 Mar 2008)
+New Revision: 24312
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24312&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24312&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/os/support/String.h
+   haiku/trunk/src/kits/support/String.cpp
+Log:
+* Fixed a bunch or concurreny bugs and memory leaks of the new reference
+  string stuff.
+* It's still not thread-safe for all usage patterns, though, so we might want
+  to remove or disable it: if a string is shared between several threads, and
+  one of those starts to use a reference, all kinds of problems can happen.
+* Some cleanup.
+
+
+Modified: haiku/trunk/headers/os/support/String.h
+===================================================================
+--- haiku/trunk/headers/os/support/String.h	2008-03-08 18:16:49 UTC (rev 24311)
++++ haiku/trunk/headers/os/support/String.h	2008-03-08 19:05:09 UTC (rev 24312)
+@@ -26,7 +26,6 @@
+ 	const char*	String() const;
+ 	int32 		Length() const;
+ 	int32		CountChars() const;
+-	int32 		ReferenceCount() const;
+ 
+ 	// Assignment
+ 	BString&amp;	operator=(const BString&amp; string);
+@@ -231,7 +230,6 @@
+ 
+ 	// Data
+ 	void		_SetLength(int32 length);
+-	void		_SetReferenceCount(int32 count);
+ 	bool		_DoAppend(const char* string, int32 length);
+ 	bool		_DoPrepend(const char* string, int32 length);
+ 	bool		_DoInsert(const char* string, int32 offset, int32 length);
+@@ -256,7 +254,11 @@
+ 					const char* with, int32 withLen);
+ 
+ private:
+-	char*	            fPrivateData;
++	inline int32&amp; 	_ReferenceCount();
++	bool			_IsShareable();
++	void			_FreePrivateData();
++
++	char*			fPrivateData;
+ };
+ 
+ 
+@@ -294,13 +296,6 @@
+ }
+ 
+ 
+-inline int32
+-BString::ReferenceCount() const
+-{
+-	return fPrivateData ? (*(((int32 *)fPrivateData) - 2)) : 1;
+-}
+-
+-
+ inline BString &amp;
+ BString::SetTo(const char* string)
+ {
+@@ -441,8 +436,7 @@
+ //	#pragma mark - BStringRef
+ 
+ 
+-class BStringRef
+-{
++class BStringRef {
+ public:
+ 	BStringRef(BString&amp; string, int32 position);
+ 	~BStringRef() {}
+@@ -453,7 +447,7 @@
+ 	const char* operator&amp;() const;
+ 
+ 	BStringRef&amp; operator=(char c);
+-	BStringRef &amp;operator=(const BStringRef &amp;rc);
++	BStringRef&amp; operator=(const BStringRef&amp; rc);
+ 
+ private:
+ 	BString&amp;	fString;
+
+Modified: haiku/trunk/src/kits/support/String.cpp
+===================================================================
+--- haiku/trunk/src/kits/support/String.cpp	2008-03-08 18:16:49 UTC (rev 24311)
++++ haiku/trunk/src/kits/support/String.cpp	2008-03-08 19:05:09 UTC (rev 24312)
+@@ -6,11 +6,11 @@
+ *		Marc Flerackers (<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">mflerackers at androme.be</A>)
+ *		Stefano Ceccherini (<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">burton666 at libero.it</A>)
+ *		Oliver Tappe (<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">openbeos at hirschkaefer.de</A>)
+-*		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
++*		Axel D&#195;&#182;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
+ *		Julun &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">host.haiku at gmx.de</A>&gt;
+ */
+ 
+-/* String class supporting common string operations. */
++/*! String class supporting common string operations. */
+ 
+ 
+ #include &lt;Debug.h&gt;
+@@ -32,6 +32,8 @@
+ #define REPLACE_ALL 0x7FFFFFFF
+ 
+ 
++const uint32 kPrivateDataOffset = 2 * sizeof(int32);
++
+ const char *B_EMPTY_STRING = &quot;&quot;;
+ 
+ 
+@@ -146,7 +148,7 @@
+ const char*
+ BStringRef::operator&amp;() const
+ {
+-	return &amp;(fString.fPrivateData[fPosition]);
++	return &amp;fString.fPrivateData[fPosition];
+ }
+ 
+ 
+@@ -154,8 +156,9 @@
+ BStringRef::operator&amp;()
+ {
+ 	fString._Detach();
+-	fString._SetReferenceCount(-1);
+-	return &amp;(fString.fPrivateData[fPosition]);
++	fString._ReferenceCount() = -1;
++		// mark as unsharable
++	return &amp;fString.fPrivateData[fPosition];
+ }
+ 
+ 
+@@ -180,11 +183,12 @@
+ 	: fPrivateData(NULL)
+ {
+ 	// check if source is sharable - if so, share else clone
+-	if (atomic_get(&amp;(*(((vint32*)string.fPrivateData) - 2))) &gt;= 0) {
++	if (_IsShareable()) {
+ 		fPrivateData = string.fPrivateData;
+-		atomic_add(&amp;(*(((vint32*)fPrivateData) - 2)), 1);
++		atomic_add(&amp;_ReferenceCount(), 1);
++			// string cannot go away right now
+ 	} else
+-		fPrivateData = _Clone(string.fPrivateData, string.Length());
++		_Init(string.String(), string.Length());
+ }
+ 
+ 
+@@ -197,8 +201,8 @@
+ 
+ BString::~BString()
+ {
+-	if (atomic_add(&amp;(*(((vint32*)fPrivateData) - 2)), -1) &lt; 1)
+-		free(fPrivateData - (2 * sizeof(int32)));
++	if (!_IsShareable() || atomic_add(&amp;_ReferenceCount(), -1) == 1)
++		_FreePrivateData();
+ }
+ 
+ 
+@@ -268,27 +272,23 @@
+ 	if (fPrivateData == string.fPrivateData)
+ 		return *this;
+ 
+-	// check if we are shared by someone else
+-	if (atomic_get(&amp;(*(((vint32*)fPrivateData) - 2))) &gt; 1) {
+-		// we share our data with someone else
+-		if (atomic_add(&amp;(*((vint32*)fPrivateData - 2)), -1) &lt; 1) {
+-			// someone else decrement, we are the last owner
+-			free(fPrivateData - (2 * sizeof(int32)));
+-		} else {
+-			; // there is still someone who shares our data
+-		}
+-	} else {
+-		// we don't share our data with someone else
+-		// or we are marked as unsharable, but this will go away
+-		free(fPrivateData - (2 * sizeof(int32)));
++	bool freeData = true;
++
++	if (_IsShareable() &amp;&amp; atomic_add(&amp;_ReferenceCount(), -1) &gt; 1) {
++		// there is still someone who shares our data
++		freeData = false;
+ 	}
+ 
++	if (freeData)
++		_FreePrivateData();
++
+ 	// if source is sharable share, otherwise clone
+-	if (atomic_get(&amp;(*(((vint32*)string.fPrivateData) - 2))) &gt;= 0) {
++	if (_IsShareable()) {
+ 		fPrivateData = string.fPrivateData;
+-		atomic_add(&amp;(*(((vint32*)fPrivateData) - 2)), 1);
++		atomic_add(&amp;_ReferenceCount(), 1);
++			// the string cannot go away right now
+ 	} else
+-		fPrivateData = _Clone(string.fPrivateData, string.Length());
++		_Init(string.String(), string.Length());
+ 
+ 	return *this;
+ }
+@@ -309,10 +309,10 @@
+ {
+ 	if (fPrivateData != string.fPrivateData
+ 		// make sure we reassing in case length is different
+-		|| (fPrivateData == string.fPrivateData &amp;&amp; Length() != maxLength)) {
+-			maxLength = min_clamp0(maxLength, string.Length());
+-			if (_DetachWith(&quot;&quot;, maxLength) == B_OK)
+-				memcpy(fPrivateData, string.fPrivateData, maxLength);
++		|| (fPrivateData == string.fPrivateData &amp;&amp; Length() &gt; maxLength)) {
++		maxLength = min_clamp0(maxLength, string.Length());
++		if (_DetachWith(&quot;&quot;, maxLength) == B_OK)
++			memcpy(fPrivateData, string.String(), maxLength);
+ 	}
+ 	return *this;
+ }
+@@ -1384,7 +1384,7 @@
+ BString::operator[](int32 index)
+ {
+ 	_Detach();
+-	_SetReferenceCount(-1);
++	_ReferenceCount() = -1;
+ 
+ 	return fPrivateData[index];
+ }
+@@ -1643,24 +1643,27 @@
+ //	#pragma mark - Private or reserved
+ 
+ 
++/*!	Detaches this string from an eventually shared fPrivateData.
++*/
+ status_t
+ BString::_Detach()
+ {
+ 	char* newData = fPrivateData;
+-	if (atomic_get(&amp;(*(((vint32*)fPrivateData - 2)))) &gt; 1) {
+-		// we share our data with someone else
+-		if (atomic_add(&amp;(*(((vint32*)fPrivateData) - 2)), -1) &lt; 1) {
+-			; // someone else decrement, we are the last owner
+-		} else {
+-			// there is still someone who shares our data
+-			newData = _Clone(fPrivateData, Length());
++
++	// TODO: this is not thread safe! A string could be used in than one
++	// thread at a time (and one of those threads could create a ref)
++	if (atomic_get(&amp;_ReferenceCount()) &gt; 1) {
++		// It might be shared, and this requires special treatment
++		newData = _Clone(fPrivateData, Length());
++		if (atomic_add(&amp;_ReferenceCount(), -1) == 1) {
++			// someone else left, we were the last owner
++			_FreePrivateData();
+ 		}
+-	} else {
+-		; // we don't share our data with someone else
+ 	}
+ 
+ 	if (newData)
+ 		fPrivateData = newData;
++
+ 	return newData != NULL ? B_OK : B_NO_MEMORY;
+ }
+ 
+@@ -1671,20 +1674,18 @@
+ 	if (length == Length())
+ 		return fPrivateData;
+ 
+-	int32 offset = 2 * sizeof(int32);
+-	char *dataPtr = fPrivateData ? fPrivateData - offset : NULL;
++	char *dataPtr = fPrivateData ? fPrivateData - kPrivateDataOffset : NULL;
+ 	if (length &lt; 0)
+ 		length = 0;
+ 
+-	dataPtr = (char*)realloc(dataPtr, length + offset + 1);
++	dataPtr = (char*)realloc(dataPtr, length + kPrivateDataOffset + 1);
+ 	if (dataPtr) {
+-		dataPtr += offset;
++		dataPtr += kPrivateDataOffset;
+ 
+ 		fPrivateData = dataPtr;
+ 		fPrivateData[length] = '\0';
+ 
+ 		_SetLength(length);
+-		_SetReferenceCount(1);
+ 	}
+ 	return dataPtr;
+ }
+@@ -1694,41 +1695,33 @@
+ BString::_Init(const char* src, int32 length)
+ {
+ 	fPrivateData = _Clone(src, length);
+-	if (!fPrivateData) {
+-		int32 offset = 2 * sizeof(int32);
+-		fPrivateData = (char *)realloc(fPrivateData, offset + 1);
+-
+-		fPrivateData += offset;
+-		fPrivateData[0] = '\0';
+-
+-		_SetLength(0);
+-		_SetReferenceCount(1);
+-	}
++	if (fPrivateData == NULL)
++		fPrivateData = _Clone(NULL, 0);
+ }
+ 
+ 
+ char*
+ BString::_Clone(const char* data, int32 length)
+ {
+-	char* newData = NULL;
+-	int32 offset = 2 * sizeof(int32);
+-	newData = (char *)realloc(newData, length + offset + 1);
++	char* newData = (char *)malloc(length + kPrivateDataOffset + 1);
++	if (newData == NULL)
++		return NULL;
+ 
+-	if (newData) {
+-		newData += offset;
+-		newData[length] = '\0';
++	newData += kPrivateDataOffset;
++	newData[length] = '\0';
+ 
+-		*(((vint32*)newData) - 2) = 1;
+-		*(((int32*)newData) - 1) = length &amp; 0x7fffffff;
++	// initialize reference count &amp; length
++	*(((vint32*)newData) - 2) = 1;
++	*(((int32*)newData) - 1) = length &amp; 0x7fffffff;
+ 
+-		if (data &amp;&amp; length)
+-			memcpy(newData, data, length);
+-	}
++	if (data &amp;&amp; length)
++		memcpy(newData, data, length);
++
+ 	return newData;
+ }
+ 
+ 
+-char *
++char*
+ BString::_OpenAtBy(int32 offset, int32 length)
+ {
+ 	int32 oldLength = Length();
+@@ -1759,14 +1752,14 @@
+ BString::_DetachWith(const char* string, int32 length)
+ {
+ 	char* newData = NULL;
+-	if (atomic_get(&amp;(*(((vint32*)fPrivateData) - 2))) &gt; 1) {
+-		// we share our data with someone else
+-		if (atomic_add(&amp;(*(((vint32*)fPrivateData) - 2)), -1) &lt; 1) {
+-			// someone else decrement, we are the last owner
+-			newData = _Realloc(length);
+-		} else {
+-			// there is still someone who shares our data
+-			newData = _Clone(string, length);
++	// TODO: this is not thread safe! A string could be used in than one
++	// thread at a time (and one of those threads could create a ref)
++	if (atomic_get(&amp;_ReferenceCount()) &gt; 1) {
++		// we might share our data with someone else
++		newData = _Clone(string, length);
++		if (atomic_add(&amp;_ReferenceCount(), -1) == 1) {
++			// someone else left, we were the last owner
++			_FreePrivateData();
+ 		}
+ 	} else {
+ 		// we don't share our data with someone else
+@@ -1775,6 +1768,7 @@
+ 
+ 	if (newData)
+ 		fPrivateData = newData;
++
+ 	return newData != NULL ? B_OK : B_NO_MEMORY;
+ }
+ 
+@@ -1786,20 +1780,34 @@
+ }
+ 
+ 
++inline int32&amp;
++BString::_ReferenceCount()
++{
++	return *(((int32 *)fPrivateData) - 2);
++}
++
++
++inline bool
++BString::_IsShareable()
++{
++	return fPrivateData != NULL &amp;&amp; _ReferenceCount() &gt;= 0;
++}
++
++
+ void
+-BString::_SetReferenceCount(int32 count)
++BString::_FreePrivateData()
+ {
+-	*(((vint32*)fPrivateData) - 2) = count;
++	free(fPrivateData - (2 * sizeof(int32)));
+ }
+ 
+ 
+ bool
+ BString::_DoAppend(const char* string, int32 length)
+ {
+-	int32 len = Length();
+-	if (_DetachWith(fPrivateData, len + length) == B_OK) {
++	int32 oldLength = Length();
++	if (_DetachWith(fPrivateData, oldLength + length) == B_OK) {
+ 		if (string &amp;&amp; length)
+-			memcpy(fPrivateData + len, string, length);
++			memcpy(fPrivateData + oldLength, string, length);
+ 		return true;
+ 	}
+ 	return false;
+@@ -1809,9 +1817,9 @@
+ bool
+ BString::_DoPrepend(const char* string, int32 length)
+ {
+-	int32 len = Length();
+-	if (_DetachWith(fPrivateData, len + length) == B_OK) {
+-		memmove(fPrivateData + length, fPrivateData, len);
++	int32 oldLength = Length();
++	if (_DetachWith(fPrivateData, oldLength + length) == B_OK) {
++		memmove(fPrivateData + length, fPrivateData, oldLength);
+ 		if (string &amp;&amp; length)
+ 			memcpy(fPrivateData, string, length);
+ 		return true;
+@@ -1823,9 +1831,10 @@
+ bool
+ BString::_DoInsert(const char* string, int32 offset, int32 length)
+ {
+-	int32 len = Length();
+-	if (_DetachWith(fPrivateData, len + length) == B_OK) {
+-		memmove(fPrivateData + offset + length, fPrivateData + offset, len - offset);
++	int32 oldLength = Length();
++	if (_DetachWith(fPrivateData, oldLength + length) == B_OK) {
++		memmove(fPrivateData + offset + length, fPrivateData + offset,
++			oldLength - offset);
+ 		if (string &amp;&amp; length)
+ 			memcpy(fPrivateData + offset, string, length);
+ 		return true;
+@@ -1903,8 +1912,8 @@
+ 
+ 
+ BString&amp;
+-BString::_DoCharacterEscape(const char* string,
+-							const char *setOfCharsToEscape, char escapeChar)
++BString::_DoCharacterEscape(const char* string, const char *setOfCharsToEscape,
++	char escapeChar)
+ {
+ 	if (_DetachWith(string, strlen(safestr(string))) != B_OK)
+ 		return *this;
+@@ -1930,11 +1939,10 @@
+ 
+ 	int32 lastPos = 0;
+ 	char* oldAdr = fPrivateData;
+-	int32 offset = 2 * sizeof(int32);
+ 
+-	char* newData = (char*)malloc(newLength + offset + 1);
++	char* newData = (char*)malloc(newLength + kPrivateDataOffset + 1);
+ 	if (newData) {
+-		newData += offset;
++		newData += kPrivateDataOffset;
+ 		char* newAdr = newData;
+ 		for (uint32 i = 0; i &lt; count; ++i) {
+ 			pos = positions.ItemAt(i);
+@@ -1952,7 +1960,7 @@
+ 		if (len &gt; 0)
+ 			memcpy(newAdr, oldAdr, len);
+ 
+-		free(fPrivateData - offset);
++		_FreePrivateData();
+ 
+ 		fPrivateData = newData;
+ 		_SetLength(newLength);
+@@ -1976,7 +1984,7 @@
+ 
+ BString&amp;
+ BString::_DoReplace(const char* findThis, const char* replaceWith,
+-					int32 maxReplaceCount, int32 fromOffset, bool ignoreCase)
++	int32 maxReplaceCount, int32 fromOffset, bool ignoreCase)
+ {
+ 	if (findThis == NULL || maxReplaceCount &lt;= 0
+ 		|| fromOffset &lt; 0 || fromOffset &gt;= Length())
+@@ -2006,7 +2014,7 @@
+ 
+ void
+ BString::_ReplaceAtPositions(const PosVect* positions, int32 searchLen,
+-							 const char* with, int32 withLen)
++	const char* with, int32 withLen)
+ {
+ 	int32 len = Length();
+ 	uint32 count = positions-&gt;CountItems();
+@@ -2020,10 +2028,9 @@
+ 	int32 lastPos = 0;
+ 	char *oldAdr = fPrivateData;
+ 
+-	int32 offset = 2 * sizeof(int32);
+-	char *newData = (char *)malloc(newLength + offset + 1);
++	char *newData = (char *)malloc(newLength + kPrivateDataOffset + 1);
+ 	if (newData) {
+-		newData += offset;
++		newData += kPrivateDataOffset;
+ 		char *newAdr = newData;
+ 		for (uint32 i = 0; i &lt; count; ++i) {
+ 			pos = positions-&gt;ItemAt(i);
+@@ -2042,7 +2049,7 @@
+ 		if (len &gt; 0)
+ 			memcpy(newAdr, oldAdr, len);
+ 
+-		free(fPrivateData - offset);
++		_FreePrivateData();
+ 
+ 		fPrivateData = newData;
+ 		_SetLength(newLength);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006669.html">[Haiku-commits] r24311 - haiku/trunk/src/bin/network/ifconfig
+</A></li>
+	<LI>Next message: <A HREF="006657.html">[Haiku-commits] r24312 - in haiku/trunk: headers/os/support src/kits/support
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6656">[ date ]</a>
+              <a href="thread.html#6656">[ thread ]</a>
+              <a href="subject.html#6656">[ subject ]</a>
+              <a href="author.html#6656">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

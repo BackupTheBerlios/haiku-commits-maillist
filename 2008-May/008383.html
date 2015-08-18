@@ -1,0 +1,880 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25276 - in haiku/trunk: headers/private/kernel	headers/private/kernel/util src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25276%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09headers/private/kernel/util%20src/system/kernel&In-Reply-To=%3C200805010153.m411r95k031376%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   
+   <LINK REL="Next"  HREF="008385.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25276 - in haiku/trunk: headers/private/kernel	headers/private/kernel/util src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25276%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09headers/private/kernel/util%20src/system/kernel&In-Reply-To=%3C200805010153.m411r95k031376%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25276 - in haiku/trunk: headers/private/kernel	headers/private/kernel/util src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu May  1 03:53:09 CEST 2008</I>
+    <P><UL>
+        
+        <LI>Next message: <A HREF="008385.html">[Haiku-commits] r25276 - in haiku/trunk: headers/private/kernel	headers/private/kernel/util src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8383">[ date ]</a>
+              <a href="thread.html#8383">[ thread ]</a>
+              <a href="subject.html#8383">[ subject ]</a>
+              <a href="author.html#8383">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-05-01 03:53:07 +0200 (Thu, 01 May 2008)
+New Revision: 25276
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25276&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25276&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/lock.cpp
+Removed:
+   haiku/trunk/src/system/kernel/lock.c
+Modified:
+   haiku/trunk/headers/private/kernel/lock.h
+   haiku/trunk/headers/private/kernel/thread_types.h
+   haiku/trunk/headers/private/kernel/util/AutoLock.h
+   haiku/trunk/src/system/kernel/Jamfile
+   haiku/trunk/src/system/kernel/main.c
+   haiku/trunk/src/system/kernel/thread.cpp
+Log:
+* Introduced a new locking primitive I called &quot;cutex&quot; (sorry for the
+  name, couldn't resist :-P). It's semantically equivalent to a mutex,
+  but doesn't need a semaphore (it uses thread blocking and a simple
+  queue instead). Initialization can't fail. In fact it is ready to use
+  without initialization when living in the bss segment, also in the
+  early boot process. It's as fast as a benaphore in cases of low lock
+  contention, and faster otherwise.  Only disadvantage is the higher
+  immediate memory footprint of 16 bytes.
+* Changed how the &quot;thread&quot; and &quot;threads&quot; debugger commands list the
+  objects they are waiting for. Cutexes are also included.
+
+
+Modified: haiku/trunk/headers/private/kernel/lock.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/lock.h	2008-04-30 18:47:11 UTC (rev 25275)
++++ haiku/trunk/headers/private/kernel/lock.h	2008-05-01 01:53:07 UTC (rev 25276)
+@@ -39,13 +39,29 @@
+ 
+ #define RW_MAX_READERS 1000000
+ 
++struct cutex_waiter;
++
++typedef struct cutex {
++	const char*				name;
++	struct cutex_waiter*	waiters;
++#ifdef KDEBUG
++	thread_id				holder;
++#else
++	int32					count;
++#endif
++	int32					release_count;
++} cutex;
++
++
+ #if 0 &amp;&amp; KDEBUG // XXX disable this for now, it causes problems when including thread.h here
+ #	include &lt;thread.h&gt;
+ #define ASSERT_LOCKED_RECURSIVE(r) { ASSERT(thread_get_current_thread_id() == (r)-&gt;holder); }
+ #define ASSERT_LOCKED_MUTEX(m) { ASSERT(thread_get_current_thread_id() == (m)-&gt;holder); }
++#define ASSERT_LOCKED_CUTEX(m) { ASSERT(thread_get_current_thread_id() == (m)-&gt;holder); }
+ #else
+ #define ASSERT_LOCKED_RECURSIVE(r)
+ #define ASSERT_LOCKED_MUTEX(m)
++#define ASSERT_LOCKED_CUTEX(m)
+ #endif
+ 
+ 
+@@ -103,6 +119,54 @@
+ extern status_t rw_lock_write_lock(rw_lock *lock);
+ extern status_t rw_lock_write_unlock(rw_lock *lock);
+ 
++extern void cutex_init(cutex* lock, const char *name);
++	// name is *not* cloned nor freed in cutex_destroy()
++extern void cutex_destroy(cutex* lock);
++
++// implementation private:
++extern void _cutex_lock(cutex* lock);
++extern void _cutex_unlock(cutex* lock);
++extern status_t _cutex_trylock(cutex* lock);
++
++
++static inline void
++cutex_lock(cutex* lock)
++{
++#ifdef KDEBUG
++	_cutex_lock(lock);
++#else
++	if (atomic_add(&amp;lock-&gt;count, -1) &lt; 0)
++		_cutex_lock(lock);
++#endif
++}
++
++
++static inline status_t
++cutex_trylock(cutex* lock)
++{
++#ifdef KDEBUG
++	return _cutex_trylock(lock);
++#else
++	if (atomic_test_and_set(&amp;lock-&gt;count, -1, 0) != 0)
++		return B_WOULD_BLOCK;
++#endif
++}
++
++
++static inline void
++cutex_unlock(cutex* lock)
++{
++#ifdef KDEBUG
++	_cutex_unlock(lock);
++#else
++	if (atomic_add(&amp;lock-&gt;count, 1) &lt; -1)
++		_cutex_unlock(lock);
++#endif
++}
++
++
++extern void lock_debug_init();
++
+ #ifdef __cplusplus
+ }
+ #endif
+
+Modified: haiku/trunk/headers/private/kernel/thread_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/thread_types.h	2008-04-30 18:47:11 UTC (rev 25275)
++++ haiku/trunk/headers/private/kernel/thread_types.h	2008-05-01 01:53:07 UTC (rev 25276)
+@@ -62,6 +62,7 @@
+ 	THREAD_BLOCK_TYPE_CONDITION_VARIABLE	= 1,
+ 	THREAD_BLOCK_TYPE_SNOOZE				= 2,
+ 	THREAD_BLOCK_TYPE_SIGNAL				= 3,
++	THREAD_BLOCK_TYPE_CUTEX					= 4,
+ 
+ 	THREAD_BLOCK_TYPE_OTHER					= 9999,
+ 	THREAD_BLOCK_TYPE_USER_BASE				= 10000
+
+Modified: haiku/trunk/headers/private/kernel/util/AutoLock.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/util/AutoLock.h	2008-04-30 18:47:11 UTC (rev 25275)
++++ haiku/trunk/headers/private/kernel/util/AutoLock.h	2008-05-01 01:53:07 UTC (rev 25276)
+@@ -67,6 +67,24 @@
+ // BenaphoreLocker
+ typedef AutoLocker&lt;benaphore, BenaphoreLocking&gt; BenaphoreLocker;
+ 
++// CutexLocking
++class CutexLocking {
++public:
++	inline bool Lock(cutex *lockable)
++	{
++		cutex_lock(lockable);
++		return true;
++	}
++
++	inline void Unlock(cutex *lockable)
++	{
++		cutex_unlock(lockable);
++	}
++};
++
++// CutexLocker
++typedef AutoLocker&lt;cutex, CutexLocking&gt; CutexLocker;
++
+ // InterruptsLocking
+ class InterruptsLocking {
+ public:
+@@ -153,6 +171,7 @@
+ using BPrivate::MutexLocker;
+ using BPrivate::RecursiveLocker;
+ using BPrivate::BenaphoreLocker;
++using BPrivate::CutexLocker;
+ using BPrivate::InterruptsLocker;
+ using BPrivate::SpinLocker;
+ using BPrivate::InterruptsSpinLocker;
+
+Modified: haiku/trunk/src/system/kernel/Jamfile
+===================================================================
+--- haiku/trunk/src/system/kernel/Jamfile	2008-04-30 18:47:11 UTC (rev 25275)
++++ haiku/trunk/src/system/kernel/Jamfile	2008-05-01 01:53:07 UTC (rev 25276)
+@@ -27,7 +27,7 @@
+ 	int.c
+ 	kernel_daemon.c
+ 	linkhack.c
+-	lock.c
++	lock.cpp
+ 	main.c
+ 	module.cpp
+ 	Notifications.cpp
+
+Deleted: haiku/trunk/src/system/kernel/lock.c
+
+Copied: haiku/trunk/src/system/kernel/lock.cpp (from rev 25274, haiku/trunk/src/system/kernel/lock.c)
+===================================================================
+--- haiku/trunk/src/system/kernel/lock.c	2008-04-30 16:14:42 UTC (rev 25274)
++++ haiku/trunk/src/system/kernel/lock.cpp	2008-05-01 01:53:07 UTC (rev 25276)
+@@ -0,0 +1,458 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Copyright 2002-2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.
++ * Distributed under the terms of the NewOS License.
++ */
++
++/* Mutex and recursive_lock code */
++
++#include &lt;lock.h&gt;
++
++#include &lt;OS.h&gt;
++
++#include &lt;debug.h&gt;
++#include &lt;int.h&gt;
++#include &lt;kernel.h&gt;
++#include &lt;thread.h&gt;
++#include &lt;util/AutoLock.h&gt;
++
++
++struct cutex_waiter {
++	struct thread*	thread;
++	cutex_waiter*	next;		// next in queue
++	cutex_waiter*	last;		// last in queue (valid for the first in queue)
++};
++
++
++int32
++recursive_lock_get_recursion(recursive_lock *lock)
++{
++	if (lock-&gt;holder == thread_get_current_thread_id())
++		return lock-&gt;recursion;
++
++	return -1;
++}
++
++
++status_t
++recursive_lock_init(recursive_lock *lock, const char *name)
++{
++	if (lock == NULL)
++		return B_BAD_VALUE;
++
++	if (name == NULL)
++		name = &quot;recursive lock&quot;;
++
++	lock-&gt;holder = -1;
++	lock-&gt;recursion = 0;
++	lock-&gt;sem = create_sem(1, name);
++
++	if (lock-&gt;sem &gt;= B_OK)
++		return B_OK;
++
++	return lock-&gt;sem;
++}
++
++
++void
++recursive_lock_destroy(recursive_lock *lock)
++{
++	if (lock == NULL)
++		return;
++
++	delete_sem(lock-&gt;sem);
++	lock-&gt;sem = -1;
++}
++
++
++status_t
++recursive_lock_lock(recursive_lock *lock)
++{
++	thread_id thread = thread_get_current_thread_id();
++
++	if (!kernel_startup &amp;&amp; !are_interrupts_enabled())
++		panic(&quot;recursive_lock_lock: called with interrupts disabled for lock %p, sem %#lx\n&quot;, lock, lock-&gt;sem);
++
++	if (thread != lock-&gt;holder) {
++		status_t status = acquire_sem(lock-&gt;sem);
++		if (status &lt; B_OK)
++			return status;
++
++		lock-&gt;holder = thread;
++	}
++	lock-&gt;recursion++;
++	return B_OK;
++}
++
++
++void
++recursive_lock_unlock(recursive_lock *lock)
++{
++	if (thread_get_current_thread_id() != lock-&gt;holder)
++		panic(&quot;recursive_lock %p unlocked by non-holder thread!\n&quot;, lock);
++
++	if (--lock-&gt;recursion == 0) {
++		lock-&gt;holder = -1;
++		release_sem_etc(lock-&gt;sem, 1, 0/*B_DO_NOT_RESCHEDULE*/);
++	}
++}
++
++
++//	#pragma mark -
++
++
++status_t
++mutex_init(mutex *m, const char *name)
++{
++	if (m == NULL)
++		return EINVAL;
++
++	if (name == NULL)
++		name = &quot;mutex_sem&quot;;
++
++	m-&gt;holder = -1;
++
++	m-&gt;sem = create_sem(1, name);
++	if (m-&gt;sem &gt;= B_OK)
++		return B_OK;
++
++	return m-&gt;sem;
++}
++
++
++void
++mutex_destroy(mutex *mutex)
++{
++	if (mutex == NULL)
++		return;
++
++	if (mutex-&gt;sem &gt;= 0) {
++		delete_sem(mutex-&gt;sem);
++		mutex-&gt;sem = -1;
++	}
++	mutex-&gt;holder = -1;
++}
++
++
++status_t
++mutex_trylock(mutex *mutex)
++{
++	thread_id me = thread_get_current_thread_id();
++	status_t status;
++
++	if (kernel_startup)
++		return B_OK;
++
++	status = acquire_sem_etc(mutex-&gt;sem, 1, B_RELATIVE_TIMEOUT, 0);
++	if (status &lt; B_OK)
++		return status;
++
++	if (me == mutex-&gt;holder) {
++		panic(&quot;mutex_trylock failure: mutex %p (sem = 0x%lx) acquired twice by&quot;
++			&quot; thread 0x%lx\n&quot;, mutex, mutex-&gt;sem, me);
++	}
++
++	mutex-&gt;holder = me;
++	return B_OK;
++}
++
++
++status_t
++mutex_lock(mutex *mutex)
++{
++	thread_id me = thread_get_current_thread_id();
++	status_t status;
++
++	if (kernel_startup)
++		return B_OK;
++
++	status = acquire_sem(mutex-&gt;sem);
++	if (status &lt; B_OK)
++		return status;
++
++	if (me == mutex-&gt;holder) {
++		panic(&quot;mutex_lock failure: mutex %p (sem = 0x%lx) acquired twice by&quot;
++			&quot; thread 0x%lx\n&quot;, mutex, mutex-&gt;sem, me);
++	}
++
++	mutex-&gt;holder = me;
++	return B_OK;
++}
++
++
++void
++mutex_unlock(mutex *mutex)
++{
++	thread_id me = thread_get_current_thread_id();
++
++	if (kernel_startup)
++		return;
++
++	if (me != mutex-&gt;holder) {
++		panic(&quot;mutex_unlock failure: thread 0x%lx is trying to release mutex %p&quot;
++			&quot; (current holder 0x%lx)\n&quot;, me, mutex, mutex-&gt;holder);
++	}
++
++	mutex-&gt;holder = -1;
++	release_sem_etc(mutex-&gt;sem, 1, 0/*B_DO_NOT_RESCHEDULE*/);
++}
++
++
++//	#pragma mark -
++
++
++status_t
++benaphore_init(benaphore *ben, const char *name)
++{
++	if (ben == NULL || name == NULL)
++		return B_BAD_VALUE;
++
++	ben-&gt;count = 1;
++#ifdef KDEBUG
++	ben-&gt;sem = create_sem(1, name);
++#else
++	ben-&gt;sem = create_sem(0, name);
++#endif
++	if (ben-&gt;sem &gt;= B_OK)
++		return B_OK;
++
++	return ben-&gt;sem;
++}
++
++
++void
++benaphore_destroy(benaphore *ben)
++{
++	delete_sem(ben-&gt;sem);
++	ben-&gt;sem = -1;
++}
++
++
++//	#pragma mark -
++
++
++status_t
++rw_lock_init(rw_lock *lock, const char *name)
++{
++	if (lock == NULL)
++		return B_BAD_VALUE;
++
++	if (name == NULL)
++		name = &quot;r/w lock&quot;;
++
++	lock-&gt;sem = create_sem(RW_MAX_READERS, name);
++	if (lock-&gt;sem &gt;= B_OK)
++		return B_OK;
++
++	return lock-&gt;sem;
++}
++
++
++void
++rw_lock_destroy(rw_lock *lock)
++{
++	if (lock == NULL)
++		return;
++
++	delete_sem(lock-&gt;sem);
++}
++
++
++status_t
++rw_lock_read_lock(rw_lock *lock)
++{
++	return acquire_sem(lock-&gt;sem);
++}
++
++
++status_t
++rw_lock_read_unlock(rw_lock *lock)
++{
++	return release_sem_etc(lock-&gt;sem, 1, 0/*B_DO_NOT_RESCHEDULE*/);
++}
++
++
++status_t
++rw_lock_write_lock(rw_lock *lock)
++{
++	return acquire_sem_etc(lock-&gt;sem, RW_MAX_READERS, 0, 0);
++}
++
++
++status_t
++rw_lock_write_unlock(rw_lock *lock)
++{
++	return release_sem_etc(lock-&gt;sem, RW_MAX_READERS, 0);
++}
++
++
++// #pragma mark -
++
++
++void
++cutex_init(cutex* lock, const char *name)
++{
++	lock-&gt;name = name;
++	lock-&gt;waiters = NULL;
++#ifdef KDEBUG
++	lock-&gt;holder = -1;
++#else
++	lock-&gt;count = 0;
++#endif
++	lock-&gt;release_count = 0;
++}
++
++
++void
++cutex_destroy(cutex* lock)
++{
++	// no-op
++}
++
++
++void
++_cutex_lock(cutex* lock)
++{
++#ifdef KDEBUG
++	if (!kernel_startup &amp;&amp; !are_interrupts_enabled()) {
++		panic(&quot;_cutex_unlock: called with interrupts disabled for lock %p&quot;,
++			lock);
++	}
++#endif
++
++	InterruptsSpinLocker _(thread_spinlock);
++
++	// Might have been released after we decremented the count, but before
++	// we acquired the spinlock.
++#ifdef KDEBUG
++	if (lock-&gt;release_count &gt;= 0) {
++		lock-&gt;holder = thread_get_current_thread_id();
++#else
++	if (lock-&gt;release_count &gt; 0) {
++#endif
++		lock-&gt;release_count--;
++		return;
++	}
++
++	// enqueue in waiter list
++	cutex_waiter waiter;
++	waiter.thread = thread_get_current_thread();
++	waiter.next = NULL;
++
++	if (lock-&gt;waiters != NULL) {
++		lock-&gt;waiters-&gt;last-&gt;next = &waiter;
++	} else
++		lock-&gt;waiters = &waiter;
++
++	lock-&gt;waiters-&gt;last = &waiter;
++
++	// block
++	thread_prepare_to_block(waiter.thread, 0, THREAD_BLOCK_TYPE_CUTEX, lock);
++	thread_block_locked(waiter.thread);
++
++#ifdef KDEBUG
++	lock-&gt;holder = waiter.thread-&gt;id;
++#endif
++}
++
++
++void
++_cutex_unlock(cutex* lock)
++{
++	InterruptsSpinLocker _(thread_spinlock);
++
++#ifdef KDEBUG
++	if (thread_get_current_thread_id() != lock-&gt;holder) {
++		panic(&quot;_cutex_unlock() failure: thread %ld is trying to release &quot;
++			&quot;cutex %p (current holder %ld)\n&quot;, thread_get_current_thread_id(),
++			lock, lock-&gt;holder);
++		return;
++	}
++
++	lock-&gt;holder = -1;
++#endif
++
++	cutex_waiter* waiter = lock-&gt;waiters;
++	if (waiter != NULL) {
++		// dequeue the first waiter
++		lock-&gt;waiters = waiter-&gt;next;
++		if (lock-&gt;waiters != NULL)
++			lock-&gt;waiters-&gt;last = waiter-&gt;last;
++
++		// unblock thread
++		thread_unblock_locked(waiter-&gt;thread, B_OK);
++	} else {
++		// We acquired the spinlock before the locker that is going to wait.
++		// Just increment the release count.
++		lock-&gt;release_count++;
++	}
++}
++
++
++status_t
++_cutex_trylock(cutex* lock)
++{
++#ifdef KDEBUG
++	InterruptsSpinLocker _(thread_spinlock);
++
++	if (lock-&gt;release_count &gt;= 0) {
++		lock-&gt;holder = thread_get_current_thread_id();
++		lock-&gt;release_count--;
++		return B_OK;
++	}
++#endif
++	return B_WOULD_BLOCK;
++}
++
++
++static int
++dump_cutex_info(int argc, char** argv)
++{
++	if (argc &lt; 2) {
++		print_debugger_command_usage(argv[0]);
++		return 0;
++	}
++
++	cutex* lock = (cutex*)strtoul(argv[1], NULL, 0);
++
++	if (!IS_KERNEL_ADDRESS(lock)) {
++		kprintf(&quot;invalid address: %p\n&quot;, lock);
++		return 0;
++	}
++
++	kprintf(&quot;cutex %p:\n&quot;, lock);
++	kprintf(&quot;  name:            %s\n&quot;, lock-&gt;name);
++	kprintf(&quot;  release count:   %ld\n&quot;, lock-&gt;release_count);
++#ifdef KDEBUG
++	kprintf(&quot;  holder:          %ld\n&quot;, lock-&gt;holder);
++#else
++	kprintf(&quot;  count:           %ld\n&quot;, lock-&gt;count);
++#endif
++
++	kprintf(&quot;  waiting threads:&quot;);
++	cutex_waiter* waiter = lock-&gt;waiters;
++	while (waiter != NULL) {
++		kprintf(&quot; %ld&quot;, waiter-&gt;thread-&gt;id);
++		waiter = waiter-&gt;next;
++	}
++	kputs(&quot;\n&quot;);
++
++	return 0;
++}
++
++
++// #pragma mark -
++
++
++void
++lock_debug_init()
++{
++	add_debugger_command_etc(&quot;cutex&quot;, &amp;dump_cutex_info,
++		&quot;Dump info about a cutex&quot;,
++		&quot;&lt;cutex&gt;\n&quot;
++		&quot;Prints info about the specified cutex.\n&quot;
++		&quot;  &lt;cutex&gt;  - pointer to the cutex to print the info for.\n&quot;, 0);
++}
+
+Modified: haiku/trunk/src/system/kernel/main.c
+===================================================================
+--- haiku/trunk/src/system/kernel/main.c	2008-04-30 18:47:11 UTC (rev 25275)
++++ haiku/trunk/src/system/kernel/main.c	2008-05-01 01:53:07 UTC (rev 25276)
+@@ -28,6 +28,7 @@
+ #include &lt;kmodule.h&gt;
+ #include &lt;kscheduler.h&gt;
+ #include &lt;ksyscalls.h&gt;
++#include &lt;lock.h&gt;
+ #include &lt;messaging.h&gt;
+ #include &lt;Notifications.h&gt;
+ #include &lt;port.h&gt;
+@@ -117,6 +118,7 @@
+ 
+ 		// now we can use the heap and create areas
+ 		arch_platform_init_post_vm(&amp;sKernelArgs);
++		lock_debug_init();
+ 		TRACE(&quot;init driver_settings\n&quot;);
+ 		boot_item_init();
+ 		driver_settings_init(&amp;sKernelArgs);
+
+Modified: haiku/trunk/src/system/kernel/thread.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/thread.cpp	2008-04-30 18:47:11 UTC (rev 25275)
++++ haiku/trunk/src/system/kernel/thread.cpp	2008-05-01 01:53:07 UTC (rev 25276)
+@@ -667,17 +667,6 @@
+ }
+ 
+ 
+-static ConditionVariable*
+-get_thread_wait_cvar(struct thread* thread)
+-{
+-	if (thread-&gt;state == B_THREAD_WAITING
+-		&amp;&amp; thread-&gt;wait.type == THREAD_BLOCK_TYPE_CONDITION_VARIABLE) {
+-		return (ConditionVariable*)thread-&gt;wait.object;
+-	}
+-	return NULL;
+-}
+-
+-
+ /*!
+ 	Fills the thread_info structure with information from the specified
+ 	thread.
+@@ -1091,10 +1080,6 @@
+ 						return &quot;receive&quot;;
+ 					break;
+ 				}
+-	
+-				case THREAD_BLOCK_TYPE_CONDITION_VARIABLE:
+-				default:
+-					break;
+ 			}
+ 
+ 			return &quot;waiting&quot;;
+@@ -1133,8 +1118,47 @@
+ 	kprintf(&quot;sig_pending:        %#lx (blocked: %#lx)\n&quot;, thread-&gt;sig_pending,
+ 		thread-&gt;sig_block_mask);
+ 	kprintf(&quot;in_kernel:          %d\n&quot;, thread-&gt;in_kernel);
+-	kprintf(&quot;sem blocking:       %ld\n&quot;, get_thread_wait_sem(thread));
+-	kprintf(&quot;condition variable: %p\n&quot;, get_thread_wait_cvar(thread));
++
++	kprintf(&quot;waiting for:        &quot;);
++
++	if (thread-&gt;state == B_THREAD_WAITING) {
++		switch (thread-&gt;wait.type) {
++			case THREAD_BLOCK_TYPE_SEMAPHORE:
++			{
++				sem_id sem = (sem_id)(addr_t)thread-&gt;wait.object;
++				if (sem == thread-&gt;msg.read_sem)
++					kprintf(&quot;data\n&quot;);
++				else
++					kprintf(&quot;semaphore %ld\n&quot;, sem);
++				break;
++			}
++
++			case THREAD_BLOCK_TYPE_CONDITION_VARIABLE:
++				kprintf(&quot;condition variable %p\n&quot;, thread-&gt;wait.object);
++				break;
++
++			case THREAD_BLOCK_TYPE_SNOOZE:
++				kprintf(&quot;snooze()\n&quot;);
++				break;
++
++			case THREAD_BLOCK_TYPE_SIGNAL:
++				kprintf(&quot;signal\n&quot;);
++				break;
++
++			case THREAD_BLOCK_TYPE_CUTEX:
++				kprintf(&quot;cutex %p\n&quot;, thread-&gt;wait.object);
++				break;
++
++			case THREAD_BLOCK_TYPE_OTHER:
++				kprintf(&quot;other (%s)\n&quot;, (char*)thread-&gt;wait.object);
++				break;
++
++			default:
++				kprintf(&quot;unknown (%p)\n&quot;, thread-&gt;wait.object);
++				break;
++		}
++	}
++
+ 	kprintf(&quot;fault_handler:      %p\n&quot;, (void *)thread-&gt;fault_handler);
+ 	kprintf(&quot;args:               %p %p\n&quot;, thread-&gt;args1, thread-&gt;args2);
+ 	kprintf(&quot;entry:              %p\n&quot;, (void *)thread-&gt;entry);
+@@ -1254,8 +1278,8 @@
+ 			kprintf(&quot;ignoring invalid team argument.\n&quot;);
+ 	}
+ 
+-	kprintf(&quot;thread         id  state        sem/cv cpu pri  stack      team  &quot;
+-		&quot;name\n&quot;);
++	kprintf(&quot;thread         id  state     wait for  object  cpu pri  stack    &quot;
++		&quot;  team  name\n&quot;);
+ 
+ 	hash_open(sThreadHash, &amp;i);
+ 	while ((thread = (struct thread*)hash_next(sThreadHash, &amp;i)) != NULL) {
+@@ -1268,17 +1292,48 @@
+ 			|| (realTimeOnly &amp;&amp; thread-&gt;priority &lt; B_REAL_TIME_DISPLAY_PRIORITY))
+ 			continue;
+ 
+-		kprintf(&quot;%p %6ld  %-9s&quot;, thread, thread-&gt;id, state_to_text(thread,
++		kprintf(&quot;%p %6ld  %-10s&quot;, thread, thread-&gt;id, state_to_text(thread,
+ 			thread-&gt;state));
+ 
+ 		// does it block on a semaphore or a condition variable?
+ 		if (thread-&gt;state == B_THREAD_WAITING) {
+-			if (get_thread_wait_cvar(thread))
+-				kprintf(&quot;%p  &quot;, get_thread_wait_cvar(thread));
+-			else
+-				kprintf(&quot;%10ld  &quot;, get_thread_wait_sem(thread));
++			switch (thread-&gt;wait.type) {
++				case THREAD_BLOCK_TYPE_SEMAPHORE:
++				{
++					sem_id sem = (sem_id)(addr_t)thread-&gt;wait.object;
++					if (sem == thread-&gt;msg.read_sem)
++						kprintf(&quot;                   &quot;);
++					else
++						kprintf(&quot;sem %12ld   &quot;, sem);
++					break;
++				}
++
++				case THREAD_BLOCK_TYPE_CONDITION_VARIABLE:
++					kprintf(&quot;cvar  %p   &quot;, thread-&gt;wait.object);
++					break;
++
++				case THREAD_BLOCK_TYPE_SNOOZE:
++					kprintf(&quot;                   &quot;);
++					break;
++
++				case THREAD_BLOCK_TYPE_SIGNAL:
++					kprintf(&quot;signal             &quot;);
++					break;
++
++				case THREAD_BLOCK_TYPE_CUTEX:
++					kprintf(&quot;cutex %p   &quot;, thread-&gt;wait.object);
++					break;
++
++				case THREAD_BLOCK_TYPE_OTHER:
++					kprintf(&quot;other              &quot;);
++					break;
++
++				default:
++					kprintf(&quot;???   %p   &quot;, thread-&gt;wait.object);
++					break;
++			}
+ 		} else
+-			kprintf(&quot;      -     &quot;);
++			kprintf(&quot;       -           &quot;);
+ 
+ 		// on which CPU does it run?
+ 		if (thread-&gt;cpu)
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	
+	<LI>Next message: <A HREF="008385.html">[Haiku-commits] r25276 - in haiku/trunk: headers/private/kernel	headers/private/kernel/util src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8383">[ date ]</a>
+              <a href="thread.html#8383">[ thread ]</a>
+              <a href="subject.html#8383">[ subject ]</a>
+              <a href="author.html#8383">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

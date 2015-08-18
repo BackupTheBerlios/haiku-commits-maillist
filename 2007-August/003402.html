@@ -1,0 +1,359 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21841 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21841%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200708061806.l76I64PA019521%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003401.html">
+   <LINK REL="Next"  HREF="003403.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21841 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21841%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200708061806.l76I64PA019521%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21841 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Aug  6 20:06:04 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003401.html">[Haiku-commits] r21840 - haiku/trunk/src/system/libroot/posix/unistd
+</A></li>
+        <LI>Next message: <A HREF="003403.html">[Haiku-commits] r21842 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3402">[ date ]</a>
+              <a href="thread.html#3402">[ thread ]</a>
+              <a href="subject.html#3402">[ subject ]</a>
+              <a href="author.html#3402">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-08-06 20:06:01 +0200 (Mon, 06 Aug 2007)
+New Revision: 21841
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21841&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21841&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+* Changed the signatures of fault_get_page() and fault_find_page(), so
+  that an error can be propagated back to vm_soft_fault().
+* Added boolean restart reference parameter to fault_find_page() which
+  is set to true whenever a condition is it encountered that requires
+  to start fault_find_page() from the very beginning. fault_get_page()
+  checks the flag and executes fault_find_page() in a loop, now.
+* Removed the panic()s+TODOs in fault_find_page() when a cache became
+  busy. The restart feature is used in this case.
+* fault_find_page(): If after the loop we haven't found a page yet,
+  and after locking the right cache one turned up, we restart the
+  function, too, thus avoiding double insertion of a page into a cache.
+* Fixed potential dead-lock in fault_get_page(): After inserting a clean
+  page into a cache other than the top cache (read fault on
+  copy-on-write area not backed by a file (e.g. the heap)) the dummy
+  page was removed from the to be locked top cache while we still held a
+  lock for the lower cache, thus inverting the locking direction
+  required by the cache locking policy (top -&gt; bottom).
+* fault_get_page(): In case of a write access and a readable page found
+  in a lower cache, vm_cache_remove_consumer() could have replaced our
+  dummy page with a real page from a collapsed lower cache while we
+  had unlocked both caches. We didn't check for this condition and
+  always inserted our freshly allocated page, thus potentially inserting
+  a duplicate page into the top cache. We do the check now and discard our
+  page, when another page turned up. Fixes bug #1359.
+* fault_get_page(), same if block: Removed unused case for removal of the
+  dummy page from a non-top cache. We only ever insert it into the top
+  cache and it should not be moved to another cache. Added an assert.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-06 18:03:52 UTC (rev 21840)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-06 18:06:01 UTC (rev 21841)
+@@ -3184,10 +3184,12 @@
+ 	otherwise, it will return the vm_cache that contains the cache.
+ 	It always grabs a reference to the vm_cache that it returns, and also locks it.
+ */
+-static inline vm_page *
++static inline status_t
+ fault_find_page(vm_translation_map *map, vm_cache *topCache,
+-	off_t cacheOffset, bool isWrite, vm_page &amp;dummyPage, vm_cache **_pageCache)
++	off_t cacheOffset, bool isWrite, vm_page &amp;dummyPage, vm_cache **_pageCache,
++	vm_page** _page, bool* _restart)
+ {
++	*_restart = false;
+ 	vm_cache *cache = topCache;
+ 	vm_cache *lastCache = NULL;
+ 	vm_page *page = NULL;
+@@ -3225,12 +3227,8 @@
+ 				// the top cache.
+ 				mutex_unlock(&amp;cache-&gt;lock);
+ 				vm_cache_release_ref(cache);
+-
+-				cache = topCache;
+-				lastCache = cache;
+-				
+-				vm_cache_acquire_ref(cache);
+-				mutex_lock(&amp;cache-&gt;lock);
++				*_restart = true;
++				return B_OK;
+ 			}
+ 		}
+ 
+@@ -3274,7 +3272,7 @@
+ 				vm_cache_remove_page(cache, page);
+ 				vm_page_set_state(page, PAGE_STATE_FREE);
+ 
+-				return NULL;
++				return status;
+ 			}
+ 
+ 			// mark the page unbusy again
+@@ -3296,10 +3294,17 @@
+ 			// with his only consumer (cacheRef); since its pages are moved
+ 			// upwards, too, we try this cache again
+ 			mutex_unlock(&amp;cache-&gt;lock);
++			thread_yield();
+ 			mutex_lock(&amp;cache-&gt;lock);
+-			if (cache-&gt;busy)
+-				panic(&quot;fault_find_page(): cache became busy: %p\n&quot;, cache);
+-					// TODO: Don't panic()!
++			if (cache-&gt;busy) {
++				// The cache became busy, which means, it is about to be
++				// removed by vm_cache_remove_consumer(). We start again with
++				// the top cache.
++				mutex_unlock(&amp;cache-&gt;lock);
++				vm_cache_release_ref(cache);
++				*_restart = true;
++				return B_OK;
++			}
+ 			lastCache = NULL;
+ 			continue;
+ 		} else if (status &lt; B_OK)
+@@ -3321,9 +3326,26 @@
+ 				// top most cache may have direct write access.
+ 			vm_cache_acquire_ref(cache);
+ 			mutex_lock(&amp;cache-&gt;lock);
+-			if (cache-&gt;busy)
+-				panic(&quot;fault_find_page(): 2. cache became busy: %p\n&quot;, cache);
+-					// TOOD: Don't panic()!
++
++			if (cache-&gt;busy) {
++				// The cache became busy, which means, it is about to be
++				// removed by vm_cache_remove_consumer(). We start again with
++				// the top cache.
++				mutex_unlock(&amp;cache-&gt;lock);
++				vm_cache_release_ref(cache);
++				*_restart = true;
++			} else {
++				vm_page* newPage = vm_cache_lookup_page(cache, cacheOffset);
++				if (newPage &amp;&amp; newPage != &amp;dummyPage) {
++					// A new page turned up. It could be the one we're looking
++					// for, but it could as well be a dummy page from someone
++					// else or an otherwise busy page. We can't really handle
++					// that here. Hence we completely restart this functions.
++					mutex_unlock(&amp;cache-&gt;lock);
++					vm_cache_release_ref(cache);
++					*_restart = true;
++				}
++			}
+ 		}
+ 
+ 		// release the reference of the last vm_cache we still have from the loop above
+@@ -3334,7 +3356,8 @@
+ 	}
+ 
+ 	*_pageCache = cache;
+-	return page;
++	*_page = page;
++	return B_OK;
+ }
+ 
+ 
+@@ -3343,14 +3366,35 @@
+ 	It returns the owner of the page in \a sourceCache - it keeps a reference
+ 	to it, and has also locked it on exit.
+ */
+-static inline vm_page *
++static inline status_t
+ fault_get_page(vm_translation_map *map, vm_cache *topCache,
+ 	off_t cacheOffset, bool isWrite, vm_page &amp;dummyPage, vm_cache **_sourceCache,
+-	vm_cache **_copiedSource)
++	vm_cache **_copiedSource, vm_page** _page)
+ {
+ 	vm_cache *cache;
+-	vm_page *page = fault_find_page(map, topCache, cacheOffset, isWrite,
+-		dummyPage, &amp;cache);
++	vm_page *page;
++	bool restart;
++	for (;;) {
++		status_t status = fault_find_page(map, topCache, cacheOffset, isWrite,
++			dummyPage, &amp;cache, &amp;page, &amp;restart);
++		if (status != B_OK)
++			return status;
++
++		if (!restart)
++			break;
++
++		// Remove the dummy page, if it has been inserted.
++		mutex_lock(&amp;topCache-&gt;lock);
++
++		if (dummyPage.state == PAGE_STATE_BUSY) {
++			ASSERT_PRINT(dummyPage.cache == topCache, &quot;dummy page: %p\n&quot;,
++				&amp;dummyPage);
++			fault_remove_dummy_page(dummyPage, true);
++		}
++
++		mutex_unlock(&amp;topCache-&gt;lock);
++	}
++
+ 	if (page == NULL) {
+ 		// we still haven't found a page, so we allocate a clean one
+ 
+@@ -3359,7 +3403,8 @@
+ 
+ 		// Insert the new page into our cache, and replace it with the dummy page if necessary
+ 
+-		// if we inserted a dummy page into this cache, we have to remove it now
++		// If we inserted a dummy page into this cache (i.e. if it is the top
++		// cache), we have to remove it now
+ 		if (dummyPage.state == PAGE_STATE_BUSY &amp;&amp; dummyPage.cache == cache) {
+ #ifdef DEBUG_PAGE_CACHE_TRANSITIONS
+ 			page-&gt;debug_flags = dummyPage.debug_flags | 0x8;
+@@ -3383,8 +3428,12 @@
+ 			}
+ #endif	// DEBUG_PAGE_CACHE_TRANSITIONS
+ 
+-			// we had inserted the dummy cache in another cache, so let's remove it from there
++			// This is not the top cache into which we inserted the dummy page,
++			// let's remove it from there. We need to temporarily unlock our
++			// cache to comply with the cache locking policy.
++			mutex_unlock(&amp;cache-&gt;lock);
+ 			fault_remove_dummy_page(dummyPage, false);
++			mutex_lock(&amp;cache-&gt;lock);
+ 		}
+ 	}
+ 
+@@ -3392,8 +3441,11 @@
+ 	// sure that the area's cache can access it, too, and sees the correct data
+ 
+ 	if (page-&gt;cache != topCache &amp;&amp; isWrite) {
+-		// now we have a page that has the data we want, but in the wrong cache object
+-		// so we need to copy it and stick it into the top cache
++		// Now we have a page that has the data we want, but in the wrong cache
++		// object so we need to copy it and stick it into the top cache.
++		// Note that this and the &quot;if&quot; before are mutual exclusive. If
++		// fault_find_page() didn't find the page, it would return the top cache
++		// for write faults.
+ 		vm_page *sourcePage = page;
+ 		void *source, *dest;
+ 
+@@ -3431,17 +3483,41 @@
+ 		mutex_unlock(&amp;cache-&gt;lock);
+ 		mutex_lock(&amp;topCache-&gt;lock);
+ 
+-		// Insert the new page into our cache, and replace it with the dummy page if necessary
++		// Since the top cache has been unlocked for a while, someone else
++		// (vm_cache_remove_consumer()) might have replaced our dummy page.
++		vm_page* newPage = NULL;
++		for (;;) {
++			newPage = vm_cache_lookup_page(topCache, cacheOffset);
++			if (newPage == NULL || newPage == &amp;dummyPage) {
++				newPage = NULL;
++				break;
++			}
+ 
+-		// if we inserted a dummy page into this cache, we have to remove it now
+-		if (dummyPage.state == PAGE_STATE_BUSY &amp;&amp; dummyPage.cache == topCache)
+-			fault_remove_dummy_page(dummyPage, true);
++			if (newPage-&gt;state != PAGE_STATE_BUSY)
++				break;
+ 
+-		vm_cache_insert_page(topCache, page, cacheOffset);
++			// The page is busy, wait till it becomes unbusy.
++			mutex_unlock(&amp;topCache-&gt;lock);
++			snooze(10000);
++			mutex_lock(&amp;topCache-&gt;lock);
++		}
+ 
+-		if (dummyPage.state == PAGE_STATE_BUSY) {
+-			// we had inserted the dummy cache in another cache, so let's remove it from there
+-			fault_remove_dummy_page(dummyPage, false);
++		if (newPage) {
++			// Indeed someone else threw in a page. We free ours and are happy.
++			vm_page_set_state(page, PAGE_STATE_FREE);
++			page = newPage;
++		} else {
++			// Insert the new page into our cache and remove the dummy page, if
++			// necessary.
++
++			// if we inserted a dummy page into this cache, we have to remove it now
++			if (dummyPage.state == PAGE_STATE_BUSY) {
++				ASSERT_PRINT(dummyPage.cache == topCache, &quot;dummy page: %p\n&quot;,
++					&amp;dummyPage);
++				fault_remove_dummy_page(dummyPage, true);
++			}
++
++			vm_cache_insert_page(topCache, page, cacheOffset);
+ 		}
+ 
+ 		*_copiedSource = cache;
+@@ -3451,7 +3527,8 @@
+ 	}
+ 
+ 	*_sourceCache = cache;
+-	return page;
++	*_page = page;
++	return B_OK;
+ }
+ 
+ 
+@@ -3562,13 +3639,12 @@
+ 
+ 	vm_cache *copiedPageSource = NULL;
+ 	vm_cache *pageSource;
+-	vm_page *page = fault_get_page(map, topCache, cacheOffset, isWrite,
+-		dummyPage, &amp;pageSource, &amp;copiedPageSource);
++	vm_page *page;
++	status_t status = fault_get_page(map, topCache, cacheOffset, isWrite,
++		dummyPage, &amp;pageSource, &amp;copiedPageSource, &amp;page);
+ 
+-	status_t status = B_OK;
+-
+ 	acquire_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0, 0);
+-	if (changeCount != addressSpace-&gt;change_count) {
++	if (status == B_OK &amp;&amp; changeCount != addressSpace-&gt;change_count) {
+ 		// something may have changed, see if the address is still valid
+ 		area = vm_area_lookup(addressSpace, address);
+ 		if (area == NULL
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003401.html">[Haiku-commits] r21840 - haiku/trunk/src/system/libroot/posix/unistd
+</A></li>
+	<LI>Next message: <A HREF="003403.html">[Haiku-commits] r21842 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3402">[ date ]</a>
+              <a href="thread.html#3402">[ thread ]</a>
+              <a href="subject.html#3402">[ subject ]</a>
+              <a href="author.html#3402">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

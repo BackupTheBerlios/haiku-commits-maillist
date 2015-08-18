@@ -1,0 +1,397 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25000 - in haiku/trunk/src:	system/libroot/posix/pthread	tests/system/libroot/posix/posixtestsuite
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25000%20-%20in%20haiku/trunk/src%3A%0A%09system/libroot/posix/pthread%0A%09tests/system/libroot/posix/posixtestsuite&In-Reply-To=%3C200804171344.m3HDieQQ006225%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007828.html">
+   <LINK REL="Next"  HREF="007832.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25000 - in haiku/trunk/src:	system/libroot/posix/pthread	tests/system/libroot/posix/posixtestsuite</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25000%20-%20in%20haiku/trunk/src%3A%0A%09system/libroot/posix/pthread%0A%09tests/system/libroot/posix/posixtestsuite&In-Reply-To=%3C200804171344.m3HDieQQ006225%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25000 - in haiku/trunk/src:	system/libroot/posix/pthread	tests/system/libroot/posix/posixtestsuite">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 17 15:44:40 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007828.html">[Haiku-commits] r24999 -	haiku/trunk/src/tests/system/benchmarks/libMicro
+</A></li>
+        <LI>Next message: <A HREF="007832.html">[Haiku-commits] r25000 - in haiku/trunk/src: system/libroot/posix/pthread tests/system/libroot/posix/posixtestsuite
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7829">[ date ]</a>
+              <a href="thread.html#7829">[ thread ]</a>
+              <a href="subject.html#7829">[ subject ]</a>
+              <a href="author.html#7829">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-04-17 15:44:39 +0200 (Thu, 17 Apr 2008)
+New Revision: 25000
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25000&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25000&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/libroot/posix/pthread/pthread_key.cpp
+Removed:
+   haiku/trunk/src/system/libroot/posix/pthread/pthread_key.c
+Modified:
+   haiku/trunk/src/system/libroot/posix/pthread/Jamfile
+   haiku/trunk/src/system/libroot/posix/pthread/pthread.c
+   haiku/trunk/src/system/libroot/posix/pthread/pthread_private.h
+   haiku/trunk/src/tests/system/libroot/posix/posixtestsuite/run_posix_tests.sh
+Log:
+* Replaced the previous pthread_key implementation with a lockless one
+  that does not rely on the Be API TLS anymore, and is also more compliant
+  with respect to the lifespan of the key specific values.
+* It supports up to 256 different keys, which is equivalent of the solution
+  that FreeBSD offers.
+* The main thread now also gets a pthread_thread structure.
+* Reenabled the POSIX suite test pthread_key_delete_2-1 as we now pass it.
+* This also fixes bug #1642.
+
+
+Modified: haiku/trunk/src/system/libroot/posix/pthread/Jamfile
+===================================================================
+--- haiku/trunk/src/system/libroot/posix/pthread/Jamfile	2008-04-17 13:10:07 UTC (rev 24999)
++++ haiku/trunk/src/system/libroot/posix/pthread/Jamfile	2008-04-17 13:44:39 UTC (rev 25000)
+@@ -10,7 +10,7 @@
+ 	pthread_cleanup.cpp
+ 	pthread_cond.c
+ 	pthread_condattr.c
+-	pthread_key.c
++	pthread_key.cpp
+ 	pthread_mutex.c
+ 	pthread_mutexattr.c
+ 	pthread_once.c
+
+Modified: haiku/trunk/src/system/libroot/posix/pthread/pthread.c
+===================================================================
+--- haiku/trunk/src/system/libroot/posix/pthread/pthread.c	2008-04-17 13:10:07 UTC (rev 24999)
++++ haiku/trunk/src/system/libroot/posix/pthread/pthread.c	2008-04-17 13:44:39 UTC (rev 25000)
+@@ -18,6 +18,7 @@
+ };
+ 
+ 
++static struct pthread_thread sMainThread;
+ static int32 sPthreadSlot = -1;
+ static int sConcurrencyLevel;
+ 
+@@ -25,7 +26,16 @@
+ struct pthread_thread *
+ __get_pthread(void)
+ {
+-	return (struct pthread_thread *)tls_get(sPthreadSlot);
++	struct pthread_thread *thread;
++
++	if (sPthreadSlot == -1)
++		return &sMainThread;
++
++	thread = (struct pthread_thread *)tls_get(sPthreadSlot);
++	if (thread == NULL)
++		return &sMainThread;
++
++	return thread;
+ }
+ 
+ 
+@@ -36,14 +46,15 @@
+ 
+ 	// call cleanup handlers
+ 	while (true) {
+-		struct __pthread_cleanup_handler *handler = __pthread_cleanup_pop_handler();
++		struct __pthread_cleanup_handler *handler
++			= __pthread_cleanup_pop_handler();
+ 		if (handler == NULL)
+ 			break;
+ 
+ 		handler-&gt;function(handler-&gt;argument);
+ 	}
+ 
+-	__pthread_key_call_destructors();
++	__pthread_key_call_destructors(thread);
+ 	free(thread);
+ }
+ 
+@@ -100,9 +111,10 @@
+ 
+ 	threadID = spawn_thread(pthread_thread_entry, &quot;pthread func&quot;,
+ 		attr-&gt;sched_priority, thread);
+-	if (threadID &lt; B_OK)
++	if (threadID &lt; B_OK) {
++		// stupid error code (EAGAIN) but demanded by POSIX
+ 		return B_WOULD_BLOCK;
+-		// stupid error code (EAGAIN) but demanded by POSIX
++	}
+ 
+ 	resume_thread(threadID);
+ 	*_thread = threadID;
+
+Deleted: haiku/trunk/src/system/libroot/posix/pthread/pthread_key.c
+
+Added: haiku/trunk/src/system/libroot/posix/pthread/pthread_key.cpp
+===================================================================
+--- haiku/trunk/src/system/libroot/posix/pthread/pthread_key.cpp	2008-04-17 13:10:07 UTC (rev 24999)
++++ haiku/trunk/src/system/libroot/posix/pthread/pthread_key.cpp	2008-04-17 13:44:39 UTC (rev 25000)
+@@ -0,0 +1,150 @@
++/*
++ * Copyright 2008, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++#include &quot;pthread_private.h&quot;
++
++#include &lt;stdlib.h&gt;
++
++
++static pthread_key sKeyTable[PTHREAD_KEYS_MAX];
++static int32 sNextSequence = 1;
++
++
++/*!	Retrieves the destructor of a key locklessly.
++	Returns the destructor's sequence in \a sequence.
++*/
++static pthread_key_destructor
++get_key_destructor(uint32 key, int32&amp; sequence)
++{
++	pthread_key_destructor destructor = NULL;
++
++	do {
++		sequence = sKeyTable[key].sequence;
++		if (sequence == PTHREAD_UNUSED_SEQUENCE)
++			return NULL;
++
++		destructor = sKeyTable[key].destructor;
++	} while (sKeyTable[key].sequence != sequence);
++
++	return destructor;
++}
++
++
++/*!	Function to get the thread specific value of a key in a lockless
++	way.
++	\a sequence must be the sequence of the key table that this value
++	has to fit to.
++*/
++static void*
++get_key_value(pthread_thread* thread, uint32 key, int32 sequence)
++{
++	pthread_key_data&amp; keyData = thread-&gt;specific[key];
++	int32 specificSequence;
++	void* value;
++
++	do {
++		specificSequence = keyData.sequence;
++		if (specificSequence != sequence)
++			return NULL;
++
++		value = keyData.value;
++	} while (specificSequence != sequence);
++
++	return value;
++}
++
++
++void
++__pthread_key_call_destructors(pthread_thread* thread)
++{
++	for (uint32 key = 0; key &lt; PTHREAD_KEYS_MAX; key++) {
++		int32 sequence;
++		pthread_key_destructor destructor = get_key_destructor(key, sequence);
++		void* value = get_key_value(thread, key, sequence);
++
++		if (value != NULL &amp;&amp; destructor != NULL)
++			destructor(value);
++	}
++}
++
++
++//	#pragma mark - public API
++
++
++int
++pthread_key_create(pthread_key_t* _key, void (*destructor)(void*))
++{
++	int32 nextSequence = atomic_add(&amp;sNextSequence, 1);
++
++	for (uint32 key = 0; key &lt; PTHREAD_KEYS_MAX; key++) {
++		int32 sequence = sKeyTable[key].sequence;
++		if (sequence != PTHREAD_UNUSED_SEQUENCE)
++			continue;
++
++		// try to acquire this slot
++
++		if (atomic_test_and_set(&amp;sKeyTable[key].sequence, nextSequence,
++				sequence) != sequence)
++			continue;
++
++		sKeyTable[key].destructor = destructor;
++		*_key = key;
++		return 0;
++	}
++
++	return EAGAIN;
++}
++
++
++int
++pthread_key_delete(pthread_key_t key)
++{
++	if (key &lt; 0 || key &gt;= PTHREAD_KEYS_MAX)
++		return EINVAL;
++
++	int32 sequence = atomic_set(&amp;sKeyTable[key].sequence,
++		PTHREAD_UNUSED_SEQUENCE);
++	if (sequence == PTHREAD_UNUSED_SEQUENCE)
++		return EINVAL;
++
++	return 0;
++}
++
++
++void*
++pthread_getspecific(pthread_key_t key)
++{
++	pthread_thread* thread = __get_pthread();
++
++	if (key &lt; 0 || key &gt;= PTHREAD_KEYS_MAX)
++		return NULL;
++
++	// check if this key is used, and our value belongs to its current meaning
++	int32 sequence = atomic_get(&amp;sKeyTable[key].sequence);
++	if (sequence == PTHREAD_UNUSED_SEQUENCE
++		|| thread-&gt;specific[key].sequence != sequence)
++		return NULL;
++
++	return thread-&gt;specific[key].value;
++}
++
++
++int
++pthread_setspecific(pthread_key_t key, const void* value)
++{
++	if (key &lt; 0 || key &gt;= PTHREAD_KEYS_MAX)
++		return EINVAL;
++
++	int32 sequence = atomic_get(&amp;sKeyTable[key].sequence);
++	if (sequence == PTHREAD_UNUSED_SEQUENCE)
++		return EINVAL;
++
++	pthread_key_data&amp; keyData = __get_pthread()-&gt;specific[key];
++	keyData.sequence = sequence;
++	keyData.value = const_cast&lt;void*&gt;(value);
++	return 0;
++}
++
+
+Modified: haiku/trunk/src/system/libroot/posix/pthread/pthread_private.h
+===================================================================
+--- haiku/trunk/src/system/libroot/posix/pthread/pthread_private.h	2008-04-17 13:10:07 UTC (rev 24999)
++++ haiku/trunk/src/system/libroot/posix/pthread/pthread_private.h	2008-04-17 13:44:39 UTC (rev 25000)
+@@ -46,7 +46,21 @@
+ 	int32		sched_priority;
+ } pthread_attr;
+ 
++typedef void (*pthread_key_destructor)(void *data);
+ 
++struct pthread_key {
++	vint32		sequence;
++	pthread_key_destructor destructor;
++};
++
++struct pthread_key_data {
++	vint32		sequence;
++	void		*value;
++};
++
++#define PTHREAD_KEYS_MAX		256
++#define PTHREAD_UNUSED_SEQUENCE	0
++
+ // This structure is used internally only, it has no public equivalent
+ struct pthread_thread {
+ 	void		*(*entry)(void*);
+@@ -54,6 +68,7 @@
+ 	int			cancel_state;
+ 	int			cancel_type;
+ 	bool		cancelled;
++	struct pthread_key_data specific[PTHREAD_KEYS_MAX];
+ 	struct __pthread_cleanup_handler *cleanup_handlers;
+ 	// TODO: move pthread keys in here, too
+ };
+@@ -63,7 +78,7 @@
+ extern &quot;C&quot; {
+ #endif
+ 
+-void __pthread_key_call_destructors(void);
++void __pthread_key_call_destructors(struct pthread_thread *thread);
+ struct pthread_thread *__get_pthread(void);
+ 
+ #ifdef __cplusplus
+
+Modified: haiku/trunk/src/tests/system/libroot/posix/posixtestsuite/run_posix_tests.sh
+===================================================================
+--- haiku/trunk/src/tests/system/libroot/posix/posixtestsuite/run_posix_tests.sh	2008-04-17 13:10:07 UTC (rev 24999)
++++ haiku/trunk/src/tests/system/libroot/posix/posixtestsuite/run_posix_tests.sh	2008-04-17 13:44:39 UTC (rev 25000)
+@@ -2,7 +2,7 @@
+ 
+ usage()
+ {
+-    cat &lt;&lt;EOF 
++    cat &lt;&lt;EOF
+ Usage: $0 all
+ 	to run all the available tests
+ 
+@@ -13,7 +13,7 @@
+ 	functionality areas as specified by the
+ 	letter tag in the posix spec
+ 	$0 [AIO|MEM|MSG|SEM|SIG|THR|TMR|TPS]
+-	
++
+ EOF
+ }
+ 
+@@ -62,8 +62,7 @@
+ 	echo &quot;pthread_key_delete()&quot;
+ 	conformance/interfaces/pthread_key_delete/pthread_key_delete_1-1
+ 	conformance/interfaces/pthread_key_delete/pthread_key_delete_1-2
+-#	conformance/interfaces/pthread_key_delete/pthread_key_delete_2-1
+-	echo &quot;pthread_key_delete_2-1: FIXME: test blocks, see bug #1642&quot;
++	conformance/interfaces/pthread_key_delete/pthread_key_delete_2-1
+ 	echo
+ 	echo &quot;pthread_once()&quot;
+ 	conformance/interfaces/pthread_once/pthread_once_1-1
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007828.html">[Haiku-commits] r24999 -	haiku/trunk/src/tests/system/benchmarks/libMicro
+</A></li>
+	<LI>Next message: <A HREF="007832.html">[Haiku-commits] r25000 - in haiku/trunk/src: system/libroot/posix/pthread tests/system/libroot/posix/posixtestsuite
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7829">[ date ]</a>
+              <a href="thread.html#7829">[ thread ]</a>
+              <a href="subject.html#7829">[ subject ]</a>
+              <a href="author.html#7829">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

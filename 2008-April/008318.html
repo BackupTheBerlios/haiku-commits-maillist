@@ -1,0 +1,854 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25254 -	haiku/trunk/src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25254%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200804291905.m3TJ5sCA013464%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008317.html">
+   <LINK REL="Next"  HREF="008319.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25254 -	haiku/trunk/src/add-ons/kernel/network/stack</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25254%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200804291905.m3TJ5sCA013464%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25254 -	haiku/trunk/src/add-ons/kernel/network/stack">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Apr 29 21:05:54 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008317.html">[Haiku-commits] r25253 - haiku/trunk/headers/private/kernel
+</A></li>
+        <LI>Next message: <A HREF="008319.html">[Haiku-commits] r25255 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8318">[ date ]</a>
+              <a href="thread.html#8318">[ thread ]</a>
+              <a href="subject.html#8318">[ subject ]</a>
+              <a href="author.html#8318">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-04-29 21:05:50 +0200 (Tue, 29 Apr 2008)
+New Revision: 25254
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25254&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25254&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/add-ons/kernel/network/stack/simple_net_buffer.cpp
+   haiku/trunk/src/add-ons/kernel/network/stack/simple_net_buffer.h
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/stack/Jamfile
+Log:
+Added a simple net_buffer implementation (using a single malloc()ed
+buffer) for debugging/testing purposes.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/Jamfile
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/Jamfile	2008-04-29 18:42:31 UTC (rev 25253)
++++ haiku/trunk/src/add-ons/kernel/network/stack/Jamfile	2008-04-29 19:05:50 UTC (rev 25254)
+@@ -26,6 +26,9 @@
+ 	stack.cpp
+ 	stack_interface.cpp
+ 	utility.cpp
++
++	# for test purposes
++	#simple_net_buffer.cpp
+ ;
+ 
+ # Installation
+
+Added: haiku/trunk/src/add-ons/kernel/network/stack/simple_net_buffer.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/simple_net_buffer.cpp	2008-04-29 18:42:31 UTC (rev 25253)
++++ haiku/trunk/src/add-ons/kernel/network/stack/simple_net_buffer.cpp	2008-04-29 19:05:50 UTC (rev 25254)
+@@ -0,0 +1,727 @@
++/*
++ * Copyright 2006-2008, Haiku, Inc. All Rights Reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * Authors:
++ *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
++ *		Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de</A>
++ */
++
++#include &quot;simple_net_buffer.h&quot;
++
++#include &quot;utility.h&quot;
++
++#include &lt;net_buffer.h&gt;
++#include &lt;slab/Slab.h&gt;
++#include &lt;tracing.h&gt;
++#include &lt;util/list.h&gt;
++
++#include &lt;ByteOrder.h&gt;
++#include &lt;debug.h&gt;
++#include &lt;KernelExport.h&gt;
++#include &lt;util/AutoLock.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
++
++#include &lt;algorithm&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/uio.h&gt;
++
++#include &quot;paranoia_config.h&quot;
++
++
++//#define TRACE_BUFFER
++#ifdef TRACE_BUFFER
++#	define TRACE(x) dprintf x
++#else
++#	define TRACE(x) ;
++#endif
++
++
++#define MAX_ANCILLARY_DATA_SIZE	128
++
++struct ancillary_data : DoublyLinkedListLinkImpl&lt;ancillary_data&gt; {
++	void* Data()
++	{
++		return (char*)this + _ALIGN(sizeof(ancillary_data));
++	}
++
++	static ancillary_data* FromData(void* data)
++	{
++		return (ancillary_data*)((char*)data - _ALIGN(sizeof(ancillary_data)));
++	}
++
++	ancillary_data_header	header;
++	void (*destructor)(const ancillary_data_header*, void*);
++};
++
++typedef DoublyLinkedList&lt;ancillary_data&gt; ancillary_data_list;
++
++
++struct net_buffer_private : simple_net_buffer {
++	ancillary_data_list	ancillary_data;
++};
++
++
++static status_t append_data(net_buffer *buffer, const void *data, size_t size);
++static status_t trim_data(net_buffer *_buffer, size_t newSize);
++static status_t remove_header(net_buffer *_buffer, size_t bytes);
++static status_t remove_trailer(net_buffer *_buffer, size_t bytes);
++
++
++static void
++copy_metadata(net_buffer *destination, const net_buffer *source)
++{
++	memcpy(destination-&gt;source, source-&gt;source,
++		min_c(source-&gt;source-&gt;sa_len, sizeof(sockaddr_storage)));
++	memcpy(destination-&gt;destination, source-&gt;destination,
++		min_c(source-&gt;destination-&gt;sa_len, sizeof(sockaddr_storage)));
++
++	destination-&gt;flags = source-&gt;flags;
++	destination-&gt;interface = source-&gt;interface;
++	destination-&gt;offset = source-&gt;offset;
++	destination-&gt;size = source-&gt;size;
++	destination-&gt;protocol = source-&gt;protocol;
++	destination-&gt;type = source-&gt;type;
++}
++
++
++//	#pragma mark - module API
++
++
++static net_buffer *
++create_buffer(size_t headerSpace)
++{
++	net_buffer_private *buffer = new(nothrow) net_buffer_private;
++	if (buffer == NULL)
++		return NULL;
++
++	TRACE((&quot;%ld: create buffer %p\n&quot;, find_thread(NULL), buffer));
++
++	buffer-&gt;data = NULL;
++	new(&amp;buffer-&gt;ancillary_data) ancillary_data_list;
++
++	buffer-&gt;source = (sockaddr *)&amp;buffer-&gt;storage.source;
++	buffer-&gt;destination = (sockaddr *)&amp;buffer-&gt;storage.destination;
++
++	buffer-&gt;storage.source.ss_len = 0;
++	buffer-&gt;storage.destination.ss_len = 0;
++
++	buffer-&gt;interface = NULL;
++	buffer-&gt;offset = 0;
++	buffer-&gt;flags = 0;
++	buffer-&gt;size = 0;
++
++	buffer-&gt;type = -1;
++
++	return buffer;
++}
++
++
++static void
++free_buffer(net_buffer *_buffer)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	free(buffer-&gt;data);
++	delete buffer;
++}
++
++
++/*!	Creates a duplicate of the \a buffer. The new buffer does not share internal
++	storage; they are completely independent from each other.
++*/
++static net_buffer *
++duplicate_buffer(net_buffer *_buffer)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	net_buffer* duplicate = create_buffer(0);
++	if (duplicate == NULL)
++		return NULL;
++
++	if (append_data(duplicate, buffer-&gt;data, buffer-&gt;size) != B_OK) {
++		free_buffer(duplicate);
++		return NULL;
++	}
++
++	copy_metadata(duplicate, buffer);
++
++	return duplicate;
++}
++
++
++/*!	Clones the buffer by grabbing another reference to the underlying data.
++	If that data changes, it will be changed in the clone as well.
++
++	If \a shareFreeSpace is \c true, the cloned buffer may claim the free
++	space in the original buffer as the original buffer can still do. If you
++	are using this, it's your responsibility that only one of the buffers
++	will do this.
++*/
++static net_buffer *
++clone_buffer(net_buffer *_buffer, bool shareFreeSpace)
++{
++	return duplicate_buffer(_buffer);
++}
++
++
++/*!
++	Split the buffer at offset, the header data
++	is returned as new buffer.
++	TODO: optimize and avoid making a copy.
++*/
++static net_buffer *
++split_buffer(net_buffer *_from, uint32 offset)
++{
++	net_buffer_private *from = (net_buffer_private *)_from;
++
++	if (offset &gt; from-&gt;size)
++		return NULL;
++
++	net_buffer_private* buffer = (net_buffer_private*)create_buffer(0);
++	if (buffer == NULL)
++		return NULL;
++
++	// allocate space for the tail data
++	size_t remaining = from-&gt;size - offset;
++	uint8* tailData = (uint8*)malloc(remaining);
++	if (tailData == NULL) {
++		free_buffer(buffer);
++		return NULL;
++	}
++
++	memcpy(tailData, from-&gt;data + offset, remaining);
++
++	// truncate original data and move it to the new buffer
++	buffer-&gt;data = (uint8*)realloc(from-&gt;data, offset);
++	buffer-&gt;size = offset;
++
++	// the old buffer gets the newly allocated tail data
++	from-&gt;data = tailData;
++	from-&gt;size = remaining;
++
++	return buffer;
++}
++
++
++/*!
++	Merges the second buffer with the first. If \a after is \c true, the
++	second buffer's contents will be appended to the first ones, else they
++	will be prepended.
++	The second buffer will be freed if this function succeeds.
++*/
++static status_t
++merge_buffer(net_buffer *_buffer, net_buffer *_with, bool after)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++	net_buffer_private *with = (net_buffer_private *)_with;
++	if (with == NULL)
++		return B_BAD_VALUE;
++
++	if (after) {
++		// the simple case: just append the second buffer
++		status_t error = append_data(buffer, with-&gt;data, with-&gt;size);
++		if (error != B_OK)
++			return error;
++	} else {
++		// append buffer to the second buffer, then switch the data
++		status_t error = append_data(with, buffer-&gt;data, buffer-&gt;size);
++		if (error != B_OK)
++			return error;
++
++		free(buffer-&gt;data);
++		buffer-&gt;data = with-&gt;data;
++		buffer-&gt;size = with-&gt;size;
++
++		with-&gt;data = NULL;
++	}
++
++	free_buffer(with);
++
++	return B_OK;
++}
++
++
++/*!	Writes into existing allocated memory.
++	\return B_BAD_VALUE if you write outside of the buffers current
++		bounds.
++*/
++static status_t
++write_data(net_buffer *_buffer, size_t offset, const void *data, size_t size)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	if (offset + size &gt; buffer-&gt;size)
++		return B_BAD_VALUE;
++	if (size == 0)
++		return B_OK;
++
++	memcpy(buffer-&gt;data + offset, data, size);
++
++	return B_OK;
++}
++
++
++static status_t
++read_data(net_buffer *_buffer, size_t offset, void *data, size_t size)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	if (offset + size &gt; buffer-&gt;size)
++		return B_BAD_VALUE;
++	if (size == 0)
++		return B_OK;
++
++	memcpy(data, buffer-&gt;data + offset, size);
++
++	return B_OK;
++}
++
++
++static status_t
++prepend_size(net_buffer *_buffer, size_t size, void **_contiguousBuffer)
++{
++	if (size == 0)
++		return B_OK;
++
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	uint8* newData = (uint8*)malloc(buffer-&gt;size + size);
++	if (newData == NULL)
++		return B_NO_MEMORY;
++
++	memcpy(newData + size, buffer-&gt;data, buffer-&gt;size);
++
++	free(buffer-&gt;data);
++	buffer-&gt;data = newData;
++	buffer-&gt;size += size;
++
++	if (_contiguousBuffer != NULL)
++		*_contiguousBuffer = buffer-&gt;data;
++
++	return B_OK;
++}
++
++
++static status_t
++prepend_data(net_buffer *buffer, const void *data, size_t size)
++{
++	status_t status = prepend_size(buffer, size, NULL);
++	if (status &lt; B_OK)
++		return status;
++
++	write_data(buffer, 0, data, size);
++
++	return B_OK;
++}
++
++
++static status_t
++append_size(net_buffer *_buffer, size_t size, void **_contiguousBuffer)
++{
++	if (size == 0)
++		return B_OK;
++
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	uint8* newData = (uint8*)realloc(buffer-&gt;data, buffer-&gt;size + size);
++	if (newData == NULL)
++		return B_NO_MEMORY;
++
++	if (_contiguousBuffer != NULL)
++		*_contiguousBuffer = newData + buffer-&gt;size;
++
++	buffer-&gt;data = newData;
++	buffer-&gt;size += size;
++
++	return B_OK;
++}
++
++
++static status_t
++append_data(net_buffer *buffer, const void *data, size_t size)
++{
++	size_t used = buffer-&gt;size;
++
++	status_t status = append_size(buffer, size, NULL);
++	if (status &lt; B_OK)
++		return status;
++
++	write_data(buffer, used, data, size);
++
++	return B_OK;
++}
++
++
++/*!
++	Removes bytes from the beginning of the buffer.
++*/
++static status_t
++remove_header(net_buffer *_buffer, size_t bytes)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	if (bytes &gt; buffer-&gt;size)
++		return B_BAD_VALUE;
++	if (bytes == 0)
++		return B_OK;
++
++	buffer-&gt;size -= bytes;
++	memmove(buffer-&gt;data, buffer-&gt;data + bytes, buffer-&gt;size);
++	buffer-&gt;data = (uint8*)realloc(buffer-&gt;data, buffer-&gt;size);
++
++	return B_OK;
++}
++
++
++/*!
++	Removes bytes from the end of the buffer.
++*/
++static status_t
++remove_trailer(net_buffer *buffer, size_t bytes)
++{
++	return trim_data(buffer, buffer-&gt;size - bytes);
++}
++
++
++/*!
++	Trims the buffer to the specified \a newSize by removing space from
++	the end of the buffer.
++*/
++static status_t
++trim_data(net_buffer *_buffer, size_t newSize)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	if (newSize &gt; buffer-&gt;size)
++		return B_BAD_VALUE;
++	if (newSize == buffer-&gt;size)
++		return B_OK;
++
++	buffer-&gt;data = (uint8*)realloc(buffer-&gt;data, newSize);
++	buffer-&gt;size = newSize;
++
++	return B_OK;
++}
++
++
++/*!
++	Appends data coming from buffer \a source to the buffer \a buffer. It only
++	clones the data, though, that is the data is not copied, just referenced.
++*/
++static status_t
++append_cloned_data(net_buffer *_buffer, net_buffer *_source, uint32 offset,
++	size_t bytes)
++{
++	if (bytes == 0)
++		return B_OK;
++
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++	net_buffer_private *source = (net_buffer_private *)_source;
++
++	if (offset + bytes &gt; source-&gt;size)
++		return B_BAD_VALUE;
++
++	return append_data(buffer, source-&gt;data + offset, bytes);
++}
++
++
++/*!
++	Attaches ancillary data to the given buffer. The data are completely
++	orthogonal to the data the buffer stores.
++
++	\param buffer The buffer.
++	\param header Description of the data.
++	\param data If not \c NULL, the data are copied into the allocated storage.
++	\param destructor If not \c NULL, this function will be invoked with the
++		data as parameter when the buffer is destroyed.
++	\param _allocatedData Will be set to the storage allocated for the data.
++	\return \c B_OK when everything goes well, another error code otherwise.
++*/
++static status_t
++attach_ancillary_data(net_buffer *_buffer, const ancillary_data_header *header,
++	const void *data, void (*destructor)(const ancillary_data_header*, void*),
++	void **_allocatedData)
++{
++	// TODO: Obviously it would be nice to allocate the memory for the
++	// ancillary data in the buffer.
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	// check parameters
++	if (header == NULL)
++		return B_BAD_VALUE;
++
++	if (header-&gt;len &gt; MAX_ANCILLARY_DATA_SIZE)
++		return ENOBUFS;
++
++	// allocate buffer
++	void *dataBuffer = malloc(_ALIGN(sizeof(ancillary_data)) + header-&gt;len);
++	if (dataBuffer == NULL)
++		return B_NO_MEMORY;
++
++	// init and attach the structure
++	ancillary_data *ancillaryData = new(dataBuffer) ancillary_data;
++	ancillaryData-&gt;header = *header;
++	ancillaryData-&gt;destructor = destructor;
++
++	buffer-&gt;ancillary_data.Add(ancillaryData);
++
++	if (data != NULL)
++		memcpy(ancillaryData-&gt;Data(), data, header-&gt;len);
++
++	if (_allocatedData != NULL)
++		*_allocatedData = ancillaryData-&gt;Data();
++
++	return B_OK;
++}
++
++
++/*!
++	Detaches ancillary data from the given buffer. The associated memory is
++	free, i.e. the \a data pointer must no longer be used after calling this
++	function. Depending on \a destroy, the destructor is invoked before freeing
++	the data.
++
++	\param buffer The buffer.
++	\param data Pointer to the data to be removed (as returned by
++		attach_ancillary_data() or next_ancillary_data()).
++	\param destroy If \c true, the destructor, if one was passed to
++		attach_ancillary_data(), is invoked for the data.
++	\return \c B_OK when everything goes well, another error code otherwise.
++*/
++static status_t
++detach_ancillary_data(net_buffer *_buffer, void *data, bool destroy)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	if (data == NULL)
++		return B_BAD_VALUE;
++
++	ancillary_data *ancillaryData = ancillary_data::FromData(data);
++
++	buffer-&gt;ancillary_data.Remove(ancillaryData);
++
++	if (destroy &amp;&amp; ancillaryData-&gt;destructor != NULL) {
++		ancillaryData-&gt;destructor(&amp;ancillaryData-&gt;header,
++			ancillaryData-&gt;Data());
++	}
++
++	free(ancillaryData);
++
++	return B_OK;
++}
++
++
++/*!
++	Moves all ancillary data from buffer \c from to the end of the list of
++	ancillary data of buffer \c to. Note, that this is the only function that
++	transfers or copies ancillary data from one buffer to another.
++
++	\param from The buffer from which to remove the ancillary data.
++	\param to The buffer to which to add teh ancillary data.
++	\return A pointer to the first of the moved ancillary data, if any, \c NULL
++		otherwise.
++*/
++static void *
++transfer_ancillary_data(net_buffer *_from, net_buffer *_to)
++{
++	net_buffer_private *from = (net_buffer_private *)_from;
++	net_buffer_private *to = (net_buffer_private *)_to;
++
++	if (from == NULL || to == NULL)
++		return NULL;
++
++	ancillary_data *ancillaryData = from-&gt;ancillary_data.Head();
++	to-&gt;ancillary_data.MoveFrom(&amp;from-&gt;ancillary_data);
++
++	return ancillaryData != NULL ? ancillaryData-&gt;Data() : NULL;
++}
++
++
++/*!
++	Returns the next ancillary data. When iterating over the data, initially
++	a \c NULL pointer shall be passed as \a previousData, subsequently the
++	previously returned data pointer. After the last item, \c NULL is returned.
++
++	Note, that it is not safe to call detach_ancillary_data() for a data item
++	and then pass that pointer to this function. First get the next item, then
++	detach the previous one.
++
++	\param buffer The buffer.
++	\param previousData The pointer to the previous data returned by this
++		function. Initially \c NULL shall be passed.
++	\param header Pointer to allocated storage into which the data description
++		is written. May be \c NULL.
++	\return A pointer to the next ancillary data in the buffer. \c NULL after
++		the last one.
++*/
++static void*
++next_ancillary_data(net_buffer *_buffer, void *previousData,
++	ancillary_data_header *_header)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	ancillary_data *ancillaryData;
++
++	if (previousData == NULL) {
++		ancillaryData = buffer-&gt;ancillary_data.Head();
++	} else {
++		ancillaryData = ancillary_data::FromData(previousData);
++		ancillaryData = buffer-&gt;ancillary_data.GetNext(ancillaryData);
++	}
++
++	if (ancillaryData == NULL)
++		return NULL;
++
++	if (_header != NULL)
++		*_header = ancillaryData-&gt;header;
++
++	return ancillaryData-&gt;Data();
++}
++
++
++/*!
++	Tries to directly access the requested space in the buffer.
++	If the space is contiguous, the function will succeed and place a pointer
++	to that space into \a _contiguousBuffer.
++
++	\return B_BAD_VALUE if the offset is outside of the buffer's bounds.
++	\return B_ERROR in case the buffer is not contiguous at that location.
++*/
++static status_t
++direct_access(net_buffer *_buffer, uint32 offset, size_t size,
++	void **_contiguousBuffer)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	if (offset + size &gt; buffer-&gt;size)
++		return B_BAD_VALUE;
++
++	*_contiguousBuffer = buffer-&gt;data + offset;
++	return B_OK;
++}
++
++
++static int32
++checksum_data(net_buffer *_buffer, uint32 offset, size_t size, bool finalize)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	if (offset + size &gt; buffer-&gt;size || size == 0)
++		return B_BAD_VALUE;
++
++	uint16 sum = compute_checksum(buffer-&gt;data + offset, size);
++	if ((offset &amp; 1) != 0) {
++		// if we're at an uneven offset, we have to swap the checksum
++		sum = __swap_int16(sum);
++	}
++
++	if (!finalize)
++		return (uint16)sum;
++
++	return (uint16)~sum;
++}
++
++
++static uint32
++get_iovecs(net_buffer *_buffer, struct iovec *iovecs, uint32 vecCount)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	iovecs[0].iov_base = buffer-&gt;data;
++	iovecs[0].iov_len = buffer-&gt;size;
++
++	return 1;
++}
++
++
++static uint32
++count_iovecs(net_buffer *_buffer)
++{
++	return 1;
++}
++
++
++static void
++swap_addresses(net_buffer *buffer)
++{
++	std::swap(buffer-&gt;source, buffer-&gt;destination);
++}
++
++
++static void
++dump_buffer(net_buffer *_buffer)
++{
++	net_buffer_private *buffer = (net_buffer_private *)_buffer;
++
++	dprintf(&quot;buffer %p, size %ld, data: %p\n&quot;, buffer, buffer-&gt;size,
++		buffer-&gt;data);
++	dump_block((char*)buffer-&gt;data, min_c(buffer-&gt;size, 32), &quot;    &quot;);
++}
++
++
++static status_t
++std_ops(int32 op, ...)
++{
++	switch (op) {
++		case B_MODULE_INIT:
++			return B_OK;
++
++		case B_MODULE_UNINIT:
++			return B_OK;
++
++		default:
++			return B_ERROR;
++	}
++}
++
++
++net_buffer_module_info gSimpleNetBufferModule = {
++//net_buffer_module_info gNetBufferModule = {
++	{
++		NET_BUFFER_MODULE_NAME,
++		0,
++		std_ops
++	},
++	create_buffer,
++	free_buffer,
++
++	duplicate_buffer,
++	clone_buffer,
++	split_buffer,
++	merge_buffer,
++
++	prepend_size,
++	prepend_data,
++	append_size,
++	append_data,
++	NULL,	// insert
++	NULL,	// remove
++	remove_header,
++	remove_trailer,
++	trim_data,
++	append_cloned_data,
++
++	NULL,	// associate_data
++
++	attach_ancillary_data,
++	detach_ancillary_data,
++	transfer_ancillary_data,
++	next_ancillary_data,
++
++	direct_access,
++	read_data,
++	write_data,
++
++	checksum_data,
++
++	NULL,	// get_memory_map
++	get_iovecs,
++	count_iovecs,
++
++	swap_addresses,
++
++	dump_buffer,	// dump
++};
++
+
+Added: haiku/trunk/src/add-ons/kernel/network/stack/simple_net_buffer.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/simple_net_buffer.h	2008-04-29 18:42:31 UTC (rev 25253)
++++ haiku/trunk/src/add-ons/kernel/network/stack/simple_net_buffer.h	2008-04-29 19:05:50 UTC (rev 25254)
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef SIMPLE_NET_BUFFER_H
++#define SIMPLE_NET_BUFFER_H
++
++#include &lt;net_buffer.h&gt;
++
++
++struct simple_net_buffer : net_buffer {
++	uint8*				data;
++
++	struct {
++		struct sockaddr_storage source;
++		struct sockaddr_storage destination;
++	} storage;
++};
++
++
++extern net_buffer_module_info gSimpleNetBufferModule;
++
++
++#endif	// SIMPLE_NET_BUFFER_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008317.html">[Haiku-commits] r25253 - haiku/trunk/headers/private/kernel
+</A></li>
+	<LI>Next message: <A HREF="008319.html">[Haiku-commits] r25255 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8318">[ date ]</a>
+              <a href="thread.html#8318">[ thread ]</a>
+              <a href="subject.html#8318">[ subject ]</a>
+              <a href="author.html#8318">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

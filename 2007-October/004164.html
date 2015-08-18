@@ -1,0 +1,376 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22465 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22465%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200710071221.l97CLIin019464%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004178.html">
+   <LINK REL="Next"  HREF="004165.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22465 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22465%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200710071221.l97CLIin019464%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22465 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sun Oct  7 14:21:18 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004178.html">[Haiku-commits] r22464 -	haiku/trunk/src/system/boot/platform/openfirmware
+</A></li>
+        <LI>Next message: <A HREF="004165.html">[Haiku-commits] r22466 - in haiku/trunk/src/system/kernel: cache vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4164">[ date ]</a>
+              <a href="thread.html#4164">[ thread ]</a>
+              <a href="subject.html#4164">[ subject ]</a>
+              <a href="author.html#4164">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-10-07 14:21:18 +0200 (Sun, 07 Oct 2007)
+New Revision: 22465
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22465&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22465&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+Log:
+* Fixed a serious oversight that could result in trying to insert a page
+  twice into the same cache: cache_io() called read_into_cache() (or
+  write_to_cache()), and that broke down the request into smaller parts.
+  It then called read_chunk_into_cache() (or write_chunk_to_cache() resp.)
+  to actually allocate pages and fulfill the request.
+  However, it needed to unlock the cache for each chunk, and in the mean
+  time someone else could insert pages into the remaining chunks.
+* Now, cache_io() already takes care of chunking the data which makes this
+  approach safe, and also simplified the code a bit - read_into_cache()/
+  write_to_cache() are gone now. I've renamed read_chunk_into_cache() to
+  read_into_cache() (same for the write function).
+* Also got rid of that goto in that function while I was on it.
+* Disabled cache_prefetch_vnode() for now (it's similar to cache_io(), but
+  since it's currently not used [since no cache module is installed yet],
+  I didn't want to go through updating it now, too).
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-10-06 18:40:32 UTC (rev 22464)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2007-10-07 12:21:18 UTC (rev 22465)
+@@ -511,16 +511,18 @@
+ }
+ 
+ 
+-/*!
+-	This function is called by read_into_cache() (and from there only) - it
+-	can only handle a certain amount of bytes, and read_into_cache() makes
++/*!	Reads the requested amount of data into the cache, and allocates
++	pages needed to fulfill that request. This function is called by cache_io().
++	It can only handle a certain amount of bytes, and the caller must make
+ 	sure that it matches that criterion.
++	The cache_ref lock must be hold when calling this function; during
++	operation it will unlock the cache, though.
+ */
+ static inline status_t
+-read_chunk_into_cache(file_cache_ref *ref, off_t offset, size_t numBytes,
++read_into_cache(file_cache_ref *ref, off_t offset, size_t numBytes,
+ 	int32 pageOffset, addr_t buffer, size_t bufferSize)
+ {
+-	TRACE((&quot;read_chunk(offset = %Ld, size = %lu, pageOffset = %ld, buffer &quot;
++	TRACE((&quot;read_into_cache(offset = %Ld, size = %lu, pageOffset = %ld, buffer &quot;
+ 		&quot;= %#lx, bufferSize = %lu\n&quot;, offset, size, pageOffset, buffer,
+ 		bufferSize));
+ 
+@@ -620,63 +622,13 @@
+ }
+ 
+ 
+-/*!
+-	This function reads \a size bytes directly from the file into the cache.
+-	If \a bufferSize does not equal zero, \a bufferSize bytes from the data
+-	read in are also copied to the provided \a buffer.
+-	This function always allocates all pages; it is the responsibility of the
+-	calling function to only ask for yet uncached ranges.
+-	The cache_ref lock must be hold when calling this function.
++/*!	Like read_into_cache() but writes data into the cache.
++	To preserve data consistency, it might also read pages into the cache,
++	though, if only a partial page gets written.
++	The same restrictions apply.
+ */
+-static status_t
+-read_into_cache(file_cache_ref *ref, off_t offset, size_t size, addr_t buffer,
+-	size_t bufferSize)
+-{
+-	TRACE((&quot;read_from_cache: ref = %p, offset = %Ld, size = %lu, buffer = %p, &quot;
+-		&quot;bufferSize = %lu\n&quot;, ref, offset, size, (void *)buffer, bufferSize));
+-
+-	// do we have to read in anything at all?
+-	if (size == 0)
+-		return B_OK;
+-
+-	// make sure &quot;offset&quot; is page aligned - but also remember the page offset
+-	int32 pageOffset = offset &amp; (B_PAGE_SIZE - 1);
+-	size = PAGE_ALIGN(size + pageOffset);
+-	offset -= pageOffset;
+-
+-	while (true) {
+-		size_t chunkSize = size;
+-		if (chunkSize &gt; (MAX_IO_VECS * B_PAGE_SIZE))
+-			chunkSize = MAX_IO_VECS * B_PAGE_SIZE;
+-
+-		status_t status = read_chunk_into_cache(ref, offset, chunkSize,
+-			pageOffset, buffer, bufferSize);
+-		if (status != B_OK)
+-			return status;
+-
+-		if ((size -= chunkSize) == 0)
+-			return B_OK;
+-
+-		if (chunkSize &gt;= bufferSize) {
+-			bufferSize = 0;
+-			buffer = NULL;
+-		} else {
+-			bufferSize -= chunkSize - pageOffset;
+-			buffer += chunkSize - pageOffset;
+-		}
+-
+-		offset += chunkSize;
+-		pageOffset = 0;
+-	}
+-
+-	return B_OK;
+-}
+-
+-
+-/**	Like read_chunk_into_cache() but writes data into the cache */
+-
+ static inline status_t
+-write_chunk_to_cache(file_cache_ref *ref, off_t offset, size_t numBytes,
++write_to_cache(file_cache_ref *ref, off_t offset, size_t numBytes,
+ 	int32 pageOffset, addr_t buffer, size_t bufferSize)
+ {
+ 	// TODO: We're using way too much stack! Rather allocate a sufficiently
+@@ -805,66 +757,35 @@
+ }
+ 
+ 
+-/*!	Like read_into_cache() but writes data into the cache. To preserve data
+-	consistency, it might also read pages into the cache, though, if only a
+-	partial page gets written.
+-	The cache_ref lock must be hold when calling this function.
+-*/
+ static status_t
+-write_to_cache(file_cache_ref *ref, off_t offset, size_t size, addr_t buffer,
+-	size_t bufferSize)
++satisfy_cache_io(file_cache_ref *ref, off_t offset, addr_t buffer,
++	int32 &amp;pageOffset, size_t bytesLeft, off_t &amp;lastOffset, addr_t &amp;lastBuffer,
++	int32 &amp;lastPageOffset, size_t &amp;lastLeft, bool doWrite)
+ {
+-	TRACE((&quot;write_to_cache: ref = %p, offset = %Ld, size = %lu, buffer = %p, &quot;
+-		&quot;bufferSize = %lu\n&quot;, ref, offset, size, (void *)buffer, bufferSize));
++	if (lastBuffer == buffer)
++		return B_OK;
+ 
+-	// make sure &quot;offset&quot; is page aligned - but also remember the page offset
+-	int32 pageOffset = offset &amp; (B_PAGE_SIZE - 1);
+-	size = PAGE_ALIGN(size + pageOffset);
+-	offset -= pageOffset;
+-
+-	while (true) {
+-		size_t chunkSize = size;
+-		if (chunkSize &gt; (MAX_IO_VECS * B_PAGE_SIZE))
+-			chunkSize = MAX_IO_VECS * B_PAGE_SIZE;
+-
+-		status_t status = write_chunk_to_cache(ref, offset, chunkSize,
+-			pageOffset, buffer, bufferSize);
+-		if (status != B_OK)
+-			return status;
+-
+-		if ((size -= chunkSize) == 0)
+-			return B_OK;
+-
+-		if (chunkSize &gt;= bufferSize) {
+-			bufferSize = 0;
+-			buffer = NULL;
+-		} else {
+-			bufferSize -= chunkSize - pageOffset;
+-			buffer += chunkSize - pageOffset;
+-		}
+-
+-		offset += chunkSize;
++	size_t requestSize = buffer - lastBuffer;
++	status_t status;
++	if (doWrite) {
++		status = write_to_cache(ref, lastOffset, requestSize, lastPageOffset,
++			lastBuffer, requestSize);
++	} else {
++		status = read_into_cache(ref, lastOffset, requestSize, lastPageOffset,
++			lastBuffer, requestSize);
++	}
++	if (status == B_OK) {
++		lastBuffer = buffer;
++		lastLeft = bytesLeft;
++		lastOffset = offset;
++		lastPageOffset = 0;
+ 		pageOffset = 0;
+ 	}
+-
+-	return B_OK;
++	return status;
+ }
+ 
+ 
+ static status_t
+-satisfy_cache_io(file_cache_ref *ref, off_t offset, addr_t buffer,
+-	addr_t lastBuffer, bool doWrite)
+-{
+-	size_t requestSize = buffer - lastBuffer;
+-
+-	if (doWrite)
+-		return write_to_cache(ref, offset, requestSize, lastBuffer, requestSize);
+-
+-	return read_into_cache(ref, offset, requestSize, lastBuffer, requestSize);
+-}
+-
+-
+-static status_t
+ cache_io(void *_cacheRef, off_t offset, addr_t buffer, size_t *_size,
+ 	bool doWrite)
+ {
+@@ -893,11 +814,14 @@
+ 		size = fileSize - pageOffset - offset;
+ 		*_size = size;
+ 	}
++	if (size == 0)
++		return B_OK;
+ 
+ 	// &quot;offset&quot; and &quot;lastOffset&quot; are always aligned to B_PAGE_SIZE,
+ 	// the &quot;last*&quot; variables always point to the end of the last
+ 	// satisfied request part
+ 
++	const uint32 kMaxChunkSize = MAX_IO_VECS * B_PAGE_SIZE;
+ 	size_t bytesLeft = size, lastLeft = size;
+ 	int32 lastPageOffset = pageOffset;
+ 	addr_t lastBuffer = buffer;
+@@ -905,29 +829,17 @@
+ 
+ 	mutex_lock(&amp;cache-&gt;lock);
+ 
+-	for (; bytesLeft &gt; 0; offset += B_PAGE_SIZE) {
++	while (bytesLeft &gt; 0) {
+ 		// check if this page is already in memory
+-	restart:
+ 		vm_page *page = vm_cache_lookup_page(cache, offset);
+ 		if (page != NULL) {
+-			// The page is busy - since we need to unlock the cache sometime
++			// The page may be busy - since we need to unlock the cache sometime
+ 			// in the near future, we need to satisfy the request of the pages
+ 			// we didn't get yet (to make sure no one else interferes in the
+ 			// mean time).
+-			status_t status = B_OK;
+-
+-			if (lastBuffer != buffer) {
+-				status = satisfy_cache_io(ref, lastOffset + lastPageOffset,
+-					buffer, lastBuffer, doWrite);
+-				if (status == B_OK) {
+-					lastBuffer = buffer;
+-					lastLeft = bytesLeft;
+-					lastOffset = offset;
+-					lastPageOffset = 0;
+-					pageOffset = 0;
+-				}
+-			}
+-
++			status_t status = satisfy_cache_io(ref, offset, buffer, pageOffset,
++				bytesLeft, lastOffset, lastBuffer, lastPageOffset, lastLeft,
++				doWrite);
+ 			if (status != B_OK) {
+ 				mutex_unlock(&amp;cache-&gt;lock);
+ 				return status;
+@@ -939,7 +851,7 @@
+ 				mutex_unlock(&amp;cache-&gt;lock);
+ 				entry.Wait();
+ 				mutex_lock(&amp;cache-&gt;lock);
+-				goto restart;
++				continue;
+ 			}
+ 		}
+ 
+@@ -991,16 +903,27 @@
+ 		buffer += bytesInPage;
+ 		bytesLeft -= bytesInPage;
+ 		pageOffset = 0;
++		offset += B_PAGE_SIZE;
++
++		if (buffer - lastBuffer + lastPageOffset &gt;= kMaxChunkSize) {
++			status_t status = satisfy_cache_io(ref, offset, buffer, pageOffset,
++				bytesLeft, lastOffset, lastBuffer, lastPageOffset, lastLeft,
++				doWrite);
++			if (status != B_OK) {
++				mutex_unlock(&amp;cache-&gt;lock);
++				return status;
++			}
++		}
+ 	}
+ 
+ 	// fill the last remaining bytes of the request (either write or read)
+ 
+ 	status_t status;
+ 	if (doWrite) {
+-		status = write_to_cache(ref, lastOffset + lastPageOffset, lastLeft,
++		status = write_to_cache(ref, lastOffset, lastLeft, lastPageOffset,
+ 			lastBuffer, lastLeft);
+ 	} else {
+-		status = read_into_cache(ref, lastOffset + lastPageOffset, lastLeft,
++		status = read_into_cache(ref, lastOffset, lastLeft, lastPageOffset,
+ 			lastBuffer, lastLeft);
+ 	}
+ 
+@@ -1065,6 +988,7 @@
+ extern &quot;C&quot; void
+ cache_prefetch_vnode(struct vnode *vnode, off_t offset, size_t size)
+ {
++#if 0
+ 	vm_cache *cache;
+ 	if (vfs_get_vnode_cache(vnode, &amp;cache, false) != B_OK)
+ 		return;
+@@ -1131,6 +1055,7 @@
+ out:
+ 	mutex_unlock(&amp;cache-&gt;lock);
+ 	vm_cache_release_ref(cache);
++#endif
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004178.html">[Haiku-commits] r22464 -	haiku/trunk/src/system/boot/platform/openfirmware
+</A></li>
+	<LI>Next message: <A HREF="004165.html">[Haiku-commits] r22466 - in haiku/trunk/src/system/kernel: cache vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4164">[ date ]</a>
+              <a href="thread.html#4164">[ thread ]</a>
+              <a href="subject.html#4164">[ subject ]</a>
+              <a href="author.html#4164">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

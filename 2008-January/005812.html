@@ -1,0 +1,361 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23774 -	haiku/trunk/src/add-ons/kernel/bus_managers/agp_gart
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23774%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/agp_gart&In-Reply-To=%3C200801281344.m0SDiEL1017046%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005811.html">
+   <LINK REL="Next"  HREF="005813.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23774 -	haiku/trunk/src/add-ons/kernel/bus_managers/agp_gart</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23774%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/agp_gart&In-Reply-To=%3C200801281344.m0SDiEL1017046%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23774 -	haiku/trunk/src/add-ons/kernel/bus_managers/agp_gart">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Jan 28 14:44:14 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005811.html">[Haiku-commits] r23773 - in haiku/trunk/src/tests/add-ons/kernel: .	bus_managers bus_managers/agp_gart
+</A></li>
+        <LI>Next message: <A HREF="005813.html">[Haiku-commits] r23775 - haiku/trunk/src/tests/kits/net/tcp_shell
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5812">[ date ]</a>
+              <a href="thread.html#5812">[ thread ]</a>
+              <a href="subject.html#5812">[ subject ]</a>
+              <a href="author.html#5812">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-01-28 14:44:13 +0100 (Mon, 28 Jan 2008)
+New Revision: 23774
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23774&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23774&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/agp_gart/agp_gart.cpp
+Log:
+* Refactored _AdaptToReserved() out of Aperture::AllocateMemory(), as it's now
+  also used in BindMemory() and UnbindMemory() - before the latter two were
+  just not working correctly for memory in the reserved region.
+* The Aperture destructor now also frees (and unbinds) all still existing
+  allocations.
+* Aperture::fFirstMemory was not initialized.
+* Added some more debug output.
+* BindMemory()'s vertical to physical address translation didn't work correctly.
+* alignment must be at least B_PAGE_SIZE in _Insert().
+* bind_aperture() needs to pass the B_APERTURE_NON_RESERVED flag to
+  CreateMemory().
+
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/agp_gart/agp_gart.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/agp_gart/agp_gart.cpp	2008-01-28 13:36:09 UTC (rev 23773)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/agp_gart/agp_gart.cpp	2008-01-28 13:44:13 UTC (rev 23774)
+@@ -80,7 +80,7 @@
+ 	addr_t		base;
+ 	size_t		size;
+ 	uint32		flags;
+-#ifdef __HAIKU__
++#if defined(__HAIKU__) &amp;&amp; !defined(GART_TEST)
+ 	union {
+ 		vm_page	**pages;
+ 		vm_page *page;
+@@ -145,8 +145,8 @@
+ 	struct lock &amp;Lock() { return fLock; }
+ 
+ private:
++	bool _AdaptToReserved(addr_t &amp;base, size_t &amp;size, int32 *_offset = NULL);
+ 	void _Free(aperture_memory *memory);
+-
+ 	void _Remove(aperture_memory *memory);
+ 	status_t _Insert(aperture_memory *memory, size_t size, size_t alignment,
+ 		uint32 flags);
+@@ -402,6 +402,7 @@
+ 	:
+ 	fModule(module),
+ 	fHashTable(fInfo),
++	fFirstMemory(NULL),
+ 	fPrivateAperture(aperture)
+ {
+ 	fModule-&gt;get_aperture_info(fPrivateAperture, &amp;fInfo);
+@@ -412,6 +413,10 @@
+ 
+ Aperture::~Aperture()
+ {
++	while (fFirstMemory != NULL) {
++		DeleteMemory(fFirstMemory);
++	}
++
+ 	fModule-&gt;delete_aperture(fPrivateAperture);
+ 	put_module(fModule-&gt;info.name);
+ }
+@@ -431,6 +436,8 @@
+ void
+ Aperture::DeleteMemory(aperture_memory *memory)
+ {
++	TRACE(&quot;delete memory %p\n&quot;, memory);
++
+ 	UnbindMemory(memory);
+ 	_Free(memory);
+ 	_Remove(memory);
+@@ -453,8 +460,11 @@
+ 		return NULL;
+ 	}
+ 
++	TRACE(&quot;create memory %p, base %lx, size %lx, flags %lx\n&quot;, memory,
++		memory-&gt;base, memory-&gt;size, flags);
++
+ 	memory-&gt;flags = flags;
+-#ifdef __HAIKU__
++#if defined(__HAIKU__) &amp;&amp; !defined(GART_TEST)
+ 	memory-&gt;pages = NULL;
+ #else
+ 	memory-&gt;area = -1;
+@@ -465,23 +475,45 @@
+ }
+ 
+ 
++bool
++Aperture::_AdaptToReserved(addr_t &amp;base, size_t &amp;size, int32 *_offset)
++{
++	addr_t reservedEnd = fInfo.base + fInfo.reserved_size;
++	if (reservedEnd &lt;= base)
++		return false;
++
++	if (reservedEnd &gt;= base + size) {
++		size = 0;
++		return true;
++	}
++
++	if (_offset != NULL)
++		*_offset = reservedEnd - base;
++
++	size -= reservedEnd - base;
++	base = reservedEnd;
++	return true;
++}
++
++
+ status_t
+ Aperture::AllocateMemory(aperture_memory *memory, uint32 flags)
+ {
+-	// We don't need to allocate stolen memory - it's
++	// We don't need to allocate reserved memory - it's
+ 	// already there for us to use
+-	addr_t reservedEnd = fInfo.base + fInfo.reserved_size;
++	addr_t base = memory-&gt;base;
+ 	size_t size = memory-&gt;size;
+-	if (reservedEnd &gt; memory-&gt;base) {
+-		if (reservedEnd &gt;= memory-&gt;base + memory-&gt;size)
++	if (_AdaptToReserved(base, size)) {
++		if (size == 0) {
++			TRACE(&quot;allocation is made of reserved memory\n&quot;);
+ 			return B_OK;
++		}
+ 
+-		memset((void *)memory-&gt;base, 0, reservedEnd - memory-&gt;base);
+-			// TODO: this requires the aperture to be mapped!
+-		size -= reservedEnd - memory-&gt;base;
++		memset((void *)memory-&gt;base, 0, memory-&gt;size - size);
+ 	}
++	TRACE(&quot;allocate %ld bytes out of %ld\n&quot;, size, memory-&gt;size);
+ 
+-#ifdef __HAIKU__
++#if defined(__HAIKU__) &amp;&amp; !defined(GART_TEST)
+ 	uint32 count = size / B_PAGE_SIZE;
+ 
+ 	if ((flags &amp; B_APERTURE_NEED_PHYSICAL) != 0) {
+@@ -527,8 +559,16 @@
+ 	if ((memory-&gt;flags &amp; BIND_APERTURE) == 0)
+ 		return B_BAD_VALUE;
+ 
+-	addr_t start = memory-&gt;base - Base();
++	// We must not unbind reserved memory
++	addr_t base = memory-&gt;base;
++	size_t size = memory-&gt;size;
++	if (_AdaptToReserved(base, size) &amp;&amp; size == 0) {
++		memory-&gt;flags &amp;= ~BIND_APERTURE;
++		return B_OK;
++	}
+ 
++	addr_t start = base - Base();
++
+ 	for (addr_t offset = 0; offset &lt; memory-&gt;size; offset += B_PAGE_SIZE) {
+ 		status_t status = fModule-&gt;unbind_page(fPrivateAperture, start + offset);
+ 		if (status &lt; B_OK)
+@@ -536,36 +576,54 @@
+ 	}
+ 
+ 	memory-&gt;flags &amp;= ~BIND_APERTURE;
++	fModule-&gt;flush_tlbs(fPrivateAperture);
+ 	return B_OK;
+ }
+ 
+ 
+ status_t
+-Aperture::BindMemory(aperture_memory *memory, addr_t base, size_t size,
++Aperture::BindMemory(aperture_memory *memory, addr_t address, size_t size,
+ 	bool physical)
+ {
+-	addr_t start = memory-&gt;base - Base();
++	// We don't need to bind reserved memory
++	addr_t base = memory-&gt;base;
++	int32 offset;
++	if (_AdaptToReserved(base, size, &amp;offset)) {
++		if (size == 0) {
++			TRACE(&quot;reserved memory already bound\n&quot;);
++			memory-&gt;flags |= BIND_APERTURE;
++			return B_OK;
++		}
+ 
++		address += offset;
++	}
++
++	addr_t start = base - Base();
++	TRACE(&quot;bind %ld bytes at %lx\n&quot;, size, base);
++
+ 	for (addr_t offset = 0; offset &lt; size; offset += B_PAGE_SIZE) {
+ 		status_t status;
+-		addr_t address;
++		addr_t physicalAddress;
+ 
+ 		if (!physical) {
+ 			physical_entry entry;
+-			address = (addr_t)entry.address;
+-			status = get_memory_map((void *)(base + offset), B_PAGE_SIZE,
++			status = get_memory_map((void *)(address + offset), B_PAGE_SIZE,
+ 				&amp;entry, 1);
+ 			if (status &lt; B_OK)
+ 				return status;
++
++			physicalAddress = (addr_t)entry.address;
+ 		} else
+-			address = base + offset;
++			physicalAddress = address + offset;
+ 
+-		status = fModule-&gt;bind_page(fPrivateAperture, start + offset, address);
++		status = fModule-&gt;bind_page(fPrivateAperture, start + offset,
++			physicalAddress);
+ 		if (status &lt; B_OK)
+ 			return status;
+ 	}
+ 
+ 	memory-&gt;flags |= BIND_APERTURE;
++	fModule-&gt;flush_tlbs(fPrivateAperture);
+ 	return B_OK;
+ }
+ 
+@@ -576,7 +634,7 @@
+ 	if ((memory-&gt;flags &amp; ALLOCATED_APERTURE) == 0)
+ 		return;
+ 
+-#ifdef __HAIKU__
++#if defined(__HAIKU__) &amp;&amp; !defined(GART_TEST)
+ 	// Remove the stolen area from the allocation
+ 	size_t size = memory-&gt;size;
+ 	addr_t reservedEnd = fInfo.base + fInfo.reserved_size;
+@@ -641,6 +699,9 @@
+ 	if (size == 0 || size &gt; fInfo.size)
+ 		return B_BAD_VALUE;
+ 
++	if (alignment &lt; B_PAGE_SIZE)
++		alignment = B_PAGE_SIZE;
++
+ 	addr_t start = fInfo.base;
+ 	if ((flags &amp; (B_APERTURE_NON_RESERVED | B_APERTURE_NEED_PHYSICAL)) != 0)
+ 		start += fInfo.reserved_size;
+@@ -689,6 +750,8 @@
+ 			// got a spot
+ 			foundSpot = true;
+ 			memory-&gt;base = ROUNDUP(last-&gt;base + last-&gt;size, alignment);
++			if (memory-&gt;base &lt; start)
++				memory-&gt;base = start;
+ 		}
+ 
+ 		if (!foundSpot)
+@@ -898,10 +961,10 @@
+ 	if (aperture == NULL)
+ 		return B_ENTRY_NOT_FOUND;
+ 
++	size = ROUNDUP(size, B_PAGE_SIZE);
++
+ 	Autolock _(aperture-&gt;Lock());
+ 
+-	size = ROUNDUP(size, B_PAGE_SIZE);
+-
+ 	aperture_memory *memory = aperture-&gt;CreateMemory(size, alignment, flags);
+ 	if (memory == NULL)
+ 		return B_NO_MEMORY;
+@@ -915,7 +978,7 @@
+ 	}
+ 
+ 	if (_physicalBase != NULL &amp;&amp; (flags &amp; B_APERTURE_NEED_PHYSICAL) != 0) {
+-#ifdef __HAIKU__
++#if defined(__HAIKU__) &amp;&amp; !defined(GART_TEST)
+ 		*_physicalBase = memory-&gt;page-&gt;physical_page_number * B_PAGE_SIZE;
+ #else
+ 		physical_entry entry;
+@@ -981,12 +1044,14 @@
+ 	if (aperture == NULL)
+ 		return B_ENTRY_NOT_FOUND;
+ 
+-	if (size == 0 || size &gt; aperture-&gt;Size()
+-		|| (area &lt; 0 &amp;&amp; (base &amp; (B_PAGE_SIZE - 1)) != 0)
+-		|| (area &lt; 0 &amp;&amp; base == 0))
+-		return B_BAD_VALUE;
++	if (area &lt; 0) {
++		if (size == 0 || size &gt; aperture-&gt;Size()
++			|| (base &amp; (B_PAGE_SIZE - 1)) != 0
++			|| base == 0)
++			return B_BAD_VALUE;
+ 
+-	size = ROUNDUP(size, B_PAGE_SIZE);
++		size = ROUNDUP(size, B_PAGE_SIZE);
++	}
+ 
+ 	if (area &gt;= 0) {
+ 		// get base and size from area
+@@ -1009,7 +1074,8 @@
+ 			return B_BAD_VALUE;
+ 	} else {
+ 		// create new memory object
+-		memory = aperture-&gt;CreateMemory(size, alignment, 0);
++		memory = aperture-&gt;CreateMemory(size, alignment,
++			B_APERTURE_NON_RESERVED);
+ 		if (memory == NULL)
+ 			return B_NO_MEMORY;
+ 	}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005811.html">[Haiku-commits] r23773 - in haiku/trunk/src/tests/add-ons/kernel: .	bus_managers bus_managers/agp_gart
+</A></li>
+	<LI>Next message: <A HREF="005813.html">[Haiku-commits] r23775 - haiku/trunk/src/tests/kits/net/tcp_shell
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5812">[ date ]</a>
+              <a href="thread.html#5812">[ thread ]</a>
+              <a href="subject.html#5812">[ subject ]</a>
+              <a href="author.html#5812">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

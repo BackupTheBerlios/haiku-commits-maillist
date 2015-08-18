@@ -1,0 +1,229 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26783 - in haiku/trunk/src/system/kernel: . vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26783%20-%20in%20haiku/trunk/src/system/kernel%3A%20.%20vm&In-Reply-To=%3C200808040328.m743Sq5K008579%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010792.html">
+   <LINK REL="Next"  HREF="010794.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26783 - in haiku/trunk/src/system/kernel: . vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26783%20-%20in%20haiku/trunk/src/system/kernel%3A%20.%20vm&In-Reply-To=%3C200808040328.m743Sq5K008579%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26783 - in haiku/trunk/src/system/kernel: . vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Aug  4 05:28:52 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010792.html">[Haiku-commits] r26782 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="010794.html">[Haiku-commits] r26784 - haiku/trunk/src/kits/device
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10793">[ date ]</a>
+              <a href="thread.html#10793">[ thread ]</a>
+              <a href="subject.html#10793">[ subject ]</a>
+              <a href="author.html#10793">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-04 05:28:46 +0200 (Mon, 04 Aug 2008)
+New Revision: 26783
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26783&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26783&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/main.cpp
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h
+Log:
+Patch by Zhao Shuai with changes by myself:
+* Keep track of the stack space actually allocated for the cache and let
+  Write() fail when we've already allocated as much as reserved.
+* Added second phase of swap initialization (swap_init_post_modules())
+  which reads the virtual memory driver settings and creates/resizes a
+  swap file. ATM truncate() is used to resize the swap file, but that is
+  a bit slow. We should probably introduce a VFS function to use BFS's
+  fast method.
+
+This should make swap support work somewhat, but since swap space is
+never freed ATM this would be a relatively short pleasure. Still
+disabled by default.
+
+
+Modified: haiku/trunk/src/system/kernel/main.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/main.cpp	2008-08-04 03:19:54 UTC (rev 26782)
++++ haiku/trunk/src/system/kernel/main.cpp	2008-08-04 03:28:46 UTC (rev 26783)
+@@ -273,6 +273,11 @@
+ 	boot_splash_set_stage(BOOT_SPLASH_STAGE_4_MOUNT_BOOT_FS);
+ 	vfs_mount_boot_file_system(&amp;sKernelArgs);
+ 
++#if ENABLE_SWAP_SUPPORT
++	TRACE(&quot;swap_init_post_modules\n&quot;);
++	swap_init_post_modules();
++#endif
++
+ 	// CPU specific modules may now be available
+ 	boot_splash_set_stage(BOOT_SPLASH_STAGE_5_INIT_CPU_MODULES);
+ 	cpu_init_post_modules(&amp;sKernelArgs);
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-04 03:19:54 UTC (rev 26782)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-04 03:28:46 UTC (rev 26783)
+@@ -10,7 +10,11 @@
+ 
+ #include &quot;VMAnonymousCache.h&quot;
+ 
++#include &lt;errno.h&gt;
++#include &lt;fcntl.h&gt;
+ #include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;unistd.h&gt;
+ 
+ #include &lt;arch_config.h&gt;
+ #include &lt;heap.h&gt;
+@@ -18,9 +22,11 @@
+ #include &lt;slab/Slab.h&gt;
+ #include &lt;vfs.h&gt;
+ #include &lt;vm.h&gt;
++#include &lt;vm_page.h&gt;
+ #include &lt;vm_priv.h&gt;
+ #include &lt;util/DoublyLinkedList.h&gt;
+ #include &lt;util/OpenHashTable.h&gt;
++#include &lt;driver_settings.h&gt;
+ 
+ 
+ #if	ENABLE_SWAP_SUPPORT
+@@ -152,6 +158,7 @@
+ 	fPrecommittedPages = min_c(numPrecommittedPages, 255);
+ 	fGuardedSize = numGuardPages * B_PAGE_SIZE;
+ 	fCommittedSwapSize = 0;
++	fAllocatedSwapSize = 0;
+ 
+ 	return B_OK;
+ }
+@@ -223,6 +230,9 @@
+ VMAnonymousCache::Write(off_t offset, const iovec *vecs, size_t count,
+ 	size_t *_numBytes)
+ {
++	if (fAllocatedSwapSize + count * PAGE_SIZE &gt; fCommittedSwapSize)
++		return B_ERROR;
++
+ 	offset &gt;&gt;= PAGE_SHIFT;
+ 	uint32 n = count;
+ 	for (uint32 i = 0; i &lt; count; i += n) {
+@@ -234,6 +244,8 @@
+ 		if (pageIndex == SWAP_PAGE_NONE)
+ 			panic(&quot;can't allocate swap space\n&quot;);
+ 
++		fAllocatedSwapSize += n * PAGE_SIZE;
++
+ 		for (uint32 j = 0; j &lt; n; j++)
+ 			_SwapBlockBuild(offset + i + j, pageIndex + j);
+ 
+@@ -244,7 +256,6 @@
+ 		}
+ 
+ 		off_t pos = (pageIndex - swapFile-&gt;first_page) * PAGE_SIZE;
+-
+ 		status_t status = vfs_write_pages(swapFile-&gt;vnode, NULL, pos, vecs + i,
+ 				n, 0, _numBytes);
+ 		if (status != B_OK)
+@@ -728,5 +739,40 @@
+ 	sAvailSwapSpace = 0;
+ }
+ 
++void
++swap_init_post_modules()
++{
++	off_t size = 0;
++
++	void *settings = load_driver_settings(&quot;virtual_memory&quot;);
++	if (settings != NULL) {
++		if (!get_driver_boolean_parameter(settings, &quot;vm&quot;, false, false))
++			return;
++
++		const char *string = get_driver_parameter(settings, &quot;swap_size&quot;, NULL,
++			NULL);
++		size = string ? atoll(string) : 0;
++
++		unload_driver_settings(settings);
++	} else
++		size = vm_page_num_pages() * B_PAGE_SIZE * 2;
++
++	if (size &lt; B_PAGE_SIZE)
++		return;
++
++	int fd = open(&quot;/var/swap&quot;, O_RDWR | O_CREAT | O_NOCACHE, S_IRUSR | S_IWUSR);
++	if (fd &lt; 0) {
++		dprintf(&quot;Can't open/create /var/swap: %s\n&quot;, strerror(errno));
++		return;
++	}
++	close(fd);
++
++	if (truncate(&quot;/var/swap&quot;, size) &lt; 0) {
++		dprintf(&quot;Failed to resize /var/swap to %lld bytes: %s\n&quot;, size,
++			strerror(errno));
++	}
++
++	swap_file_add(&quot;/var/swap&quot;);
++}
++
+ #endif	// ENABLE_SWAP_SUPPORT
+-
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h	2008-08-04 03:19:54 UTC (rev 26782)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h	2008-08-04 03:28:46 UTC (rev 26783)
+@@ -48,10 +48,14 @@
+ 	uint8	fPrecommittedPages;
+ 	int32	fGuardedSize;
+ 	off_t   fCommittedSwapSize;
++	off_t   fAllocatedSwapSize;
+ };
+ 
+ 
+-extern &quot;C&quot; void swap_init(void);
++extern &quot;C&quot; {
++	void swap_init(void);
++	void swap_init_post_modules();
++}
+ 
+ #endif	// ENABLE_SWAP_SUPPORT
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010792.html">[Haiku-commits] r26782 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="010794.html">[Haiku-commits] r26784 - haiku/trunk/src/kits/device
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10793">[ date ]</a>
+              <a href="thread.html#10793">[ thread ]</a>
+              <a href="subject.html#10793">[ subject ]</a>
+              <a href="author.html#10793">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

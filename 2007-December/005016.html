@@ -1,0 +1,325 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23111 -	haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-December/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23111%20-%0A%09haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86&In-Reply-To=%3C200712111418.lBBEILNv003932%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005119.html">
+   <LINK REL="Next"  HREF="005017.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23111 -	haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23111%20-%0A%09haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86&In-Reply-To=%3C200712111418.lBBEILNv003932%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23111 -	haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Dec 11 15:18:21 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005119.html">[Haiku-commits] r23099 haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+        <LI>Next message: <A HREF="005017.html">[Haiku-commits] r23112 - in	haiku/trunk/src/add-ons/kernel/drivers/audio: ac97/auich	ac97/auvia ac97/es1370 emuxki
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5016">[ date ]</a>
+              <a href="thread.html#5016">[ thread ]</a>
+              <a href="subject.html#5016">[ subject ]</a>
+              <a href="author.html#5016">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-12-11 15:18:21 +0100 (Tue, 11 Dec 2007)
+New Revision: 23111
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23111&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23111&amp;view=rev</A>
+
+Modified:
+   haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/arch_interrupts.S
+   haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/asm_offsets.cpp
+Log:
+* Some cleanup using local labels.
+* Inlined the user_memcpy() for copying the syscall parameters to the
+  kernel stack. Yields about 1% speedup.
+* When returning with sysexit, load the return address from the iframe.
+  Syscall restarts couldn't work before.
+
+
+Modified: haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/arch_interrupts.S
+===================================================================
+--- haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/arch_interrupts.S	2007-12-11 01:46:36 UTC (rev 23110)
++++ haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/arch_interrupts.S	2007-12-11 14:18:21 UTC (rev 23111)
+@@ -96,6 +96,41 @@
+ 						   original eax/edx values */				\
+ 	iret
+ 
++#define DISABLE_BREAKPOINTS()											\
++	testl	$THREAD_FLAGS_BREAKPOINTS_INSTALLED, THREAD_flags(%edi);	\
++	jz		1f;															\
++	call	x86_exit_user_debug_at_kernel_entry;						\
++  1:
++
++#define COPY_SYSCALL_PARAMETERS()										\
++	/* make room for the syscall params */								\
++	subl	$80, %esp;													\
++																		\
++	/* get the address of the syscall parameters */						\
++	movl	IFRAME_user_esp(%ebp), %esi;								\
++	addl	$4, %esi;													\
++	cmp		$KERNEL_BASE, %esi;		/* must not be a kernel address */	\
++	jae		bad_syscall_params;											\
++																		\
++	/* set the fault handler */											\
++	movl	$bad_syscall_params, THREAD_fault_handler(%edi);			\
++																		\
++	/* target address is our stack */									\
++	movl	%esp, %edi;													\
++																		\
++	/* number of syscall parameter words */								\
++	movl	SYSCALL_INFO_parameter_size(%edx), %ecx;					\
++	shrl	$2, %ecx;													\
++																		\
++	/* copy */															\
++	cld;																\
++	rep movsl;															\
++																		\
++	/* restore pointers and clear fault handler */						\
++	movl	%edx, %esi;				/* syscall info pointer */			\
++	movl	%dr3, %edi;				/* thread pointer */				\
++	movl	$0, THREAD_fault_handler(%edi)
++
+ #define SYSENTER_RETURN_ADDRESS \
+ 	(USER_COMMPAGE_ADDR + TABLE_ENTRIES * 4 + 4)
+ 
+@@ -207,12 +242,9 @@
+ 	movl	%eax,%es
+ 
+ 	// disable breakpoints, if installed
+-	cli								// disable interrupts
+ 	movl	%dr3, %edi				// thread pointer
+-	testl	$THREAD_FLAGS_BREAKPOINTS_INSTALLED, THREAD_flags(%edi)
+-	jz		int_bottom_user_skip_debug_at_kernel_entry
+-	call	x86_exit_user_debug_at_kernel_entry
+-  int_bottom_user_skip_debug_at_kernel_entry:
++	cli								// disable interrupts
++	DISABLE_BREAKPOINTS()
+ 
+ 	// update the thread's user time
+ 	UPDATE_THREAD_USER_TIME()
+@@ -258,14 +290,11 @@
+ 	movl	%eax,%es
+ 
+ 	movl	%esp, %ebp				// frame pointer is the iframe
++	movl	%dr3, %edi				// thread pointer
+ 
+ 	// disable breakpoints, if installed
+ 	cli								// disable interrupts
+-	movl	%dr3, %edi				// thread pointer
+-	testl	$THREAD_FLAGS_BREAKPOINTS_INSTALLED, THREAD_flags(%edi)
+-	jz		skip_debug_at_kernel_entry
+-	call	x86_exit_user_debug_at_kernel_entry
+-  skip_debug_at_kernel_entry:
++	DISABLE_BREAKPOINTS()
+ 
+ 	// update the thread's user time
+ 	UPDATE_THREAD_USER_TIME_PUSH_TIME()
+@@ -276,29 +305,11 @@
+ 	cmp		$SYSCALL_COUNT, %esi	// check syscall number
+ 	jae		bad_syscall_number
+ 	movl	$kSyscallInfos, %eax	// get syscall info
+-	lea		(%eax, %esi, SYSCALL_INFO_sizeof), %esi
++	lea		(%eax, %esi, SYSCALL_INFO_sizeof), %edx
+ 
+ 	// copy parameters onto this stack
+-	subl	$80, %esp				// leave some room for the syscall params
++	COPY_SYSCALL_PARAMETERS()
+ 
+-	// get the address of the syscall parameters
+-	movl	IFRAME_user_esp(%ebp), %eax
+-	addl	$4, %eax				
+-	cmp		$KERNEL_BASE, %eax		// must not be a kernel address
+-	jae		bad_syscall_params	
+-
+-	// get and push the syscall parameter size
+-	movl	SYSCALL_INFO_parameter_size(%esi), %ebx
+-	push	%ebx
+-
+-	push	%eax
+-	lea		8(%esp), %ebx			// stack address where to copy the params
+-	push	%ebx
+-	call	user_memcpy
+-	addl	$12, %esp
+-	test	%eax, %eax
+-	jne		bad_syscall_params
+-
+ 	// pre syscall debugging
+ 	testl	$THREAD_FLAGS_DEBUGGER_INSTALLED, THREAD_flags(%edi)
+ 	jnz		do_pre_syscall_debug
+@@ -336,18 +347,18 @@
+ 	// if the 64 bit return value bit is set, we have to clear it
+ 	testl	$THREAD_FLAGS_64_BIT_SYSCALL_RETURN, THREAD_flags(%edi)
+ 	jz		post_syscall_work
+-  post_syscall_work_clear_64_bit_flag:
++  1:
+     movl	THREAD_flags(%edi), %eax
+ 	movl	%eax, %edx
+     orl		$THREAD_FLAGS_64_BIT_SYSCALL_RETURN, %edx
+     lock
+     cmpxchgl	%edx, THREAD_flags(%edi)
+-    jnz		post_syscall_work_clear_64_bit_flag
++    jnz		1b
+ 
+   post_syscall_work:
+ 	// post syscall debugging
+ 	testl	$THREAD_FLAGS_DEBUGGER_INSTALLED, THREAD_flags(%edi)
+-	jz		post_syscall_debug_done
++	jz		1f
+ 	pushl	-4(%ebp)				// syscall start time
+ 	pushl	-8(%ebp)
+ 	push	%edx					// syscall return value
+@@ -358,9 +369,8 @@
+ 	push	%eax
+ 	call	user_debug_post_syscall
+ 	addl	$8, %esp
+-  post_syscall_debug_done:
++  1:
+ 
+-  bad_syscall_params:
+   bad_syscall_number:
+   kernel_exit_work:
+ 	// if no signals are pending and the thread shall not be debugged, we can
+@@ -374,10 +384,10 @@
+ 
+ 	// install breakpoints, if defined
+ 	testl	$THREAD_FLAGS_BREAKPOINTS_DEFINED, THREAD_flags(%edi)
+-	jz		kernel_exit_skip_breakpoints
++	jz		1f
+ 	push	%ebp
+ 	call	x86_init_user_debug_at_kernel_exit
+-  kernel_exit_skip_breakpoints:
++  1:
+ 	POP_IFRAME_AND_RETURN()
+ 	
+   kernel_exit_handle_signals:
+@@ -385,6 +395,11 @@
+ 	cli								// disable interrupts
+ 	jmp		kernel_exit_work_done
+ 
++  bad_syscall_params:
++	// clear the fault handler and exit normally
++	movl	%dr3, %edi
++	movl	$0, THREAD_fault_handler(%edi)
++	jmp		kernel_exit_work
+ 
+ /*!	Handler called by the sysenter instruction
+ 	ecx - user esp
+@@ -413,13 +428,11 @@
+ 	movl	%eax,%es
+ 
+ 	movl	%esp, %ebp				// frame pointer is the iframe
++	movl	%dr3, %edi				// thread pointer
+ 
+ 	// disable breakpoints, if installed
+-	movl	%dr3, %edi				// thread pointer
+-	testl	$THREAD_FLAGS_BREAKPOINTS_INSTALLED, THREAD_flags(%edi)
+-	jz		skip_debug_at_kernel_entry_sysenter
+-	call	x86_exit_user_debug_at_kernel_entry
+-  skip_debug_at_kernel_entry_sysenter:
++	cli								// disable interrupts
++	DISABLE_BREAKPOINTS()
+ 
+ 	// update the thread's user time
+ 	UPDATE_THREAD_USER_TIME_PUSH_TIME()
+@@ -430,29 +443,11 @@
+ 	cmp		$SYSCALL_COUNT, %esi	// check syscall number
+ 	jae		bad_syscall_number
+ 	movl	$kSyscallInfos, %eax	// get syscall info
+-	lea		(%eax, %esi, SYSCALL_INFO_sizeof), %esi
++	lea		(%eax, %esi, SYSCALL_INFO_sizeof), %edx
+ 
+ 	// copy parameters onto this stack
+-	subl	$80, %esp				// leave some room for the syscall params
++	COPY_SYSCALL_PARAMETERS()
+ 
+-	// get the address of the syscall parameters
+-	movl	IFRAME_user_esp(%ebp), %eax
+-	addl	$4, %eax				
+-	cmp		$KERNEL_BASE, %eax		// must not be a kernel address
+-	jae		bad_syscall_params
+-
+-	// get and push the syscall parameter size
+-	movl	SYSCALL_INFO_parameter_size(%esi), %ebx
+-	push	%ebx
+-
+-	push	%eax
+-	lea		8(%esp), %ebx			// stack address where to copy the params
+-	push	%ebx
+-	call	user_memcpy
+-	addl	$12, %esp
+-	test	%eax, %eax
+-	jne		bad_syscall_params
+-
+ 	// pre syscall debugging
+ 	testl	$THREAD_FLAGS_DEBUGGER_INSTALLED, THREAD_flags(%edi)
+ 	jnz		do_pre_syscall_debug
+@@ -489,13 +484,13 @@
+ 
+ 	popa
+ 
++	// ecx already contains the user esp -- load edx with the return address
++	movl	16(%esp), %edx
++
+ 	// pop eflags, which also reenables interrupts
+ 	addl	$24, %esp	// skip, orig_eax/edx, vector, error_code, eip, cs
+ 	popfl
+ 
+-	// ecx already contains the user esp -- load edx with the return address
+-	movl	$SYSENTER_RETURN_ADDRESS, %edx
+-
+ 	sysexit
+ 
+ 
+
+Modified: haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/asm_offsets.cpp
+===================================================================
+--- haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/asm_offsets.cpp	2007-12-11 01:46:36 UTC (rev 23110)
++++ haiku/branches/developer/bonefish/optimization/src/system/kernel/arch/x86/asm_offsets.cpp	2007-12-11 14:18:21 UTC (rev 23111)
+@@ -33,6 +33,7 @@
+ 	DEFINE_OFFSET_MACRO(THREAD, thread, in_kernel);
+ 	DEFINE_OFFSET_MACRO(THREAD, thread, flags);
+ 	DEFINE_OFFSET_MACRO(THREAD, thread, kernel_stack_top);
++	DEFINE_OFFSET_MACRO(THREAD, thread, fault_handler);
+ 
+ 	// struct iframe
+ 	DEFINE_OFFSET_MACRO(IFRAME, iframe, cs);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005119.html">[Haiku-commits] r23099 haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+	<LI>Next message: <A HREF="005017.html">[Haiku-commits] r23112 - in	haiku/trunk/src/add-ons/kernel/drivers/audio: ac97/auich	ac97/auvia ac97/es1370 emuxki
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5016">[ date ]</a>
+              <a href="thread.html#5016">[ thread ]</a>
+              <a href="subject.html#5016">[ subject ]</a>
+              <a href="author.html#5016">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

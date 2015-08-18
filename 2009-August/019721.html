@@ -1,0 +1,351 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32573 - haiku/trunk/src/system/kernel/scheduler
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32573%20-%20haiku/trunk/src/system/kernel/scheduler&In-Reply-To=%3C200908211610.n7LGATx6001122%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019720.html">
+   <LINK REL="Next"  HREF="019723.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32573 - haiku/trunk/src/system/kernel/scheduler</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32573%20-%20haiku/trunk/src/system/kernel/scheduler&In-Reply-To=%3C200908211610.n7LGATx6001122%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32573 - haiku/trunk/src/system/kernel/scheduler">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Fri Aug 21 18:10:29 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019720.html">[Haiku-commits] r32572 - haiku/trunk/src/servers/app
+</A></li>
+        <LI>Next message: <A HREF="019723.html">[Haiku-commits] r32574 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19721">[ date ]</a>
+              <a href="thread.html#19721">[ thread ]</a>
+              <a href="subject.html#19721">[ subject ]</a>
+              <a href="author.html#19721">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-08-21 18:10:27 +0200 (Fri, 21 Aug 2009)
+New Revision: 32573
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32573&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32573&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/scheduler/scheduler.cpp
+   haiku/trunk/src/system/kernel/scheduler/scheduler_simple.cpp
+Log:
+* Strip down scheduler_simple. Anything related to multiple CPU handling has
+  been removed. That includes CPU disabling and thread pinning, as that becomes
+  pointless with only one CPU.
+* Return a proper reschedule hint on enqueing a thread, based on the priority
+  of the current thread vs. the enqueued one.
+* Enable dynamic scheduler selection. With one CPU the simple scheduler will
+  be used, otherwise affine is selected.
+* Removed the scheduler type define as we now always auto-select it.
+* Some cleanup.
+
+
+Modified: haiku/trunk/src/system/kernel/scheduler/scheduler.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/scheduler/scheduler.cpp	2009-08-21 15:40:53 UTC (rev 32572)
++++ haiku/trunk/src/system/kernel/scheduler/scheduler.cpp	2009-08-21 16:10:27 UTC (rev 32573)
+@@ -10,11 +10,6 @@
+ #include &quot;scheduler_affine.h&quot;
+ #include &quot;scheduler_simple.h&quot;
+ 
+-// Defines which scheduler(s) to use. Possible values:
+-// 0 - Auto-select scheduler based on detected core count
+-// 1 - Always use the simple scheduler
+-// 2 - Always use the affine scheduler
+-#define SCHEDULER_TYPE 2
+ 
+ struct scheduler_ops* gScheduler;
+ SchedulerListenerList gSchedulerListeners;
+@@ -46,21 +41,17 @@
+ void
+ scheduler_init(void)
+ {
+-	int32 cpu_count = smp_get_num_cpus();
+-	dprintf(&quot;scheduler_init: found %ld logical cpus\n&quot;, cpu_count);
+-#if SCHEDULER_TYPE == 0
+-	if (cpu_count &gt; 1) {
++	int32 cpuCount = smp_get_num_cpus();
++	dprintf(&quot;scheduler_init: found %ld logical cpu%s\n&quot;, cpuCount,
++		cpuCount != 1 ? &quot;s&quot; : &quot;&quot;);
++
++	if (cpuCount &gt; 1) {
+ 		dprintf(&quot;scheduler_init: using affine scheduler\n&quot;);
+ 		scheduler_affine_init();
+ 	} else {
+ 		dprintf(&quot;scheduler_init: using simple scheduler\n&quot;);
+ 		scheduler_simple_init();
+ 	}
+-#elif SCHEDULER_TYPE == 1
+-	scheduler_simple_init();
+-#elif SCHEDULER_TYPE == 2
+-	scheduler_affine_init();
+-#endif
+ 
+ #if SCHEDULER_TRACING
+ 	add_debugger_command_etc(&quot;scheduler&quot;, &amp;cmd_scheduler,
+
+Modified: haiku/trunk/src/system/kernel/scheduler/scheduler_simple.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/scheduler/scheduler_simple.cpp	2009-08-21 15:40:53 UTC (rev 32572)
++++ haiku/trunk/src/system/kernel/scheduler/scheduler_simple.cpp	2009-08-21 16:10:27 UTC (rev 32573)
+@@ -19,7 +19,6 @@
+ #include &lt;kscheduler.h&gt;
+ #include &lt;listeners.h&gt;
+ #include &lt;scheduler_defs.h&gt;
+-#include &lt;smp.h&gt;
+ #include &lt;thread.h&gt;
+ #include &lt;timer.h&gt;
+ #include &lt;user_debugger.h&gt;
+@@ -37,7 +36,6 @@
+ 
+ // The run queue. Holds the threads ready to run ordered by priority.
+ static struct thread *sRunQueue = NULL;
+-static cpu_mask_t sIdleCPUs = 0;
+ 
+ 
+ static int
+@@ -80,14 +78,6 @@
+ static bool
+ simple_enqueue_in_run_queue(struct thread *thread)
+ {
+-	if (thread-&gt;state == B_THREAD_RUNNING) {
+-		// The thread is currently running (on another CPU) and we cannot
+-		// insert it into the run queue. Set the next state to ready so the
+-		// thread is inserted into the run queue on the next reschedule.
+-		thread-&gt;next_state = B_THREAD_READY;
+-		return false;
+-	}
+-
+ 	thread-&gt;state = thread-&gt;next_state = B_THREAD_READY;
+ 
+ 	struct thread *curr, *prev;
+@@ -110,47 +100,11 @@
+ 
+ 	thread-&gt;next_priority = thread-&gt;priority;
+ 
+-	if (thread-&gt;priority != B_IDLE_PRIORITY) {
+-		int32 currentCPU = smp_get_current_cpu();
+-		if (sIdleCPUs != 0) {
+-			if (thread-&gt;pinned_to_cpu &gt; 0) {
+-				// thread is pinned to a CPU -- notify it, if it is idle
+-				int32 targetCPU = thread-&gt;previous_cpu-&gt;cpu_num;
+-				if ((sIdleCPUs &amp; (1 &lt;&lt; targetCPU)) != 0) {
+-					sIdleCPUs &amp;= ~(1 &lt;&lt; targetCPU);
+-					smp_send_ici(targetCPU, SMP_MSG_RESCHEDULE_IF_IDLE, 0, 0,
+-						0, NULL, SMP_MSG_FLAG_ASYNC);
+-				}
+-			} else {
+-				// Thread is not pinned to any CPU -- take it ourselves, if we
+-				// are idle, otherwise notify the next idle CPU. In either case
+-				// we clear the idle bit of the chosen CPU, so that the
+-				// simple_enqueue_in_run_queue() won't try to bother the
+-				// same CPU again, if invoked before it handled the interrupt.
+-				cpu_mask_t idleCPUs = CLEAR_BIT(sIdleCPUs, currentCPU);
+-				if ((sIdleCPUs &amp; (1 &lt;&lt; currentCPU)) != 0) {
+-					sIdleCPUs = idleCPUs;
+-				} else {
+-					int32 targetCPU = 0;
+-					for (; targetCPU &lt; B_MAX_CPU_COUNT; targetCPU++) {
+-						cpu_mask_t mask = 1 &lt;&lt; targetCPU;
+-						if ((idleCPUs &amp; mask) != 0) {
+-							sIdleCPUs &amp;= ~mask;
+-							break;
+-						}
+-					}
+-
+-					smp_send_ici(targetCPU, SMP_MSG_RESCHEDULE_IF_IDLE, 0, 0,
+-						0, NULL, SMP_MSG_FLAG_ASYNC);
+-				}
+-			}
+-		}
+-	}
+-
+ 	// notify listeners
+ 	NotifySchedulerListeners(&amp;SchedulerListener::ThreadEnqueuedInRunQueue,
+ 		thread);
+-	return false;
++
++	return thread-&gt;priority &gt; thread_get_current_thread()-&gt;priority;
+ }
+ 
+ 
+@@ -243,7 +197,7 @@
+ 	struct thread *oldThread = thread_get_current_thread();
+ 	struct thread *nextThread, *prevThread;
+ 
+-	TRACE((&quot;reschedule(): cpu %d, cur_thread = %ld\n&quot;, smp_get_current_cpu(), thread_get_current_thread()-&gt;id));
++	TRACE((&quot;reschedule(): current thread = %ld\n&quot;, oldThread-&gt;id));
+ 
+ 	oldThread-&gt;cpu-&gt;invoke_scheduler = false;
+ 
+@@ -251,7 +205,8 @@
+ 	switch (oldThread-&gt;next_state) {
+ 		case B_THREAD_RUNNING:
+ 		case B_THREAD_READY:
+-			TRACE((&quot;enqueueing thread %ld into run q. pri = %ld\n&quot;, oldThread-&gt;id, oldThread-&gt;priority));
++			TRACE((&quot;enqueueing thread %ld into run queue priority = %ld\n&quot;,
++				oldThread-&gt;id, oldThread-&gt;priority));
+ 			simple_enqueue_in_run_queue(oldThread);
+ 			break;
+ 		case B_THREAD_SUSPENDED:
+@@ -260,78 +215,50 @@
+ 		case THREAD_STATE_FREE_ON_RESCHED:
+ 			break;
+ 		default:
+-			TRACE((&quot;not enqueueing thread %ld into run q. next_state = %ld\n&quot;, oldThread-&gt;id, oldThread-&gt;next_state));
++			TRACE((&quot;not enqueueing thread %ld into run queue next_state = %ld\n&quot;,
++				oldThread-&gt;id, oldThread-&gt;next_state));
+ 			break;
+ 	}
+ 
+ 	nextThread = sRunQueue;
+ 	prevThread = NULL;
+ 
+-	if (oldThread-&gt;cpu-&gt;disabled) {
+-		// CPU is disabled - service any threads we may have that are pinned,
+-		// otherwise just select the idle thread
++	while (nextThread) {
++		// select next thread from the run queue
+ 		while (nextThread &amp;&amp; nextThread-&gt;priority &gt; B_IDLE_PRIORITY) {
+-			if (nextThread-&gt;pinned_to_cpu &gt; 0 &amp;&amp;
+-				nextThread-&gt;previous_cpu == oldThread-&gt;cpu)
+-					break;
+-			prevThread = nextThread;
+-			nextThread = nextThread-&gt;queue_next;
+-		}
+-	} else {
+-		while (nextThread) {
+-			// select next thread from the run queue
+-			while (nextThread &amp;&amp; nextThread-&gt;priority &gt; B_IDLE_PRIORITY) {
+ #if 0
+-				if (oldThread == nextThread &amp;&amp; nextThread-&gt;was_yielded) {
+-					// ignore threads that called thread_yield() once
+-					nextThread-&gt;was_yielded = false;
+-					prevThread = nextThread;
+-					nextThread = nextThread-&gt;queue_next;
+-				}
++			if (oldThread == nextThread &amp;&amp; nextThread-&gt;was_yielded) {
++				// ignore threads that called thread_yield() once
++				nextThread-&gt;was_yielded = false;
++				prevThread = nextThread;
++				nextThread = nextThread-&gt;queue_next;
++			}
+ #endif
+ 
+-				// skip thread, if it doesn't want to run on this CPU
+-				if (nextThread-&gt;pinned_to_cpu &gt; 0
+-					&amp;&amp; nextThread-&gt;previous_cpu != oldThread-&gt;cpu) {
+-					prevThread = nextThread;
+-					nextThread = nextThread-&gt;queue_next;
+-					continue;
+-				}
++			// always extract real time threads
++			if (nextThread-&gt;priority &gt;= B_FIRST_REAL_TIME_PRIORITY)
++				break;
+ 
+-				// always extract real time threads
+-				if (nextThread-&gt;priority &gt;= B_FIRST_REAL_TIME_PRIORITY)
+-					break;
++			// never skip last non-idle normal thread
++			if (nextThread-&gt;queue_next
++				&amp;&amp; nextThread-&gt;queue_next-&gt;priority == B_IDLE_PRIORITY)
++				break;
+ 
+-				// never skip last non-idle normal thread
+-				if (nextThread-&gt;queue_next &amp;&amp; nextThread-&gt;queue_next-&gt;priority == B_IDLE_PRIORITY)
+-					break;
++			// skip normal threads sometimes (roughly 20%)
++			if (_rand() &gt; 0x1a00)
++				break;
+ 
+-				// skip normal threads sometimes (roughly 20%)
+-				if (_rand() &gt; 0x1a00)
+-					break;
+-
+-				// skip until next lower priority
+-				int32 priority = nextThread-&gt;priority;
+-				do {
+-					prevThread = nextThread;
+-					nextThread = nextThread-&gt;queue_next;
+-				} while (nextThread-&gt;queue_next != NULL
+-					&amp;&amp; priority == nextThread-&gt;queue_next-&gt;priority
+-					&amp;&amp; nextThread-&gt;queue_next-&gt;priority &gt; B_IDLE_PRIORITY);
+-			}
+-
+-			if (nextThread-&gt;cpu
+-				&amp;&amp; nextThread-&gt;cpu-&gt;cpu_num != oldThread-&gt;cpu-&gt;cpu_num) {
+-				panic(&quot;thread in run queue that's still running on another CPU!\n&quot;);
+-				// ToDo: remove this check completely when we're sure that this
+-				// cannot happen anymore.
++			// skip until next lower priority
++			int32 priority = nextThread-&gt;priority;
++			do {
+ 				prevThread = nextThread;
+ 				nextThread = nextThread-&gt;queue_next;
+-				continue;
+-			}
+-
+-			break;
++			} while (nextThread-&gt;queue_next != NULL
++				&amp;&amp; priority == nextThread-&gt;queue_next-&gt;priority
++				&amp;&amp; nextThread-&gt;queue_next-&gt;priority &gt; B_IDLE_PRIORITY);
+ 		}
++
++		break;
+ 	}
+ 
+ 	if (!nextThread)
+@@ -381,13 +308,6 @@
+ 		add_timer(quantumTimer, &amp;reschedule_event, quantum,
+ 			B_ONE_SHOT_RELATIVE_TIMER | B_TIMER_ACQUIRE_THREAD_LOCK);
+ 
+-		// update the idle bit for this CPU in the CPU mask
+-		int32 cpuNum = smp_get_current_cpu();
+-		if (nextThread-&gt;priority == B_IDLE_PRIORITY)
+-			sIdleCPUs = SET_BIT(sIdleCPUs, cpuNum);
+-		else
+-			sIdleCPUs = CLEAR_BIT(sIdleCPUs, cpuNum);
+-
+ 		if (nextThread != oldThread)
+ 			context_switch(oldThread, nextThread);
+ 	}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019720.html">[Haiku-commits] r32572 - haiku/trunk/src/servers/app
+</A></li>
+	<LI>Next message: <A HREF="019723.html">[Haiku-commits] r32574 - in haiku/trunk: headers/private/kernel	src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19721">[ date ]</a>
+              <a href="thread.html#19721">[ thread ]</a>
+              <a href="subject.html#19721">[ subject ]</a>
+              <a href="author.html#19721">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

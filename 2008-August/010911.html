@@ -1,0 +1,150 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26859 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26859%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200808071423.m77ENixP010538%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011014.html">
+   <LINK REL="Next"  HREF="010912.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26859 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26859%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200808071423.m77ENixP010538%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26859 - haiku/trunk/src/system/kernel/fs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug  7 16:23:44 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011014.html">[Haiku-commits] r26858 - in haiku/trunk/src/add-ons/kernel:	bus_managers/firewire bus_managers/scsi bus_managers/usb	busses/ide/silicon_image_3112 busses/scsi/ahci drivers/audio/ac97/auich drivers/audio/ac97/auvia	drivers/audio/ac97/es1370 drivers/audio/ac97/ich	drivers/audio/ac97/ichaudio/lala drivers/audio/echo drivers/audio/emuxki drivers/audio/hda drivers/audio/ice1712	drivers/dvb/cx23882 drivers/graphics/matrox	drivers/graphics/nvidia drivers/graphics/nvidia_gpgpu drivers/network/bcm570x drivers/network/dp83815	drivers/network/ipro1000 drivers/network/ipw2100	drivers/network/rtl8169 generic/block_io generic/ide_adapter
+</A></li>
+        <LI>Next message: <A HREF="010912.html">[Haiku-commits] r26860 - haiku/trunk/src/tests/system/libroot/posix
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10911">[ date ]</a>
+              <a href="thread.html#10911">[ thread ]</a>
+              <a href="subject.html#10911">[ subject ]</a>
+              <a href="author.html#10911">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-08-07 16:23:44 +0200 (Thu, 07 Aug 2008)
+New Revision: 26859
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26859&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26859&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+Log:
+* fix_dirent() now correctly handles buffers from userland.
+* dir_read() now takes into account that we may have read more than one dir
+  entry, and calls fix_dirent() for each of them.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-08-07 13:00:36 UTC (rev 26858)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-08-07 14:23:44 UTC (rev 26859)
+@@ -5144,10 +5144,25 @@
+ }
+ 
+ 
+-static void
+-fix_dirent(struct vnode *parent, struct dirent *entry,
+-	struct io_context* ioContext)
++static status_t
++fix_dirent(struct vnode *parent, struct dirent *userEntry,
++	struct io_context* ioContext, uint32* _length)
+ {
++	char buffer[sizeof(struct dirent) + B_FILE_NAME_LENGTH];
++	struct dirent* entry;
++
++	if (IS_USER_ADDRESS(userEntry)) {
++		unsigned short length;
++		entry = (struct dirent*)buffer;
++		if (user_memcpy(&amp;length, &amp;userEntry-&gt;d_reclen, sizeof(length)) != B_OK
++			|| user_memcpy(entry, userEntry, length) != B_OK)
++			return B_BAD_ADDRESS;
++
++	} else
++		entry = userEntry;
++
++	*_length = entry-&gt;d_reclen;
++
+ 	// set d_pdev and d_pino
+ 	entry-&gt;d_pdev = parent-&gt;device;
+ 	entry-&gt;d_pino = parent-&gt;id;
+@@ -5181,7 +5196,7 @@
+ 		status_t status = get_vnode(entry-&gt;d_dev, entry-&gt;d_ino, &amp;vnode, true,
+ 			false);
+ 		if (status != B_OK)
+-			return;
++			return status;
+ 
+ 		mutex_lock(&amp;sVnodeCoveredByMutex);
+ 		if (vnode-&gt;covered_by) {
+@@ -5192,6 +5207,12 @@
+ 
+ 		put_vnode(vnode);
+ 	}
++
++	// copy back from userland buffer if needed
++	if (entry != userEntry)
++		return user_memcpy(userEntry, entry, sizeof(struct dirent) - 1);
++
++	return B_OK;
+ }
+ 
+ 
+@@ -5208,9 +5229,16 @@
+ 		return error;
+ 
+ 	// we need to adjust the read dirents
+-	if (*_count &gt; 0) {
+-		// XXX: Currently reading only one dirent is supported. Make this a loop!
+-		fix_dirent(vnode, buffer, ioContext);
++	uint32 count = *_count;
++	if (count &gt; 0) {
++		for (uint32 i = 0; i &lt; count; i++) {
++			uint32 length;
++			error = fix_dirent(vnode, buffer, ioContext, &amp;length);
++			if (error != B_OK)
++				return error;
++
++			buffer = (struct dirent*)((uint8*)buffer + length);
++		}
+ 	}
+ 
+ 	return error;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011014.html">[Haiku-commits] r26858 - in haiku/trunk/src/add-ons/kernel:	bus_managers/firewire bus_managers/scsi bus_managers/usb	busses/ide/silicon_image_3112 busses/scsi/ahci drivers/audio/ac97/auich drivers/audio/ac97/auvia	drivers/audio/ac97/es1370 drivers/audio/ac97/ich	drivers/audio/ac97/ichaudio/lala drivers/audio/echo drivers/audio/emuxki drivers/audio/hda drivers/audio/ice1712	drivers/dvb/cx23882 drivers/graphics/matrox	drivers/graphics/nvidia drivers/graphics/nvidia_gpgpu drivers/network/bcm570x drivers/network/dp83815	drivers/network/ipro1000 drivers/network/ipw2100	drivers/network/rtl8169 generic/block_io generic/ide_adapter
+</A></li>
+	<LI>Next message: <A HREF="010912.html">[Haiku-commits] r26860 - haiku/trunk/src/tests/system/libroot/posix
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10911">[ date ]</a>
+              <a href="thread.html#10911">[ thread ]</a>
+              <a href="subject.html#10911">[ subject ]</a>
+              <a href="author.html#10911">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

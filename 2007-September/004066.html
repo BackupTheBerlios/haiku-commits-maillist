@@ -1,0 +1,1007 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22378 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22378%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200709292352.l8TNqO4u025588%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004065.html">
+   <LINK REL="Next"  HREF="004067.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22378 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22378%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200709292352.l8TNqO4u025588%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22378 - haiku/trunk/src/system/kernel/fs">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Sep 30 01:52:24 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004065.html">[Haiku-commits] r22377 - haiku/trunk/src/tests/kits/interface
+</A></li>
+        <LI>Next message: <A HREF="004067.html">[Haiku-commits] r22379 - haiku/trunk/src/add-ons/kernel/drivers/tty
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4066">[ date ]</a>
+              <a href="thread.html#4066">[ thread ]</a>
+              <a href="subject.html#4066">[ subject ]</a>
+              <a href="author.html#4066">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-09-30 01:52:23 +0200 (Sun, 30 Sep 2007)
+New Revision: 22378
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22378&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22378&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/pipefs.cpp
+Log:
+* Use condition variables instead of semaphores for blocking readers and
+  writers.
+* Removed the optimization for piping data between two threads of the
+  same team. This greatly simplifies the code. It seems to me the case
+  is very uncommon; it could be added back later, though.
+* Basically rewrote reading from and writing to the pipe:
+  - A blockable writer can now write more than what is currently
+    available in the ring buffer.
+  - Writing respects the PIPE_BUF non-interleaving limit, though our
+    headers don't seem to define PIPE_BUF anywhere.
+  - Unblock writers, when the last reader is gone and send those that
+    haven't written anything yet a SIGPIPE. Fixes bug #1476.
+* Correctly implemented select() support. We were only notifying
+  writers. We manage two separate select sync pools per pipe now: one
+  for the reader end and one for the writer end.
+* Reading/writing from the root dir does no longer end in KDL.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/pipefs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/pipefs.cpp	2007-09-29 18:17:40 UTC (rev 22377)
++++ haiku/trunk/src/system/kernel/fs/pipefs.cpp	2007-09-29 23:52:23 UTC (rev 22378)
+@@ -1,12 +1,19 @@
+ /*
++ * Copyright 2007, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at cs.tu-berlin.de.</A>
+  * Copyright 2003-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  */
+ 
++#include &lt;limits.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++#include &lt;string.h&gt;
++#include &lt;sys/stat.h&gt;
+ 
+ #include &lt;KernelExport.h&gt;
+ #include &lt;NodeMonitor.h&gt;
+ 
++#include &lt;condition_variable.h&gt;
+ #include &lt;util/kernel_cpp.h&gt;
+ #include &lt;util/DoublyLinkedList.h&gt;
+ #include &lt;util/AutoLock.h&gt;
+@@ -20,12 +27,7 @@
+ #include &lt;vm.h&gt;
+ #include &lt;team.h&gt;
+ 
+-#include &lt;malloc.h&gt;
+-#include &lt;string.h&gt;
+-#include &lt;stdio.h&gt;
+-#include &lt;sys/stat.h&gt;
+ 
+-
+ //#define TRACE_PIPEFS
+ #ifdef TRACE_PIPEFS
+ #	define TRACE(x) dprintf x
+@@ -38,6 +40,10 @@
+ #define PIPEFS_MAX_BUFFER_SIZE	32768
+ 
+ 
++// TODO: PIPE_BUF is supposed to be defined somewhere else.
++#define PIPE_BUF	_POSIX_PIPE_BUF
++
++
+ namespace pipefs {
+ 
+ class Volume;
+@@ -63,31 +69,21 @@
+ 
+ class ReadRequest : public DoublyLinkedListLinkImpl&lt;ReadRequest&gt; {
+ 	public:
+-		ReadRequest(void *buffer, size_t bufferSize);
+-		~ReadRequest();
++		void SetUnnotified()	{ fNotified = false; }
+ 
+-		status_t	Wait(bool nonBlocking);
+-		void		Notify();
+-		void		Abort();
++		void Notify()
++		{
++			if (!fNotified) {
++				fWaitCondition.NotifyOne();
++				fNotified = true;
++			}
++		}
+ 
+-		status_t	PutBuffer(RingBuffer &amp;buffer, size_t *_bytesRead = NULL,
+-						bool releasePartiallyFilled = true);
+-		status_t	PutData(const void **_data, size_t *_dataSize);
++		ConditionVariable&lt;&gt;&amp; WaitCondition() { return fWaitCondition; }
+ 
+-		size_t		SpaceLeft() const { return fBufferSize - fBytesRead; }
+-		size_t		BytesRead() const { return fBytesRead; }
+-		team_id		Team() const { return fTeam; }
+-
+-		bool		IsQueued() const { return fIsQueued; }
+-		void		SetQueued(bool queued);
+-
+ 	private:
+-		sem_id		fLock;
+-		team_id		fTeam;
+-		void		*fBuffer;
+-		size_t		fBufferSize;
+-		size_t		fBytesRead;
+-		bool		fIsQueued;
++		ConditionVariable&lt;&gt;	fWaitCondition;
++		bool				fNotified;
+ };
+ 
+ typedef DoublyLinkedList&lt;ReadRequest&gt; RequestList;
+@@ -168,24 +164,30 @@
+ 		benaphore	*RequestLock() { return &fRequestLock; }
+ 		RequestList	&amp;Requests() { return fRequests; }
+ 
+-		status_t	WriteDataToBuffer(const void **_data, size_t *_bytesLeft,
++		status_t	WriteDataToBuffer(const void *data, size_t *_length,
+ 						bool nonBlocking);
++		status_t	ReadDataFromBuffer(void *data, size_t *_length,
++						bool nonBlocking, ReadRequest &amp;request);
+ 		size_t		BytesAvailable() const { return fBuffer.Readable(); }
+ 
+-		void		MayReleaseWriter();
+-		void		FillPendingRequests(const void **_buffer,
+-						size_t *_bytesLeft);
+-		void 		FillPendingRequests();
+-		status_t	AddRequest(ReadRequest &amp;request);
+-		status_t	RemoveRequest(ReadRequest &amp;request);
++		void		AddRequest(ReadRequest &amp;request);
++		void		RemoveRequest(ReadRequest &amp;request);
++		status_t	WaitForRequest(ReadRequest &amp;request);
+ 
++		void		NotifyBytesRead(size_t bytes);
++		void		NotifyReadDone();
++		void		NotifyBytesWritten(size_t bytes);
++		void		NotifyWriteDone();
++		void		NotifyEndClosed(bool writer);
++
+ 		void		Open(int openMode);
+ 		void		Close(int openMode);
+ 		int32		ReaderCount() const { return fReaderCount; }
+ 		int32		WriterCount() const { return fWriterCount; }
+ 
+-		status_t	Select(uint8 event, uint32 ref, selectsync *sync);
+-		status_t	Deselect(uint8 event, selectsync *sync);
++		status_t	Select(uint8 event, uint32 ref, selectsync *sync,
++						int openMode);
++		status_t	Deselect(uint8 event, selectsync *sync, int openMode);
+ 
+ 		static int32 NameHashNextOffset();
+ 		static uint32 name_hash_func(void *_node, const void *_key,
+@@ -213,12 +215,14 @@
+ 		RequestList	fRequests;
+ 
+ 		benaphore	fRequestLock;
+-		sem_id		fWriteLock;
+ 
++		ConditionVariable&lt;&gt; fWriteCondition;
++
+ 		int32		fReaderCount;
+ 		int32		fWriterCount;
+ 
+-		select_sync_pool	*fSelectSyncPool;
++		select_sync_pool	*fReadSelectSyncPool;
++		select_sync_pool	*fWriteSelectSyncPool;
+ };
+ 
+ 
+@@ -561,7 +565,8 @@
+ 	fHashNext(NULL),
+ 	fReaderCount(0),
+ 	fWriterCount(0),
+-	fSelectSyncPool(NULL)
++	fReadSelectSyncPool(NULL),
++	fWriteSelectSyncPool(NULL)
+ {
+ 	fName = strdup(name);
+ 	if (fName == NULL)
+@@ -571,7 +576,7 @@
+ 	fType = type;
+ 
+ 	if (S_ISFIFO(type)) {
+-		fWriteLock = create_sem(1, &quot;pipe write&quot;);
++		fWriteCondition.Publish(this, &quot;pipe&quot;);
+ 		benaphore_init(&amp;fRequestLock, &quot;pipe request&quot;);
+ 	}
+ 
+@@ -587,7 +592,7 @@
+ 	free(const_cast&lt;char *&gt;(fName));
+ 
+ 	if (S_ISFIFO(fType)) {
+-		delete_sem(fWriteLock);
++		fWriteCondition.Unpublish();
+ 		benaphore_destroy(&amp;fRequestLock);
+ 	}
+ }
+@@ -596,8 +601,7 @@
+ status_t 
+ Inode::InitCheck()
+ {
+-	if (fName == NULL
+-		|| S_ISFIFO(fType) &amp;&amp; (fRequestLock.sem &lt; B_OK || fWriteLock &lt; B_OK))
++	if (fName == NULL || S_ISFIFO(fType) &amp;&amp; fRequestLock.sem &lt; B_OK)
+ 		return B_ERROR;
+ 
+ 	return B_OK;
+@@ -606,204 +610,242 @@
+ 
+ /*!
+ 	Writes the specified data bytes to the inode's ring buffer. The
+-	Inode::WriteLock() must be held when calling this method.
+-	Releases the reader sem if necessary, so that blocking
+-	readers will get started.
++	request lock must be held when calling this method.
++	Notifies readers if necessary, so that blocking readers will get started.
+ 	Returns B_OK for success, B_BAD_ADDRESS if copying from the buffer failed,
+-	and various semaphore errors (like B_WOULD_BLOCK in non-blocking mode).
++	and various semaphore errors (like B_WOULD_BLOCK in non-blocking mode). If
++	the returned length is &gt; 0, the returned error code can be ignored.
+ */
+ status_t
+-Inode::WriteDataToBuffer(const void **_data, size_t *_bytesLeft,
+-	bool nonBlocking)
++Inode::WriteDataToBuffer(const void *_data, size_t *_length, bool nonBlocking)
+ {
+-	const void *data = *_data;
+-	size_t dataSize = *_bytesLeft;
++	const uint8* data = (const uint8*)_data;
++	size_t dataSize = *_length;
++	size_t&amp; written = *_length;
++	written = 0;
+ 
+ 	TRACE((&quot;Inode::WriteDataToBuffer(data = %p, bytes = %lu)\n&quot;,
+ 		data, dataSize));
+ 
+-	// if this is a blocking call, we need to make sure that data can
+-	// still come in and we don't block the whole inode data transfer
+-	// to prevent deadlocks from happening
++	// According to the standard, request up to PIPE_BUF bytes shall not be
++	// interleaved with other writer's data.
++	size_t minToWrite = 1;
++	if (dataSize &lt;= PIPE_BUF)
++		minToWrite = dataSize;
+ 
+-	while (fBuffer.Writable() == 0) {
+-		if (nonBlocking)
+-			return B_WOULD_BLOCK;
++	while (dataSize &gt; 0) {
++		// Wait until enough space in the buffer is available.
++		while (fBuffer.Writable() &lt; minToWrite &amp;&amp; fReaderCount &gt; 0) {
++			if (nonBlocking)
++				return B_WOULD_BLOCK;
+ 
+-		benaphore_unlock(&amp;fRequestLock);
++			ConditionVariableEntry&lt;&gt; entry;
++			entry.Add(this);
+ 
+-		status_t status = acquire_sem_etc(fWriteLock, 1, B_CAN_INTERRUPT, 0);
++			benaphore_unlock(&amp;fRequestLock);
+ 
+-		benaphore_lock(&amp;fRequestLock);
++			status_t status = entry.Wait(B_CAN_INTERRUPT);
+ 
+-		if (status != B_OK)
+-			return status;
+-	}
++			benaphore_lock(&amp;fRequestLock);
+ 
+-	// ensure that we don't write more than PIPEFS_MAX_BUFFER_SIZE
+-	// into a pipe without blocking
++			if (status != B_OK)
++				return status;
++		}
+ 
+-	size_t spaceLeft = fBuffer.Writable();
+-	if (dataSize &gt; spaceLeft)
+-		dataSize = spaceLeft;
++		// write only as long as there are readers left
++		if (fReaderCount == 0) {
++			if (written == 0)
++				send_signal(find_thread(NULL), SIGPIPE);
++			return EPIPE;
++		}
+ 
+-	if (fBuffer.UserWrite(data, dataSize) &lt; B_OK) {
+-		release_sem(fWriteLock);
+-		return B_BAD_ADDRESS;
+-	}
++		// write as much as we can
+ 
+-	*_data = (const void *)((addr_t)data + dataSize);
+-	*_bytesLeft -= dataSize;
++		size_t toWrite = fBuffer.Writable();
++		if (toWrite &gt; dataSize)
++			toWrite = dataSize;
+ 
+-	MayReleaseWriter();
++		if (fBuffer.UserWrite(data, toWrite) &lt; B_OK)
++			return B_BAD_ADDRESS;
+ 
++		data += toWrite;
++		dataSize -= toWrite;
++		written += toWrite;
++
++		NotifyBytesWritten(toWrite);
++	}
++
+ 	return B_OK;
+ }
+ 
+ 
+-void 
+-Inode::MayReleaseWriter()
++status_t
++Inode::ReadDataFromBuffer(void *data, size_t *_length, bool nonBlocking,
++	ReadRequest &amp;request)
+ {
+-	if (fBuffer.Writable() &gt; 0) {
+-		if (fSelectSyncPool)
+-			notify_select_event_pool(fSelectSyncPool, B_SELECT_WRITE);
++	size_t dataSize = *_length;
++	*_length = 0;
+ 
+-		release_sem(fWriteLock);
++	// wait until our request is first in queue
++	status_t error;
++	if (fRequests.Head() != &amp;request) {
++		if (nonBlocking)
++			return B_WOULD_BLOCK;
++
++		error = WaitForRequest(request);
++		if (error != B_OK)
++			return error;
+ 	}
+-}
+ 
++	// wait until data are available
++	while (fBuffer.Readable() == 0) {
++		if (nonBlocking)
++			return B_WOULD_BLOCK;
+ 
+-/*!
+-	This functions fills pending requests out of the ring buffer.
+-	It either stops when there are no more requests to satisfy, or
+-	the ring buffer is empty, whatever comes first.
+-	You must hold the request lock when calling this function.
+-*/
+-void
+-Inode::FillPendingRequests()
+-{
+-	size_t bytesLeft = fBuffer.Readable();
++		if (fWriterCount == 0)
++			return B_OK;
+ 
+-	TRACE((&quot;Inode::FillPendingRequests(): bytesLeft = %lu\n&quot;, bytesLeft));
++		error = WaitForRequest(request);
++		if (error != B_OK)
++			return error;
++	}
+ 
+-	ReadRequest *request;
+-	RequestList::Iterator iterator = fRequests.GetIterator();
+-	while (bytesLeft != 0 &amp;&amp; (request = iterator.Next()) != NULL) {
+-		// notify the request, so that it can be filled
+-		size_t space = request-&gt;SpaceLeft();
+-		if (space == 0)
+-			continue;
++	// read as much as we can
++	size_t toRead = fBuffer.Readable();
++	if (toRead &gt; dataSize)
++		toRead = dataSize;
+ 
+-		if (space &gt; bytesLeft)
+-			bytesLeft = 0;
+-		else
+-			bytesLeft -= space;
++	if (fBuffer.UserRead(data, toRead) &lt; B_OK)
++		return B_BAD_ADDRESS;
+ 
+-		request-&gt;Notify();
+-		MayReleaseWriter();
+-	}
+-	
+-	if (fSelectSyncPool)
+-		notify_select_event_pool(fSelectSyncPool, B_SELECT_READ);
++	NotifyBytesRead(toRead);
++
++	*_length = toRead;
++
++	return B_OK;
+ }
+ 
+ 
+-/*!
+-	This function feeds the pending read requests using the provided
+-	buffer directly. It will also make sure that bytes in the ring
+-	buffer are served first.
+-	It only does something as long as the first request in the queue
+-	shares the same team context as the caller (write context).
+-	You must hold the request lock when calling this function.
+-*/
+ void
+-Inode::FillPendingRequests(const void **_data, size_t *_bytesLeft)
++Inode::AddRequest(ReadRequest &amp;request)
+ {
+-	team_id team = team_get_current_team_id();
++	fRequests.Add(&amp;request);
++}
+ 
+-	TRACE((&quot;Inode::FillPendingRequests(data = %p, bytes = %lu)\n&quot;, 
+-		_data, *_bytesLeft));
+ 
+-	ReadRequest *request;
+-	RequestList::Iterator iterator = fRequests.GetIterator();
+-	while (*_bytesLeft != 0 &amp;&amp; (request = iterator.Next()) != NULL) {
+-		// Note that we leave this loop not to mess up the request queue
+-		if (request-&gt;Team() != team)
+-			break;
++void
++Inode::RemoveRequest(ReadRequest &amp;request)
++{
++	fRequests.Remove(&amp;request);
++}
+ 
+-		// try to fill this request from the ring buffer first
+-		size_t bytesRead;
+-		if (request-&gt;PutBuffer(fBuffer, &amp;bytesRead, false) != B_OK)
+-			continue;
+ 
+-		MayReleaseWriter();
++status_t
++Inode::WaitForRequest(ReadRequest &amp;request)
++{
++	request.SetUnnotified();
+ 
+-		if (request-&gt;SpaceLeft() &gt; 0) {
+-			// ToDo: This is something where we can optimize the buffer
+-			//	hand-shaking considerably: we should have a function
+-			//	that copies the data to another address space - either
+-			//	remapping copy on write or a direct copy.
++	// publish the condition variable
++	ConditionVariable&lt;&gt;&amp; conditionVariable = request.WaitCondition();
++	conditionVariable.Publish(&amp;request, &quot;pipe read request&quot;);
+ 
+-			// place our data into that buffer
+-			request-&gt;PutData(_data, _bytesLeft);
+-		}
+-	}
+-}
++	// add the entry to wait on
++	ConditionVariableEntry&lt;&gt; entry;
++	entry.Add(&amp;request);
+ 
++	// wait
++	benaphore_unlock(&amp;fRequestLock);
++	status_t status = entry.Wait(B_CAN_INTERRUPT);
++	benaphore_lock(&amp;fRequestLock);
+ 
+-/** This function adds a request into the queue.
+- *	If there is already data waiting in the pipe, the request will
+- *	be fulfilled.
+- *	This function is called from within the readers thread only.
+- */
++	// unpublish the condition variable
++	conditionVariable.Unpublish();
+ 
+-status_t
+-Inode::AddRequest(ReadRequest &amp;request)
++	return status != B_OK;
++}
++
++
++void
++Inode::NotifyBytesRead(size_t bytes)
+ {
+-	BenaphoreLocker locker(RequestLock());
+-	if (!locker.IsLocked())
+-		return B_ERROR;
++	// notify writer, if something can be written now
++	if (bytes &gt; 0 &amp;&amp; fBuffer.Writable() == bytes) {
++		if (fWriteSelectSyncPool)
++			notify_select_event_pool(fWriteSelectSyncPool, B_SELECT_WRITE);
+ 
+-	if (BytesAvailable() &gt; 0 &amp;&amp; request.PutBuffer(fBuffer) == B_OK) {
+-		MayReleaseWriter();
+-	} else {
+-		fRequests.Add(&amp;request);
+-		request.SetQueued(true);
++		fWriteCondition.NotifyOne();
+ 	}
+-
+-	return B_OK;
+ }
+ 
+ 
+-/** This function removes a request from the queue.
+- *	This function is called from within the readers thread only.
+- */
++void
++Inode::NotifyReadDone()
++{
++	// notify next reader, if there's still something to be read
++	if (fBuffer.Readable() &gt; 0) {
++		if (ReadRequest* request = fRequests.First())
++			request-&gt;Notify();
++	}
++}
+ 
+-status_t
+-Inode::RemoveRequest(ReadRequest &amp;request)
++
++void
++Inode::NotifyBytesWritten(size_t bytes)
+ {
+-	TRACE((&quot;Inode::RemoveRequest(request = %p)\n&quot;, &amp;request));
++	// notify reader, if something can be read now
++	if (bytes &gt; 0 &amp;&amp; fBuffer.Readable() == bytes) {
++		if (fReadSelectSyncPool)
++			notify_select_event_pool(fReadSelectSyncPool, B_SELECT_READ);
+ 
+-	BenaphoreLocker locker(RequestLock());
+-	if (!locker.IsLocked())
+-		return B_ERROR;
++		if (ReadRequest* request = fRequests.First())
++			request-&gt;Notify();
++	}
++}
+ 
+-	// we might have some data waiting now, if the direct team
+-	// handshake couldn't be done
+ 
+-	if (BytesAvailable() &gt; 0 &amp;&amp; request.PutBuffer(fBuffer) == B_OK)
+-		release_sem(fWriteLock);
++void
++Inode::NotifyWriteDone()
++{
++	// notify next writer, if there's still space for writing
++	if (fBuffer.Writable() &gt; 0)
++		fWriteCondition.NotifyOne();
++}
+ 
+-	if (request.IsQueued())
+-		fRequests.Remove(&amp;request);
+ 
+-	return B_OK;
++void
++Inode::NotifyEndClosed(bool writer)
++{
++	if (writer) {
++		// Our last writer has been closed; if the pipe
++		// contains no data, unlock all waiting readers
++		if (fBuffer.Readable() == 0) {
++			ReadRequest *request;
++			RequestList::Iterator iterator = fRequests.GetIterator();
++			while ((request = iterator.Next()) != NULL)
++				request-&gt;Notify();
++
++			if (fReadSelectSyncPool)
++				notify_select_event_pool(fReadSelectSyncPool, B_SELECT_READ);
++		}
++	} else {
++		// Last reader is gone. Wake up all writers.
++		fWriteCondition.NotifyAll();
++
++		if (fWriteSelectSyncPool) {
++			notify_select_event_pool(fWriteSelectSyncPool, B_SELECT_WRITE);
++			notify_select_event_pool(fWriteSelectSyncPool, B_SELECT_ERROR);
++		}
++	}
+ }
+ 
+ 
++
+ void
+ Inode::Open(int openMode)
+ {
++	if (!S_ISFIFO(fType))
++		return;
++
+ 	if ((openMode &amp; O_ACCMODE) == O_WRONLY)
+ 		atomic_add(&amp;fWriterCount, 1);
+ 
+@@ -817,23 +859,20 @@
+ {
+ 	TRACE((&quot;Inode::Close(openMode = %d)\n&quot;, openMode));
+ 
+-	if ((openMode &amp; O_ACCMODE) == O_WRONLY
+-		&amp;&amp; atomic_add(&amp;fWriterCount, -1) == 1) {
+-		// Our last writer has been closed; if the pipe
+-		// contains no data, unlock all waiting readers
++	if (!S_ISFIFO(fType))
++		return;
+ 
+-		BenaphoreLocker locker(RequestLock());
++	BenaphoreLocker locker(RequestLock());
+ 
+-		if (BytesAvailable() == 0) {
+-			ReadRequest *request;
+-			RequestList::Iterator iterator = fRequests.GetIterator();
+-			while ((request = iterator.Next()) != NULL)
+-				request-&gt;Abort();
+-		}
++	if ((openMode &amp; O_ACCMODE) == O_WRONLY
++		&amp;&amp; atomic_add(&amp;fWriterCount, -1) == 1) {
++		NotifyEndClosed(true);
+ 	}
+ 
+-	if ((openMode &amp; O_ACCMODE) == O_RDONLY || (openMode &amp; O_ACCMODE) == O_RDWR)
+-		atomic_add(&amp;fReaderCount, -1);
++	if ((openMode &amp; O_ACCMODE) == O_RDONLY || (openMode &amp; O_ACCMODE) == O_RDWR) {
++		if (atomic_add(&amp;fReaderCount, -1) == 1)
++			NotifyEndClosed(false);
++	}
+ }
+ 
+ 
+@@ -906,153 +945,57 @@
+ 
+ 
+ status_t
+-Inode::Select(uint8 event, uint32 ref, selectsync *sync)
++Inode::Select(uint8 event, uint32 ref, selectsync *sync, int openMode)
+ {
+-	if (add_select_sync_pool_entry(&amp;fSelectSyncPool, sync, ref, event) != B_OK)
+-		return B_ERROR;
++	if (!S_ISFIFO(fType))
++		return B_IS_A_DIRECTORY;
+ 
+-	if ((event == B_SELECT_READ &amp;&amp; BytesAvailable() &gt; 0)
+-		|| (event == B_SELECT_WRITE &amp;&amp; fBuffer.Writable() &gt; 0))
+-		return notify_select_event(sync, ref, event);
++	bool writer = true;
++	select_sync_pool** pool;
++	if ((openMode &amp; O_RWMASK) == O_RDONLY) {
++		pool = &fReadSelectSyncPool;
++		writer = false;
++	} else if ((openMode &amp; O_RWMASK) == O_WRONLY) {
++		pool = &fWriteSelectSyncPool;
++	} else
++		return B_NOT_ALLOWED;
+ 
+-	return B_OK;
+-}
++	if (add_select_sync_pool_entry(pool, sync, ref, event) != B_OK)
++		return B_ERROR;
+ 
+-
+-status_t
+-Inode::Deselect(uint8 event, selectsync *sync)
+-{
+-	remove_select_sync_pool_entry(&amp;fSelectSyncPool, sync, event);
+-	return B_OK;
+-}
+-
+-
+-//	#pragma mark -
+-
+-
+-ReadRequest::ReadRequest(void *buffer, size_t bufferSize)
+-	:
+-	fBuffer(buffer),
+-	fBufferSize(bufferSize),
+-	fBytesRead(0),
+-	fIsQueued(false)
+-{
+-	fLock = create_sem(0, &quot;request lock&quot;);
+-	fTeam = team_get_current_team_id();
+-}
+-
+-
+-ReadRequest::~ReadRequest()
+-{
+-	delete_sem(fLock);
+-}
+-
+-
+-status_t 
+-ReadRequest::Wait(bool nonBlocking)
+-{
+-	TRACE((&quot;pipefs: request@%p waits for data (%sblocking), thread 0x%lx\n&quot;,
+-		this, nonBlocking ? &quot;non&quot; : &quot;&quot;, find_thread(NULL)));
+-	return acquire_sem_etc(fLock, 1,
+-		(nonBlocking ? B_TIMEOUT : 0) | B_CAN_INTERRUPT, 0);
+-}
+-
+-
+-void
+-ReadRequest::Notify()
+-{
+-	release_sem(fLock);
+-}
+-
+-
+-void
+-ReadRequest::Abort()
+-{
+-	fBuffer = NULL;
+-	release_sem(fLock);
+-}
+-
+-
+-void
+-ReadRequest::SetQueued(bool queued)
+-{
+-	fIsQueued = queued;
+-}
+-
+-
+-/*!
+-	Reads the contents of the ring buffer into the requests data buffer
+-	if any (canceled requests don't have a buffer anymore).
+-	This function must only be called in the team context that initiated
+-	the read request.
+-*/
+-status_t
+-ReadRequest::PutBuffer(RingBuffer &amp;buffer, size_t *_bytesRead,
+-	bool releasePartiallyFilled)
+-{
+-	TRACE((&quot;pipefs: ReadRequest::PutBuffer()\n&quot;));
+-
+-	if (_bytesRead)
+-		*_bytesRead = 0;
+-
+-	if (fBuffer == NULL)
+-		return B_CANCELED;
+-
+-	size_t length = buffer.Readable();
+-	size_t spaceLeft = SpaceLeft();
+-
+-	// we read spaceLeft bytes at maximum - but never
+-	// more than there are in the buffer
+-	if (spaceLeft &lt; length)
+-		length = spaceLeft;
+-
+-	if (length == 0)
+-		return B_OK;
+-
+-	if (buffer.UserRead((char*)fBuffer + fBytesRead, length) &lt; B_OK) {
+-		// if the buffer is just invalid, we release the reader as well
+-		release_sem(fLock);
+-		return B_BAD_ADDRESS;
++	// signal right away, if the condition holds already
++	if (writer) {
++		if (event == B_SELECT_WRITE
++				&amp;&amp; (fBuffer.Writable() &gt; 0 || fReaderCount == 0)
++			|| event == B_SELECT_ERROR &amp;&amp; fReaderCount == 0) {
++			return notify_select_event(sync, ref, event);
++		}
++	} else {
++		if (event == B_SELECT_READ
++				&amp;&amp; (fBuffer.Readable() &gt; 0 || fWriterCount == 0)) {
++			return notify_select_event(sync, ref, event);
++		}
+ 	}
+ 
+-	fBytesRead += length;
+-	if (_bytesRead)
+-		*_bytesRead = length;
+-
+-	if (releasePartiallyFilled || SpaceLeft() == 0)
+-		release_sem(fLock);
+-
+ 	return B_OK;
+ }
+ 
+ 
+-/*!
+-	Copies the specified buffer into the request. This function currently
+-	only works for the local address space (both, sender and receiver must
+-	be in the same address space).
+-*/
+ status_t
+-ReadRequest::PutData(const void **_buffer, size_t *_bytesLeft)
++Inode::Deselect(uint8 event, selectsync *sync, int openMode)
+ {
+-	TRACE((&quot;pipefs: ReadRequest::PutData(buffer = %p, size = %lu)\n&quot;,
+-		*_buffer, *_bytesLeft));
++	if (!S_ISFIFO(fType))
++		return B_IS_A_DIRECTORY;
+ 
+-	size_t bytes = *_bytesLeft;
+-	if (bytes &gt; SpaceLeft())
+-		bytes = SpaceLeft();
++	select_sync_pool** pool;
++	if ((openMode &amp; O_RWMASK) == O_RDONLY) {
++		pool = &fReadSelectSyncPool;
++	} else if ((openMode &amp; O_RWMASK) == O_WRONLY) {
++		pool = &fWriteSelectSyncPool;
++	} else
++		return B_NOT_ALLOWED;
+ 
+-	uint8 *source = (uint8 *)*_buffer;
+-
+-	if (user_memcpy((uint8 *)fBuffer + fBytesRead, source, bytes) &lt; B_OK) {
+-		release_sem(fLock);
+-		return B_BAD_ADDRESS;
+-	}
+-
+-	fBytesRead += bytes;
+-	*_buffer = (void *)(source + bytes);
+-	*_bytesLeft -= bytes;
+-
+-	release_sem(fLock);
++	remove_select_sync_pool_entry(pool, sync, event);
+ 	return B_OK;
+ }
+ 
+@@ -1353,11 +1296,15 @@
+ 	TRACE((&quot;pipefs_read(vnode = %p, cookie = %p, length = %lu, mode = %d)\n&quot;,
+ 		_node, cookie, *_length, cookie-&gt;open_mode));
+ 
++	if (!S_ISFIFO(inode-&gt;Type()))
++		return B_IS_A_DIRECTORY;
++
+ 	if ((cookie-&gt;open_mode &amp; O_RWMASK) != O_RDONLY)
+ 		return B_NOT_ALLOWED;
+ 
++	BenaphoreLocker locker(inode-&gt;RequestLock());
++
+ 	if (inode-&gt;WriterCount() == 0) {
+-		BenaphoreLocker locker(inode-&gt;RequestLock());
+ 
+ 		// as long there is no writer, and the pipe is empty,
+ 		// we always just return 0 to indicate end of file
+@@ -1369,22 +1316,20 @@
+ 
+ 	// issue read request
+ 
+-	ReadRequest request(buffer, *_length);
+-	if (inode-&gt;AddRequest(request) != B_OK)
+-		return B_ERROR;
++	ReadRequest request;
++	inode-&gt;AddRequest(request);
+ 
+-	// wait for it to be filled
++	size_t length = *_length;
++	status_t status = inode-&gt;ReadDataFromBuffer(buffer, &amp;length,
++		(cookie-&gt;open_mode &amp; O_NONBLOCK) != 0, request);
+ 
+-	status_t status = request.Wait((cookie-&gt;open_mode &amp; O_NONBLOCK) != 0);
+ 	inode-&gt;RemoveRequest(request);
++	inode-&gt;NotifyReadDone();
+ 
+-	if ((status == B_TIMED_OUT || status == B_INTERRUPTED || status == B_WOULD_BLOCK)
+-		&amp;&amp; request.BytesRead() &gt; 0)
++	if (length &gt; 0)
+ 		status = B_OK;
+ 
+-	if (status == B_OK)
+-		*_length = request.BytesRead();
+-
++	*_length = length;
+ 	return status;
+ }
+ 
+@@ -1399,37 +1344,28 @@
+ 	TRACE((&quot;pipefs_write(vnode = %p, cookie = %p, length = %lu)\n&quot;,
+ 		_node, cookie, *_length));
+ 
++	if (!S_ISFIFO(inode-&gt;Type()))
++		return B_IS_A_DIRECTORY;
++
+ 	if ((cookie-&gt;open_mode &amp; O_RWMASK) != O_WRONLY)
+ 		return B_NOT_ALLOWED;
+ 
+-	if (inode-&gt;ReaderCount() == 0) {
+-		// if there is no reader yet, we signal the thread and return
+-		send_signal(find_thread(NULL), SIGPIPE);
+-		return EPIPE;
+-	}
+-
+ 	BenaphoreLocker locker(inode-&gt;RequestLock());
+ 
+-	size_t bytesLeft = *_length;
+-	inode-&gt;FillPendingRequests(&amp;buffer, &amp;bytesLeft);	
++	size_t length = *_length;
++	if (length == 0)
++		return B_OK;
+ 
+-	status_t status;
++	// copy data into ring buffer
++	status_t status = inode-&gt;WriteDataToBuffer(buffer, &amp;length,
++		(cookie-&gt;open_mode &amp; O_NONBLOCK) != 0);
+ 
+-	if (bytesLeft != 0) {
+-		// we could not place all our data in pending requests, so
+-		// have to put them into a temporary buffer
++	inode-&gt;NotifyWriteDone();
+ 
+-		status = inode-&gt;WriteDataToBuffer(&amp;buffer, &amp;bytesLeft,
+-			(cookie-&gt;open_mode &amp; O_NONBLOCK) != 0);
+-		if (status == B_OK) {
+-			inode-&gt;FillPendingRequests();
+-			*_length -= bytesLeft;
+-		}
+-	} else {
+-		// could write everything without the need to copy!
++	if (length &gt; 0)
+ 		status = B_OK;
+-	}
+ 
++	*_length = length;
+ 	return status;
+ }
+ 
+@@ -1624,13 +1560,15 @@
+ pipefs_select(fs_volume _fs, fs_vnode _node, fs_cookie _cookie, uint8 event,
+ 	uint32 ref, selectsync *sync)
+ {
++	file_cookie *cookie = (file_cookie *)_cookie;
++
+ 	TRACE((&quot;pipefs_select(vnode = %p)\n&quot;, _node));
+ 	Inode *inode = (Inode *)_node;
+ 	if (!inode)
+ 		return B_ERROR;
+ 
+ 	BenaphoreLocker locker(inode-&gt;RequestLock());
+-	return inode-&gt;Select(event, ref, sync);
++	return inode-&gt;Select(event, ref, sync, cookie-&gt;open_mode);
+ }
+ 
+ 
+@@ -1638,13 +1576,15 @@
+ pipefs_deselect(fs_volume _fs, fs_vnode _node, fs_cookie _cookie, uint8 event,
+ 	selectsync *sync)
+ {
++	file_cookie *cookie = (file_cookie *)_cookie;
++
+ 	TRACE((&quot;pipefs_deselect(vnode = %p)\n&quot;, _node));
+ 	Inode *inode = (Inode *)_node;
+ 	if (!inode)
+ 		return B_ERROR;
+ 	
+ 	BenaphoreLocker locker(inode-&gt;RequestLock());
+-	return inode-&gt;Deselect(event, sync);
++	return inode-&gt;Deselect(event, sync, cookie-&gt;open_mode);
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004065.html">[Haiku-commits] r22377 - haiku/trunk/src/tests/kits/interface
+</A></li>
+	<LI>Next message: <A HREF="004067.html">[Haiku-commits] r22379 - haiku/trunk/src/add-ons/kernel/drivers/tty
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4066">[ date ]</a>
+              <a href="thread.html#4066">[ thread ]</a>
+              <a href="subject.html#4066">[ subject ]</a>
+              <a href="author.html#4066">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

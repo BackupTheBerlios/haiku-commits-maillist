@@ -1,0 +1,228 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22495 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22495%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200710091105.l99B5pYS019752%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004208.html">
+   <LINK REL="Next"  HREF="004212.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22495 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22495%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200710091105.l99B5pYS019752%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22495 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Tue Oct  9 13:05:51 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004208.html">[Haiku-commits] r22494 - haiku/trunk/src/system/kernel/cache
+</A></li>
+        <LI>Next message: <A HREF="004212.html">[Haiku-commits] r22496 -	haiku/trunk/src/add-ons/kernel/debugger/hangman
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4209">[ date ]</a>
+              <a href="thread.html#4209">[ thread ]</a>
+              <a href="subject.html#4209">[ subject ]</a>
+              <a href="author.html#4209">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-10-09 13:05:50 +0200 (Tue, 09 Oct 2007)
+New Revision: 22495
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22495&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22495&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+* vm_set_area_protection() would remap the whole area instead of just the page
+  it intended to. That resulted in more writable pages where you wouldn't want
+  them (ie. allowing the area to change pages in lower caches).
+* We were losing modified pages: vm_unmap_pages() sometimes has to preserve
+  the modified flag (eg. when called from page fault).
+* Both of these were responsible that stealing active pages would crash
+  applications - even if less likely, this could also have happened when
+  stealing inactive pages. Therefore, I've activated stealing active pages
+  again.
+* The page writer now pushes the pages of busy vnodes to the end of the queue,
+  so that it won't pick them up again too soon (the vnode destruction would
+  be in the process of writing those pages back, anyway).
+* The page thief now triggers the page writer to run once it has to steal
+  active pages. This might be a bit too aggressive, though.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm.h	2007-10-09 02:04:36 UTC (rev 22494)
++++ haiku/trunk/headers/private/kernel/vm.h	2007-10-09 11:05:50 UTC (rev 22495)
+@@ -131,7 +131,8 @@
+ int32 vm_test_map_activation(struct vm_page *page, bool *_modified);
+ void vm_clear_map_flags(struct vm_page *page, uint32 flags);
+ void vm_remove_all_page_mappings(struct vm_page *page, uint32 *_flags);
+-status_t vm_unmap_pages(struct vm_area *area, addr_t base, size_t length);
++status_t vm_unmap_pages(struct vm_area *area, addr_t base, size_t length,
++			bool preserveModified);
+ status_t vm_map_page(struct vm_area *area, struct vm_page *page, addr_t address,
+ 			uint32 protection);
+ status_t vm_get_physical_page(addr_t paddr, addr_t *vaddr, uint32 flags);
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-10-09 02:04:36 UTC (rev 22494)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-10-09 11:05:50 UTC (rev 22495)
+@@ -2061,10 +2061,10 @@
+ 	// still exists in the area list.
+ 
+ 	// Unmap the virtual address space the area occupied
+-	vm_unmap_pages(area, area-&gt;base, area-&gt;size);
++	vm_unmap_pages(area, area-&gt;base, area-&gt;size, !area-&gt;cache-&gt;temporary);
+ 
+-	// TODO: do that only for vnode stores
+-	vm_cache_write_modified(area-&gt;cache, false);
++	if (!area-&gt;cache-&gt;temporary)
++		vm_cache_write_modified(area-&gt;cache, false);
+ 
+ 	arch_vm_unset_memory_type(area);
+ 	remove_area_from_address_space(addressSpace, area);
+@@ -2333,7 +2333,7 @@
+ 				while (page) {
+ 					addr_t address = area-&gt;base
+ 						+ (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+-					map-&gt;ops-&gt;protect(map, area-&gt;base, area-&gt;base + area-&gt;size,
++					map-&gt;ops-&gt;protect(map, address, address - 1 + B_PAGE_SIZE,
+ 						newProtection);
+ 					page = page-&gt;cache_next;
+ 				}
+@@ -2505,7 +2505,7 @@
+ 
+ 
+ status_t
+-vm_unmap_pages(vm_area *area, addr_t base, size_t size)
++vm_unmap_pages(vm_area *area, addr_t base, size_t size, bool preserveModified)
+ {
+ 	vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
+ 	addr_t end = base + (size - 1);
+@@ -2535,6 +2535,29 @@
+ 	}
+ 
+ 	map-&gt;ops-&gt;unmap(map, base, end);
++	if (preserveModified) {
++		map-&gt;ops-&gt;flush(map);
++
++		for (addr_t virtualAddress = base; virtualAddress &lt; end;
++				virtualAddress += B_PAGE_SIZE) {
++			addr_t physicalAddress;
++			uint32 flags;
++			status_t status = map-&gt;ops-&gt;query(map, virtualAddress,
++				&amp;physicalAddress, &amp;flags);
++			if (status &lt; B_OK || (flags &amp; PAGE_PRESENT) == 0)
++				continue;
++
++			vm_page *page = vm_lookup_page(physicalAddress / B_PAGE_SIZE);
++			if (page == NULL) {
++				panic(&quot;area %p looking up page failed for pa 0x%lx\n&quot;, area,
++					physicalAddress);
++			}
++
++			if ((flags &amp; PAGE_MODIFIED) != 0
++				&amp;&amp; page-&gt;state != PAGE_STATE_MODIFIED)
++				vm_page_set_state(page, PAGE_STATE_MODIFIED);
++		}
++	}
+ 	map-&gt;ops-&gt;unlock(map);
+ 
+ 	if (area-&gt;wiring == B_NO_LOCK) {
+@@ -4251,7 +4274,7 @@
+ 
+ 		// In case this is a copy-on-write page, we need to unmap it from the area now
+ 		if (isWrite &amp;&amp; page-&gt;cache == topCache)
+-			vm_unmap_pages(area, address, B_PAGE_SIZE);
++			vm_unmap_pages(area, address, B_PAGE_SIZE, true);
+ 
+ 		// TODO: there is currently no mechanism to prevent a page being mapped
+ 		//	more than once in case of a second page fault!
+@@ -4907,8 +4930,10 @@
+ 		current-&gt;size = newSize;
+ 
+ 		// we also need to unmap all pages beyond the new size, if the area has shrinked
+-		if (newSize &lt; oldSize)
+-			vm_unmap_pages(current, current-&gt;base + newSize, oldSize - newSize);
++		if (newSize &lt; oldSize) {
++			vm_unmap_pages(current, current-&gt;base + newSize, oldSize - newSize,
++				false);
++		}
+ 	}
+ 
+ 	if (status == B_OK)
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-10-09 02:04:36 UTC (rev 22494)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-10-09 11:05:50 UTC (rev 22495)
+@@ -688,8 +688,14 @@
+ 				// we need our own reference to the store, as it might
+ 				// currently be destructed
+ 				if (cache-&gt;store-&gt;ops-&gt;acquire_unreferenced_ref(cache-&gt;store)
+-						!= B_OK)
++						!= B_OK) {
++					// put it to the tail of the queue, then, so that we
++					// won't touch it too soon again
++					vm_page_requeue(page, true);
++					cacheLocker.Unlock();
++					thread_yield();
+ 					continue;
++				}
+ 			}
+ 
+ 			locker.Lock();
+@@ -821,12 +827,13 @@
+ 						score = 127;
+ 						desperate = true;
+ 					} else {
+-						// TODO: for now, we never steal active pages
+-						break;
+ 						stealActive = true;
+ 						score = 5;
+ 						steal = 5;
+ 					}
++
++					// let the page writer clear some pages for reuse
++					release_sem_etc(sWriterWaitSem, 1, B_DO_NOT_RESCHEDULE);
+ 					continue;
+ 				}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004208.html">[Haiku-commits] r22494 - haiku/trunk/src/system/kernel/cache
+</A></li>
+	<LI>Next message: <A HREF="004212.html">[Haiku-commits] r22496 -	haiku/trunk/src/add-ons/kernel/debugger/hangman
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4209">[ date ]</a>
+              <a href="thread.html#4209">[ thread ]</a>
+              <a href="subject.html#4209">[ subject ]</a>
+              <a href="author.html#4209">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,159 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25278 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25278%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200805011144.m41BiKug018384%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008428.html">
+   <LINK REL="Next"  HREF="008392.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25278 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25278%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200805011144.m41BiKug018384%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25278 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu May  1 13:44:20 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008428.html">[Haiku-commits] r25269 - in haiku/trunk/src: kits kits/interface servers/app
+</A></li>
+        <LI>Next message: <A HREF="008392.html">[Haiku-commits] r25279 - haiku/trunk/src/tools/fs_shell
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8389">[ date ]</a>
+              <a href="thread.html#8389">[ thread ]</a>
+              <a href="subject.html#8389">[ subject ]</a>
+              <a href="author.html#8389">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-05-01 13:44:19 +0200 (Thu, 01 May 2008)
+New Revision: 25278
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25278&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25278&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+Log:
+* As Ingo pointed out to me earlier, TCP could now delete its socket too early
+  when using the shutdown() command.
+* If TCP no longer needs a socket, it will now set the flag FLAG_DELETE_ON_CLOSE;
+  when the socket is closed from the upper layers, it will set the FLAG_CLOSED
+  flag - and only if both are set, TCP will now delete the socket itself on
+  receive.
+* This fixes bug #2189.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2008-05-01 01:59:09 UTC (rev 25277)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2008-05-01 11:44:19 UTC (rev 25278)
+@@ -219,7 +219,7 @@
+ 	//       is performed on a listen()ing socket.
+ 	FLAG_NO_RECEIVE				= 0x04,
+ 	FLAG_CLOSED					= 0x08,
+-	FLAG_DELETE					= 0x10,
++	FLAG_DELETE_ON_CLOSE		= 0x10,
+ };
+ 
+ 
+@@ -500,7 +500,6 @@
+ 			fSendQueue.Used());
+ 	}
+ 
+-	fFlags |= FLAG_CLOSED;
+ 	return B_OK;
+ }
+ 
+@@ -512,11 +511,16 @@
+ 
+ 	MutexLocker _(fLock);
+ 
+-	if (fState &lt;= SYNCHRONIZE_SENT || fState == TIME_WAIT)
++	if (fState &lt;= SYNCHRONIZE_SENT)
+ 		return B_OK;
+ 
+ 	// we are only interested in the timer, not in changing state
+ 	_EnterTimeWait();
++
++	fFlags |= FLAG_CLOSED;
++	if ((fFlags &amp; FLAG_DELETE_ON_CLOSE) != 0)
++		return B_OK;
++
+ 	return B_BUSY;
+ 		// we'll be freed later when the 2MSL timer expires
+ }
+@@ -1009,14 +1013,15 @@
+ {
+ 	TRACE(&quot;_EnterTimeWait()\n&quot;);
+ 
++	_CancelConnectionTimers();
++
+ 	if (fState == TIME_WAIT &amp;&amp; fRoute != NULL
+ 		&amp;&amp; (fRoute-&gt;flags &amp; RTF_LOCAL) != 0) {
+ 		// we do not use TIME_WAIT state for local connections
+-		fFlags |= FLAG_DELETE;
++		fFlags |= FLAG_DELETE_ON_CLOSE;
+ 		return;
+ 	}
+ 
+-	_CancelConnectionTimers();
+ 	_UpdateTimeWait();
+ }
+ 
+@@ -1106,11 +1111,7 @@
+ 	fState = CLOSED;
+ 	T(State(this));
+ 
+-	if ((fFlags &amp; FLAG_CLOSED) != 0) {
+-		// this socket has been closed already, we don't need to keep
+-		// it around anymore
+-		fFlags |= FLAG_DELETE;
+-	}
++	fFlags |= FLAG_DELETE_ON_CLOSE;
+ }
+ 
+ 
+@@ -1671,7 +1672,8 @@
+ 	else if (segmentAction &amp; ACKNOWLEDGE)
+ 		DelayedAcknowledge();
+ 
+-	if ((fFlags &amp; FLAG_DELETE) != 0) {
++	if ((fFlags &amp; (FLAG_CLOSED | FLAG_DELETE_ON_CLOSE))
++			== (FLAG_CLOSED | FLAG_DELETE_ON_CLOSE)) {
+ 		locker.Unlock();
+ 		gSocketModule-&gt;delete_socket(socket);
+ 			// this will also delete us
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008428.html">[Haiku-commits] r25269 - in haiku/trunk/src: kits kits/interface servers/app
+</A></li>
+	<LI>Next message: <A HREF="008392.html">[Haiku-commits] r25279 - haiku/trunk/src/tools/fs_shell
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8389">[ date ]</a>
+              <a href="thread.html#8389">[ thread ]</a>
+              <a href="subject.html#8389">[ subject ]</a>
+              <a href="author.html#8389">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

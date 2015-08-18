@@ -1,0 +1,330 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32900 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32900%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay&In-Reply-To=%3C200909020309.n8239WxB021429%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020279.html">
+   <LINK REL="Next"  HREF="020284.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32900 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32900%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay&In-Reply-To=%3C200909020309.n8239WxB021429%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32900 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Wed Sep  2 05:09:32 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020279.html">[Haiku-commits] r32899 - in haiku/trunk: headers/os/drivers	src/add-ons/kernel/bus_managers/pci	src/add-ons/kernel/drivers/audio/ac97/es1370	src/add-ons/kernel/drivers/audio/hda
+</A></li>
+        <LI>Next message: <A HREF="020284.html">[Haiku-commits] r32901 - haiku/trunk/headers/os/drivers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20280">[ date ]</a>
+              <a href="thread.html#20280">[ thread ]</a>
+              <a href="subject.html#20280">[ subject ]</a>
+              <a href="author.html#20280">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-09-02 05:09:28 +0200 (Wed, 02 Sep 2009)
+New Revision: 32900
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32900&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32900&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/Jamfile
+   haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp
+Log:
+Implement the rest of the IO hook. We now do directly satisfy write requests
+by writing them into our buffers and directly satisfy read requests by copying
+our buffers, filling any gaps by spawning off subrequests to the underlaying
+filesystem.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/Jamfile
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/Jamfile	2009-09-01 23:56:02 UTC (rev 32899)
++++ haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/Jamfile	2009-09-02 03:09:28 UTC (rev 32900)
+@@ -1,6 +1,7 @@
+ SubDir HAIKU_TOP src add-ons kernel file_systems layers write_overlay ;
+ 
+ UsePrivateKernelHeaders ;
++SubDirHdrs $(HAIKU_TOP) src system kernel device_manager ;
+ 
+ KernelAddon write_overlay :
+ 	write_overlay.cpp
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp	2009-09-01 23:56:02 UTC (rev 32899)
++++ haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp	2009-09-02 03:09:28 UTC (rev 32900)
+@@ -23,7 +23,9 @@
+ #include &lt;KernelExport.h&gt;
+ #include &lt;NodeMonitor.h&gt;
+ 
++#include &quot;IORequest.h&quot;
+ 
++
+ //#define TRACE_OVERLAY
+ #ifdef TRACE_OVERLAY
+ #define TRACE(x...)			dprintf(&quot;write_overlay: &quot; x)
+@@ -132,9 +134,14 @@
+ 		status_t			Close(void *cookie);
+ 		status_t			FreeCookie(void *cookie);
+ 		status_t			Read(void *cookie, off_t position, void *buffer,
+-								size_t *length, bool readPages);
++								size_t *length, bool readPages,
++								IORequest *ioRequest);
+ 		status_t			Write(void *cookie, off_t position,
+-								const void *buffer, size_t *length);
++								const void *buffer, size_t length,
++								IORequest *request);
++
++		status_t			SynchronousIO(void *cookie, IORequest *request);
++
+ 		status_t			SetFlags(void *cookie, int flags);
+ 
+ 		status_t			CreateDir(const char *name, int perms);
+@@ -519,7 +526,7 @@
+ 
+ status_t
+ OverlayInode::Read(void *_cookie, off_t position, void *buffer, size_t *length,
+-	bool readPages)
++	bool readPages, IORequest *ioRequest)
+ {
+ 	if (position &gt;= fStat.st_size) {
+ 		*length = 0;
+@@ -555,6 +562,20 @@
+ 				result = fSuperVnode.ops-&gt;read_pages(SuperVolume(),
+ 					&amp;fSuperVnode, superCookie, position, &amp;vector, 1,
+ 					&amp;readLength);
++			} else if (ioRequest != NULL) {
++				IORequest *subRequest;
++				result = ioRequest-&gt;CreateSubRequest(position, position,
++					readLength, subRequest);
++				if (result != B_OK)
++					return result;
++
++				result = fSuperVnode.ops-&gt;io(SuperVolume(), &amp;fSuperVnode,
++					superCookie, subRequest);
++				if (result != B_OK)
++					return result;
++
++				result = subRequest-&gt;Wait(0, 0);
++				readLength = subRequest-&gt;TransferredBytes();
+ 			} else {
+ 				result = fSuperVnode.ops-&gt;read(SuperVolume(), &amp;fSuperVnode,
+ 					superCookie, position, pointer, &amp;readLength);
+@@ -572,7 +593,11 @@
+ 		if (gapSize &gt; 0) {
+ 			// there's a gap before our next position which we cannot
+ 			// fill with original file content, zero it out
+-			memset(pointer, 0, gapSize);
++			if (ioRequest != NULL)
++				;// TODO: handle this case
++			else
++				memset(pointer, 0, gapSize);
++
+ 			bytesLeft -= gapSize;
+ 			position += gapSize;
+ 			pointer += gapSize;
+@@ -585,9 +610,15 @@
+ 		off_t elementEnd = element-&gt;position + element-&gt;length;
+ 		if (elementEnd &gt; position) {
+ 			size_t copyLength = MIN(elementEnd - position, bytesLeft);
+-			memcpy(pointer, element-&gt;buffer + (position - element-&gt;position),
+-				copyLength);
+ 
++			const void *source = element-&gt;buffer + (position
++				- element-&gt;position);
++			if (ioRequest != NULL) {
++				ioRequest-&gt;CopyData(source, (addr_t)pointer - (addr_t)buffer,
++					copyLength);
++			} else
++				memcpy(pointer, source, copyLength);
++
+ 			bytesLeft -= copyLength;
+ 			position += copyLength;
+ 			pointer += copyLength;
+@@ -602,7 +633,7 @@
+ 
+ status_t
+ OverlayInode::Write(void *_cookie, off_t position, const void *buffer,
+-	size_t *length)
++	size_t length, IORequest *ioRequest)
+ {
+ 	if (_cookie != NULL) {
+ 		open_cookie *cookie = (open_cookie *)_cookie;
+@@ -618,7 +649,7 @@
+ 	write_buffer *other = fWriteBuffers;
+ 	write_buffer *swallow = NULL;
+ 	off_t newPosition = position;
+-	size_t newLength = *length;
++	size_t newLength = length;
+ 	uint32 swallowCount = 0;
+ 
+ 	while (other) {
+@@ -643,8 +674,11 @@
+ 		if (other-&gt;position &lt;= newPosition) {
+ 			if (swallowCount == 1 &amp;&amp; otherEnd &gt;= newEnd) {
+ 				// other chunk completely covers us, just copy
+-				memcpy(other-&gt;buffer + (newPosition - other-&gt;position),
+-					buffer, *length);
++				void *target = other-&gt;buffer + (newPosition - other-&gt;position);
++				if (ioRequest != NULL)
++					ioRequest-&gt;CopyData(0, target, length);
++				else
++					memcpy(target, buffer, length);
+ 
+ 				fStat.st_mtime = time(NULL);
+ 				notify_stat_changed(SuperVolume()-&gt;id, fInodeNumber,
+@@ -694,7 +728,11 @@
+ 		}
+ 	}
+ 
+-	memcpy(element-&gt;buffer + (position - newPosition), buffer, *length);
++	void *target = element-&gt;buffer + (position - newPosition);
++	if (ioRequest != NULL)
++		ioRequest-&gt;CopyData(0, target, length);
++	else
++		memcpy(target, buffer, length);
+ 
+ 	fStat.st_mtime = time(NULL);
+ 	notify_stat_changed(SuperVolume()-&gt;id, fInodeNumber,
+@@ -704,6 +742,25 @@
+ 
+ 
+ status_t
++OverlayInode::SynchronousIO(void *cookie, IORequest *request)
++{
++	status_t result;
++	size_t length = request-&gt;Length();
++	if (request-&gt;IsWrite())
++		result = Write(cookie, request-&gt;Offset(), NULL, length, request);
++	else
++		result = Read(cookie, request-&gt;Offset(), NULL, &amp;length, false, request);
++
++	if (result != B_OK)
++		return result;
++
++	request-&gt;SetTransferredBytes(false, length);
++	request-&gt;SetStatusAndNotify(B_OK);
++	return B_OK;
++}
++
++
++status_t
+ OverlayInode::SetFlags(void *_cookie, int flags)
+ {
+ 	// we can only handle O_APPEND, O_NONBLOCK is ignored.
+@@ -803,8 +860,7 @@
+ 	if (result != B_OK)
+ 		return result;
+ 
+-	size_t writeLength = strlen(path);
+-	return newNode-&gt;Write(NULL, 0, path, &amp;writeLength);
++	return newNode-&gt;Write(NULL, 0, path, strlen(path), NULL);
+ }
+ 
+ 
+@@ -815,7 +871,7 @@
+ 		if (!S_ISLNK(fStat.st_mode))
+ 			return B_BAD_VALUE;
+ 
+-		return Read(NULL, 0, buffer, bufferSize, false);
++		return Read(NULL, 0, buffer, bufferSize, false, NULL);
+ 	}
+ 
+ 	if (fSuperVnode.ops-&gt;read_symlink == NULL)
+@@ -1239,7 +1295,7 @@
+ 	for (size_t i = 0; i &lt; count; i++) {
+ 		size_t transferBytes = MIN(vecs[i].iov_len, bytesLeft);
+ 		status_t result = node-&gt;Read(cookie, pos, vecs[i].iov_base,
+-			&amp;transferBytes, true);
++			&amp;transferBytes, true, NULL);
+ 		if (result != B_OK) {
+ 			*numBytes -= bytesLeft;
+ 			return result;
+@@ -1272,7 +1328,7 @@
+ 	for (size_t i = 0; i &lt; count; i++) {
+ 		size_t transferBytes = MIN(vecs[i].iov_len, bytesLeft);
+ 		status_t result = node-&gt;Write(cookie, pos, vecs[i].iov_base,
+-			&amp;transferBytes);
++			transferBytes, NULL);
+ 		if (result != B_OK) {
+ 			*numBytes -= bytesLeft;
+ 			return result;
+@@ -1299,17 +1355,15 @@
+ overlay_io(fs_volume *volume, fs_vnode *vnode, void *cookie,
+ 	io_request *request)
+ {
+-	if (io_request_is_write(request))
+-		return B_UNSUPPORTED;
+-
+ 	OverlayInode *node = (OverlayInode *)vnode-&gt;private_node;
+-	if (node-&gt;IsModified())
+-		return B_UNSUPPORTED;
++	if (io_request_is_write(request) || node-&gt;IsModified())
++		return node-&gt;SynchronousIO(cookie, (IORequest *)request);
+ 
+ 	TRACE(&quot;relaying op: io\n&quot;);
+ 	fs_vnode *superVnode = node-&gt;SuperVnode();
+ 	if (superVnode-&gt;ops-&gt;io != NULL) {
+-		return superVnode-&gt;ops-&gt;io(volume-&gt;super_volume, superVnode, cookie,
++		return superVnode-&gt;ops-&gt;io(volume-&gt;super_volume, superVnode,
++			cookie != NULL ? ((open_cookie *)cookie)-&gt;super_cookie : NULL,
+ 			request);
+ 	}
+ 
+@@ -1521,7 +1575,7 @@
+ {
+ 	TRACE(&quot;read\n&quot;);
+ 	return ((OverlayInode *)vnode-&gt;private_node)-&gt;Read(cookie, pos, buffer,
+-		length, false);
++		length, false, NULL);
+ }
+ 
+ 
+@@ -1531,7 +1585,7 @@
+ {
+ 	TRACE(&quot;write\n&quot;);
+ 	return ((OverlayInode *)vnode-&gt;private_node)-&gt;Write(cookie, pos, buffer,
+-		length);
++		*length, NULL);
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020279.html">[Haiku-commits] r32899 - in haiku/trunk: headers/os/drivers	src/add-ons/kernel/bus_managers/pci	src/add-ons/kernel/drivers/audio/ac97/es1370	src/add-ons/kernel/drivers/audio/hda
+</A></li>
+	<LI>Next message: <A HREF="020284.html">[Haiku-commits] r32901 - haiku/trunk/headers/os/drivers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20280">[ date ]</a>
+              <a href="thread.html#20280">[ thread ]</a>
+              <a href="subject.html#20280">[ subject ]</a>
+              <a href="author.html#20280">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,401 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22909 - in haiku/trunk:	headers/private/kernel/disk_device_manager	src/system/kernel/disk_device_manager
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22909%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/disk_device_manager%0A%09src/system/kernel/disk_device_manager&In-Reply-To=%3C200711121841.lACIfbup017877%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004731.html">
+   <LINK REL="Next"  HREF="004733.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22909 - in haiku/trunk:	headers/private/kernel/disk_device_manager	src/system/kernel/disk_device_manager</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22909%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/disk_device_manager%0A%09src/system/kernel/disk_device_manager&In-Reply-To=%3C200711121841.lACIfbup017877%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22909 - in haiku/trunk:	headers/private/kernel/disk_device_manager	src/system/kernel/disk_device_manager">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Nov 12 19:41:37 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004731.html">[Haiku-commits] r22908 - haiku/trunk/src/servers/app/drawing
+</A></li>
+        <LI>Next message: <A HREF="004733.html">[Haiku-commits] r22910 - in haiku/trunk: headers/private/kernel	src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4732">[ date ]</a>
+              <a href="thread.html#4732">[ thread ]</a>
+              <a href="subject.html#4732">[ subject ]</a>
+              <a href="author.html#4732">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-11-12 19:41:36 +0100 (Mon, 12 Nov 2007)
+New Revision: 22909
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22909&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22909&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/disk_device_manager/KDiskDeviceManager.h
+   haiku/trunk/headers/private/kernel/disk_device_manager/KPartition.h
+   haiku/trunk/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp
+   haiku/trunk/src/system/kernel/disk_device_manager/KFileDiskDevice.cpp
+   haiku/trunk/src/system/kernel/disk_device_manager/KPartition.cpp
+   haiku/trunk/src/system/kernel/disk_device_manager/ddm_userland_interface.cpp
+Log:
+axeld + bonefish:
+* Unmount when uninitializing a partition.
+* Finished the media checker implementation, i.e. we rescan when a media
+  was inserted and uninitialize when ejected.
+* Turned the disk device media checker from a kernel daemon into a thread.
+
+
+Modified: haiku/trunk/headers/private/kernel/disk_device_manager/KDiskDeviceManager.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/disk_device_manager/KDiskDeviceManager.h	2007-11-12 11:44:55 UTC (rev 22908)
++++ haiku/trunk/headers/private/kernel/disk_device_manager/KDiskDeviceManager.h	2007-11-12 18:41:36 UTC (rev 22909)
+@@ -99,8 +99,8 @@
+ 	status_t RescanDiskSystems();
+ 
+ private:
+-	static void _CheckMediaStatusDaemon(void* self, int iteration);
+-	void _CheckMediaStatus();
++	static status_t _CheckMediaStatusDaemon(void* self);
++	status_t _CheckMediaStatus();
+ 
+ 	status_t _RescanDiskSystems(bool fileSystems);
+ 
+@@ -127,6 +127,8 @@
+ 	PartitionMap				*fPartitions;
+ 	DiskSystemMap				*fDiskSystems;
+ 	PartitionSet				*fObsoletePartitions;
++	thread_id					fMediaChecker;
++	volatile bool				fTerminating;
+ 
+ 	static KDiskDeviceManager	*sDefaultManager;
+ };
+
+Modified: haiku/trunk/headers/private/kernel/disk_device_manager/KPartition.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/disk_device_manager/KPartition.h	2007-11-12 11:44:55 UTC (rev 22908)
++++ haiku/trunk/headers/private/kernel/disk_device_manager/KPartition.h	2007-11-12 18:41:36 UTC (rev 22909)
+@@ -54,6 +54,7 @@
+ 	bool IsBusy() const;
+ 	bool IsBusy(bool includeDescendants);
+ 	bool CheckAndMarkBusy(bool includeDescendants);
++	void MarkBusy(bool includeDescendants);
+ 	void UnmarkBusy(bool includeDescendants);
+ 
+ 	void SetOffset(off_t offset);
+
+Modified: haiku/trunk/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp	2007-11-12 11:44:55 UTC (rev 22908)
++++ haiku/trunk/src/system/kernel/disk_device_manager/KDiskDeviceManager.cpp	2007-11-12 18:41:36 UTC (rev 22909)
+@@ -103,15 +103,19 @@
+ 	  fDevices(new(nothrow) DeviceMap),
+ 	  fPartitions(new(nothrow) PartitionMap),
+ 	  fDiskSystems(new(nothrow) DiskSystemMap),
+-	  fObsoletePartitions(new(nothrow) PartitionSet)
++	  fObsoletePartitions(new(nothrow) PartitionSet),
++	  fMediaChecker(-1),
++	  fTerminating(false)
+ {
+ 	if (InitCheck() != B_OK)
+ 		return;
+ 
+ 	RescanDiskSystems();
+ 
+-	register_kernel_daemon(&amp;_CheckMediaStatusDaemon, this, 10);
+-		// once every second
++	fMediaChecker = spawn_kernel_thread(_CheckMediaStatusDaemon,
++		&quot;media checker&quot;, B_NORMAL_PRIORITY, this);
++	if (fMediaChecker &gt;= 0)
++		resume_thread(fMediaChecker);
+ 
+ 	DBG(OUT(&quot;number of disk systems: %ld\n&quot;, CountDiskSystems()));
+ 	// TODO: Watch the disk systems and the relevant directories.
+@@ -120,9 +124,11 @@
+ 
+ KDiskDeviceManager::~KDiskDeviceManager()
+ {
+-	unregister_kernel_daemon(&amp;_CheckMediaStatusDaemon, this);
++	fTerminating = true;
+ 
+-	// TODO: terminate and remove all jobs
++	status_t result;
++	wait_for_thread(fMediaChecker, &amp;result);
++
+ 	// remove all devices
+ 	for (int32 cookie = 0; KDiskDevice *device = NextDevice(&amp;cookie);) {
+ 		PartitionRegistrar _(device);
+@@ -1127,35 +1133,45 @@
+ }
+ 
+ 
+-void
++status_t
+ KDiskDeviceManager::_CheckMediaStatus()
+ {
+-	if (fLock.LockWithTimeout(0) != B_OK)
+-		return;
+-
+-	int32 cookie = 0;
+ 	while (true) {
+-		KDiskDevice* device = NextDevice(&amp;cookie);
+-		if (device == NULL)
+-			break;
++		int32 cookie = 0;
++		while (KDiskDevice* device = RegisterNextDevice(&amp;cookie)) {
++			DeviceWriteLocker locker(device);
+ 
+-		bool hadMedia = device-&gt;HasMedia();
+-		device-&gt;UpdateMediaStatusIfNeeded();
++			if (device-&gt;IsBusy(true))
++				continue;
+ 
+-		// TODO: propagate changes!
+-		if (device-&gt;MediaChanged()) {
++			bool hadMedia = device-&gt;HasMedia();
++			device-&gt;UpdateMediaStatusIfNeeded();
++
++			if (!device-&gt;MediaChanged() &amp;&amp; (device-&gt;HasMedia() || !hadMedia))
++				continue;
++
++			device-&gt;MarkBusy(true);
++			device-&gt;UninitializeContents(true);
++
++			if (device-&gt;MediaChanged()) {
+ 				dprintf(&quot;Media changed from %s\n&quot;, device-&gt;Path());
+-		} else if (!device-&gt;HasMedia() &amp;&amp; hadMedia) {
+-			dprintf(&quot;Media removed from %s\n&quot;, device-&gt;Path());
++				_ScanPartition(device, false);
++			} else if (!device-&gt;HasMedia() &amp;&amp; hadMedia) {
++				dprintf(&quot;Media removed from %s\n&quot;, device-&gt;Path());
++			}
++
++			device-&gt;UnmarkBusy(true);
+ 		}
++
++		snooze(1000000);
+ 	}
+ 
+-	fLock.Unlock();
++	return 0;
+ }
+ 
+ 
+-void
+-KDiskDeviceManager::_CheckMediaStatusDaemon(void* self, int iteration)
++status_t
++KDiskDeviceManager::_CheckMediaStatusDaemon(void* self)
+ {
+-	((KDiskDeviceManager*)self)-&gt;_CheckMediaStatus();
++	return ((KDiskDeviceManager*)self)-&gt;_CheckMediaStatus();
+ }
+
+Modified: haiku/trunk/src/system/kernel/disk_device_manager/KFileDiskDevice.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/disk_device_manager/KFileDiskDevice.cpp	2007-11-12 11:44:55 UTC (rev 22908)
++++ haiku/trunk/src/system/kernel/disk_device_manager/KFileDiskDevice.cpp	2007-11-12 18:41:36 UTC (rev 22909)
+@@ -13,7 +13,6 @@
+ #include &lt;KFileDiskDevice.h&gt;
+ #include &lt;KPath.h&gt;
+ 
+-#include &quot;virtualdrive.h&quot;
+ 
+ // debugging
+ //#define DBG(x)
+@@ -166,7 +165,6 @@
+ 	geometry-&gt;write_once = false;
+ 
+ 	return B_OK;
+-
+ }
+ 
+ // _RegisterDevice
+@@ -175,48 +173,6 @@
+ {
+ 	return devfs_publish_file_device(device + 5, file);
+ 		// we need to remove the &quot;/dev/&quot; part from the path
+-
+-	// TODO: For now we use the virtualdrive driver to register a file
+-	// as a device and then simply symlink the assigned device to the
+-	// desired device location. Replace that with the
+-	// respective kernel magic for the OBOS kernel!
+-	// -&gt; Well, we could simply symlink the file there. Doesn't work for R5,
+-	// but we should be able to deal with it properly.
+-//
+-//	// open the virtualdrive control device
+-//	int fd = open(VIRTUAL_DRIVE_CONTROL_DEVICE, O_RDONLY);
+-//	if (fd &lt; 0) {
+-//		DBG(OUT(&quot;Failed to open virtualdrive control device: %s\n&quot;,
+-//				strerror(errno)));
+-//		return errno;
+-//	}
+-//	// set up the info
+-//	virtual_drive_info info;
+-//	strcpy(info.file_name, file);
+-//	info.use_geometry = false;
+-//	status_t error = B_OK;
+-//	if (ioctl(fd, VIRTUAL_DRIVE_REGISTER_FILE, &amp;info) != 0) {
+-//		error = errno;
+-//		DBG(OUT(&quot;Failed to install file device: %s\n&quot;, strerror(error)));
+-//	}
+-//	// close the control device
+-//	close(fd);
+-//	// create a symlink
+-//	if (error == B_OK) {
+-//		if (symlink(info.device_name, device) != 0) {
+-//			DBG(OUT(&quot;Failed to create file device symlink: %s\n&quot;,
+-//					strerror(error)));
+-//			error = errno;
+-//			// unregister the file device
+-//			// open the device
+-//			int deviceFD = open(info.device_name, O_RDONLY);
+-//			if (deviceFD &gt;= 0) {
+-//				ioctl(deviceFD, VIRTUAL_DRIVE_UNREGISTER_FILE);
+-//				close(deviceFD);
+-//			}
+-//		}
+-//	}
+-//	return error;
+ }
+ 
+ // _UnregisterDevice
+@@ -225,29 +181,6 @@
+ {
+ 	return devfs_unpublish_file_device(_device + 5);
+ 		// we need to remove the &quot;/dev/&quot; part from the path
+-
+-//	// read the symlink to get the path of the virtualdrive device
+-//	char device[B_PATH_NAME_LENGTH];
+-//	ssize_t bytesRead = readlink(_device, device, sizeof(device) - 1);
+-//	if (bytesRead &lt; 0)
+-//		return errno;
+-//	device[bytesRead] = '\0';
+-//	// open the device
+-//	int fd = open(device, O_RDONLY);
+-//	if (fd &lt; 0)
+-//		return errno;
+-//	// issue the ioctl
+-//	status_t error = B_OK;
+-//	if (ioctl(fd, VIRTUAL_DRIVE_UNREGISTER_FILE) != 0)
+-//		error = errno;
+-//	// close the control device
+-//	close(fd);
+-//	// remove the symlink
+-//	if (error == B_OK) {
+-//		if (remove(_device) &lt; 0)
+-//			error = errno;
+-//	}
+-//	return error;
+ }
+ 
+ // _GetDirectoryPath
+
+Modified: haiku/trunk/src/system/kernel/disk_device_manager/KPartition.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/disk_device_manager/KPartition.cpp	2007-11-12 11:44:55 UTC (rev 22908)
++++ haiku/trunk/src/system/kernel/disk_device_manager/KPartition.cpp	2007-11-12 18:41:36 UTC (rev 22909)
+@@ -9,6 +9,7 @@
+ #include &lt;KernelExport.h&gt;
+ #include &lt;Drivers.h&gt;
+ #include &lt;Errors.h&gt;
++#include &lt;fs_volume.h&gt;
+ #include &lt;util/kernel_cpp.h&gt;
+ 
+ #include &lt;ddm_userland_interface.h&gt;
+@@ -22,6 +23,7 @@
+ #include &lt;KPartitionVisitor.h&gt;
+ #include &lt;KPath.h&gt;
+ #include &lt;VectorSet.h&gt;
++#include &lt;vfs.h&gt;
+ 
+ #include &quot;UserDataWriter.h&quot;
+ 
+@@ -272,6 +274,16 @@
+ 	if (IsBusy(includeDescendants))
+ 		return false;
+ 
++	MarkBusy(includeDescendants);
++
++	return true;
++}
++
++
++// MarkBusy
++void
++KPartition::MarkBusy(bool includeDescendants)
++{
+ 	if (includeDescendants) {
+ 		struct MarkBusyVisitor : KPartitionVisitor {
+ 			virtual bool VisitPre(KPartition* partition)
+@@ -284,8 +296,6 @@
+ 		VisitEachDescendant(&amp;markVisitor);
+ 	} else
+ 		SetBusy(true);
+-
+-	return true;
+ }
+ 
+ 
+@@ -1039,7 +1049,13 @@
+ 
+ 		// volume
+ 		if (VolumeID() &gt;= 0) {
+-// TODO: Unmount?
++			status_t error = vfs_unmount(VolumeID(),
++				B_FORCE_UNMOUNT | B_UNMOUNT_BUSY_PARTITION);
++			if (error != B_OK) {
++				dprintf(&quot;KPartition::UninitializeContents(): Failed to unmount &quot;
++					&quot;device %ld: %s\n&quot;, VolumeID(), strerror(error));
++			}
++
+ 			SetVolumeID(-1);
+ 			flags |= B_PARTITION_CHANGED_VOLUME;
+ 		}
+
+Modified: haiku/trunk/src/system/kernel/disk_device_manager/ddm_userland_interface.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/disk_device_manager/ddm_userland_interface.cpp	2007-11-12 11:44:55 UTC (rev 22908)
++++ haiku/trunk/src/system/kernel/disk_device_manager/ddm_userland_interface.cpp	2007-11-12 18:41:36 UTC (rev 22909)
+@@ -1225,7 +1225,7 @@
+ 		return B_BAD_VALUE;
+ 
+ 	// check busy
+-	if (partition-&gt;IsBusy(true))
++	if (!partition-&gt;CheckAndMarkBusy(true))
+ 		return B_BUSY;
+ 
+ // TODO: We should also check, if any partition is mounted!
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004731.html">[Haiku-commits] r22908 - haiku/trunk/src/servers/app/drawing
+</A></li>
+	<LI>Next message: <A HREF="004733.html">[Haiku-commits] r22910 - in haiku/trunk: headers/private/kernel	src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4732">[ date ]</a>
+              <a href="thread.html#4732">[ thread ]</a>
+              <a href="subject.html#4732">[ subject ]</a>
+              <a href="author.html#4732">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

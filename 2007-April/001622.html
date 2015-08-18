@@ -1,0 +1,449 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20712 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/datalink_protocols/arp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20712%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/datalink_protocols/arp&In-Reply-To=%3C200704152100.l3FL0VoN019973%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001621.html">
+   <LINK REL="Next"  HREF="001623.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20712 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/datalink_protocols/arp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20712%20-%20in%20haiku/trunk%3A%20headers/private/net%0A%09src/add-ons/kernel/network/datalink_protocols/arp&In-Reply-To=%3C200704152100.l3FL0VoN019973%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20712 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/datalink_protocols/arp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Sun Apr 15 23:00:31 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001621.html">[Haiku-commits] r20711 - in haiku/trunk: headers/private/media	src/kits/support src/servers/media
+</A></li>
+        <LI>Next message: <A HREF="001623.html">[Haiku-commits] r20713 - haiku/trunk/src/bin/network/arp
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1622">[ date ]</a>
+              <a href="thread.html#1622">[ thread ]</a>
+              <a href="subject.html#1622">[ subject ]</a>
+              <a href="author.html#1622">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-15 23:00:12 +0200 (Sun, 15 Apr 2007)
+New Revision: 20712
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20712&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20712&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/net/arp_control.h
+   haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+Log:
+ARP now queues packets while resolving a destination instead of blocking on send_data(). This fixes several issues:
+
+ - TCP now behaves correctly when receiving new connections as its SYN/ACK is queued, or if lost correctly retransmitted when the peer resends a SYN.
+ - The first ICMP Replies from an external on-link host pinging Haiku are no longer lost.
+ - Reduced the number of ARP messages Haiku needs to generate until resolving an entry.
+
+
+Modified: haiku/trunk/headers/private/net/arp_control.h
+===================================================================
+--- haiku/trunk/headers/private/net/arp_control.h	2007-04-15 20:40:12 UTC (rev 20711)
++++ haiku/trunk/headers/private/net/arp_control.h	2007-04-15 21:00:12 UTC (rev 20712)
+@@ -16,6 +16,7 @@
+ #define ARP_FLAG_REJECT		0x02
+ #define ARP_FLAG_PERMANENT	0x04
+ #define ARP_FLAG_PUBLISH	0x08
++#define ARP_FLAG_VALID		0x10
+ 
+ 
+ // generic syscall interface
+
+Modified: haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp	2007-04-15 20:40:12 UTC (rev 20711)
++++ haiku/trunk/src/add-ons/kernel/network/datalink_protocols/arp/arp.cpp	2007-04-15 21:00:12 UTC (rev 20712)
+@@ -4,6 +4,7 @@
+  *
+  * Authors:
+  *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
++ *		Hugo Santos, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">hugosantos at gmail.com</A>
+  */
+ 
+ //! Ethernet Address Resolution Protocol, see RFC 826.
+@@ -18,6 +19,7 @@
+ 
+ #include &lt;generic_syscall.h&gt;
+ #include &lt;util/AutoLock.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
+ #include &lt;util/khash.h&gt;
+ 
+ #include &lt;ByteOrder.h&gt;
+@@ -65,18 +67,28 @@
+ 	in_addr_t	protocol_address;
+ 	sockaddr_dl	hardware_address;
+ 	uint32		flags;
+-	sem_id		resolved_sem;
+ 	net_buffer	*request_buffer;
+ 	net_timer	timer;
+ 	uint32		timer_state;
+ 	bigtime_t	timestamp;
+ 	net_datalink_protocol *protocol;
+ 
++	typedef DoublyLinkedListCLink&lt;net_buffer&gt; NetBufferLink;
++	typedef DoublyLinkedList&lt;net_buffer, NetBufferLink&gt; BufferList;
++
++	BufferList  queue;
++
+ 	static int Compare(void *_entry, const void *_key);
+ 	static uint32 Hash(void *_entry, const void *_key, uint32 range);
+ 	static arp_entry *Lookup(in_addr_t protocolAddress);
+ 	static arp_entry *Add(in_addr_t protocolAddress, sockaddr_dl *hardwareAddress,
+ 		uint32 flags);
++
++	~arp_entry();
++
++	void ClearQueue();
++	void MarkFailed();
++	void MarkValid();
+ };
+ 
+ // see arp_control.h for flags
+@@ -109,9 +121,9 @@
+ arp_entry::Compare(void *_entry, const void *_key)
+ {
+ 	arp_entry *entry = (arp_entry *)_entry;
+-	in_addr_t key = (in_addr_t)_key;
++	in_addr_t *key = (in_addr_t *)_key;
+ 
+-	if (entry-&gt;protocol_address == key)
++	if (entry-&gt;protocol_address == *key)
+ 		return 0;
+ 
+ 	return 1;
+@@ -122,13 +134,13 @@
+ arp_entry::Hash(void *_entry, const void *_key, uint32 range)
+ {
+ 	arp_entry *entry = (arp_entry *)_entry;
+-	in_addr_t key = (in_addr_t)_key;
++	const in_addr_t *key = (const in_addr_t *)_key;
+ 
+ // TODO: check if this makes a good hash...
+-#define HASH(o) (((o &gt;&gt; 24) ^ (o &gt;&gt; 16) ^ (o &gt;&gt; 8) ^ o) % range)
++#define HASH(o) ((((o) &gt;&gt; 24) ^ ((o) &gt;&gt; 16) ^ ((o) &gt;&gt; 8) ^ (o)) % range)
+ 
+ #ifdef TRACE_ARP
+-	in_addr_t a = entry ? entry-&gt;protocol_address : key; 
++	in_addr_t a = entry ? entry-&gt;protocol_address : *key; 
+ 	dprintf(&quot;%ld.%ld.%ld.%ld: Hash: %lu\n&quot;, a &gt;&gt; 24, (a &gt;&gt; 16) &amp; 0xff,
+ 		(a &gt;&gt; 8) &amp; 0xff, a &amp; 0xff, HASH(a));
+ #endif
+@@ -136,7 +148,7 @@
+ 	if (entry != NULL)
+ 		return HASH(entry-&gt;protocol_address);
+ 
+-	return HASH(key);
++	return HASH(*key);
+ #undef HASH
+ }
+ 
+@@ -144,7 +156,7 @@
+ /*static*/ arp_entry *
+ arp_entry::Lookup(in_addr_t address)
+ {
+-	return (arp_entry *)hash_lookup(sCache, (void *)address);
++	return (arp_entry *)hash_lookup(sCache, &amp;address);
+ }
+ 
+ 
+@@ -168,18 +180,9 @@
+ 		// this entry is already resolved
+ 		entry-&gt;hardware_address = *hardwareAddress;
+ 		entry-&gt;hardware_address.sdl_e_type = ETHER_TYPE_IP;
+-		entry-&gt;resolved_sem = -1;
+ 	} else {
+ 		// this entry still needs to be resolved
+ 		entry-&gt;hardware_address.sdl_alen = 0;
+-
+-		char name[32];
+-		snprintf(name, sizeof(name), &quot;arp %08lx&quot;, protocolAddress);
+-		entry-&gt;resolved_sem = create_sem(0, name);
+-		if (entry-&gt;resolved_sem &lt; B_OK) {
+-			delete entry;
+-			return NULL;
+-		}
+ 	}
+ 	if (entry-&gt;hardware_address.sdl_len != sizeof(sockaddr_dl)) {
+ 		// explicitly set correct length in case our caller hasn't...
+@@ -195,6 +198,55 @@
+ }
+ 
+ 
++arp_entry::~arp_entry()
++{
++	ClearQueue();
++}
++
++
++void
++arp_entry::ClearQueue()
++{
++	BufferList::Iterator iterator = queue.GetIterator();
++	while (iterator.HasNext()) {
++		gBufferModule-&gt;free(iterator.Next());
++		iterator.Remove();
++	}
++}
++
++
++void
++arp_entry::MarkFailed()
++{
++	TRACE((&quot;ARP entry %p Marked as FAILED\n&quot;, this));
++
++	flags = (flags &amp; ~ARP_FLAG_VALID) | ARP_FLAG_REJECT;
++	ClearQueue();
++}
++
++
++void
++arp_entry::MarkValid()
++{
++	TRACE((&quot;ARP entry %p Marked as VALID, have %li packets queued.\n&quot;, this,
++		queue.Size()));
++
++	flags = (flags &amp; ~ARP_FLAG_REJECT) | ARP_FLAG_VALID;
++
++	BufferList::Iterator iterator = queue.GetIterator();
++	while (iterator.HasNext()) {
++		net_buffer *buffer = iterator.Next();
++		iterator.Remove();
++
++		TRACE((&quot;  ARP Dequeing packet %p...\n&quot;, buffer));
++
++		memcpy(&amp;buffer-&gt;destination, &amp;hardware_address,
++			hardware_address.sdl_len);
++		protocol-&gt;next-&gt;module-&gt;send_data(protocol-&gt;next, buffer);
++	}
++}
++
++
+ //	#pragma mark -
+ 
+ 
+@@ -237,12 +289,6 @@
+ 			return B_NO_MEMORY;
+ 	}
+ 
+-	// if someone was waiting for this ARP request to be resolved
+-	if (entry-&gt;resolved_sem &gt;= B_OK) {
+-		delete_sem(entry-&gt;resolved_sem);
+-		entry-&gt;resolved_sem = -1;
+-	}
+-
+ 	if (entry-&gt;request_buffer != NULL) {
+ 		gBufferModule-&gt;free(entry-&gt;request_buffer);
+ 		entry-&gt;request_buffer = NULL;
+@@ -254,6 +300,11 @@
+ 		sStackModule-&gt;set_timer(&amp;entry-&gt;timer, ARP_STALE_TIMEOUT);
+ 	}
+ 
++	if (entry-&gt;flags &amp; ARP_FLAG_REJECT)
++		entry-&gt;MarkFailed();
++	else
++		entry-&gt;MarkValid();
++
+ 	if (_entry)
+ 		*_entry = entry;
+ 
+@@ -424,7 +475,7 @@
+ 			// so that we won't try to request the same address again too soon.
+ 			TRACE((&quot;  requesting ARP entry %p failed!\n&quot;, entry));
+ 			entry-&gt;timer_state = ARP_STATE_REMOVE_FAILED;
+-			entry-&gt;flags |= ARP_FLAG_REJECT;
++			entry-&gt;MarkFailed();
+ 			sStackModule-&gt;set_timer(&amp;entry-&gt;timer, ARP_REJECT_TIMEOUT);
+ 			break;
+ 
+@@ -476,59 +527,13 @@
+ 
+ 
+ /*!
+-	Checks if the ARP \a entry has already been resolved. If it wasn't yet,
+-	and MSG_DONTWAIT is not set in \a flags, it will wait for the entry to
+-	become resolved.
+-	You need to have the sCacheLock held when calling this function - but
+-	note that the lock may be interrupted (in which case entry is updated).
+-*/
+-static status_t
+-arp_check_resolved(arp_entry **_entry, uint32 flags)
+-{
+-	arp_entry *entry = *_entry;
+-
+-	if ((entry-&gt;flags &amp; ARP_FLAG_REJECT) != 0)
+-		return EHOSTUNREACH;
+-
+-	if (entry-&gt;resolved_sem &lt; B_OK)
+-		return B_OK;
+-
+-	// we need to wait for this entry to become resolved
+-
+-	if ((flags &amp; MSG_DONTWAIT) != 0)
+-		return B_ERROR;
+-
+-	// store information we cannot access anymore after having unlocked the cache
+-	sem_id waitSem = entry-&gt;resolved_sem;
+-	in_addr_t address = entry-&gt;protocol_address;
+-
+-	benaphore_unlock(&amp;sCacheLock);
+-	
+-	status_t status = acquire_sem_etc(waitSem, 1, B_RELATIVE_TIMEOUT, 5 * 1000000);
+-
+-	benaphore_lock(&amp;sCacheLock);
+-
+-	if (status == B_TIMED_OUT)
+-		return EHOSTUNREACH;
+-
+-	// retrieve the entry again, as we reacquired the cache lock
+-	entry = arp_entry::Lookup(address);
+-	if (entry == NULL)
+-		return B_ERROR;
+-
+-	*_entry = entry;	
+-	return B_OK;
+-}
+-
+-
+-/*!
+ 	Address resolver function: prepares and sends the ARP request necessary
+ 	to retrieve the hardware address for \a address.
+ 	You need to have the sCacheLock held when calling this function - but
+ 	note that the lock will be interrupted here if everything goes well.
+ */
+ static status_t
+-arp_resolve(net_datalink_protocol *protocol, in_addr_t address, arp_entry **_entry)
++arp_start_resolve(net_datalink_protocol *protocol, in_addr_t address, arp_entry **_entry)
+ {
+ 	// create an unresolved ARP entry as a placeholder
+ 	arp_entry *entry = arp_entry::Add(address, NULL, 0);
+@@ -590,26 +595,6 @@
+ 	sStackModule-&gt;set_timer(&amp;entry-&gt;timer, 0);
+ 		// start request timer
+ 
+-	sem_id waitSem = entry-&gt;resolved_sem;
+-	benaphore_unlock(&amp;sCacheLock);
+-
+-	status = acquire_sem_etc(waitSem, 1, B_RELATIVE_TIMEOUT, 5 * 1000000);
+-		// wait for the entry to become resolved
+-
+-	benaphore_lock(&amp;sCacheLock);
+-
+-	// retrieve the entry again, as we reacquired the cache lock
+-	entry = arp_entry::Lookup(address);
+-	if (entry == NULL)
+-		return B_ERROR;
+-
+-	if (status == B_TIMED_OUT) {
+-		// we didn't get a response, mark ARP entry as non-existant
+-		entry-&gt;flags = ARP_FLAG_REJECT;
+-		// TODO: remove the ARP entry after some time
+-		return EHOSTUNREACH;
+-	}
+-
+ 	*_entry = entry;
+ 	return B_OK;
+ }
+@@ -646,7 +631,7 @@
+ 		case ARP_GET_ENTRY:
+ 		{
+ 			arp_entry *entry = arp_entry::Lookup(control.address);
+-			if (entry == NULL || entry-&gt;resolved_sem &lt; B_OK)
++			if (entry == NULL || !(entry-&gt;flags &amp; ARP_FLAG_VALID))
+ 				return B_ENTRY_NOT_FOUND;
+ 
+ 			memcpy(control.ethernet_address, entry-&gt;hardware_address.sdl_data,
+@@ -683,7 +668,7 @@
+ 		case ARP_DELETE_ENTRY:
+ 		{
+ 			arp_entry *entry = arp_entry::Lookup(control.address);
+-			if (entry == NULL || entry-&gt;resolved_sem &lt; B_OK)
++			if (entry == NULL)
+ 				return B_ENTRY_NOT_FOUND;
+ 			if ((entry-&gt;flags &amp; ARP_FLAG_LOCAL) != 0)
+ 				return B_BAD_VALUE;
+@@ -832,25 +817,22 @@
+ 			entry = arp_entry::Lookup(
+ 				((struct sockaddr_in *)&amp;buffer-&gt;destination)-&gt;sin_addr.s_addr);
+ 			if (entry == NULL) {
+-				// The ARP entry does not yet exist, if we're allowed to wait,
+-				// we'll send an ARP request and try to change that.
+-				if ((buffer-&gt;flags &amp; MSG_DONTWAIT) != 0) {
+-					// TODO: implement delaying packet send after ARP response!
+-					return B_ERROR;
+-				}
+-
+-				status_t status = arp_resolve(protocol,
++				status_t status = arp_start_resolve(protocol,
+ 					((struct sockaddr_in *)&amp;buffer-&gt;destination)-&gt;sin_addr.s_addr, &amp;entry);
+ 				if (status &lt; B_OK)
+ 					return status;
+-			} else {
+-				// The entry exists, but we have to check if it has already been
+-				// resolved and is valid.
+-				status_t status = arp_check_resolved(&amp;entry, buffer-&gt;flags);
+-				if (status &lt; B_OK)
+-					return status;
+ 			}
+ 
++			if (entry-&gt;flags &amp; ARP_FLAG_REJECT)
++				return EHOSTUNREACH;
++			else if (!(entry-&gt;flags &amp; ARP_FLAG_VALID)) {
++				// entry is still being resolved.
++				TRACE((&quot;ARP Queuing packet %p, entry still being resolved.\n&quot;,
++					buffer));
++				entry-&gt;queue.Add(buffer);
++				return B_OK;
++			}
++
+ 			memcpy(&amp;buffer-&gt;destination, &amp;entry-&gt;hardware_address,
+ 				entry-&gt;hardware_address.sdl_len);
+ 		}
+@@ -896,7 +878,7 @@
+ 		}
+ 	}
+ 
+-	protocol-&gt;next-&gt;module-&gt;interface_down(protocol-&gt;next);	
++	protocol-&gt;next-&gt;module-&gt;interface_down(protocol-&gt;next);
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001621.html">[Haiku-commits] r20711 - in haiku/trunk: headers/private/media	src/kits/support src/servers/media
+</A></li>
+	<LI>Next message: <A HREF="001623.html">[Haiku-commits] r20713 - haiku/trunk/src/bin/network/arp
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1622">[ date ]</a>
+              <a href="thread.html#1622">[ thread ]</a>
+              <a href="subject.html#1622">[ subject ]</a>
+              <a href="author.html#1622">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

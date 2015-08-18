@@ -1,0 +1,318 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25554 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25554%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200805182257.m4IMvIGT021998%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008926.html">
+   <LINK REL="Next"  HREF="008928.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25554 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25554%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200805182257.m4IMvIGT021998%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25554 - haiku/trunk/src/add-ons/kernel/busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Mon May 19 00:57:18 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008926.html">[Haiku-commits] r25553 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+        <LI>Next message: <A HREF="008928.html">[Haiku-commits] r25555 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8927">[ date ]</a>
+              <a href="thread.html#8927">[ thread ]</a>
+              <a href="subject.html#8927">[ subject ]</a>
+              <a href="author.html#8927">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-05-19 00:57:17 +0200 (Mon, 19 May 2008)
+New Revision: 25554
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25554&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25554&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+Log:
+* Build the interrupt tree the same (imperfect) way as in EHCI to conserve
+  on resources but still satisfy the scheduling policy. This works well, but
+  effectifly limits the bandwidth available as the interrupts aren't spread
+  across different frames.
+* Implement finding the interrupt endpoint head for a certain interval.
+* Deactivate endpoints that are going away until removing them is implemented.
+* Allow short packets for all data phases.
+* Disable tracing by default.
+
+There you go, interrupt transfers should work as well. Should enable mice,
+keyboards, hubs and other devices that use interrupt pipes. Note that it's
+still easily possible that a single failed request will hang an endpoint and
+prevent a device from working.
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2008-05-18 22:42:04 UTC (rev 25553)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2008-05-18 22:57:17 UTC (rev 25554)
+@@ -7,7 +7,7 @@
+  *		Salvatore Benedetto &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">salvatore.benedetto at gmail.com</A>&gt;
+  *		Michael Lotz &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">mmlr at mlotz.ch</A>&gt;
+  */
+-#define TRACE_USB
++
+ #include &lt;module.h&gt;
+ #include &lt;PCI.h&gt;
+ #include &lt;USB3.h&gt;
+@@ -51,15 +51,6 @@
+ };
+ 
+ 
+-// Reverse the bits in a value between 0 and 31 (Section 3.3.2)
+-static uint8 revbits[OHCI_NUMBER_OF_INTERRUPTS] = {
+-	0x00, 0x10, 0x08, 0x18, 0x04, 0x14, 0x0c, 0x1c,
+-	0x02, 0x12, 0x0a, 0x1a, 0x06, 0x16, 0x0e, 0x1e,
+-	0x01, 0x11, 0x09, 0x19, 0x05, 0x15, 0x0d, 0x1d,
+-	0x03, 0x13, 0x0b, 0x1b, 0x07, 0x17, 0x0f, 0x1f
+-};
+-
+-
+ OHCI::OHCI(pci_info *info, Stack *stack)
+ 	:	BusManager(stack),
+ 		fPCIInfo(info),
+@@ -162,21 +153,19 @@
+ 
+ 	// Static endpoints that get linked in the HCCA
+ 	fInterruptEndpoints = new(std::nothrow)
+-		ohci_endpoint_descriptor *[OHCI_NUMBER_OF_INTERRUPTS];
++		ohci_endpoint_descriptor *[OHCI_STATIC_ENDPOINT_COUNT];
+ 	if (!fInterruptEndpoints) {
+-		TRACE_ERROR((&quot;ohci_usb: cannot allocate memory for&quot;
+-			&quot; fInterruptEndpoints array\n&quot;));
++		TRACE_ERROR((&quot;ohci_usb: failed to allocate memory for interrupt endpoints\n&quot;));
+ 		_FreeEndpoint(fDummyControl);
+ 		_FreeEndpoint(fDummyBulk);
+ 		_FreeEndpoint(fDummyIsochronous);
+ 		return;
+ 	}
+ 
+-	for (int32 i = 0; i &lt; OHCI_NUMBER_OF_INTERRUPTS; i++) {
++	for (int32 i = 0; i &lt; OHCI_STATIC_ENDPOINT_COUNT; i++) {
+ 		fInterruptEndpoints[i] = _AllocateEndpoint();
+ 		if (!fInterruptEndpoints[i]) {
+-			TRACE_ERROR((&quot;ohci_usb: cannot allocate memory for&quot;
+-				&quot; fInterruptEndpoints[%ld] endpoint\n&quot;, i));
++			TRACE_ERROR((&quot;ohci_usb: failed to allocate interrupt endpoint %ld&quot;, i));
+ 			while (--i &gt;= 0)
+ 				_FreeEndpoint(fInterruptEndpoints[i]);
+ 			_FreeEndpoint(fDummyBulk);
+@@ -184,15 +173,36 @@
+ 			_FreeEndpoint(fDummyIsochronous);
+ 			return;
+ 		}
++	}
+ 
+-		// Make them point all to the dummy isochronous endpoint
++	// build flat tree so that at each of the static interrupt endpoints
++	// fInterruptEndpoints[i] == interrupt endpoint for interval 2^i
++	uint32 interval = OHCI_BIGGEST_INTERVAL;
++	uint32 intervalIndex = OHCI_STATIC_ENDPOINT_COUNT - 1;
++	while (interval &gt; 1) {
++		uint32 insertIndex = interval / 2;
++		while (insertIndex &lt; OHCI_BIGGEST_INTERVAL) {
++			fHcca-&gt;interrupt_table[insertIndex]
++				= fInterruptEndpoints[intervalIndex]-&gt;physical_address;
++			insertIndex += interval;
++		}
++
++		intervalIndex--;
++		interval /= 2;
++	}
++
++	// setup the empty slot in the list and linking of all -&gt; first
++	fHcca-&gt;interrupt_table[0] = fInterruptEndpoints[0]-&gt;physical_address;
++	for (int32 i = 1; i &lt; OHCI_STATIC_ENDPOINT_COUNT; i++) {
+ 		fInterruptEndpoints[i]-&gt;next_physical_endpoint
+-			= fDummyIsochronous-&gt;physical_address;
++			= fInterruptEndpoints[0]-&gt;physical_address;
++		fInterruptEndpoints[i]-&gt;next_logical_endpoint
++			= fInterruptEndpoints[0];
+ 	}
+ 
+-	// Fill HCCA interrupt table.
+-	for (uint32 i = 0; i &lt; OHCI_NUMBER_OF_INTERRUPTS; i++)
+-		fHcca-&gt;interrupt_table[i] = fInterruptEndpoints[i]-&gt;physical_address;
++	// Now link the first endpoint to the isochronous endpoint
++	fInterruptEndpoints[0]-&gt;next_physical_endpoint
++		= fDummyIsochronous-&gt;physical_address;
+ 
+ 	// Determine in what context we are running (Kindly copied from FreeBSD)
+ 	uint32 control = _ReadReg(OHCI_CONTROL);
+@@ -288,7 +298,10 @@
+ 		uint32 descriptor = _ReadReg(OHCI_RH_DESCRIPTOR_A);
+ 		numberOfPorts = OHCI_RH_GET_PORT_COUNT(descriptor);
+ 	}
++	if (numberOfPorts &gt; OHCI_MAX_PORT_COUNT)
++		numberOfPorts = OHCI_MAX_PORT_COUNT;
+ 	fPortCount = numberOfPorts;
++	TRACE((&quot;usb_ohci: port count is %d\n&quot;, fPortCount));
+ 
+ 	// Create semaphore the finisher thread will wait for
+ 	fFinishTransfersSem = create_sem(0, &quot;OHCI Finish Transfers&quot;);
+@@ -332,7 +345,7 @@
+ 	_FreeEndpoint(fDummyIsochronous);
+ 
+ 	if (fInterruptEndpoints != NULL) {
+-		for (int i = 0; i &lt; OHCI_NUMBER_OF_INTERRUPTS; i++)
++		for (int i = 0; i &lt; OHCI_STATIC_ENDPOINT_COUNT; i++)
+ 			_FreeEndpoint(fInterruptEndpoints[i]);
+ 	}
+ 
+@@ -389,7 +402,8 @@
+ 	}
+ 
+ 	if ((type &amp; USB_OBJECT_BULK_PIPE) || (type &amp; USB_OBJECT_INTERRUPT_PIPE)) {
+-		TRACE((&quot;usb_ohci: submitting bulk/interrupt transfer\n&quot;));
++		TRACE((&quot;usb_ohci: submitting %s transfer\n&quot;,
++			(type &amp; USB_OBJECT_BULK_PIPE) ? &quot;bulk&quot; : &quot;interrupt&quot;));
+ 		return _SubmitTransfer(transfer);
+ 	}
+ 
+@@ -457,25 +471,19 @@
+ 	}
+ 
+ 	switch (change) {
+-		case USB_CHANGE_CREATED: {
+-			TRACE((&quot;usb_ohci: inserting endpoint\n&quot;));
++		case USB_CHANGE_CREATED:
+ 			return _InsertEndpointForPipe(pipe);
+-		}
+ 
+-		case USB_CHANGE_DESTROYED: {
+-			TRACE((&quot;usb_ohci: removing endpoint\n&quot;));
++		case USB_CHANGE_DESTROYED:
+ 			return _RemoveEndpointForPipe(pipe);
+-		}
+ 
+-		case USB_CHANGE_PIPE_POLICY_CHANGED: {
++		case USB_CHANGE_PIPE_POLICY_CHANGED:
+ 			TRACE((&quot;usb_ohci: pipe policy changing unhandled!\n&quot;));
+ 			break;
+-		}
+ 
+-		default: {
++		default:
+ 			TRACE_ERROR((&quot;usb_ohci: unknown pipe change!\n&quot;));
+ 			return B_ERROR;
+-		}
+ 	}
+ 
+ 	return B_OK;
+@@ -1369,14 +1377,34 @@
+ status_t
+ OHCI::_RemoveEndpointForPipe(Pipe *pipe)
+ {
+-	return B_ERROR;
++	TRACE((&quot;usb_ohci: removing endpoint for device %u endpoint %u\n&quot;,
++		pipe-&gt;DeviceAddress(), pipe-&gt;EndpointAddress()));
++
++	ohci_endpoint_descriptor *endpoint
++		= (ohci_endpoint_descriptor *)pipe-&gt;ControllerCookie();
++	if (endpoint == NULL)
++		return B_OK;
++
++	// TODO implement properly, but at least disable it for now
++	endpoint-&gt;flags |= OHCI_ENDPOINT_SKIP;
++	return B_OK;
+ }
+ 
+ 
+ ohci_endpoint_descriptor *
+ OHCI::_FindInterruptEndpoint(uint8 interval)
+ {
+-	return NULL;
++	uint32 index = 0;
++	uint32 power = 1;
++	while (power &lt;= OHCI_BIGGEST_INTERVAL / 2) {
++		if (power * 2 &gt; interval)
++			break;
++
++		power *= 2;
++		index++;
++	}
++
++	return fInterruptEndpoints[index];
+ }
+ 
+ 
+@@ -1454,6 +1482,7 @@
+ 		}
+ 
+ 		descriptor-&gt;flags = direction
++			| OHCI_TD_BUFFER_ROUNDING
+ 			| OHCI_TD_SET_CONDITION_CODE(OHCI_TD_CONDITION_NOT_ACCESSED)
+ 			| OHCI_TD_TOGGLE_CARRY
+ 			| OHCI_TD_SET_DELAY_INTERRUPT(OHCI_TD_INTERRUPT_NONE);
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2008-05-18 22:42:04 UTC (rev 25553)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2008-05-18 22:57:17 UTC (rev 25554)
+@@ -271,6 +271,8 @@
+ // --------------------------------
+ 
+ #define OHCI_NUMBER_OF_INTERRUPTS	32
++#define OHCI_STATIC_ENDPOINT_COUNT	6
++#define OHCI_BIGGEST_INTERVAL		32
+ 
+ typedef struct {
+ 	uint32		interrupt_table[OHCI_NUMBER_OF_INTERRUPTS];
+@@ -343,7 +345,7 @@
+ 	void	*next_logical_descriptor;	// Logical pointer next descriptor
+ } ohci_general_td;
+ 
+-#define	OHCI_BUFFER_ROUNDING			0x00040000
++#define	OHCI_TD_BUFFER_ROUNDING			0x00040000
+ #define	OHCI_TD_DIRECTION_PID_MASK		0x00180000
+ #define	OHCI_TD_DIRECTION_PID_SETUP		0x00000000
+ #define	OHCI_TD_DIRECTION_PID_OUT		0x00080000
+@@ -442,4 +444,7 @@
+ #define	OHCI_ENABLE_POWER_DELAY			5000
+ #define	OHCI_READ_DESC_DELAY			5000
+ 
++// Maximum port count set by OHCI
++#define OHCI_MAX_PORT_COUNT				15
++
+ #endif // OHCI_HARDWARE_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008926.html">[Haiku-commits] r25553 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+	<LI>Next message: <A HREF="008928.html">[Haiku-commits] r25555 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8927">[ date ]</a>
+              <a href="thread.html#8927">[ thread ]</a>
+              <a href="subject.html#8927">[ subject ]</a>
+              <a href="author.html#8927">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

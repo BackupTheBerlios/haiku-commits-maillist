@@ -1,0 +1,307 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20995 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20995%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd&In-Reply-To=%3C200705031440.l43Eegv0009379%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002071.html">
+   <LINK REL="Next"  HREF="002073.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20995 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd</H1>
+    <B>mmu_man at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20995%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd&In-Reply-To=%3C200705031440.l43Eegv0009379%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20995 -	haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd">mmu_man at mail.berlios.de
+       </A><BR>
+    <I>Thu May  3 16:40:42 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002071.html">[Haiku-commits] r20994 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat	compat/machine compat/sys compat/vm
+</A></li>
+        <LI>Next message: <A HREF="002073.html">[Haiku-commits] r20996 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2072">[ date ]</a>
+              <a href="thread.html#2072">[ thread ]</a>
+              <a href="subject.html#2072">[ subject ]</a>
+              <a href="author.html#2072">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmu_man
+Date: 2007-05-03 16:40:42 +0200 (Thu, 03 May 2007)
+New Revision: 20995
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20995&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20995&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c
+Log:
+(not working) kludge to allow mountign with a single connection in BeOS (mount open()/close() twice).
+Implement correct settings.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c	2007-05-03 14:14:12 UTC (rev 20994)
++++ haiku/trunk/src/add-ons/kernel/drivers/disk/virtual/nbd/nbd.c	2007-05-03 14:40:42 UTC (rev 20995)
+@@ -18,6 +18,12 @@
+ 
+ #define DEBUG 1
+ 
++/* on the first open(), open ourselves for some seconds, 
++ * to avoid trying to reconnect and failing on a 2nd open,
++ * as it happens with the python server.
++ */
++//#define MOUNT_KLUDGE
++
+ /* locking support */
+ #ifdef __HAIKU__
+ #include &lt;kernel/lock.h&gt;
+@@ -68,7 +74,8 @@
+ };
+ 
+ struct nbd_device {
+-	char target[64]; // &quot;ip:port&quot;
++	bool valid;
++	bool readonly;
+ 	struct sockaddr_in server;
+ 	benaphore ben;
+ 	vint32 refcnt;
+@@ -77,6 +84,9 @@
+ 	thread_id postoffice;
+ 	uint64 size;
+ 	struct nbd_request_entry *reqs;
++#ifdef MOUNT_KLUDGE
++	int kludge;
++#endif
+ };
+ 
+ typedef struct cookie {
+@@ -103,6 +113,28 @@
+ bool gDelayUnload = false;
+ #define BONE_TEARDOWN_DELAY 60000000
+ 
++#pragma mark ==== support ====
++
++// move that to ksocket inlined
++static int kinet_aton(const char *in, struct in_addr *addr)
++{
++	int i;
++	unsigned long a;
++	uint32 inaddr = 0L;
++	const char *p = in;
++	for (i = 0; i &lt; 4; i++) {
++		a = strtoul(p, &amp;p, 10);
++		if (!p)
++			return -1;
++		inaddr = (inaddr &gt;&gt; 8) | ((a &amp; 0x0ff) &lt;&lt; 24);
++		*(uint32 *)addr = inaddr;
++		if (!*p)
++			return 0;
++		p++;
++	}
++	return 0;
++}
++
+ #pragma mark ==== request manager ====
+ 
+ status_t nbd_alloc_request(struct nbd_device *dev, struct nbd_request_entry **req, uint32 type, off_t from, size_t len, const char *data)
+@@ -383,11 +415,15 @@
+ 
+ status_t nbd_open(const char *name, uint32 flags, cookie_t **cookie) {
+ 	status_t err;
++	int32 refcnt;
++#ifdef MOUNT_KLUDGE
++	int kfd;
++#endif
+ 	struct nbd_device *dev = NULL;
+ 	PRINT((DP &quot;&gt;%s(%s, %x, )\n&quot;, __FUNCTION__, name, flags));
+ 	(void)name; (void)flags;
+ 	dev = nbd_find_device(name);
+-	if (!dev)
++	if (!dev || !dev-&gt;valid)
+ 		return ENOENT;
+ 	err = ENOMEM;
+ 	*cookie = (void*)malloc(sizeof(cookie_t));
+@@ -403,8 +439,23 @@
+ 		err = nbd_connect(dev);
+ 	if (err)
+ 		goto err2;
+-	dev-&gt;refcnt++;
++	refcnt = dev-&gt;refcnt++;
++#ifdef MOUNT_KLUDGE
++	kfd = dev-&gt;kludge;
++	dev-&gt;kludge = -1;
++#endif
+ 	benaphore_unlock(&amp;dev-&gt;ben);
++	
++#ifdef MOUNT_KLUDGE
++	if (refcnt == 0) {
++		char buf[32];
++		sprintf(buf, &quot;/dev/%s&quot;, name);
++		dev-&gt;kludge = open(buf, O_RDONLY);
++	} else if (kfd) {
++		close(kfd);
++	}
++#endif
++	
+ 	return B_OK;
+ 	
+ err2:
+@@ -419,6 +470,9 @@
+ status_t nbd_close(cookie_t *cookie) {
+ 	struct nbd_device *dev = cookie-&gt;dev;
+ 	status_t err;
++#ifdef MOUNT_KLUDGE
++	int kfd = -1;
++#endif
+ 	PRINT((DP &quot;&gt;%s(%d)\n&quot;, __FUNCTION__, WHICH(cookie-&gt;dev)));
+ 	
+ 	err = benaphore_lock(&amp;dev-&gt;ben);
+@@ -426,8 +480,18 @@
+ 		return err;
+ 	
+ 	// XXX: do something ?
++#ifdef MOUNT_KLUDGE
++	kfd = dev-&gt;kludge;
++	dev-&gt;kludge = -1;
++#endif
+ 	
+ 	benaphore_unlock(&amp;dev-&gt;ben);
++
++#ifdef MOUNT_KLUDGE
++	if (kfd &gt; -1) {
++		close(kfd);
++	}
++#endif
+ 	return B_OK;
+ }
+ 
+@@ -615,12 +679,19 @@
+ 	void *handle;
+ 	PRINT((DP &quot;&gt;%s()\n&quot;, __FUNCTION__));
+ 
++	handle = load_driver_settings(DRV);
++	if (handle == NULL)
++		return ENOENT;
++	// XXX: test for boot args ?
++	
++	
+ 	err = ksocket_init();
+ 	if (err &lt; B_OK)
+ 		return err;
+ 	
+ 	for (i = 0; i &lt; MAX_NBDS; i++) {
+-		memset(nbd_devices[i].target, 0, 64);
++		nbd_devices[i].valid = false;
++		nbd_devices[i].readonly = false;
+ 		err = benaphore_init(&amp;nbd_devices[i].ben, &quot;nbd lock&quot;);
+ 		if (err &lt; B_OK)
+ 			return err; // XXX
+@@ -630,48 +701,44 @@
+ 		nbd_devices[i].postoffice = -1;
+ 		nbd_devices[i].size = 0LL;
+ 		nbd_devices[i].reqs = NULL;
++#ifdef MOUNT_KLUDGE
++		nbd_devices[i].kludge = -1;
++#endif
+ 		nbd_name[i] = malloc(DEVICE_NAME_MAX);
+ 		if (nbd_name[i] == NULL)
+ 			break;
+ 		sprintf(nbd_name[i], DEVICE_FMT, i);
+-		/* XXX: default init */
+-		nbd_devices[i].server.sin_len = sizeof(struct sockaddr_in);
+-		nbd_devices[i].server.sin_family = AF_INET;
+-		nbd_devices[i].server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+-		nbd_devices[i].server.sin_port = htons(1337 + i);
+ 	}
+ 	nbd_name[i] = NULL;
+ 	
+-	handle = load_driver_settings(DRV);
+-	if (handle) {
+-		for (i = 0; i &lt; MAX_NBDS; i++) {
+-			char keyname[10];
+-			char *v;
+-			sprintf(keyname, &quot;nbd%d&quot;, i);
+-			v = get_driver_parameter(handle, keyname, NULL, NULL);
+-			/* should be &quot;ip:port&quot; */
+-			// XXX: test
+-			if (v || 1) {
+-				//strncpy(nbd_devices[i].target, v, 64);
+-				//XXX:TEST
+-				//strncpy(nbd_devices[i].target, &quot;127.0.0.1:1337&quot;, 64);
+-				//XXX:parse it
++	for (i = 0; i &lt; MAX_NBDS; i++) {
++		driver_settings *settings = get_driver_settings(handle);
++		driver_parameter *p;
++		char keyname[10];
++		char *v;
++		sprintf(keyname, &quot;%d&quot;, i);
++		for (j = 0; j &lt; settings-&gt;parameter_count; j++)
++			if (!strcmp(settings-&gt;parameters[j].name, keyname))
++				p = &amp;settings-&gt;parameters[j];
++		if (!p)
++			continue;
++		for (j = 0; j &lt; p-&gt;parameter_count; j++) {
++			if (!strcmp(p-&gt;parameters[j].name, &quot;readonly&quot;))
++				nbd_devices[i].readonly = true;
++			if (!strcmp(p-&gt;parameters[j].name, &quot;server&quot;)) {
++				if (p-&gt;parameters[j].value_count &lt; 2)
++					continue;
+ 				nbd_devices[i].server.sin_len = sizeof(struct sockaddr_in);
+ 				nbd_devices[i].server.sin_family = AF_INET;
+-				nbd_devices[i].server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+-				nbd_devices[i].server.sin_port = htons(1337 + i);
++				kinet_aton(p-&gt;parameters[j].values[0], &amp;nbd_devices[i].server.sin_addr);
++				nbd_devices[i].server.sin_port = htons(atoi(p-&gt;parameters[j].values[1]));
++				
++				nbd_devices[i].valid = true;
+ 			}
+ 		}
+-		/*should parse as a tree:
+-		  settings = get_driver_settings(handle);
+-		  for (i = 0; i &lt; settings-&gt;parameter_count; i++) {
+-		    
+-		  }
+-		*/
++	}
+ 		
+-		unload_driver_settings(handle);
+-	}
+-
++	unload_driver_settings(handle);
+ 	return B_OK;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002071.html">[Haiku-commits] r20994 - in	haiku/trunk/src/libs/compat/freebsd_network: . compat	compat/machine compat/sys compat/vm
+</A></li>
+	<LI>Next message: <A HREF="002073.html">[Haiku-commits] r20996 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2072">[ date ]</a>
+              <a href="thread.html#2072">[ thread ]</a>
+              <a href="subject.html#2072">[ subject ]</a>
+              <a href="author.html#2072">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

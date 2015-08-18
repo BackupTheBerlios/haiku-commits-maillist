@@ -1,0 +1,532 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26210 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26210%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200807012319.m61NJeMF023662%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009952.html">
+   <LINK REL="Next"  HREF="009958.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26210 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26210%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200807012319.m61NJeMF023662%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26210 - in haiku/trunk: headers/private/kernel	src/system/kernel">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Wed Jul  2 01:19:40 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009952.html">[Haiku-commits] r26209 - in haiku/trunk: build/jam	src/add-ons/kernel/file_systems/reiserfs
+</A></li>
+        <LI>Next message: <A HREF="009958.html">[Haiku-commits] r26210 - in haiku/trunk: headers/private/kernel src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9953">[ date ]</a>
+              <a href="thread.html#9953">[ thread ]</a>
+              <a href="subject.html#9953">[ subject ]</a>
+              <a href="author.html#9953">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-07-02 01:19:35 +0200 (Wed, 02 Jul 2008)
+New Revision: 26210
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26210&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26210&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/heap.h
+   haiku/trunk/src/system/kernel/heap.cpp
+Log:
+Implement heap classes that each have their own range of allocation sizes they
+serve, bin sizes and page size. This minimizes the amount of &quot;large&quot;
+allocations made in heaps that don't have a bin for the allocation size
+(combining multiple pages). This is desirable as such large allocations
+are generally pretty inefficient, and also because it separates larger from
+smaller allocations better, making the chance of a heap becoming empty higher.
+For now there are three heap classes &quot;small&quot;, &quot;large&quot; and &quot;huge&quot;, with a
+predefined set of bin sizes for each. This might need some finetuning later on.
+Reduce the grow size to 4MB though as the allocations should now be spread
+across heap classes which each grow on their own.
+
+Modified: haiku/trunk/headers/private/kernel/heap.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/heap.h	2008-07-01 22:46:54 UTC (rev 26209)
++++ haiku/trunk/headers/private/kernel/heap.h	2008-07-01 23:19:35 UTC (rev 26210)
+@@ -12,10 +12,12 @@
+ 
+ // allocate 16MB initial heap for the kernel
+ #define INITIAL_HEAP_SIZE			16 * 1024 * 1024
+-// grow by another 8MB each time the heap runs out of memory
+-#define HEAP_GROW_SIZE				8 * 1024 * 1024
++// grow by another 4MB each time the heap runs out of memory
++#define HEAP_GROW_SIZE				4 * 1024 * 1024
+ // allocate a dedicated 1MB area for dynamic growing
+ #define HEAP_DEDICATED_GROW_SIZE	1 * 1024 * 1024
++// use areas for allocations bigger than 1MB
++#define HEAP_AREA_USE_THRESHOLD		1 * 1024 * 1024
+ 
+ 
+ #ifdef __cplusplus
+
+Modified: haiku/trunk/src/system/kernel/heap.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/heap.cpp	2008-07-01 22:46:54 UTC (rev 26209)
++++ haiku/trunk/src/system/kernel/heap.cpp	2008-07-01 23:19:35 UTC (rev 26210)
+@@ -97,12 +97,35 @@
+ 	heap_allocator_s *	next;
+ } heap_allocator;
+ 
++typedef struct heap_class_s {
++	const char *name;
++	uint32		initial_percentage;
++	size_t		max_allocation_size;
++	size_t		page_size;
++	size_t		bin_sizes[20];
++} heap_class;
++
+ struct DeferredFreeListEntry : DoublyLinkedListLinkImpl&lt;DeferredFreeListEntry&gt; {
+ };
+ typedef DoublyLinkedList&lt;DeferredFreeListEntry&gt; DeferredFreeList;
+ 
+-static heap_allocator *sHeapList = NULL;
+-static heap_allocator *sLastGrowRequest = NULL;
++// Heap class configuration
++#define HEAP_CLASS_COUNT 3
++static heap_class sHeapClasses[HEAP_CLASS_COUNT] = {
++	{ &quot;small&quot;, 50, B_PAGE_SIZE, B_PAGE_SIZE,
++		{ 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 384, 512, 1024,
++			2048, 4096, 0 }
++	},
++	{ &quot;large&quot;, 30, B_PAGE_SIZE * 32, B_PAGE_SIZE * 32,
++		{ 4096, 5120, 6144, 7168, 8192, 12288, 16384, 24576, 32768, 65536,
++			131072, 0 }
++	},
++	{ &quot;huge&quot;, 20, HEAP_AREA_USE_THRESHOLD, B_PAGE_SIZE * 64,
++		{ 131072, 262144, 0 }
++	}
++};
++
++static heap_allocator *sHeapList[HEAP_CLASS_COUNT];
+ static heap_allocator *sGrowHeapList = NULL;
+ static thread_id sHeapGrowThread = -1;
+ static sem_id sHeapGrowSem = -1;
+@@ -263,24 +286,30 @@
+ 				heap = heap-&gt;next;
+ 			}
+ 		} else if (strcmp(argv[1], &quot;stats&quot;) == 0) {
+-			uint32 heapCount = 0;
+-			heap_allocator *heap = sHeapList;
+-			while (heap) {
+-				heapCount++;
+-				heap = heap-&gt;next;
++			for (uint32 i = 0; i &lt; HEAP_CLASS_COUNT; i++) {
++				uint32 heapCount = 0;
++				heap_allocator *heap = sHeapList[i];
++				while (heap) {
++					heapCount++;
++					heap = heap-&gt;next;
++				}
++
++				dprintf(&quot;current %s heap count: %ld\n&quot;, sHeapClasses[i].name,
++					heapCount);
+ 			}
+-
+-			dprintf(&quot;current heap count: %ld\n&quot;, heapCount);
+ 		} else
+ 			print_debugger_command_usage(argv[0]);
+ 
+ 		return 0;
+ 	}
+ 
+-	heap_allocator *heap = sHeapList;
+-	while (heap) {
+-		dump_allocator(heap);
+-		heap = heap-&gt;next;
++	for (uint32 i = 0; i &lt; HEAP_CLASS_COUNT; i++) {
++		dprintf(&quot;dumping list of %s heaps\n&quot;, sHeapClasses[i].name);
++		heap_allocator *heap = sHeapList[i];
++		while (heap) {
++			dump_allocator(heap);
++			heap = heap-&gt;next;
++		}
+ 	}
+ 
+ 	return 0;
+@@ -313,7 +342,8 @@
+ 
+ 	size_t totalSize = 0;
+ 	uint32 totalCount = 0;
+-	heap_allocator *heap = sHeapList;
++	uint32 heapClassIndex = 0;
++	heap_allocator *heap = sHeapList[0];
+ 	while (heap) {
+ 		// go through all the pages
+ 		heap_leak_check_info *info = NULL;
+@@ -390,6 +420,8 @@
+ 		}
+ 
+ 		heap = heap-&gt;next;
++		if (heap == NULL &amp;&amp; ++heapClassIndex &lt; HEAP_CLASS_COUNT)
++			heap = sHeapList[heapClassIndex];
+ 	}
+ 
+ 	dprintf(&quot;total allocations: %lu; total bytes: %lu\n&quot;, totalCount, totalSize);
+@@ -453,7 +485,8 @@
+ 
+ 	sCallerInfoCount = 0;
+ 
+-	heap_allocator *heap = sHeapList;
++	uint32 heapClassIndex = 0;
++	heap_allocator *heap = sHeapList[0];
+ 	while (heap) {
+ 		// go through all the pages
+ 		heap_leak_check_info *info = NULL;
+@@ -520,6 +553,8 @@
+ 		}
+ 
+ 		heap = heap-&gt;next;
++		if (heap == NULL &amp;&amp; ++heapClassIndex &lt; HEAP_CLASS_COUNT)
++			heap = sHeapList[heapClassIndex];
+ 	}
+ 
+ 	// sort the array
+@@ -674,27 +709,31 @@
+ 
+ 
+ static heap_allocator *
+-heap_attach(addr_t base, size_t size)
++heap_attach(addr_t base, size_t size, uint32 heapClass)
+ {
+ 	heap_allocator *heap = (heap_allocator *)base;
+ 	base += sizeof(heap_allocator);
+ 	size -= sizeof(heap_allocator);
+ 
+-	size_t binSizes[] = { 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024, 2048, B_PAGE_SIZE };
+-	uint32 binCount = sizeof(binSizes) / sizeof(binSizes[0]);
+-	heap-&gt;page_size = B_PAGE_SIZE;
+-	heap-&gt;bin_count = binCount;
++	heap-&gt;page_size = sHeapClasses[heapClass].page_size;
+ 	heap-&gt;bins = (heap_bin *)base;
+-	base += binCount * sizeof(heap_bin);
+-	size -= binCount * sizeof(heap_bin);
+ 
+-	for (uint32 i = 0; i &lt; binCount; i++) {
+-		heap_bin *bin = &amp;heap-&gt;bins[i];
+-		bin-&gt;element_size = binSizes[i];
+-		bin-&gt;max_free_count = heap-&gt;page_size / binSizes[i];
++	heap-&gt;bin_count = 0;
++	while (true) {
++		size_t binSize = sHeapClasses[heapClass].bin_sizes[heap-&gt;bin_count];
++		if (binSize == 0)
++			break;
++
++		heap_bin *bin = &amp;heap-&gt;bins[heap-&gt;bin_count];
++		bin-&gt;element_size = binSize;
++		bin-&gt;max_free_count = heap-&gt;page_size / binSize;
+ 		bin-&gt;page_list = NULL;
+-	}
++		heap-&gt;bin_count++;
++	};
+ 
++	base += heap-&gt;bin_count * sizeof(heap_bin);
++	size -= heap-&gt;bin_count * sizeof(heap_bin);
++
+ 	uint32 pageCount = size / heap-&gt;page_size;
+ 	size_t pageTableSize = pageCount * sizeof(heap_page);
+ 	heap-&gt;page_table = (heap_page *)base;
+@@ -726,8 +765,8 @@
+ 	mutex_init(&amp;heap-&gt;lock, &quot;heap_mutex&quot;);
+ 
+ 	heap-&gt;next = NULL;
+-	dprintf(&quot;heap_attach: attached to %p - usable range 0x%08lx - 0x%08lx\n&quot;,
+-		heap, heap-&gt;base, heap-&gt;base + heap-&gt;size);
++	dprintf(&quot;heap_attach: %s heap attached to %p - usable range 0x%08lx - 0x%08lx\n&quot;,
++		sHeapClasses[heapClass].name, heap, heap-&gt;base, heap-&gt;base + heap-&gt;size);
+ 	return heap;
+ }
+ 
+@@ -900,6 +939,15 @@
+ #endif
+ 
+ 
++inline bool
++heap_should_grow(heap_allocator *heap)
++{
++	// suggest growing if it is the last heap and has less than 10% free pages
++	return (heap-&gt;next == NULL)
++		&amp;&amp; heap-&gt;free_page_count &lt; heap-&gt;page_count / 10;
++}
++
++
+ static void *
+ heap_memalign(heap_allocator *heap, size_t alignment, size_t size,
+ 	bool *shouldGrow)
+@@ -932,11 +980,8 @@
+ 
+ 	TRACE((&quot;memalign(): asked to allocate %lu bytes, returning pointer %p\n&quot;, size, address));
+ 
+-	if (heap-&gt;next == NULL &amp;&amp; shouldGrow) {
+-		// suggest growing if we are the last heap and we have
+-		// less than 10% free pages
+-		*shouldGrow = heap-&gt;free_page_count &lt; heap-&gt;page_count / 10;
+-	}
++	if (shouldGrow)
++		*shouldGrow = heap_should_grow(heap);
+ 
+ #if KERNEL_HEAP_LEAK_CHECK
+ 	size -= sizeof(heap_leak_check_info);
+@@ -1076,6 +1121,9 @@
+ 		}
+ 	}
+ 
++	if (heap-&gt;free_page_count == heap-&gt;page_count)
++		dprintf(&quot;heap_free: heap %p is completely empty and could be freed\n&quot;, heap);
++
+ 	T(Free((addr_t)address));
+ 	mutex_unlock(&amp;heap-&gt;lock);
+ 	return B_OK;
+@@ -1168,6 +1216,23 @@
+ }
+ 
+ 
++inline uint32
++heap_class_for(size_t size)
++{
++#if KERNEL_HEAP_LEAK_CHECK
++	// take the extra info size into account
++	size += sizeof(heap_leak_check_info_s);
++#endif
++
++	for (uint32 i = 0; i &lt; HEAP_CLASS_COUNT; i++) {
++		if (size &lt;= sHeapClasses[i].max_allocation_size)
++			return i;
++	}
++
++	return HEAP_CLASS_COUNT - 1;
++}
++
++
+ static void
+ deferred_deleter(void *arg, int iteration)
+ {
+@@ -1191,7 +1256,7 @@
+ 
+ 
+ static heap_allocator *
+-heap_create_new_heap(const char *name, size_t size)
++heap_create_new_heap(const char *name, size_t size, uint32 heapClass)
+ {
+ 	void *heapAddress = NULL;
+ 	area_id heapArea = create_area(name, &amp;heapAddress,
+@@ -1202,7 +1267,7 @@
+ 		return NULL;
+ 	}
+ 
+-	heap_allocator *newHeap = heap_attach((addr_t)heapAddress, size);
++	heap_allocator *newHeap = heap_attach((addr_t)heapAddress, size, heapClass);
+ 	if (newHeap == NULL) {
+ 		panic(&quot;heap: could not attach heap to area!\n&quot;);
+ 		delete_area(heapArea);
+@@ -1219,7 +1284,6 @@
+ static int32
+ heap_grow_thread(void *)
+ {
+-	heap_allocator *heap = sHeapList;
+ 	heap_allocator *growHeap = sGrowHeapList;
+ 	while (true) {
+ 		// wait for a request to grow the heap list
+@@ -1234,7 +1298,7 @@
+ 			// a new one to make some room.
+ 			TRACE((&quot;heap_grower: grow heaps will run out of memory soon\n&quot;));
+ 			heap_allocator *newHeap = heap_create_new_heap(
+-				&quot;additional grow heap&quot;, HEAP_DEDICATED_GROW_SIZE);
++				&quot;additional grow heap&quot;, HEAP_DEDICATED_GROW_SIZE, 0);
+ 			if (newHeap != NULL) {
+ #if PARANOID_VALIDATION
+ 				heap_validate_heap(newHeap);
+@@ -1245,24 +1309,25 @@
+ 			}
+ 		}
+ 
+-		// find the last heap
+-		while (heap-&gt;next)
+-			heap = heap-&gt;next;
++		for (uint32 i = 0; i &lt; HEAP_CLASS_COUNT; i++) {
++			// find the last heap
++			heap_allocator *heap = sHeapList[i];
++			while (heap-&gt;next)
++				heap = heap-&gt;next;
+ 
+-		if (sLastGrowRequest != heap) {
+-			// we have already grown since the latest request, just ignore
+-			continue;
+-		}
+-
+-		TRACE((&quot;heap_grower: kernel heap will run out of memory soon, allocating new one\n&quot;));
+-		heap_allocator *newHeap = heap_create_new_heap(&quot;additional heap&quot;,
+-			HEAP_GROW_SIZE);
+-		if (newHeap != NULL) {
++			if (heap_should_grow(heap)) {
++				// grow this heap if it makes sense to
++				heap_allocator *newHeap = heap_create_new_heap(&quot;additional heap&quot;,
++					HEAP_GROW_SIZE, i);
++				if (newHeap != NULL) {
+ #if PARANOID_VALIDATION
+-			heap_validate_heap(newHeap);
++					heap_validate_heap(newHeap);
+ #endif
+-			heap-&gt;next = newHeap;
+-			TRACE((&quot;heap_grower: new heap linked in\n&quot;));
++					heap-&gt;next = newHeap;
++					TRACE((&quot;heap_grower: new %s heap linked in\n&quot;,
++						sHeapClasses[i].name));
++				}
++			}
+ 		}
+ 
+ 		// notify anyone waiting for this request
+@@ -1276,7 +1341,11 @@
+ status_t
+ heap_init(addr_t base, size_t size)
+ {
+-	sHeapList = heap_attach(base, size);
++	for (uint32 i = 0; i &lt; HEAP_CLASS_COUNT; i++) {
++		size_t partSize = size * sHeapClasses[i].initial_percentage / 100;
++		sHeapList[i] = heap_attach(base, partSize, i);
++		base += partSize;
++	}
+ 
+ 	// set up some debug commands
+ 	add_debugger_command_etc(&quot;heap&quot;, &amp;dump_heap_list,
+@@ -1329,7 +1398,7 @@
+ heap_init_post_thread()
+ {
+ 	sGrowHeapList = heap_create_new_heap(&quot;dedicated grow heap&quot;,
+-		HEAP_DEDICATED_GROW_SIZE);
++		HEAP_DEDICATED_GROW_SIZE, 0);
+ 	if (sGrowHeapList == NULL) {
+ 		panic(&quot;heap_init_post_thread(): failed to attach dedicated grow heap\n&quot;);
+ 		return B_ERROR;
+@@ -1361,19 +1430,18 @@
+ 		return NULL;
+ 	}
+ 
+-	if (size &gt; (HEAP_GROW_SIZE * 3) / 4) {
+-		// don't even attempt such a huge allocation
++	if (size &gt; HEAP_AREA_USE_THRESHOLD) {
++		// don't even attempt such a huge allocation - use areas instead
+ 		panic(&quot;heap: huge allocation of %lu bytes asked!\n&quot;, size);
+ 		return NULL;
+ 	}
+ 
+-	heap_allocator *heap = sHeapList;
++	heap_allocator *heap = sHeapList[heap_class_for(size)];
+ 	while (heap) {
+ 		bool shouldGrow = false;
+ 		void *result = heap_memalign(heap, alignment, size, &amp;shouldGrow);
+ 		if (heap-&gt;next == NULL &amp;&amp; (shouldGrow || result == NULL)) {
+ 			// the last heap will or has run out of memory, notify the grower
+-			sLastGrowRequest = heap;
+ 			if (result == NULL) {
+ 				// urgent request, do the request and wait
+ 				switch_sem(sHeapGrowSem, sHeapGrownNotify);
+@@ -1429,7 +1497,7 @@
+ 	}
+ 
+ 	// try public memory, there might be something available
+-	heap_allocator *heap = sHeapList;
++	heap_allocator *heap = sHeapList[heap_class_for(size)];
+ 	while (heap) {
+ 		void *result = heap_memalign(heap, 0, size, NULL);
+ 		if (result != NULL)
+@@ -1462,20 +1530,22 @@
+ 		return;
+ 	}
+ 
+-	heap_allocator *heap = sHeapList;
+-	while (heap) {
+-		if (heap_free(heap, address) == B_OK) {
++	for (uint32 i = 0; i &lt; HEAP_CLASS_COUNT; i++) {
++		heap_allocator *heap = sHeapList[i];
++		while (heap) {
++			if (heap_free(heap, address) == B_OK) {
+ #if PARANOID_VALIDATION
+-			heap_validate_heap(heap);
++				heap_validate_heap(heap);
+ #endif
+-			return;
++				return;
++			}
++
++			heap = heap-&gt;next;
+ 		}
+-
+-		heap = heap-&gt;next;
+ 	}
+ 
+ 	// maybe it was allocated from a dedicated grow heap
+-	heap = sGrowHeapList;
++	heap_allocator *heap = sGrowHeapList;
+ 	while (heap) {
+ 		if (heap_free(heap, address) == B_OK)
+ 			return;
+@@ -1503,17 +1573,19 @@
+ 		return NULL;
+ 	}
+ 
+-	heap_allocator *heap = sHeapList;
+-	while (heap) {
+-		void *newAddress = NULL;
+-		if (heap_realloc(heap, address, &amp;newAddress, newSize) == B_OK) {
++	for (uint32 i = 0; i &lt; HEAP_CLASS_COUNT; i++) {
++		heap_allocator *heap = sHeapList[i];
++		while (heap) {
++			void *newAddress = NULL;
++			if (heap_realloc(heap, address, &amp;newAddress, newSize) == B_OK) {
+ #if PARANOID_VALIDATION
+-			heap_validate_heap(heap);
++				heap_validate_heap(heap);
+ #endif
+-			return newAddress;
++				return newAddress;
++			}
++
++			heap = heap-&gt;next;
+ 		}
+-
+-		heap = heap-&gt;next;
+ 	}
+ 
+ 	panic(&quot;realloc(): failed to realloc address %p to size %lu\n&quot;, address, newSize);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009952.html">[Haiku-commits] r26209 - in haiku/trunk: build/jam	src/add-ons/kernel/file_systems/reiserfs
+</A></li>
+	<LI>Next message: <A HREF="009958.html">[Haiku-commits] r26210 - in haiku/trunk: headers/private/kernel src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9953">[ date ]</a>
+              <a href="thread.html#9953">[ thread ]</a>
+              <a href="subject.html#9953">[ subject ]</a>
+              <a href="author.html#9953">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

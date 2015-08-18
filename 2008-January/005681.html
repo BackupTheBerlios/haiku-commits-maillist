@@ -1,0 +1,147 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23679 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23679%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200801211028.m0LASXpn004140%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005680.html">
+   <LINK REL="Next"  HREF="005682.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23679 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23679%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200801211028.m0LASXpn004140%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23679 - haiku/trunk/src/system/kernel/fs">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Jan 21 11:28:33 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005680.html">[Haiku-commits] r23678 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="005682.html">[Haiku-commits] r23680 - in haiku/trunk/src: kits/interface	preferences/backgrounds
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5681">[ date ]</a>
+              <a href="thread.html#5681">[ thread ]</a>
+              <a href="subject.html#5681">[ subject ]</a>
+              <a href="author.html#5681">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-01-21 11:28:32 +0100 (Mon, 21 Jan 2008)
+New Revision: 23679
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23679&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23679&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+Log:
+* Rethought fs_sync(): since we no longer deadlock when calling
+  vm_cache_write_modified() here anymore since quite some time, it actually
+  doesn't make any sense to call the file system's &quot;fsync&quot; method here.
+  This should make syncing all file systems much faster when many vnodes are
+  in use.
+* If a file system doesn't use the file cache, it can still just sync everything
+  it needs to in its &quot;sync&quot; method.
+* Added a TODO item on how to improve sync speed further, if necessary.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-01-21 00:41:45 UTC (rev 23678)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2008-01-21 10:28:32 UTC (rev 23679)
+@@ -6025,20 +6025,19 @@
+ 	if (status &lt; B_OK)
+ 		return status;
+ 
+-	mutex_lock(&amp;sMountMutex);
++	// First, synchronize all file caches
+ 
+-	if (FS_MOUNT_CALL(mount, sync))
+-		status = FS_MOUNT_CALL(mount, sync)(mount-&gt;cookie);
+-
+-	mutex_unlock(&amp;sMountMutex);
+-
+ 	struct vnode *previousVnode = NULL;
+ 	while (true) {
+ 		// synchronize access to vnode list
+ 		recursive_lock_lock(&amp;mount-&gt;rlock);
+ 
+-		struct vnode *vnode = (struct vnode *)list_get_next_item(&amp;mount-&gt;vnodes,
+-			previousVnode);
++		struct vnode *vnode = previousVnode;
++		do {
++			// TODO: we could track writes (and writable mapped vnodes)
++			//	and have a simple flag that we could test for here
++			vnode = (struct vnode *)list_get_next_item(&amp;mount-&gt;vnodes, vnode);
++		} while (vnode != NULL &amp;&amp; vnode-&gt;cache == NULL);
+ 
+ 		ino_t id = -1;
+ 		if (vnode != NULL)
+@@ -6055,14 +6054,15 @@
+ 			if (previousVnode != NULL)
+ 				put_vnode(previousVnode);
+ 
+-			if (FS_CALL(vnode, fsync) != NULL)
+-				FS_CALL(vnode, fsync)(vnode-&gt;mount-&gt;cookie, vnode-&gt;private_node);
++			if (vnode-&gt;cache != NULL)
++				vm_cache_write_modified(vnode-&gt;cache, false);
+ 
+ 			// the next vnode might change until we lock the vnode list again,
+ 			// but this vnode won't go away since we keep a reference to it.
+ 			previousVnode = vnode;
+ 		} else {
+-			dprintf(&quot;syncing of mount %ld stopped due to vnode %Ld.\n&quot;, mount-&gt;id, id);
++			dprintf(&quot;syncing of mount %ld stopped due to vnode %Ld.\n&quot;,
++				mount-&gt;id, id);
+ 			break;
+ 		}
+ 	}
+@@ -6070,6 +6070,15 @@
+ 	if (previousVnode != NULL)
+ 		put_vnode(previousVnode);
+ 
++	// And then, let the file systems do their synchronizing work
++
++	mutex_lock(&amp;sMountMutex);
++
++	if (FS_MOUNT_CALL(mount, sync))
++		status = FS_MOUNT_CALL(mount, sync)(mount-&gt;cookie);
++
++	mutex_unlock(&amp;sMountMutex);
++
+ 	put_mount(mount);
+ 	return status;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005680.html">[Haiku-commits] r23678 - in haiku/trunk: headers/private/kernel	src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="005682.html">[Haiku-commits] r23680 - in haiku/trunk/src: kits/interface	preferences/backgrounds
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5681">[ date ]</a>
+              <a href="thread.html#5681">[ thread ]</a>
+              <a href="subject.html#5681">[ subject ]</a>
+              <a href="author.html#5681">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,220 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22401 - in haiku/trunk: headers/private/kernel	src/system/kernel
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22401%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200710012224.l91MOgSv021330%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004088.html">
+   <LINK REL="Next"  HREF="004090.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22401 - in haiku/trunk: headers/private/kernel	src/system/kernel</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22401%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel&In-Reply-To=%3C200710012224.l91MOgSv021330%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22401 - in haiku/trunk: headers/private/kernel	src/system/kernel">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Oct  2 00:24:42 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004088.html">[Haiku-commits] r22400 - haiku/trunk/src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="004090.html">[Haiku-commits] r22402 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4089">[ date ]</a>
+              <a href="thread.html#4089">[ thread ]</a>
+              <a href="subject.html#4089">[ subject ]</a>
+              <a href="author.html#4089">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-10-02 00:24:42 +0200 (Tue, 02 Oct 2007)
+New Revision: 22401
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22401&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22401&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/condition_variable.h
+   haiku/trunk/src/system/kernel/condition_variable.cpp
+   haiku/trunk/src/system/kernel/signal.cpp
+Log:
+Addressed a deadlock race condition: Acquiration of condition variable
+and thread spinlock was reverse in Wait() and Notify(). The thread lock
+is now the outer lock -- this way it is still possible to call Notify()
+with the thread lock being held.
+
+
+Modified: haiku/trunk/headers/private/kernel/condition_variable.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/condition_variable.h	2007-10-01 18:48:52 UTC (rev 22400)
++++ haiku/trunk/headers/private/kernel/condition_variable.h	2007-10-01 22:24:42 UTC (rev 22401)
+@@ -82,8 +82,7 @@
+ 			void				Notify(bool all, bool threadsLocked);
+ 
+ private:
+-			void				_Notify(bool all, bool threadsLocked,
+-									status_t result);
++			void				_Notify(bool all, status_t result);
+ 
+ protected:
+ 			const void*			fObject;
+
+Modified: haiku/trunk/src/system/kernel/condition_variable.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/condition_variable.cpp	2007-10-01 18:48:52 UTC (rev 22400)
++++ haiku/trunk/src/system/kernel/condition_variable.cpp	2007-10-01 22:24:42 UTC (rev 22401)
+@@ -134,6 +134,7 @@
+ 	}
+ 
+ 	InterruptsLocker _;
++	SpinLocker threadLocker(thread_spinlock);
+ 	SpinLocker locker(sConditionVariablesLock);
+ 
+ 	// get first entry for this thread
+@@ -159,10 +160,9 @@
+ 	thread-&gt;condition_variable_entry = firstEntry;
+ 	thread-&gt;sem.blocking = -1;
+ 
+-	GRAB_THREAD_LOCK();
+ 	locker.Unlock();
+ 	scheduler_reschedule();
+-	RELEASE_THREAD_LOCK();
++	threadLocker.Unlock();
+ 
+ 	return firstEntry-&gt;fResult;
+ }
+@@ -289,6 +289,7 @@
+ 	ASSERT(fObject != NULL);
+ 
+ 	InterruptsLocker _;
++	SpinLocker threadLocker(threadsLocked ? NULL : &amp;thread_spinlock);
+ 	SpinLocker locker(sConditionVariablesLock);
+ 
+ #if KDEBUG
+@@ -304,7 +305,7 @@
+ 	fObjectType = NULL;
+ 
+ 	if (fEntries)
+-		_Notify(true, threadsLocked, B_ENTRY_NOT_FOUND);
++		_Notify(true, B_ENTRY_NOT_FOUND);
+ }
+ 
+ 
+@@ -314,6 +315,7 @@
+ 	ASSERT(fObject != NULL);
+ 
+ 	InterruptsLocker _;
++	SpinLocker threadLocker(threadsLocked ? NULL : &amp;thread_spinlock);
+ 	SpinLocker locker(sConditionVariablesLock);
+ 
+ #if KDEBUG
+@@ -325,18 +327,17 @@
+ #endif
+ 
+ 	if (fEntries)
+-		_Notify(all, threadsLocked, B_OK);
++		_Notify(all, B_OK);
+ }
+ 
+ 
+-//! Called with interrupts disabled and the condition variable spinlock held.
++/*! Called with interrupts disabled and the condition variable spinlock and
++	thread lock held.
++*/
+ void
+-PrivateConditionVariable::_Notify(bool all, bool threadsLocked, status_t result)
++PrivateConditionVariable::_Notify(bool all, status_t result)
+ {
+ 	// dequeue and wake up the blocked threads
+-	if (!threadsLocked)
+-		GRAB_THREAD_LOCK();
+-
+ 	while (PrivateConditionVariableEntry* entry = fEntries) {
+ 		fEntries = entry-&gt;fVariableNext;
+ 		entry-&gt;fVariableNext = NULL;
+@@ -370,37 +371,19 @@
+ 		if (!all)
+ 			break;
+ 	}
+-
+-	if (!threadsLocked)
+-		RELEASE_THREAD_LOCK();
+ }
+ 
+ 
+ // #pragma mark -
+ 
+ 
+-/*!	Interrupts must be disabled, thread lock must be held. Note, that the thread
+-	lock may temporarily be released.
++/*!	Interrupts must be disabled, thread lock must be held.
+ */
+ status_t
+ condition_variable_interrupt_thread(struct thread* thread)
+ {
+-	if (thread == NULL || thread-&gt;state != B_THREAD_WAITING
+-		|| thread-&gt;condition_variable_entry == NULL) {
+-		return B_BAD_VALUE;
+-	}
+-
+-	thread_id threadID = thread-&gt;id;
+-
+-	// We also need the condition variable spin lock, so, in order to respect
+-	// the locking order, we must temporarily release the thread lock.
+-	RELEASE_THREAD_LOCK();
+ 	SpinLocker locker(sConditionVariablesLock);
+-	GRAB_THREAD_LOCK();
+ 
+-	// re-get the thread and do the checks again
+-	thread = thread_get_thread_struct_locked(threadID);
+-
+ 	if (thread == NULL || thread-&gt;state != B_THREAD_WAITING
+ 		|| thread-&gt;condition_variable_entry == NULL) {
+ 		return B_BAD_VALUE;
+
+Modified: haiku/trunk/src/system/kernel/signal.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/signal.cpp	2007-10-01 18:48:52 UTC (rev 22400)
++++ haiku/trunk/src/system/kernel/signal.cpp	2007-10-01 22:24:42 UTC (rev 22401)
+@@ -274,8 +274,7 @@
+ 
+ 
+ /*!	Tries to interrupt a thread waiting for a semaphore or a condition variable.
+-	Interrupts must be disabled, the thread lock be held. Note, that the thread
+-	lock may temporarily be released.
++	Interrupts must be disabled, the thread lock be held.
+ */
+ static status_t
+ signal_interrupt_thread(struct thread* thread)
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004088.html">[Haiku-commits] r22400 - haiku/trunk/src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="004090.html">[Haiku-commits] r22402 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4089">[ date ]</a>
+              <a href="thread.html#4089">[ thread ]</a>
+              <a href="subject.html#4089">[ subject ]</a>
+              <a href="author.html#4089">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

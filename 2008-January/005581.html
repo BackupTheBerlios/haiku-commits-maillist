@@ -1,0 +1,174 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r23589 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23589%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200801171802.m0HI2SkV027957%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005580.html">
+   <LINK REL="Next"  HREF="005582.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r23589 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>sbenedetto at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r23589%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200801171802.m0HI2SkV027957%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r23589 - haiku/trunk/src/add-ons/kernel/busses/usb">sbenedetto at mail.berlios.de
+       </A><BR>
+    <I>Thu Jan 17 19:02:28 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005580.html">[Haiku-commits] r23588 - haiku/trunk/src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="005582.html">[Haiku-commits] r23590 - haiku/trunk/src/kits/storage/disk_device
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5581">[ date ]</a>
+              <a href="thread.html#5581">[ thread ]</a>
+              <a href="subject.html#5581">[ subject ]</a>
+              <a href="author.html#5581">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: sbenedetto
+Date: 2008-01-17 19:02:26 +0100 (Thu, 17 Jan 2008)
+New Revision: 23589
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=23589&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=23589&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+Log:
+* Added hash function and related data in order to find the virtual address
+of the descriptor from its physical address returned by the controller.
+
+NOTE: As stated in the commented code, when the controller has finished processing
+some descriptors, it returns the first element physical address of an heterogeneous list
+(general + isochronous) and there is not way to tell the descriptor type.
+This solution, which implementes two hash tables (one for generic descriptors and
+one for isochronous) is the one adopted from *BSD.
+If somebody has better idea, please let me know. :)
+
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2008-01-17 15:29:27 UTC (rev 23588)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2008-01-17 18:02:26 UTC (rev 23589)
+@@ -48,7 +48,18 @@
+ 
+ #define	OHCI_NUMBER_OF_ENDPOINTS	(2 * OHCI_NUMBER_OF_INTERRUPTS - 1)
+ 
++// Note: the controller returns only the physical
++// address of the first processed descriptor of
++// an heterogeneous list (isochronous + generic). Unfortunately
++// we don't have a way to know whether the descriptor is
++// generic or isochronous, either way to translate the address back to
++// kernel address. The physical address is used as the hash value.
++// (Kindly borrowed from *BSD)
+ 
++#define OHCI_HASH_SIZE 128
++#define HASH(x) (((x) &gt;&gt; 4) % OHCI_HASH_SIZE)
++
++
+ class OHCI : public BusManager
+ {
+ public:
+@@ -128,10 +139,22 @@
+ 										iovec *vector,
+ 										size_t vectorCount);
+ 
+-		// OHCI needs this function
+-		addr_t						_LogicalAddress(addr_t physical);
+-		bool						_IsIsochronous(addr_t logical);
++		// Hash tables related methods
++		void						_AddDescriptorToHash(
++										ohci_general_td *descriptor);
++		void						_RemoveDescriptorFromHash(
++										addr_t physicalAddress);
++		ohci_general_td				*_FindDescriptorInHash(
++										addr_t physicalAddress);
+ 
++		void						_AddIsoDescriptorToHash(
++										ohci_isochronous_td *descriptor);
++		void						_RemoveIsoDescriptorFromHash(
++										addr_t physicalAddress);
++		ohci_isochronous_td			*_FindIsoDescriptorInHash(
++										addr_t physicalAddress);
++
++
+ 		// Register functions
+ inline	void						_WriteReg(uint32 reg, uint32 value);
+ inline	uint32						_ReadReg(uint32 reg);
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2008-01-17 15:29:27 UTC (rev 23588)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2008-01-17 18:02:26 UTC (rev 23589)
+@@ -335,16 +335,19 @@
+ 
+ typedef struct ohci_general_td
+ {
+-	// Hardware part
++	// Hardware part 16 bytes
+ 	uint32	flags;						// Flags field
+ 	uint32	buffer_physical;			// Physical buffer pointer
+ 	uint32 	next_physical_descriptor;	// Physical pointer next descriptor
+ 	uint32 	last_physical_byte_address;	// Physical pointer to buffer end
+ 	// Software part
+-	addr_t	physical_address;			// Physical pointer to this address
++	addr_t	physical_address;			// Physical address of this descriptor
+ 	void	*buffer_logical;			// Logical pointer to the buffer
+ 	void	*next_logical_descriptor;	// Logical pointer next descriptor
+ 	size_t	buffer_size;				// Size of the buffer
++	void	*endpoint;					// Necessary when there is an error
++	void	*transfer;					// Pointer to the transfer
++	bool	is_last;					// Last descriptor of the transfer
+ };
+ 
+ #define	OHCI_BUFFER_ROUNDING			0x00040000
+@@ -373,11 +376,14 @@
+ #define OHCI_ITD_NOFFSET 8
+ typedef struct ohci_isochronous_td
+ {
++	// Hardware part 32 byte
+ 	uint32		flags;
+ 	uint32		buffer_page_byte_0;			// Physical page number of byte 0
+ 	uint32		next_physical_descriptor;	// Next isochronous transfer descriptor
+ 	uint32		last_byte_address;			// Physical buffer end
+ 	uint16		offset[OHCI_ITD_NOFFSET];	// Buffer offsets
++	// Software part
++	addr_t		physical_address;			// Physical address of this descriptor
+ };
+ 
+ #define	OHCI_ITD_GET_STARTING_FRAME(x)			((x) &amp; 0x0000ffff)
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005580.html">[Haiku-commits] r23588 - haiku/trunk/src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="005582.html">[Haiku-commits] r23590 - haiku/trunk/src/kits/storage/disk_device
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5581">[ date ]</a>
+              <a href="thread.html#5581">[ thread ]</a>
+              <a href="subject.html#5581">[ subject ]</a>
+              <a href="author.html#5581">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

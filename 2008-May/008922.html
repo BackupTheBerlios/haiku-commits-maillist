@@ -1,0 +1,268 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25549 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25549%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200805182115.m4ILF77b005849%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008921.html">
+   <LINK REL="Next"  HREF="008923.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25549 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25549%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200805182115.m4ILF77b005849%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25549 - haiku/trunk/src/add-ons/kernel/busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun May 18 23:15:07 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008921.html">[Haiku-commits] r25548 - haiku/trunk/headers/os/drivers
+</A></li>
+        <LI>Next message: <A HREF="008923.html">[Haiku-commits] r25550 -	haiku/trunk/src/add-ons/kernel/bus_managers/pci
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8922">[ date ]</a>
+              <a href="thread.html#8922">[ thread ]</a>
+              <a href="subject.html#8922">[ subject ]</a>
+              <a href="author.html#8922">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2008-05-18 23:15:07 +0200 (Sun, 18 May 2008)
+New Revision: 25549
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25549&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25549&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+Log:
+* Handle the data == first and last == first case as this can occure for
+  single td bulk transfers.
+* Implement SubmitTransfer() for bulk transfers (interrupts will use the exact
+  same code path, but as their endpoints aren't yet setup, interrupt transfers
+  won't work).
+* Handle the cancel case when finishing transfers. The descriptors of the
+  canceled transfers cannot be accessed by the controller so they can be freed.
+
+Bulk transfers should work now, so devices only using control and bulk transfers
+should too (anything using usb_disk for example). Note though that a transfer
+error will cause the whole thing to fail miserably as the error case is not
+yet handled correctly (failed descriptors aren't removed from the endpoint).
+Therefore I suggest not testing with the memory stick with that important
+presentation you haven't stored anywhere else...
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2008-05-18 20:59:14 UTC (rev 25548)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2008-05-18 21:15:07 UTC (rev 25549)
+@@ -763,8 +763,9 @@
+ 
+ status_t
+ OHCI::_AddPendingTransfer(Transfer *transfer,
+-	ohci_endpoint_descriptor *endpoint, ohci_general_td *dataDescriptor,
+-	ohci_general_td *lastDescriptor, bool directionIn)
++	ohci_endpoint_descriptor *endpoint, ohci_general_td *firstDescriptor,
++	ohci_general_td *dataDescriptor, ohci_general_td *lastDescriptor,
++	bool directionIn)
+ {
+ 	if (!transfer || !endpoint || !lastDescriptor)
+ 		return B_BAD_VALUE;
+@@ -781,14 +782,25 @@
+ 
+ 	data-&gt;transfer = transfer;
+ 	data-&gt;endpoint = endpoint;
+-	// the current tail will become the fist descriptor
+-	data-&gt;first_descriptor = (ohci_general_td *)endpoint-&gt;tail_logical_descriptor;
+-	data-&gt;data_descriptor = dataDescriptor;
+-	data-&gt;last_descriptor = lastDescriptor;
+ 	data-&gt;incoming = directionIn;
+ 	data-&gt;canceled = false;
+ 	data-&gt;link = NULL;
+ 
++	// the current tail will become the fist descriptor
++	data-&gt;first_descriptor = (ohci_general_td *)endpoint-&gt;tail_logical_descriptor;
++
++	// the data and first descriptors might be the same
++	if (dataDescriptor == firstDescriptor)
++		data-&gt;data_descriptor = data-&gt;first_descriptor;
++	else
++		data-&gt;data_descriptor = dataDescriptor;
++
++	// even the last and the first descriptor might be the same
++	if (lastDescriptor == firstDescriptor)
++		data-&gt;last_descriptor = data-&gt;first_descriptor;
++	else
++		data-&gt;last_descriptor = lastDescriptor;
++
+ 	if (!Lock()) {
+ 		delete data;
+ 		return B_ERROR;
+@@ -849,7 +861,7 @@
+ 			ohci_general_td *descriptor = transfer-&gt;first_descriptor;
+ 			status_t callbackStatus = B_OK;
+ 
+-			while (descriptor) {
++			while (descriptor &amp;&amp; !transfer-&gt;canceled) {
+ 				uint32 status = OHCI_TD_GET_CONDITION_CODE(descriptor-&gt;flags);
+ 				if (status == OHCI_TD_CONDITION_NOT_ACCESSED) {
+ 					// td is still active
+@@ -938,6 +950,15 @@
+ 					= (ohci_general_td *)descriptor-&gt;next_logical_descriptor;
+ 			}
+ 
++			if (transfer-&gt;canceled) {
++				// when a transfer is canceled, all transfers to that endpoint
++				// are canceled by setting the head pointer to the tail pointer
++				// which causes all of the tds to become &quot;free&quot; (as they are
++				// inaccessible and not accessed anymore (as setting the head
++				// pointer required disabling the endpoint))
++				transferDone = true;
++			}
++
+ 			if (!transferDone) {
+ 				lastTransfer = transfer;
+ 				transfer = transfer-&gt;link;
+@@ -1075,18 +1096,18 @@
+ 		_LinkDescriptors(setupDescriptor, statusDescriptor);
+ 	}
+ 
+-	// Append Transfer
++	// Add to the transfer list
+ 	ohci_endpoint_descriptor *endpoint
+ 		= (ohci_endpoint_descriptor *)transfer-&gt;TransferPipe()-&gt;ControllerCookie();
+-	result = _AddPendingTransfer(transfer, endpoint, dataDescriptor,
+-		statusDescriptor, directionIn);
++	result = _AddPendingTransfer(transfer, endpoint, setupDescriptor,
++		dataDescriptor, statusDescriptor, directionIn);
+ 	if (result &lt; B_OK) {
+ 		TRACE_ERROR((&quot;usb_ohci: failed to add pending transfer\n&quot;));
+ 		_FreeDescriptorChain(setupDescriptor);
+ 		return result;
+ 	}
+ 
+-	// Append descriptor chain to the endpoint
++	// Add the descriptor chain to the endpoint
+ 	_SwitchEndpointTail(endpoint, setupDescriptor, statusDescriptor);
+ 
+ 	// Tell the controller to process the control list
+@@ -1099,8 +1120,49 @@
+ status_t
+ OHCI::_SubmitTransfer(Transfer *transfer)
+ {
+-	// TODO
+-	return B_ERROR;
++	Pipe *pipe = transfer-&gt;TransferPipe();
++	bool directionIn = (pipe-&gt;Direction() == Pipe::In);
++
++	ohci_general_td *firstDescriptor = NULL;
++	ohci_general_td *lastDescriptor = NULL;
++	status_t result = _CreateDescriptorChain(&amp;firstDescriptor, &amp;lastDescriptor,
++		directionIn ? OHCI_TD_DIRECTION_PID_IN : OHCI_TD_DIRECTION_PID_OUT,
++		transfer-&gt;VectorLength());
++
++	if (result &lt; B_OK)
++		return result;
++
++	// Set the last descriptor to generate an interrupt
++	lastDescriptor-&gt;flags &amp;= ~OHCI_TD_INTERRUPT_MASK;
++	lastDescriptor-&gt;flags |=
++		OHCI_TD_SET_DELAY_INTERRUPT(OHCI_TD_INTERRUPT_IMMEDIATE);
++
++	if (!directionIn) {
++		_WriteDescriptorChain(firstDescriptor, transfer-&gt;Vector(),
++			transfer-&gt;VectorCount());
++	}
++
++	// Add to the transfer list
++	ohci_endpoint_descriptor *endpoint
++		= (ohci_endpoint_descriptor *)pipe-&gt;ControllerCookie();
++	result = _AddPendingTransfer(transfer, endpoint, firstDescriptor,
++		firstDescriptor, lastDescriptor, directionIn);
++	if (result &lt; B_OK) {
++		TRACE_ERROR((&quot;usb_ohci: failed to add pending transfer\n&quot;));
++		_FreeDescriptorChain(firstDescriptor);
++		return result;
++	}
++
++	// Add the descriptor chain to the endpoint
++	_SwitchEndpointTail(endpoint, firstDescriptor, lastDescriptor);
++	endpoint-&gt;flags &amp;= ~OHCI_ENDPOINT_SKIP;
++
++	if (pipe-&gt;Type() &amp; USB_OBJECT_BULK_PIPE) {
++		// Tell the controller to process the bulk list
++		_WriteReg(OHCI_COMMAND_STATUS, OHCI_BULK_LIST_FILLED);
++	}
++
++	return B_OK;
+ }
+ 
+ 
+@@ -1133,8 +1195,12 @@
+ 	first-&gt;buffer_size = 0;
+ 	first-&gt;buffer_logical = NULL;
+ 	first-&gt;next_logical_descriptor = NULL;
+-	_LinkDescriptors(last, first);
+ 
++	if (first == last)
++		_LinkDescriptors(tail, first);
++	else
++		_LinkDescriptors(last, first);
++
+ 	// update the endpoint tail pointer to reflect the change
+ 	endpoint-&gt;tail_logical_descriptor = first;
+ 	endpoint-&gt;tail_physical_descriptor = (uint32)first-&gt;physical_address;
+@@ -1265,7 +1331,7 @@
+ 		return B_ERROR;
+ 	}
+ 
+-	// Create (necessary) dummy descriptor
++	// Create (necessary) tail descriptor
+ 	if (pipe-&gt;Type() &amp; USB_OBJECT_ISO_PIPE) {
+ 		// Set the isochronous bit format
+ 		endpoint-&gt;flags |= OHCI_ENDPOINT_ISOCHRONOUS_FORMAT;
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2008-05-18 20:59:14 UTC (rev 25548)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2008-05-18 21:15:07 UTC (rev 25549)
+@@ -64,6 +64,7 @@
+ 		// Transfer functions
+ 		status_t					_AddPendingTransfer(Transfer *transfer,
+ 										ohci_endpoint_descriptor *endpoint,
++										ohci_general_td *firstDescriptor,
+ 										ohci_general_td *dataDescriptor,
+ 										ohci_general_td *lastDescriptor,
+ 										bool directionIn);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008921.html">[Haiku-commits] r25548 - haiku/trunk/headers/os/drivers
+</A></li>
+	<LI>Next message: <A HREF="008923.html">[Haiku-commits] r25550 -	haiku/trunk/src/add-ons/kernel/bus_managers/pci
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8922">[ date ]</a>
+              <a href="thread.html#8922">[ thread ]</a>
+              <a href="subject.html#8922">[ subject ]</a>
+              <a href="author.html#8922">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

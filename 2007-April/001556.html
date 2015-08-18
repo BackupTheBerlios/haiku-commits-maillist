@@ -1,0 +1,1074 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20661 -	haiku/trunk/src/add-ons/kernel/network/protocols/udp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20661%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/udp&In-Reply-To=%3C200704120822.l3C8Muv9006041%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001553.html">
+   <LINK REL="Next"  HREF="001557.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20661 -	haiku/trunk/src/add-ons/kernel/network/protocols/udp</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20661%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/udp&In-Reply-To=%3C200704120822.l3C8Muv9006041%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20661 -	haiku/trunk/src/add-ons/kernel/network/protocols/udp">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 12 10:22:56 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001553.html">[Haiku-commits] r20660 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/protocols/icmp	src/add-ons/kernel/network/protocols/ipv4	src/add-ons/kernel/network/protocols/tcp	src/add-ons/kernel/network/protocols/udp	src/add-ons/kernel/network/stack
+</A></li>
+        <LI>Next message: <A HREF="001557.html">[Haiku-commits] r20662 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1556">[ date ]</a>
+              <a href="thread.html#1556">[ thread ]</a>
+              <a href="subject.html#1556">[ subject ]</a>
+              <a href="author.html#1556">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-12 10:22:47 +0200 (Thu, 12 Apr 2007)
+New Revision: 20661
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20661&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20661&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/udp/udp.cpp
+Log:
+made UDP agnostic to the underlying network protocol (preparing some work into the future).
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/udp/udp.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/udp/udp.cpp	2007-04-11 22:24:12 UTC (rev 20660)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/udp/udp.cpp	2007-04-12 08:22:47 UTC (rev 20661)
+@@ -15,6 +15,7 @@
+ 
+ #include &lt;lock.h&gt;
+ #include &lt;util/AutoLock.h&gt;
++#include &lt;util/DoublyLinkedList.h&gt;
+ #include &lt;util/khash.h&gt;
+ 
+ #include &lt;KernelExport.h&gt;
+@@ -28,14 +29,25 @@
+ #include &lt;string.h&gt;
+ #include &lt;utility&gt;
+ 
++// TODO move the locking from the FIFO to the whole Endpoint
++//      much like we did with the LinkProtocol.
+ 
+ //#define TRACE_UDP
+ #ifdef TRACE_UDP
+-#	define TRACE(x) dprintf x
+ #	define TRACE_BLOCK(x) dump_block x
++// do not remove the space before ', ##args' if you want this
++// to compile with gcc 2.95
++#	define TRACE_EP(format, args...)	dprintf(&quot;UDP [%llu] %p &quot; format &quot;\n&quot;, \
++		system_time(), this , ##args)
++#	define TRACE_EPM(format, args...)	dprintf(&quot;UDP [%llu] &quot; format &quot;\n&quot;, \
++		system_time() , ##args)
++#	define TRACE_DOMAIN(format, args...)	dprintf(&quot;UDP [%llu] (%d) &quot; format \
++		&quot;\n&quot;, system_time(), Domain()-&gt;family , ##args)
+ #else
+-#	define TRACE(x)
+ #	define TRACE_BLOCK(x)
++#	define TRACE_EP(args...)	do { } while (0)
++#	define TRACE_EPM(args...)	do { } while (0)
++#	define TRACE_DOMAIN(args...)	do { } while (0)
+ #endif
+ 
+ 
+@@ -50,12 +62,15 @@
+ typedef NetBufferField&lt;uint16, offsetof(udp_header, udp_checksum)&gt;
+ 	UDPChecksumField;
+ 
++class UdpDomainSupport;
+ 
+ class UdpEndpoint : public net_protocol {
+ public:
+ 	UdpEndpoint(net_socket *socket);
+ 	~UdpEndpoint();
+ 
++	status_t				InitCheck() const;
++
+ 	status_t				Bind(sockaddr *newAddr);
+ 	status_t				Unbind(sockaddr *newAddr);
+ 	status_t				Connect(const sockaddr *newAddr);
+@@ -64,21 +79,35 @@
+ 	status_t				Close();
+ 	status_t				Free();
+ 
+-	status_t				SendData(net_buffer *buffer, net_route *route);
++	status_t				SendRoutedData(net_buffer *buffer, net_route *route);
++	status_t				SendData(net_buffer *buffer);
+ 
+ 	ssize_t					BytesAvailable();
+-	status_t				FetchData(size_t numBytes, uint32 flags, 
++	status_t				FetchData(size_t numBytes, uint32 flags,
+ 								net_buffer **_buffer);
+ 
+ 	status_t				StoreData(net_buffer *buffer);
+ 
+-	UdpEndpoint 			*hash_link;
++	net_domain *			Domain() const
++	{
++		return socket-&gt;first_protocol-&gt;module-&gt;get_domain(socket-&gt;first_protocol);
++	}
++
++	net_address_module_info *AddressModule() const
++	{
++		return Domain()-&gt;address_module;
++	}
++
++	UdpDomainSupport		*DomainSupport() const { return fDomain; }
++
++	UdpEndpoint				*hash_link;
+ 								// link required by hash_table (see khash.h)
+ private:
+ 	status_t				_Activate();
+ 	status_t				_Deactivate();
+-	
+-	bool 					fActive;
++
++	UdpDomainSupport		*fDomain;
++	bool					fActive;
+ 								// an active UdpEndpoint is part of the endpoint 
+ 								// hash (and it is bound and optionally connected)
+ 	net_fifo				fFifo;
+@@ -86,253 +115,227 @@
+ };
+ 
+ 
+-class UdpEndpointManager {
+-	typedef std::pair&lt;const sockaddr *, const sockaddr *&gt; HashKey;
++class UdpDomainSupport : public DoublyLinkedListLinkImpl&lt;UdpDomainSupport&gt; {
++public:
++	UdpDomainSupport(net_domain *domain);
++	~UdpDomainSupport();
+ 
+-	class Ephemerals {
+-	public:
+-							Ephemerals();
+-							~Ephemerals();
+-		
+-			uint16			GetNext(hash_table *activeEndpoints);
+-	static 	const uint16	kFirst = 49152;
+-	static 	const uint16	kLast = 65535;
+-	private:
+-			uint16			fLastUsed;
++	status_t InitCheck() const;
++
++	net_domain *Domain() const { return fDomain; }
++
++	void Ref() { fEndpointCount++; }
++	void Put() { fEndpointCount--; }
++
++	bool IsEmpty() const { return fEndpointCount == 0; }
++
++	status_t DemuxIncomingBuffer(net_buffer *buffer);
++	status_t CheckBindRequest(sockaddr *address, int socketOptions);
++	status_t ActivateEndpoint(UdpEndpoint *endpoint);
++	status_t DeactivateEndpoint(UdpEndpoint *endpoint);
++
++	uint16 GetEphemeralPort();
++
++private:
++	struct HashKey {
++		HashKey() {}
++		HashKey(net_address_module_info *module, const sockaddr *_local,
++			const sockaddr *_peer)
++			: address_module(module), local(_local), peer(_peer) {}
++
++		net_address_module_info *address_module;
++		const sockaddr *local;
++		const sockaddr *peer;
+ 	};
+-	
+-public:
+-	UdpEndpointManager();
+-	~UdpEndpointManager();
+ 
+-			status_t		DemuxBroadcast(net_buffer *buffer);
+-			status_t		DemuxMulticast(net_buffer *buffer);
+-			status_t		DemuxUnicast(net_buffer *buffer);
+-			status_t		DemuxIncomingBuffer(net_buffer *buffer);
+-			status_t		ReceiveData(net_buffer *buffer);
++	UdpEndpoint *_FindActiveEndpoint(sockaddr *ourAddress,
++		sockaddr *peerAddress);
++	status_t _DemuxBroadcast(net_buffer *buffer);
++	status_t _DemuxMulticast(net_buffer *buffer);
++	status_t _DemuxUnicast(net_buffer *buffer);
+ 
+-	static	int				Compare(void *udpEndpoint, const void *_key);
+-	static	uint32			ComputeHash(const sockaddr *ourAddress,
+-										const sockaddr *peerAddress);
+-	static	uint32			Hash(void *udpEndpoint, const void *key, uint32 range);
++	uint16 _GetNextEphemeral();
+ 
+-			UdpEndpoint		*FindActiveEndpoint(sockaddr *ourAddress, 
+-								sockaddr *peerAddress);
+-			status_t		CheckBindRequest(sockaddr *address, int socketOptions);
++	static int _Compare(void *udpEndpoint, const void *_key);
++	static uint32 _Hash(void *udpEndpoint, const void *key, uint32 range);
+ 
+-			status_t		ActivateEndpoint(UdpEndpoint *endpoint);
+-			status_t		DeactivateEndpoint(UdpEndpoint *endpoint);
++	net_address_module_info *AddressModule() const
++	{
++		return fDomain-&gt;address_module;
++	}
+ 
+-			status_t		OpenEndpoint(UdpEndpoint *endpoint);
+-			status_t		CloseEndpoint(UdpEndpoint *endpoint);
+-			status_t		FreeEndpoint(UdpEndpoint *endpoint);
+-	
+-			uint16			GetEphemeralPort();
++	net_domain		*fDomain;
++	uint16			fLastUsedEphemeral;
++	hash_table		*fActiveEndpoints;
++	uint32			fEndpointCount;
+ 
+-			benaphore		*Locker();
+-			status_t		InitCheck() const;
+-private:
+-			benaphore		fLock;
+-			hash_table		*fActiveEndpoints;
+-	static	const uint32 	kNumHashBuckets = 0x800;
+-								// if you change this, adjust the shifting in 
+-								// Hash() accordingly!
+-			Ephemerals		fEphemerals;
+-			status_t		fStatus;
+-			uint32			fEndpointCount;
++	static const uint16		kFirst = 49152;
++	static const uint16		kLast = 65535;
++	static const uint32		kNumHashBuckets = 0x800;
++							// if you change this, adjust the shifting in
++							// Hash() accordingly!
+ };
+ 
+ 
+-static UdpEndpointManager *sUdpEndpointManager;
++typedef DoublyLinkedList&lt;UdpDomainSupport&gt; UdpDomainList;
+ 
+-static net_domain *sDomain;
+ 
+-static net_address_module_info *sAddressModule;
+-net_buffer_module_info *gBufferModule;
+-static net_datalink_module_info *sDatalinkModule;
+-static net_stack_module_info *sStackModule;
++class UdpEndpointManager {
++public:
++	UdpEndpointManager();
++	~UdpEndpointManager();
+ 
++	status_t		DemuxIncomingBuffer(net_domain *domain,
++		net_buffer *buffer);
++	status_t		ReceiveData(net_buffer *buffer);
+ 
+-// #pragma mark -
++	UdpDomainSupport *OpenEndpoint(UdpEndpoint *endpoint);
++	status_t FreeEndpoint(UdpDomainSupport *domain);
+ 
++	uint16			GetEphemeralPort();
+ 
+-UdpEndpointManager::Ephemerals::Ephemerals()
+-	:
+-	fLastUsed(kLast)
+-{
+-}
++	benaphore		*Locker() { return &fLock; }
++	status_t		InitCheck() const;
+ 
++private:
++	UdpDomainSupport *_GetDomain(net_domain *domain, bool create);
+ 
+-UdpEndpointManager::Ephemerals::~Ephemerals()
+-{
+-}
++	benaphore		fLock;
++	status_t		fStatus;
++	UdpDomainList	fDomains;
++};
+ 
+ 
+-uint16
+-UdpEndpointManager::Ephemerals::GetNext(hash_table *activeEndpoints)
+-{
+-	uint16 stop, curr, ncurr;
+-	if (fLastUsed &lt; kLast) {
+-		stop = fLastUsed;
+-		curr = fLastUsed + 1;
+-	} else {
+-		stop = kLast;
+-		curr = kFirst;
+-	}
++static UdpEndpointManager *sUdpEndpointManager;
+ 
+-	TRACE((&quot;UdpEndpointManager::Ephemerals::GetNext()...\n&quot;));
+-	// TODO: a free list could be used to avoid the impact of these
+-	//       two nested loops most of the time... let's see how bad this really is
+-	UdpEndpoint *endpoint;
+-	struct hash_iterator endpointIterator;
+-	hash_open(activeEndpoints, &amp;endpointIterator);
+-	bool found = false;
+-	uint16 endpointPort;
+-	while(!found &amp;&amp; curr != stop) {
+-		TRACE((&quot;...trying port %u...\n&quot;, curr));
+-		ncurr = htons(curr);
+-		for(hash_rewind(activeEndpoints, &amp;endpointIterator); !found; ) {
+-			endpoint = (UdpEndpoint *)hash_next(activeEndpoints, &amp;endpointIterator);
+-			if (!endpoint) {
+-				found = true;
+-				break;
+-			}
+-			endpointPort = sAddressModule-&gt;get_port(
+-				(sockaddr *)&amp;endpoint-&gt;socket-&gt;address);
+-			TRACE((&quot;...checking endpoint %p (port=%u)...\n&quot;, endpoint, 
+-				ntohs(endpointPort)));
+-			if (endpointPort == ncurr)
+-				break;
+-		}
+-		if (!found) {
+-			if (curr &lt; kLast)
+-				curr++;
+-			else
+-				curr = kFirst;
+-		}
+-	}
+-	hash_close(activeEndpoints, &amp;endpointIterator, false);
+-	if (!found)
+-		return 0;
+-	TRACE((&quot;...using port %u\n&quot;, curr));
+-	fLastUsed = curr;
+-	return curr;
+-}
++net_buffer_module_info *gBufferModule;
++static net_datalink_module_info *sDatalinkModule;
++static net_stack_module_info *sStackModule;
+ 
+ 
+ // #pragma mark -
+ 
+ 
+-UdpEndpointManager::UdpEndpointManager()
++UdpDomainSupport::UdpDomainSupport(net_domain *domain)
+ 	:
+-	fStatus(B_NO_INIT),
++	fDomain(domain),
++	fLastUsedEphemeral(kLast),
+ 	fEndpointCount(0)
+ {
+-	fActiveEndpoints = hash_init(kNumHashBuckets, offsetof(UdpEndpoint, hash_link), 
+-		&amp;Compare, &amp;Hash);
+-	if (fActiveEndpoints == NULL) {
+-		fStatus = B_NO_MEMORY;
+-		return;
+-	}
+-
+-	fStatus = benaphore_init(&amp;fLock, &quot;UDP endpoints&quot;);
+-	if (fStatus &lt; B_OK)
+-		hash_uninit(fActiveEndpoints);
++	fActiveEndpoints = hash_init(kNumHashBuckets, offsetof(UdpEndpoint, hash_link),
++		&amp;_Compare, &amp;_Hash);
+ }
+ 
+ 
+-UdpEndpointManager::~UdpEndpointManager()
++UdpDomainSupport::~UdpDomainSupport()
+ {
+-	benaphore_destroy(&amp;fLock);
+-	hash_uninit(fActiveEndpoints);
++	if (fActiveEndpoints)
++		hash_uninit(fActiveEndpoints);
+ }
+ 
+ 
+-inline benaphore *
+-UdpEndpointManager::Locker()
++status_t
++UdpDomainSupport::InitCheck() const
+ {
+-	return &fLock;
++	return fActiveEndpoints ? B_OK : B_NO_MEMORY;
+ }
+ 
+ 
+-inline status_t
+-UdpEndpointManager::InitCheck() const
++status_t
++UdpDomainSupport::DemuxIncomingBuffer(net_buffer *buffer)
+ {
+-	return fStatus;
++	if (buffer-&gt;flags &amp; MSG_BCAST)
++		return _DemuxBroadcast(buffer);
++	else if (buffer-&gt;flags &amp; MSG_MCAST)
++		return _DemuxMulticast(buffer);
++
++	return _DemuxUnicast(buffer);
+ }
+ 
+ 
+-// #pragma mark - hashing
++status_t
++UdpDomainSupport::CheckBindRequest(sockaddr *address, int socketOptions)
++{		// sUdpEndpointManager-&gt;Locker() must be locked!
++	status_t status = B_OK;
++	UdpEndpoint *otherEndpoint;
++	sockaddr *otherAddr;
++	struct hash_iterator endpointIterator;
+ 
++	// Iterate over all active UDP-endpoints and check if the requested bind
++	// is allowed (see figure 22.24 in [Stevens - TCP2, p735]):
++	hash_open(fActiveEndpoints, &amp;endpointIterator);
++	TRACE_DOMAIN(&quot;CheckBindRequest() for %s...&quot;,
++		AddressString(fDomain, address, true).Data());
++	while(1) {
++		otherEndpoint = (UdpEndpoint *)hash_next(fActiveEndpoints, &amp;endpointIterator);
++		if (!otherEndpoint)
++			break;
++		otherAddr = (sockaddr *)&amp;otherEndpoint-&gt;socket-&gt;address;
++		TRACE_DOMAIN(&quot;  ...checking endpoint %p (port=%u)...&quot;, otherEndpoint,
++			ntohs(AddressModule()-&gt;get_port(otherAddr)));
++		if (AddressModule()-&gt;equal_ports(otherAddr, address)) {
++			// port is already bound, SO_REUSEADDR or SO_REUSEPORT is required:
++			if (otherEndpoint-&gt;socket-&gt;options &amp; (SO_REUSEADDR | SO_REUSEPORT) == 0
++				|| socketOptions &amp; (SO_REUSEADDR | SO_REUSEPORT) == 0) {
++				status = EADDRINUSE;
++				break;
++			}
++			// if both addresses are the same, SO_REUSEPORT is required:
++			if (AddressModule()-&gt;equal_addresses(otherAddr, address)
++				&amp;&amp; (otherEndpoint-&gt;socket-&gt;options &amp; SO_REUSEPORT == 0
++					|| socketOptions &amp; SO_REUSEPORT == 0)) {
++				status = EADDRINUSE;
++				break;
++			}
++		}
++	}
++	hash_close(fActiveEndpoints, &amp;endpointIterator, false);
+ 
+-/*static*/ int
+-UdpEndpointManager::Compare(void *_udpEndpoint, const void *_key)
+-{
+-	struct UdpEndpoint *udpEndpoint = (UdpEndpoint*)_udpEndpoint;
+-	const HashKey *key = (const HashKey *)_key;
++	TRACE_DOMAIN(&quot;  CheckBindRequest done (status=%lx)&quot;, status);
++	return status;
++}
+ 
+-	sockaddr *ourAddr = (sockaddr *)&amp;udpEndpoint-&gt;socket-&gt;address;
+-	sockaddr *peerAddr = (sockaddr *)&amp;udpEndpoint-&gt;socket-&gt;peer;
+ 
+-	if (sAddressModule-&gt;equal_addresses_and_ports(ourAddr, key-&gt;first)
+-		&amp;&amp; sAddressModule-&gt;equal_addresses_and_ports(peerAddr, key-&gt;second))
+-		return 0;
+-
+-	return 1;
++status_t
++UdpDomainSupport::ActivateEndpoint(UdpEndpoint *endpoint)
++{		// sUdpEndpointManager-&gt;Locker() must be locked!
++	TRACE_DOMAIN(&quot;Endpoint(%s) was activated&quot;,
++		AddressString(fDomain, (sockaddr *)&amp;endpoint-&gt;socket-&gt;address, true).Data());
++	return hash_insert(fActiveEndpoints, endpoint);
+ }
+ 
+ 
+-/*static*/ inline uint32
+-UdpEndpointManager::ComputeHash(const sockaddr *ourAddress,
+-		const sockaddr *peerAddress)
+-{
+-	return sAddressModule-&gt;hash_address_pair(ourAddress, peerAddress);
++status_t
++UdpDomainSupport::DeactivateEndpoint(UdpEndpoint *endpoint)
++{		// sUdpEndpointManager-&gt;Locker() must be locked!
++	TRACE_DOMAIN(&quot;Endpoint(%s) was deactivated&quot;,
++		AddressString(fDomain, (sockaddr *)&amp;endpoint-&gt;socket-&gt;address, true).Data());
++	return hash_remove(fActiveEndpoints, endpoint);
+ }
+ 
+ 
+-/*static*/ uint32
+-UdpEndpointManager::Hash(void *_udpEndpoint, const void *_key, uint32 range)
++uint16
++UdpDomainSupport::GetEphemeralPort()
+ {
+-	HashKey addresses;
+-	uint32 hash;
+-
+-	if (_udpEndpoint) {
+-		const UdpEndpoint *udpEndpoint = (const UdpEndpoint *)_udpEndpoint;
+-		addresses = HashKey((const sockaddr *)&amp;udpEndpoint-&gt;socket-&gt;address,
+-							(const sockaddr *)&amp;udpEndpoint-&gt;socket-&gt;peer);
+-	} else {
+-		addresses = *(const HashKey *)_key;
+-	}
+-
+-	hash = ComputeHash(addresses.first, addresses.second);
+-
+-	// move the bits into the relevant range (as defined by kNumHashBuckets):
+-	hash = (hash &amp; 0x000007FF) ^ (hash &amp; 0x003FF800) &gt;&gt; 11
+-			^ (hash &amp; 0xFFC00000UL) &gt;&gt; 22;
+-
+-	TRACE((&quot;UDP-endpoint hash is %lx\n&quot;, hash % range));
+-	return hash % range;
++	return _GetNextEphemeral();
+ }
+ 
+ 
+-// #pragma mark - inbound
+-
+-
+ UdpEndpoint *
+-UdpEndpointManager::FindActiveEndpoint(sockaddr *ourAddress,
++UdpDomainSupport::_FindActiveEndpoint(sockaddr *ourAddress,
+ 	sockaddr *peerAddress)
+ {
+-	TRACE((&quot;trying to find UDP-endpoint for (l:%s p:%s)\n&quot;,
+-		AddressString(sDomain, ourAddress, true).Data(),
+-		AddressString(sDomain, peerAddress, true).Data()));
++	TRACE_DOMAIN(&quot;finding Endpoint for %s -&gt; %s&quot;,
++		AddressString(fDomain, ourAddress, true).Data(),
++		AddressString(fDomain, peerAddress, true).Data());
+ 
+-	HashKey key(ourAddress, peerAddress);
++	HashKey key(AddressModule(), ourAddress, peerAddress);
+ 	return (UdpEndpoint *)hash_lookup(fActiveEndpoints, &amp;key);
+ }
+ 
+ 
+ status_t
+-UdpEndpointManager::DemuxBroadcast(net_buffer *buffer)
++UdpDomainSupport::_DemuxBroadcast(net_buffer *buffer)
+ {
+ 	sockaddr *peerAddr = (sockaddr *)&amp;buffer-&gt;source;
+ 	sockaddr *broadcastAddr = (sockaddr *)&amp;buffer-&gt;destination;
+@@ -340,40 +343,37 @@
+ 	if (buffer-&gt;interface)
+ 		mask = (sockaddr *)buffer-&gt;interface-&gt;mask;
+ 
+-	TRACE((&quot;demuxing buffer %p as broadcast...\n&quot;, buffer));
++	TRACE_DOMAIN(&quot;_DemuxBroadcast(%p)&quot;, buffer);
+ 
+-	uint16 incomingPort = sAddressModule-&gt;get_port(broadcastAddr);
++	uint16 incomingPort = AddressModule()-&gt;get_port(broadcastAddr);
+ 
+ 	UdpEndpoint *endpoint;
+-	sockaddr *addr, *connectAddr;
+-	struct hash_iterator endpointIterator;
+-	for(hash_open(fActiveEndpoints, &amp;endpointIterator); ; ) {
+-		endpoint = (UdpEndpoint *)hash_next(fActiveEndpoints, &amp;endpointIterator);
+-		if (!endpoint)
+-			break;
++	hash_iterator endpointIterator;
++	hash_open(fActiveEndpoints, &amp;endpointIterator);
++	while ((endpoint = (UdpEndpoint *)hash_next(fActiveEndpoints,
++		&amp;endpointIterator)) != NULL) {
++		sockaddr *addr = (sockaddr *)&amp;endpoint-&gt;socket-&gt;address;
++		TRACE_DOMAIN(&quot;  _DemuxBroadcast(): checking endpoint %s...&quot;,
++			AddressString(fDomain, addr, true).Data());
+ 
+-		addr = (sockaddr *)&amp;endpoint-&gt;socket-&gt;address;
+-		TRACE((&quot;UDP-DemuxBroadcast() is checking endpoint %s...\n&quot;,
+-			AddressString(sDomain, addr, true).Data()));
+-
+-		if (incomingPort != sAddressModule-&gt;get_port(addr)) {
++		if (incomingPort != AddressModule()-&gt;get_port(addr)) {
+ 			// ports don't match, so we do not dispatch to this endpoint...
+ 			continue;
+ 		}
+ 
+-		connectAddr = (sockaddr *)&amp;endpoint-&gt;socket-&gt;peer;
+-		if (!sAddressModule-&gt;is_empty_address(connectAddr, true)) {
++		sockaddr *connectAddr = (sockaddr *)&amp;endpoint-&gt;socket-&gt;peer;
++		if (!AddressModule()-&gt;is_empty_address(connectAddr, true)) {
+ 			// endpoint is connected to a specific destination, we check if
+ 			// this datagram is from there:
+-			if (!sAddressModule-&gt;equal_addresses_and_ports(connectAddr, peerAddr)) {
++			if (!AddressModule()-&gt;equal_addresses_and_ports(connectAddr, peerAddr)) {
+ 				// no, datagram is from another peer, so we do not dispatch to
+ 				// this endpoint...
+ 				continue;
+ 			}
+ 		}
+ 
+-		if (sAddressModule-&gt;equal_masked_addresses(addr, broadcastAddr, mask)
+-			|| sAddressModule-&gt;is_empty_address(addr, false)) {
++		if (AddressModule()-&gt;equal_masked_addresses(addr, broadcastAddr, mask)
++			|| AddressModule()-&gt;is_empty_address(addr, false)) {
+ 				// address matches, dispatch to this endpoint:
+ 			endpoint-&gt;StoreData(buffer);
+ 		}
+@@ -384,39 +384,42 @@
+ 
+ 
+ status_t
+-UdpEndpointManager::DemuxMulticast(net_buffer *buffer)
++UdpDomainSupport::_DemuxMulticast(net_buffer *buffer)
+ {	// TODO: implement!
++	TRACE_DOMAIN(&quot;_DemuxMulticast(%p)&quot;, buffer);
++
+ 	return B_ERROR;
+ }
+ 
+ 
+ status_t
+-UdpEndpointManager::DemuxUnicast(net_buffer *buffer)
++UdpDomainSupport::_DemuxUnicast(net_buffer *buffer)
+ {
+ 	struct sockaddr *peerAddr = (struct sockaddr *)&amp;buffer-&gt;source;
+ 	struct sockaddr *localAddr = (struct sockaddr *)&amp;buffer-&gt;destination;
+ 
+-	TRACE((&quot;demuxing buffer %p as unicast...\n&quot;, buffer));
++	TRACE_DOMAIN(&quot;_DemuxUnicast(%p)&quot;, buffer);
+ 
+ 	UdpEndpoint *endpoint;
+ 	// look for full (most special) match:
+-	endpoint = FindActiveEndpoint(localAddr, peerAddr);
++	endpoint = _FindActiveEndpoint(localAddr, peerAddr);
+ 	if (!endpoint) {
+ 		// look for endpoint matching local address &amp; port:
+-		endpoint = FindActiveEndpoint(localAddr, NULL);
++		endpoint = _FindActiveEndpoint(localAddr, NULL);
+ 		if (!endpoint) {
+ 			// look for endpoint matching peer address &amp; port and local port:
+ 			sockaddr localPortAddr;
+-			sAddressModule-&gt;set_to_empty_address(&amp;localPortAddr);
+-			uint16 localPort = sAddressModule-&gt;get_port(localAddr);
+-			sAddressModule-&gt;set_port(&amp;localPortAddr, localPort);
+-			endpoint = FindActiveEndpoint(&amp;localPortAddr, peerAddr);
++			AddressModule()-&gt;set_to_empty_address(&amp;localPortAddr);
++			uint16 localPort = AddressModule()-&gt;get_port(localAddr);
++			AddressModule()-&gt;set_port(&amp;localPortAddr, localPort);
++			endpoint = _FindActiveEndpoint(&amp;localPortAddr, peerAddr);
+ 			if (!endpoint) {
+ 				// last chance: look for endpoint matching local port only:
+-				endpoint = FindActiveEndpoint(&amp;localPortAddr, NULL);
++				endpoint = _FindActiveEndpoint(&amp;localPortAddr, NULL);
+ 			}
+ 		}
+ 	}
++
+ 	if (!endpoint)
+ 		return B_NAME_NOT_FOUND;
+ 
+@@ -425,25 +428,148 @@
+ }
+ 
+ 
++uint16
++UdpDomainSupport::_GetNextEphemeral()
++{
++	uint16 stop, curr, ncurr;
++	if (fLastUsedEphemeral &lt; kLast) {
++		stop = fLastUsedEphemeral;
++		curr = fLastUsedEphemeral + 1;
++	} else {
++		stop = kLast;
++		curr = kFirst;
++	}
++
++	TRACE_DOMAIN(&quot;_GetNextEphemeral()&quot;);
++	// TODO: a free list could be used to avoid the impact of these
++	//       two nested loops most of the time... let's see how bad this really is
++	bool found = false;
++	uint16 endpointPort;
++	hash_iterator endpointIterator;
++	hash_open(fActiveEndpoints, &amp;endpointIterator);
++	while(!found &amp;&amp; curr != stop) {
++		TRACE_DOMAIN(&quot;  _GetNextEphemeral(): trying port %hu...&quot;, curr);
++		ncurr = htons(curr);
++		hash_rewind(fActiveEndpoints, &amp;endpointIterator);
++		while (!found) {
++			UdpEndpoint *endpoint = (UdpEndpoint *)hash_next(fActiveEndpoints,
++				&amp;endpointIterator);
++			if (!endpoint) {
++				found = true;
++				break;
++			}
++			endpointPort = AddressModule()-&gt;get_port(
++				(sockaddr *)&amp;endpoint-&gt;socket-&gt;address);
++			TRACE_DOMAIN(&quot;  _GetNextEphemeral(): checking endpoint %p (port %hu)...&quot;,
++				endpoint, ntohs(endpointPort));
++			if (endpointPort == ncurr)
++				break;
++		}
++		if (!found) {
++			if (curr &lt; kLast)
++				curr++;
++			else
++				curr = kFirst;
++		}
++	}
++	hash_close(fActiveEndpoints, &amp;endpointIterator, false);
++	if (!found)
++		return 0;
++	TRACE_DOMAIN(&quot;  _GetNextEphemeral(): ...using port %hu&quot;, curr);
++	fLastUsedEphemeral = curr;
++	return curr;
++}
++
++
++int
++UdpDomainSupport::_Compare(void *_udpEndpoint, const void *_key)
++{
++	struct UdpEndpoint *udpEndpoint = (UdpEndpoint*)_udpEndpoint;
++	const HashKey *key = (const HashKey *)_key;
++
++	sockaddr *ourAddr = (sockaddr *)&amp;udpEndpoint-&gt;socket-&gt;address;
++	sockaddr *peerAddr = (sockaddr *)&amp;udpEndpoint-&gt;socket-&gt;peer;
++
++	net_address_module_info *addressModule = key-&gt;address_module;
++
++	if (addressModule-&gt;equal_addresses_and_ports(ourAddr, key-&gt;local)
++		&amp;&amp; addressModule-&gt;equal_addresses_and_ports(peerAddr, key-&gt;peer))
++		return 0;
++
++	return 1;
++}
++
++
++uint32
++UdpDomainSupport::_Hash(void *_udpEndpoint, const void *_key, uint32 range)
++{
++	const HashKey *key = (const HashKey *)_key;
++	HashKey key_storage;
++	uint32 hash;
++
++	if (_udpEndpoint) {
++		const UdpEndpoint *udpEndpoint = (const UdpEndpoint *)_udpEndpoint;
++		key_storage = HashKey(udpEndpoint-&gt;DomainSupport()-&gt;AddressModule(),
++			(const sockaddr *)&amp;udpEndpoint-&gt;socket-&gt;address,
++			(const sockaddr *)&amp;udpEndpoint-&gt;socket-&gt;peer);
++		key = &amp;key_storage;
++	}
++
++	hash = key-&gt;address_module-&gt;hash_address_pair(key-&gt;local, key-&gt;peer);
++
++	// move the bits into the relevant range (as defined by kNumHashBuckets):
++	hash = (hash &amp; 0x000007FF) ^ (hash &amp; 0x003FF800) &gt;&gt; 11
++			^ (hash &amp; 0xFFC00000UL) &gt;&gt; 22;
++
++	return hash % range;
++}
++
++
++// #pragma mark -
++
++
++UdpEndpointManager::UdpEndpointManager()
++{
++	fStatus = benaphore_init(&amp;fLock, &quot;UDP endpoints&quot;);
++}
++
++
++UdpEndpointManager::~UdpEndpointManager()
++{
++	benaphore_destroy(&amp;fLock);
++}
++
++
+ status_t
+-UdpEndpointManager::DemuxIncomingBuffer(net_buffer *buffer)
++UdpEndpointManager::InitCheck() const
+ {
+-	status_t status;
++	return fStatus;
++}
+ 
+-	if (buffer-&gt;flags &amp; MSG_BCAST)
+-		status = DemuxBroadcast(buffer);
+-	else if (buffer-&gt;flags &amp; MSG_MCAST)
+-		status = DemuxMulticast(buffer);
+-	else
+-		status = DemuxUnicast(buffer);
+ 
+-	return status;
++// #pragma mark - inbound
++
++
++status_t
++UdpEndpointManager::DemuxIncomingBuffer(net_domain *domain, net_buffer *buffer)
++{
++	UdpDomainSupport *domainSupport = _GetDomain(domain, false);
++	if (domainSupport == NULL) {
++		// we don't instantiate domain supports in the
++		// RX path as we are only interested in delivering
++		// data to existing sockets.
++		return B_BAD_VALUE;
++	}
++
++	return domainSupport-&gt;DemuxIncomingBuffer(buffer);
+ }
+ 
+ 
+ status_t
+ UdpEndpointManager::ReceiveData(net_buffer *buffer)
+ {
++	TRACE_EPM(&quot;ReceiveData(%p [%ld bytes])&quot;, buffer, buffer-&gt;size);
++
+ 	NetBufferHeaderReader&lt;udp_header&gt; bufferHeader(buffer);
+ 	if (bufferHeader.Status() &lt; B_OK)
+ 		return bufferHeader.Status();
+@@ -453,44 +579,40 @@
+ 	struct sockaddr *source = (struct sockaddr *)&amp;buffer-&gt;source;
+ 	struct sockaddr *destination = (struct sockaddr *)&amp;buffer-&gt;destination;
+ 
+-	BenaphoreLocker locker(sUdpEndpointManager-&gt;Locker());
+-	if (!sDomain) {
+-		// domain and address module are not known yet, we copy them from
+-		// the buffer's interface (if any):
+-		if (buffer-&gt;interface == NULL || buffer-&gt;interface-&gt;domain == NULL)
+-			sDomain = sStackModule-&gt;get_domain(AF_INET);
+-		else
+-			sDomain = buffer-&gt;interface-&gt;domain;
+-		if (sDomain == NULL) {
+-			// this shouldn't occur, of course, but who knows...
+-			return B_BAD_VALUE;
+-		}
+-		sAddressModule = sDomain-&gt;address_module;
++	if (buffer-&gt;interface == NULL || buffer-&gt;interface-&gt;domain == NULL) {
++		TRACE_EPM(&quot;  ReceiveData(): UDP packed dropped as there was no domain &quot;
++			&quot;specified (interface %p).&quot;, buffer-&gt;interface);
++		return B_BAD_VALUE;
+ 	}
+-	sAddressModule-&gt;set_port(source, header.source_port);
+-	sAddressModule-&gt;set_port(destination, header.destination_port);
+-	TRACE((&quot;UDP received data from source %s for destination %s\n&quot;,
+-		AddressString(sDomain, source, true).Data(),
+-		AddressString(sDomain, destination, true).Data()));
+ 
++	net_domain *domain = buffer-&gt;interface-&gt;domain;
++	net_address_module_info *addressModule = domain-&gt;address_module;
++
++	BenaphoreLocker _(fLock);
++
++	addressModule-&gt;set_port(source, header.source_port);
++	addressModule-&gt;set_port(destination, header.destination_port);
++
++	TRACE_EPM(&quot;  ReceiveData(): data from %s to %s&quot;,
++		AddressString(domain, source, true).Data(),
++		AddressString(domain, destination, true).Data());
++
+ 	uint16 udpLength = ntohs(header.udp_length);
+ 	if (udpLength &gt; buffer-&gt;size) {
+-		TRACE((&quot;buffer %p is too short (%lu instead of %u), we drop it!\n&quot;, 
+-			buffer, buffer-&gt;size, udpLength));
++		TRACE_EPM(&quot;  ReceiveData(): buffer is too short, expected %hu.&quot;,
++			udpLength);
+ 		return B_MISMATCHED_VALUES;
+ 	}
+-	if (buffer-&gt;size &gt; udpLength) {
+-		TRACE((&quot;buffer %p is too long (%lu instead of %u), trimming it.\n&quot;, 
+-			buffer, buffer-&gt;size, udpLength));
++
++	if (buffer-&gt;size &gt; udpLength)
+ 		gBufferModule-&gt;trim(buffer, udpLength);
+-	}
+ 
+ 	if (header.udp_checksum != 0) {
+ 		// check UDP-checksum (simulating a so-called &quot;pseudo-header&quot;):
+ 		Checksum udpChecksum;
+-		sAddressModule-&gt;checksum_address(&amp;udpChecksum, source);
+-		sAddressModule-&gt;checksum_address(&amp;udpChecksum, destination);
+-		udpChecksum 
++		addressModule-&gt;checksum_address(&amp;udpChecksum, source);
++		addressModule-&gt;checksum_address(&amp;udpChecksum, destination);
++		udpChecksum
+ 			&lt;&lt; (uint16)htons(IPPROTO_UDP)
+ 			&lt;&lt; header.udp_length
+ 					// peculiar but correct: UDP-len is used twice for checksum
+@@ -498,7 +620,7 @@
+ 			&lt;&lt; Checksum::BufferHelper(buffer, gBufferModule);
+ 		uint16 sum = udpChecksum;
+ 		if (sum != 0) {
+-			TRACE((&quot;buffer %p has bad checksum (%u), we drop it!\n&quot;, buffer, sum));
++			TRACE_EPM(&quot;  ReceiveData(): bad checksum 0x%hx.&quot;, sum);
+ 			return B_BAD_VALUE;
+ 		}
+ 	}
+@@ -506,9 +628,9 @@
+ 	bufferHeader.Remove();
+ 		// remove UDP-header from buffer before passing it on
+ 
+-	status_t status = DemuxIncomingBuffer(buffer);
++	status_t status = DemuxIncomingBuffer(domain, buffer);
+ 	if (status &lt; B_OK) {
+-		TRACE((&quot;no matching endpoint found for buffer %p, we drop it!&quot;, buffer));
++		TRACE_EPM(&quot;  ReceiveData(): no endpoint.&quot;);
+ 		// TODO: send ICMP-error
+ 		return B_ERROR;
+ 	}
+@@ -517,105 +639,66 @@
+ }
+ 
+ 
+-// #pragma mark - activation
++UdpDomainSupport *
++UdpEndpointManager::OpenEndpoint(UdpEndpoint *endpoint)
++{
++	BenaphoreLocker _(fLock);
+ 
++	UdpDomainSupport *domain = _GetDomain(endpoint-&gt;Domain(), true);
++	if (domain)
++		domain-&gt;Ref();
++	return domain;
++}
+ 
++
+ status_t
+-UdpEndpointManager::CheckBindRequest(sockaddr *address, int socketOptions)
+-{		// sUdpEndpointManager-&gt;Locker() must be locked!
+-	status_t status = B_OK;
+-	UdpEndpoint *otherEndpoint;
+-	sockaddr *otherAddr;
+-	struct hash_iterator endpointIterator;
++UdpEndpointManager::FreeEndpoint(UdpDomainSupport *domain)
++{
++	BenaphoreLocker _(fLock);
+ 
+-	// Iterate over all active UDP-endpoints and check if the requested bind
+-	// is allowed (see figure 22.24 in [Stevens - TCP2, p735]):
+-	hash_open(fActiveEndpoints, &amp;endpointIterator);
+-	TRACE((&quot;UdpEndpointManager::CheckBindRequest() for %s...\n&quot;,
+-		AddressString(sDomain, address, true).Data()));
+-	while(1) {
+-		otherEndpoint = (UdpEndpoint *)hash_next(fActiveEndpoints, &amp;endpointIterator);
+-		if (!otherEndpoint)
+-			break;
+-		otherAddr = (sockaddr *)&amp;otherEndpoint-&gt;socket-&gt;address;
+-		TRACE((&quot;...checking endpoint %p (port=%u)...\n&quot;, otherEndpoint, 
+-			ntohs(sAddressModule-&gt;get_port(otherAddr))));
+-		if (sAddressModule-&gt;equal_ports(otherAddr, address)) {
+-			// port is already bound, SO_REUSEADDR or SO_REUSEPORT is required:
+-			if (otherEndpoint-&gt;socket-&gt;options &amp; (SO_REUSEADDR | SO_REUSEPORT) == 0
+-				|| socketOptions &amp; (SO_REUSEADDR | SO_REUSEPORT) == 0) {
+-				status = EADDRINUSE;
+-				break;
+-			}
+-			// if both addresses are the same, SO_REUSEPORT is required:
+-			if (sAddressModule-&gt;equal_addresses(otherAddr, address)
+-				&amp;&amp; (otherEndpoint-&gt;socket-&gt;options &amp; SO_REUSEPORT == 0
+-					|| socketOptions &amp; SO_REUSEPORT == 0)) {
+-				status = EADDRINUSE;
+-				break;
+-			}
+-		}
++	domain-&gt;Put();
++
++	if (domain-&gt;IsEmpty()) {
++		fDomains.Remove(domain);
++		delete domain;
+ 	}
+-	hash_close(fActiveEndpoints, &amp;endpointIterator, false);
+ 
+-	TRACE((&quot;UdpEndpointManager::CheckBindRequest done (status=%lx)\n&quot;, status));
+-	return status;
++	return B_OK;
+ }
+ 
+ 
+-status_t
+-UdpEndpointManager::ActivateEndpoint(UdpEndpoint *endpoint)
+-{		// sUdpEndpointManager-&gt;Locker() must be locked!
+-	TRACE((&quot;UDP-endpoint(%s) is activated\n&quot;, 
+-		AddressString(sDomain, (sockaddr *)&amp;endpoint-&gt;socket-&gt;address, true).Data()));
+-	return hash_insert(fActiveEndpoints, endpoint);
+-}
++// #pragma mark -
+ 
+ 
+-status_t
+-UdpEndpointManager::DeactivateEndpoint(UdpEndpoint *endpoint)
+-{		// sUdpEndpointManager-&gt;Locker() must be locked!
+-	TRACE((&quot;UDP-endpoint(%s) is deactivated\n&quot;, 
+-		AddressString(sDomain, (sockaddr *)&amp;endpoint-&gt;socket-&gt;address, true).Data()));
+-	return hash_remove(fActiveEndpoints, endpoint);
+-}
++UdpDomainSupport *
++UdpEndpointManager::_GetDomain(net_domain *domain, bool create)
++{
++	UdpDomainList::Iterator it = fDomains.GetIterator();
+ 
+-
+-status_t
+-UdpEndpointManager::OpenEndpoint(UdpEndpoint *endpoint)
+-{		// sUdpEndpointManager-&gt;Locker() must be locked!
+-	if (fEndpointCount++ == 0) {
+-		sDomain = sStackModule-&gt;get_domain(AF_INET);
+-		sAddressModule = sDomain-&gt;address_module;
+-		TRACE((&quot;udp: setting domain-pointer to %p.\n&quot;, sDomain));
++	// TODO convert this into a Hashtable or install per-domain
++	//      receiver handlers that forward the requests to the
++	//      appropriate DemuxIncomingBuffer(). For instance, while
++	//      being constructed UdpDomainSupport could call
++	//      register_domain_receiving_protocol() with the right
++	//      family.
++	while (it.HasNext()) {
++		UdpDomainSupport *domainSupport = it.Next();
++		if (domainSupport-&gt;Domain() == domain)
++			return domainSupport;
+ 	}
+-	return B_OK;
+-}
+ 
++	if (!create)
++		return NULL;
+ 
+-status_t
+-UdpEndpointManager::CloseEndpoint(UdpEndpoint *endpoint)
+-{		// sUdpEndpointManager-&gt;Locker() must be locked!
+-	return B_OK;
+-}
+-
+-
+-status_t
+-UdpEndpointManager::FreeEndpoint(UdpEndpoint *endpoint)
+-{		// sUdpEndpointManager-&gt;Locker() must be locked!
+-	if (--fEndpointCount == 0) {
+-		TRACE((&quot;udp: clearing domain-pointer and address-module.\n&quot;));
+-		sDomain = NULL;
+-		sAddressModule = NULL;
++	UdpDomainSupport *domainSupport =
++		new (std::nothrow) UdpDomainSupport(domain);
++	if (domainSupport == NULL || domainSupport-&gt;InitCheck() &lt; B_OK) {
++		delete domainSupport;
++		return NULL;
+ 	}
+-	return B_OK;
+-}
+ 
+-
+
+[... truncated: 470 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001553.html">[Haiku-commits] r20660 - in haiku/trunk: headers/private/net	src/add-ons/kernel/network/protocols/icmp	src/add-ons/kernel/network/protocols/ipv4	src/add-ons/kernel/network/protocols/tcp	src/add-ons/kernel/network/protocols/udp	src/add-ons/kernel/network/stack
+</A></li>
+	<LI>Next message: <A HREF="001557.html">[Haiku-commits] r20662 - haiku/trunk/src/servers/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1556">[ date ]</a>
+              <a href="thread.html#1556">[ thread ]</a>
+              <a href="subject.html#1556">[ subject ]</a>
+              <a href="author.html#1556">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

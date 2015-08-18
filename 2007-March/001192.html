@@ -1,0 +1,176 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20413 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20413%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200703232119.l2NLJ5oF001731%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001191.html">
+   <LINK REL="Next"  HREF="001202.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20413 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20413%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200703232119.l2NLJ5oF001731%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20413 - haiku/trunk/src/system/kernel/fs">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Mar 23 22:19:05 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001191.html">[Haiku-commits] r20412 - haiku/trunk/src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="001202.html">[Haiku-commits] r20413 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1192">[ date ]</a>
+              <a href="thread.html#1192">[ thread ]</a>
+              <a href="subject.html#1192">[ subject ]</a>
+              <a href="author.html#1192">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-03-23 22:19:02 +0100 (Fri, 23 Mar 2007)
+New Revision: 20413
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20413&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20413&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/vfs.cpp
+Log:
+* The close-on-exit bitmap vfs_new_io_context() created was a byte
+  short, if the FD table size wasn't a multiple of 8.
+* vfs_resize_fd_table() didn't seem to know at all about the
+  close-on-exit bitmap. The pointer in the io_context would point to
+  free()d memory afterwards. This explains the sporadically closed
+  stdin/out/err descriptors in programs started from Tracker and
+  Deskbar.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/vfs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/vfs.cpp	2007-03-23 20:40:03 UTC (rev 20412)
++++ haiku/trunk/src/system/kernel/fs/vfs.cpp	2007-03-23 21:19:02 UTC (rev 20413)
+@@ -3244,14 +3244,14 @@
+ 
+ 	// allocate space for FDs and their close-on-exec flag
+ 	context-&gt;fds = (file_descriptor **)malloc(sizeof(struct file_descriptor *) * tableSize
+-		+ tableSize / 8);
++		+ (tableSize + 7) / 8);
+ 	if (context-&gt;fds == NULL) {
+ 		free(context);
+ 		return NULL;
+ 	}
+ 
+ 	memset(context-&gt;fds, 0, sizeof(struct file_descriptor *) * tableSize
+-		+ tableSize / 8);
++		+ (tableSize + 7) / 8);
+ 	context-&gt;fds_close_on_exec = (uint8 *)(context-&gt;fds + tableSize);
+ 
+ 	if (mutex_init(&amp;context-&gt;io_mutex, &quot;I/O context&quot;) &lt; 0) {
+@@ -3330,7 +3330,7 @@
+ static status_t
+ vfs_resize_fd_table(struct io_context *context, const int newSize)
+ {
+-	void *fds;
++	struct file_descriptor **fds;
+ 	int	status = B_OK;
+ 
+ 	if (newSize &lt;= 0 || newSize &gt; MAX_FD_TABLE_SIZE)
+@@ -3338,42 +3338,57 @@
+ 
+ 	mutex_lock(&amp;context-&gt;io_mutex);
+ 
+-	if ((size_t)newSize &lt; context-&gt;table_size) {
++	int oldSize = context-&gt;table_size;
++	int oldCloseOnExitBitmapSize = (oldSize + 7) / 8;
++	int newCloseOnExitBitmapSize = (newSize + 7) / 8;
++
++	if (newSize &lt; oldSize) {
+ 		// shrink the fd table
+-		int i;
+ 
+ 		// Make sure none of the fds being dropped are in use
+-		for(i = context-&gt;table_size; i-- &gt; newSize;) {
++		for (int i = oldSize; i-- &gt; newSize;) {
+ 			if (context-&gt;fds[i]) {
+ 				status = EBUSY;
+ 				goto out;
+ 			}
+ 		}
+ 
+-		fds = malloc(sizeof(struct file_descriptor *) * newSize);
++		fds = (struct file_descriptor **)malloc(
++			sizeof(struct file_descriptor *) * newSize
++			+ newCloseOnExitBitmapSize);
+ 		if (fds == NULL) {
+ 			status = ENOMEM;
+ 			goto out;
+ 		}
+ 
+ 		memcpy(fds, context-&gt;fds, sizeof(struct file_descriptor *) * newSize);
++
++		// copy close-on-exit bitmap
++		memcpy(fds + newSize, context-&gt;fds + oldSize, newCloseOnExitBitmapSize);
+ 	} else {
+ 		// enlarge the fd table
+ 
+-		fds = malloc(sizeof(struct file_descriptor *) * newSize);
++		fds = (struct file_descriptor **)malloc(
++			sizeof(struct file_descriptor *) * newSize
++			+ newCloseOnExitBitmapSize);
+ 		if (fds == NULL) {
+ 			status = ENOMEM;
+ 			goto out;
+ 		}
+ 
+ 		// copy the fd array, and zero the additional slots
+-		memcpy(fds, context-&gt;fds, sizeof(void *) * context-&gt;table_size);
+-		memset((char *)fds + (sizeof(void *) * context-&gt;table_size), 0,
+-			sizeof(void *) * (newSize - context-&gt;table_size));
++		memcpy(fds, context-&gt;fds, sizeof(void *) * oldSize);
++		memset(fds + oldSize, 0, sizeof(void *) * (newSize - oldSize));
++
++		// copy close-on-exit bitmap, and zero out additional bytes
++		memcpy(fds + newSize, context-&gt;fds + oldSize, oldCloseOnExitBitmapSize);
++		memset((uint8*)(fds + newSize) + oldCloseOnExitBitmapSize, 0,
++			newCloseOnExitBitmapSize - oldCloseOnExitBitmapSize);
+ 	}
+ 
+ 	free(context-&gt;fds);
+-	context-&gt;fds = (file_descriptor **)fds;
++	context-&gt;fds = fds;
++	context-&gt;fds_close_on_exec = (uint8 *)(context-&gt;fds + newSize);
+ 	context-&gt;table_size = newSize;
+ 
+ out:
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001191.html">[Haiku-commits] r20412 - haiku/trunk/src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="001202.html">[Haiku-commits] r20413 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1192">[ date ]</a>
+              <a href="thread.html#1192">[ thread ]</a>
+              <a href="subject.html#1192">[ subject ]</a>
+              <a href="author.html#1192">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,862 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21822 - in haiku/trunk/src/servers/app: . drawing	drawing/Painter
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21822%20-%20in%20haiku/trunk/src/servers/app%3A%20.%20drawing%0A%09drawing/Painter&In-Reply-To=%3C200708041137.l74BbHtl001700%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003365.html">
+   <LINK REL="Next"  HREF="003372.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21822 - in haiku/trunk/src/servers/app: . drawing	drawing/Painter</H1>
+    <B>stippi at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21822%20-%20in%20haiku/trunk/src/servers/app%3A%20.%20drawing%0A%09drawing/Painter&In-Reply-To=%3C200708041137.l74BbHtl001700%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21822 - in haiku/trunk/src/servers/app: . drawing	drawing/Painter">stippi at mail.berlios.de
+       </A><BR>
+    <I>Sat Aug  4 13:37:17 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003365.html">[Haiku-commits] r21821 - in haiku/trunk: headers/private/app	src/kits/interface src/servers/app
+</A></li>
+        <LI>Next message: <A HREF="003372.html">[Haiku-commits] r21822 - in haiku/trunk/src/servers/app: . drawing drawing/Painter
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3366">[ date ]</a>
+              <a href="thread.html#3366">[ thread ]</a>
+              <a href="subject.html#3366">[ subject ]</a>
+              <a href="author.html#3366">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2007-08-04 13:37:16 +0200 (Sat, 04 Aug 2007)
+New Revision: 21822
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21822&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21822&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/FontCache.cpp
+   haiku/trunk/src/servers/app/FontCacheEntry.cpp
+   haiku/trunk/src/servers/app/GlyphLayoutEngine.h
+   haiku/trunk/src/servers/app/ProfileMessageSupport.cpp
+   haiku/trunk/src/servers/app/drawing/DrawingEngine.cpp
+   haiku/trunk/src/servers/app/drawing/Painter/AGGTextRenderer.cpp
+   haiku/trunk/src/servers/app/drawing/Painter/AGGTextRenderer.h
+   haiku/trunk/src/servers/app/drawing/Painter/Painter.cpp
+   haiku/trunk/src/servers/app/drawing/Painter/Painter.h
+Log:
+* after my last changes to font rendering, it was about 15% slower than
+  before (although there should be much less lock contention)
+* with this change, there is quite a bit of cleanup, text drawing is now
+  about 20% faster than before the original changes to font caching,
+  mostly due to turning off the kerning feature, which at the moment
+  gives absolutely no benefit. The correct way of doing it might be to
+  use kerning depending on the provided glyph spacing mode
+* removed fPenLocation from Painter, the usage should be more correct now,
+  since it is now consistently applied before the coordinate transformation
+  from view to screen (also for DrawShape() now, before any view scaling
+  and origin offset)
+* Painter no longer has it's own instance of a ServerFont, instead it uses
+  its AGGTextRenderer instance, which was per Painter again after the
+  last change, and not global anymore, made _UpdateFont() useless
+* When using GlyphLayoutEngine, it supports a second pass with the same
+  FontCacheEntry through the introduction of a FontCacheReference. This
+  speeds up DrawString a little, since it needs to calculate the bounding
+  box for the string, and then draw the string in a second pass. This is
+  now done with only one FontCacheEntry lookup
+* I also tried to optimize the on-the-fly conversion of UTF8-&gt;CharCode away,
+  since it was done four times per DrawString, but surprisingly, it proofed
+  to be a slight slowdown.
+* introduced a shortcut in DrawingEngine::DrawString() which avoids
+  calculating the bounding box, we are now a tiny bit faster to figure
+  out that we don't need to draw any string than Dano
+
+In the test environment (drawing to offscreen bitmap and blitting to
+screen eventually), text rendering is now about 3.7 times _faster_ than Dano
+text rendering (directly to screen), for untransformed text. Unfortunately
+I cannot test on the same machine in accelerant using version of the test
+environment.
+
+
+Modified: haiku/trunk/src/servers/app/FontCache.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/FontCache.cpp	2007-08-04 11:22:47 UTC (rev 21821)
++++ haiku/trunk/src/servers/app/FontCache.cpp	2007-08-04 11:37:16 UTC (rev 21822)
+@@ -48,7 +48,7 @@
+ 	return &sDefaultInstance;
+ }
+ 
+-// SetFont
++// FontCacheEntryFor
+ FontCacheEntry*
+ FontCache::FontCacheEntryFor(const ServerFont&amp; font)
+ {
+@@ -62,6 +62,7 @@
+ 	if (entry) {
+ 		// the entry was already there
+ 		entry-&gt;AddReference();
++//printf(&quot;FontCacheEntryFor(%ld): %p\n&quot;, font.GetFamilyAndStyle(), entry);
+ 		return entry;
+ 	}
+ 
+@@ -91,6 +92,7 @@
+ 			return NULL;
+ 		}
+ 	}
++//printf(&quot;FontCacheEntryFor(%ld): %p (insert)\n&quot;, font.GetFamilyAndStyle(), entry);
+ 
+ 	entry-&gt;AddReference();
+ 	return entry;
+@@ -100,6 +102,7 @@
+ void
+ FontCache::Recycle(FontCacheEntry* entry)
+ {
++//printf(&quot;Recycle(%p)\n&quot;, entry);
+ 	entry-&gt;UpdateUsage();
+ 	entry-&gt;RemoveReference();
+ }
+
+Modified: haiku/trunk/src/servers/app/FontCacheEntry.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/FontCacheEntry.cpp	2007-08-04 11:22:47 UTC (rev 21821)
++++ haiku/trunk/src/servers/app/FontCacheEntry.cpp	2007-08-04 11:37:16 UTC (rev 21822)
+@@ -212,8 +212,11 @@
+ FontCacheEntry::GenerateSignature(char* signature, const ServerFont&amp; font)
+ {
+ 	glyph_rendering renderingType = glyph_ren_native_gray8;
+-	if (font.Rotation() != 0.0 || font.Shear() != 90.0)
++	if (font.Rotation() != 0.0 || font.Shear() != 90.0
++		|| font.Flags() &amp; B_DISABLE_ANTIALIASING
++		|| font.Size() &gt; 30) {
+ 		renderingType = glyph_ren_outline;
++	}
+ 
+ 	// TODO: read more of these from the font
+ 	FT_Encoding charMap = FT_ENCODING_NONE;
+
+Modified: haiku/trunk/src/servers/app/GlyphLayoutEngine.h
+===================================================================
+--- haiku/trunk/src/servers/app/GlyphLayoutEngine.h	2007-08-04 11:22:47 UTC (rev 21821)
++++ haiku/trunk/src/servers/app/GlyphLayoutEngine.h	2007-08-04 11:37:16 UTC (rev 21822)
+@@ -16,6 +16,42 @@
+ #include &quot;ServerFont.h&quot;
+ 
+ 
++class FontCacheReference {
++ public:
++								FontCacheReference()
++									: fCacheEntry(NULL)
++									, fWriteLocked(false)
++								{
++								}
++								~FontCacheReference()
++								{
++									if (fCacheEntry) {
++										if (fWriteLocked)
++											fCacheEntry-&gt;WriteUnlock();
++										else
++											fCacheEntry-&gt;ReadUnlock();
++									
++										FontCache::Default()-&gt;Recycle(
++											fCacheEntry);
++									}
++								}
++			void				SetTo(FontCacheEntry* entry,
++									bool writeLocked)
++								{
++									fCacheEntry = entry;
++									fWriteLocked = writeLocked;
++								}
++	inline	FontCacheEntry*		Entry() const
++									{ return fCacheEntry; }
++	inline	bool				WriteLocked() const
++									{ return fWriteLocked; }
++
++ private:
++			FontCacheEntry*		fCacheEntry;
++			bool				fWriteLocked;
++};
++
++
+ class GlyphLayoutEngine {
+  public:
+ 
+@@ -26,7 +62,8 @@
+ 									int32 length,
+ 									const escapement_delta* delta = NULL,
+ 									bool kerning = true,
+-									uint8 spacing = B_BITMAP_SPACING);
++									uint8 spacing = B_BITMAP_SPACING,
++									FontCacheReference* cacheReference = NULL);
+ 
+ 	static	bool				IsWhiteSpace(uint32 glyphCode);
+ 
+@@ -62,27 +99,37 @@
+ GlyphLayoutEngine::LayoutGlyphs(GlyphConsumer&amp; consumer,
+ 	const ServerFont&amp; font,
+ 	const char* utf8String, int32 length,
+-	const escapement_delta* delta, bool kerning, uint8 spacing)
++	const escapement_delta* delta, bool kerning, uint8 spacing,
++	FontCacheReference* cacheReference)
+ {
+ 	// TODO: implement spacing modes
+-	FontCache* cache = FontCache::Default();
+-	FontCacheEntry* entry = cache-&gt;FontCacheEntryFor(font);
+ 
+-	if (!entry || !entry-&gt;ReadLock()) {
+-		cache-&gt;Recycle(entry);
+-		return false;
++	FontCacheEntry* entry = NULL;
++	bool needsWriteLock = false;
++	if (cacheReference) {
++		entry = cacheReference-&gt;Entry();
++		needsWriteLock = cacheReference-&gt;WriteLocked();
+ 	}
+ 
+-	bool needsWriteLock
+-		= !entry-&gt;HasGlyphs(utf8String, length);
+-
+-	if (needsWriteLock) {
+-		entry-&gt;ReadUnlock();
+-		if (!entry-&gt;WriteLock()) {
++	if (!entry) {
++		FontCache* cache = FontCache::Default();
++		entry = cache-&gt;FontCacheEntryFor(font);
++	
++		if (!entry || !entry-&gt;ReadLock()) {
+ 			cache-&gt;Recycle(entry);
+ 			return false;
+ 		}
+-	}
++	
++		needsWriteLock = !entry-&gt;HasGlyphs(utf8String, length);
++	
++		if (needsWriteLock) {
++			entry-&gt;ReadUnlock();
++			if (!entry-&gt;WriteLock()) {
++				cache-&gt;Recycle(entry);
++				return false;
++			}
++		}
++	} // else the entry was already used and is still locked
+ 
+ 	consumer.Start();
+ 
+@@ -107,8 +154,8 @@
+ 			continue;
+ 		}
+ 
+-		if (kerning)
+-			entry-&gt;GetKerning(lastCharCode, charCode, &amp;advanceX, &amp;advanceY);
++//		if (kerning)
++//			entry-&gt;GetKerning(lastCharCode, charCode, &amp;advanceX, &amp;advanceY);
+ 
+ 		x += advanceX;
+ 		y += advanceY;
+@@ -133,12 +180,18 @@
+ 	y += advanceY;
+ 	consumer.Finish(x, y);
+ 
+-	if (needsWriteLock)
+-		entry-&gt;WriteUnlock();
+-	else
+-		entry-&gt;ReadUnlock();
+-
+-	cache-&gt;Recycle(entry);
++	if (!cacheReference) {
++		if (needsWriteLock)
++			entry-&gt;WriteUnlock();
++		else
++			entry-&gt;ReadUnlock();
++	
++		FontCache::Default()-&gt;Recycle(entry);
++	} else {
++		// the reference will take care of locking
++		if (!cacheReference-&gt;Entry())
++			cacheReference-&gt;SetTo(entry, needsWriteLock);
++	}
+ 	return true;
+ }
+ 
+
+Modified: haiku/trunk/src/servers/app/ProfileMessageSupport.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/ProfileMessageSupport.cpp	2007-08-04 11:22:47 UTC (rev 21821)
++++ haiku/trunk/src/servers/app/ProfileMessageSupport.cpp	2007-08-04 11:37:16 UTC (rev 21822)
+@@ -201,6 +201,7 @@
+ 		case AS_FILL_TRIANGLE: string = &quot;AS_FILL_TRIANGLE&quot;; break;
+ 
+ 		case AS_DRAW_STRING: string = &quot;AS_DRAW_STRING&quot;; break;
++		case AS_DRAW_STRING_WITH_DELTA: string = &quot;AS_DRAW_STRING_WITH_DELTA&quot;; break;
+ 
+ 		case AS_SYNC: string = &quot;AS_SYNC&quot;; break;
+ 
+
+Modified: haiku/trunk/src/servers/app/drawing/DrawingEngine.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/DrawingEngine.cpp	2007-08-04 11:22:47 UTC (rev 21821)
++++ haiku/trunk/src/servers/app/drawing/DrawingEngine.cpp	2007-08-04 11:37:16 UTC (rev 21822)
+@@ -185,7 +185,7 @@
+ void
+ DrawingEngine::SetDrawState(const DrawState* state, int32 xOffset, int32 yOffset)
+ {
+-	fPainter-&gt;SetDrawState(state, true, xOffset, yOffset);	
++	fPainter-&gt;SetDrawState(state, xOffset, yOffset);	
+ }
+ 
+ 
+@@ -665,18 +665,12 @@
+ 	bool cursorTouched = fGraphicsCard-&gt;HideSoftwareCursor(touched);
+ 
+ 	if (!fPainter-&gt;StraightLine(start, end, color.GetColor32())) {
+-		// TODO: all this is quite expensive, but it is currently
+-		// used only for the &quot;gradient&quot; decorator tab buttons
+-		rgb_color previousColor = fPainter-&gt;HighColor();
+-		drawing_mode previousMode = fPainter-&gt;DrawingMode();
+ 		fPainter-&gt;SetHighColor(color);
+ 		fPainter-&gt;SetDrawingMode(B_OP_OVER);
+ 		fPainter-&gt;StrokeLine(start, end);
+-		fPainter-&gt;SetHighColor(previousColor);
+-		fPainter-&gt;SetDrawingMode(previousMode);
+-	} else {
+-		fGraphicsCard-&gt;Invalidate(touched);
+ 	}
++
++	fGraphicsCard-&gt;Invalidate(touched);
+ 	if (cursorTouched)
+ 		fGraphicsCard-&gt;ShowSoftwareCursor();
+ }
+@@ -742,17 +736,12 @@
+ 	BRect frame = r.Frame();
+ 	bool cursorTouched = fGraphicsCard-&gt;HideSoftwareCursor(frame);
+ 
+-	bool doInSoftware = true;
+ 	// try hardware optimized version first
+ 	if ((fAvailableHWAccleration &amp; HW_ACC_FILL_REGION) != 0
+ 		&amp;&amp; frame.Width() * frame.Height() &gt; 100) {
+ 		fGraphicsCard-&gt;FillRegion(r, color, fSuspendSyncLevel == 0
+ 											|| cursorTouched);
+-		doInSoftware = false;
+-	}
+-
+-	if (doInSoftware) {
+-
++	} else {
+ 		int32 count = r.CountRects();
+ 		for (int32 i = 0; i &lt; count; i++) {
+ 			fPainter-&gt;FillRectNoClipping(r.RectAt(i), color.GetColor32());
+@@ -1037,6 +1026,19 @@
+ 
+ 	BPoint penLocation = pt;
+ 
++	// try a fast clipping path
++	float fontSize = fPainter-&gt;Font().Size();
++	BRect clippingFrame = fPainter-&gt;ClippingRegion()-&gt;Frame();
++	if (pt.x &gt; clippingFrame.right || pt.y + fontSize &lt; clippingFrame.top
++		|| pt.y - fontSize &gt; clippingFrame.bottom) {
++		penLocation.x += StringWidth(string, length, delta);
++		return penLocation;
++	}
++
++	// use a FontCacheRefernece to speed up the second pass of
++	// drawing the string
++	FontCacheReference cacheReference;
++
+ //bigtime_t now = system_time();
+ // TODO: BoundingBox is quite slow!! Optimizing it will be beneficial.
+ // Cursiously, the DrawString after it is actually faster!?!
+@@ -1045,7 +1047,8 @@
+ // in case we don't have one.
+ // TODO: Watch out about penLocation and use Painter::PenLocation() when
+ // not using BoundindBox anymore.
+-	BRect b = fPainter-&gt;BoundingBox(string, length, pt, &amp;penLocation, delta);
++	BRect b = fPainter-&gt;BoundingBox(string, length, pt, &amp;penLocation, delta,
++		&amp;cacheReference);
+ 	// stop here if we're supposed to render outside of the clipping
+ 	b = fPainter-&gt;ClipRect(b);
+ 	if (b.IsValid()) {
+@@ -1053,7 +1056,8 @@
+ 		bool cursorTouched = fGraphicsCard-&gt;HideSoftwareCursor(b);
+ 
+ //now = system_time();
+-		BRect touched = fPainter-&gt;DrawString(string, length, pt, delta);
++		BRect touched = fPainter-&gt;DrawString(string, length, pt, delta,
++			&amp;cacheReference);
+ //printf(&quot;drawing string: %lld &#181;s\n&quot;, system_time() - now);
+ 
+ 		fGraphicsCard-&gt;Invalidate(touched);
+
+Modified: haiku/trunk/src/servers/app/drawing/Painter/AGGTextRenderer.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/Painter/AGGTextRenderer.cpp	2007-08-04 11:22:47 UTC (rev 21821)
++++ haiku/trunk/src/servers/app/drawing/Painter/AGGTextRenderer.cpp	2007-08-04 11:37:16 UTC (rev 21822)
+@@ -29,7 +29,8 @@
+ 
+ 
+ // constructor
+-AGGTextRenderer::AGGTextRenderer()
++AGGTextRenderer::AGGTextRenderer(renderer_type&amp; solidRenderer,
++		renderer_bin_type&amp; binRenderer, scanline_unpacked_type&amp; scanline)
+ 	: fPathAdaptor()
+ 	, fGray8Adaptor()
+ 	, fGray8Scanline()
+@@ -39,6 +40,11 @@
+ 	, fCurves(fPathAdaptor)
+ 	, fContour(fCurves)
+ 
++	, fSolidRenderer(solidRenderer)
++	, fBinRenderer(binRenderer)
++	, fScanline(scanline)
++	, fRasterizer()
++
+ 	, fHinted(true)
+ 	, fAntialias(true)
+ 	, fKerning(true)
+@@ -101,9 +107,6 @@
+ class AGGTextRenderer::StringRenderer {
+  public:
+ 	StringRenderer(const IntRect&amp; clippingFrame, bool dryRun,
+-			renderer_type&amp; solidRenderer,
+-			renderer_bin_type&amp; binRenderer,
+-			scanline_unpacked_type&amp; scanline,
+ 			FontCacheEntry::TransformedOutline&amp; transformedGlyph,
+ 			FontCacheEntry::TransformedContourOutline&amp; transformedContour,
+ 			const Transformable&amp; transform,
+@@ -119,10 +122,6 @@
+ 		, fNextCharPos(nextCharPos)
+ 		, fVector(false)
+ 
+-		, fSolidRenderer(solidRenderer)
+-		, fBinRenderer(binRenderer)
+-		, fScanline(scanline)
+-
+ 		, fTransformedGlyph(transformedGlyph)
+ 		, fTransformedContour(transformedContour)
+ 
+@@ -137,8 +136,8 @@
+ 	void Finish(double x, double y)
+ 	{
+ 		if (fVector) {
+-			agg::render_scanlines(fRenderer.fRasterizer, fScanline,
+-				fSolidRenderer);
++			agg::render_scanlines(fRenderer.fRasterizer, fRenderer.fScanline,
++				fRenderer.fSolidRenderer);
+ 		}
+ 
+ 		if (fNextCharPos) {
+@@ -157,7 +156,8 @@
+ 	{
+ 		// &quot;glyphBounds&quot; is the bounds of the glyph transformed
+ 		// by the x y location of the glyph along the base line,
+-		// it is therefor yet &quot;untransformed&quot;.
++		// it is therefor yet &quot;untransformed&quot; in case there is an
++		// embedded transformation.
+ 		const agg::rect_i&amp; r = glyph-&gt;bounds;
+ 		IntRect glyphBounds(r.x1 + x, r.y1 + y - 1,
+ 			r.x2 + x + 1, r.y2 + y + 1);
+@@ -211,12 +211,12 @@
+ 				switch (glyph-&gt;data_type) {
+ 					case glyph_data_mono:
+ 						agg::render_scanlines(fRenderer.fMonoAdaptor, 
+-							fRenderer.fMonoScanline, fBinRenderer);
++							fRenderer.fMonoScanline, fRenderer.fBinRenderer);
+ 						break;
+ 
+ 					case glyph_data_gray8:
+ 						agg::render_scanlines(fRenderer.fGray8Adaptor, 
+-							fRenderer.fGray8Scanline, fSolidRenderer);
++							fRenderer.fGray8Scanline, fRenderer.fSolidRenderer);
+ 						break;
+ 
+ 					case glyph_data_outline: {
+@@ -262,9 +262,6 @@
+ 	BPoint*				fNextCharPos;
+ 	bool				fVector;
+ 
+-	renderer_type&amp;		fSolidRenderer;
+-	renderer_bin_type&amp;	fBinRenderer;
+-	scanline_unpacked_type&amp; fScanline;
+ 	FontCacheEntry::TransformedOutline&amp; fTransformedGlyph;
+ 	FontCacheEntry::TransformedContourOutline&amp; fTransformedContour;
+ 	AGGTextRenderer&amp;	fRenderer;
+@@ -274,14 +271,12 @@
+ BRect
+ AGGTextRenderer::RenderString(const char* string,
+ 							  uint32 length,
+-							  renderer_type* solidRenderer,
+-							  renderer_bin_type* binRenderer,
+-							  scanline_unpacked_type&amp; scanline,
+ 							  const BPoint&amp; baseLine,
+ 							  const BRect&amp; clippingFrame,
+ 							  bool dryRun,
+ 							  BPoint* nextCharPos,
+-							  const escapement_delta* delta)
++							  const escapement_delta* delta,
++							  FontCacheReference* cacheReference)
+ {
+ //printf(&quot;RenderString(\&quot;%s\&quot;, length: %ld, dry: %d)\n&quot;, string, length, dryRun);
+ 
+@@ -303,12 +298,11 @@
+ 	transform.Transform(&amp;transformOffset);
+ 
+ 	StringRenderer renderer(clippingFrame, dryRun,
+-		*solidRenderer, *binRenderer, scanline,
+ 		transformedOutline, transformedContourOutline,
+ 		transform, transformOffset, nextCharPos, *this);
+ 
+ 	GlyphLayoutEngine::LayoutGlyphs(renderer, fFont, string, length, delta,
+-		fKerning, B_BITMAP_SPACING);
++		fKerning, B_BITMAP_SPACING, cacheReference);
+ 
+ 	return transform.TransformBounds(renderer.Bounds());
+ }
+
+Modified: haiku/trunk/src/servers/app/drawing/Painter/AGGTextRenderer.h
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/Painter/AGGTextRenderer.h	2007-08-04 11:22:47 UTC (rev 21821)
++++ haiku/trunk/src/servers/app/drawing/Painter/AGGTextRenderer.h	2007-08-04 11:37:16 UTC (rev 21822)
+@@ -1,10 +1,11 @@
+ /*
+- * Copyright 2005-2006, Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;. All rights reserved.
++ * Copyright 2005-2007, Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;. All rights reserved.
+  * Distributed under the terms of the MIT License.
+  */
+ #ifndef AGG_TEXT_RENDERER_H
+ #define AGG_TEXT_RENDERER_H
+ 
++
+ #include &quot;defines.h&quot;
+ 
+ #include &quot;FontCacheEntry.h&quot;
+@@ -16,12 +17,18 @@
+ #include &lt;agg_scanline_u.h&gt;
+ 
+ 
++class FontCacheReference;
++
+ class AGGTextRenderer {
+  public:
+-								AGGTextRenderer();
++								AGGTextRenderer(renderer_type&amp; solidRenderer,
++									renderer_bin_type&amp; binRenderer,
++									scanline_unpacked_type&amp; scanline);
+ 	virtual						~AGGTextRenderer();
+ 
+ 			void				SetFont(const ServerFont &amp;font);
++	inline	const ServerFont&amp;	Font() const
++									{ return fFont; }
+ 
+ 			void				SetHinting(bool hinting);
+ 			bool				Hinting() const
+@@ -37,14 +44,12 @@
+ 
+ 			BRect				RenderString(const char* utf8String,
+ 											 uint32 length,
+-											 renderer_type* solidRenderer,
+-											 renderer_bin_type* binRenderer,
+-											 scanline_unpacked_type&amp; scanline,
+ 											 const BPoint&amp; baseLine,
+ 											 const BRect&amp; clippingFrame,
+-											 bool dryRun = false,
+-											 BPoint* nextCharPos = NULL,
+-											 const escapement_delta* delta = NULL);
++											 bool dryRun,
++											 BPoint* nextCharPos,
++											 const escapement_delta* delta,
++											 FontCacheReference* cacheReference);
+ 
+  private:
+ 
+@@ -61,6 +66,9 @@
+ 	FontCacheEntry::CurveConverter		fCurves;
+ 	FontCacheEntry::ContourConverter	fContour;
+ 
++	renderer_type&amp;				fSolidRenderer;
++	renderer_bin_type&amp;			fBinRenderer;
++	scanline_unpacked_type&amp;		fScanline;
+ 	rasterizer_type				fRasterizer;
+ 		// NOTE: the object has it's own rasterizer object
+ 		// since it might be using a different gamma setting
+
+Modified: haiku/trunk/src/servers/app/drawing/Painter/Painter.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/Painter/Painter.cpp	2007-08-04 11:22:47 UTC (rev 21821)
++++ haiku/trunk/src/servers/app/drawing/Painter/Painter.cpp	2007-08-04 11:37:16 UTC (rev 21822)
+@@ -72,13 +72,12 @@
+ 	  fDrawingText(false),
+ 	  fAlphaSrcMode(B_PIXEL_ALPHA),
+ 	  fAlphaFncMode(B_ALPHA_OVERLAY),
+-	  fPenLocation(0.0, 0.0),
+ 	  fLineCapMode(B_BUTT_CAP),
+ 	  fLineJoinMode(B_MITER_JOIN),
+ 	  fMiterLimit(B_DEFAULT_MITER_LIMIT),
+ 
+ 	  fPatternHandler(),
+-	  fTextRenderer()
++	  fTextRenderer(fRenderer, fRendererBin, fUnpackedScanline)
+ {
+ 	fPixelFormat.SetDrawingMode(fDrawingMode, fAlphaSrcMode, fAlphaFncMode, false);
+ 
+@@ -122,22 +121,19 @@
+ 
+ // SetDrawState
+ void
+-Painter::SetDrawState(const DrawState* data, bool updateFont,
+-					  int32 xOffset, int32 yOffset)
++Painter::SetDrawState(const DrawState* data, int32 xOffset, int32 yOffset)
+ {
+-	// NOTE: The custom clipping in &quot;data&quot; is ignored, because it has already been
+-	// taken into account elsewhere
++	// NOTE: The custom clipping in &quot;data&quot; is ignored, because it has already
++	// been taken into account elsewhere
+ 
+ 	// TODO: optimize &quot;context switch&quot; for speed...
+ 	// but for now...
+ 	SetPenSize(data-&gt;PenSize());
+-	SetPenLocation(data-&gt;PenLocation());
+ 
+-	if (updateFont)
+-		SetFont(data-&gt;Font());
++	SetFont(data-&gt;Font());
++	fTextRenderer.SetAntialiasing(!(data-&gt;ForceFontAliasing()
++		|| data-&gt;Font().Flags() &amp; B_DISABLE_ANTIALIASING));
+ 
+-	fTextRenderer.SetAntialiasing(!(data-&gt;ForceFontAliasing() || data-&gt;Font().Flags() &amp; B_DISABLE_ANTIALIASING));
+-
+ 	fSubpixelPrecise = data-&gt;SubPixelPrecise();
+ 
+ 	// any of these conditions means we need to use a different drawing
+@@ -259,18 +255,11 @@
+ 	}
+ }
+ 
+-// SetPenLocation
+-void
+-Painter::SetPenLocation(const BPoint&amp; location)
+-{
+-	fPenLocation = location;
+-}
+-
+ // SetFont
+ void
+ Painter::SetFont(const ServerFont&amp; font)
+ {
+-	fFont = font;
++	fTextRenderer.SetFont(font);
+ }
+ 
+ // #pragma mark - drawing
+@@ -524,14 +513,14 @@
+ 	for (int32 i = 0; i &lt; opCount; i++) {
+ 		uint32 op = opList[i] &amp; 0xFF000000;
+ 		if (op &amp; OP_MOVETO) {
+-			fPath.move_to(points-&gt;x + fPenLocation.x, points-&gt;y + fPenLocation.y);
++			fPath.move_to(points-&gt;x, points-&gt;y);
+ 			points++;
+ 		}
+ 
+ 		if (op &amp; OP_LINETO) {
+ 			int32 count = opList[i] &amp; 0x00FFFFFF;
+ 			while (count--) {
+-				fPath.line_to(points-&gt;x + fPenLocation.x, points-&gt;y + fPenLocation.y);
++				fPath.line_to(points-&gt;x, points-&gt;y);
+ 				points++;
+ 			}
+ 		}
+@@ -539,9 +528,9 @@
+ 		if (op &amp; OP_BEZIERTO) {
+ 			int32 count = opList[i] &amp; 0x00FFFFFF;
+ 			while (count) {
+-				fPath.curve4(points[0].x + fPenLocation.x, points[0].y + fPenLocation.y,
+-							 points[1].x + fPenLocation.x, points[1].y + fPenLocation.y,
+-							 points[2].x + fPenLocation.x, points[2].y + fPenLocation.y);
++				fPath.curve4(points[0].x, points[0].y,
++							 points[1].x, points[1].y,
++							 points[2].x, points[2].y);
+ 				points += 3;
+ 				count -= 3;
+ 			}
+@@ -972,7 +961,8 @@
+ // DrawString
+ BRect
+ Painter::DrawString(const char* utf8String, uint32 length,
+-					BPoint baseLine, const escapement_delta* delta)
++					BPoint baseLine, const escapement_delta* delta,
++					FontCacheReference* cacheReference)
+ {
+ 	CHECK_CLIPPING
+ 
+@@ -987,14 +977,10 @@
+ 	// make sure that the previous pattern is restored
+ 	pattern oldPattern = *fPatternHandler.GetR5Pattern();
+ 	SetPattern(B_SOLID_HIGH, true);
+-	// make sure the text renderer is using our font (the global
+-	// instance of the text renderer is used by everyone)
+-	_UpdateFont();
+ 
+ 	bounds = fTextRenderer.RenderString(utf8String, length,
+-		&amp;fRenderer, &amp;fRendererBin, fUnpackedScanline,
+-		baseLine, fClippingRegion-&gt;Frame(), false,
+-		&amp;fPenLocation,  delta);
++		baseLine, fClippingRegion-&gt;Frame(), false, NULL, delta,
++		cacheReference);
+ 
+ 	SetPattern(oldPattern);
+ 
+@@ -1005,21 +991,17 @@
+ BRect
+ Painter::BoundingBox(const char* utf8String, uint32 length,
+ 					 BPoint baseLine, BPoint* penLocation,
+-					 const escapement_delta* delta) const
++					 const escapement_delta* delta,
++					 FontCacheReference* cacheReference) const
+ {
+ 	if (!fSubpixelPrecise) {
+ 		baseLine.x = roundf(baseLine.x);
+ 		baseLine.y = roundf(baseLine.y);
+ 	}
+ 
+-	// make sure the text renderer is using our font (the global
+-	// instance of the text renderer is used by everyone)
+-	_UpdateFont();
+-
+ 	static BRect dummy;
+ 	return fTextRenderer.RenderString(utf8String, length,
+-		&amp;fRenderer, &amp;fRendererBin, fUnpackedScanline,
+-		baseLine, dummy, true, penLocation, delta);
++		baseLine, dummy, true, penLocation, delta, cacheReference);
+ }
+ 
+ // StringWidth
+@@ -1027,7 +1009,7 @@
+ Painter::StringWidth(const char* utf8String, uint32 length,
+ 	const escapement_delta* delta)
+ {
+-	return fFont.StringWidth(utf8String, length, delta);
++	return Font().StringWidth(utf8String, length, delta);
+ }
+ 
+ // #pragma mark -
+@@ -1051,7 +1033,8 @@
+ 						 bitmap-&gt;Height(),
+ 						 bitmap-&gt;BytesPerRow());
+ 
+-		_DrawBitmap(srcBuffer, bitmap-&gt;ColorSpace(), actualBitmapRect, bitmapRect, viewRect);
++		_DrawBitmap(srcBuffer, bitmap-&gt;ColorSpace(), actualBitmapRect,
++			bitmapRect, viewRect);
+ 	}
+ 	return touched;
+ }
+@@ -1131,13 +1114,6 @@
+ 	return BRect(rect);
+ }
+ 
+-// _UpdateFont
+-void
+-Painter::_UpdateFont() const
+-{
+-	fTextRenderer.SetFont(fFont);
+-}
+-
+ // _UpdateDrawingMode
+ void
+ Painter::_UpdateDrawingMode(bool drawingText)
+
+Modified: haiku/trunk/src/servers/app/drawing/Painter/Painter.h
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/Painter/Painter.h	2007-08-04 11:22:47 UTC (rev 21821)
++++ haiku/trunk/src/servers/app/drawing/Painter/Painter.h	2007-08-04 11:37:16 UTC (rev 21822)
+@@ -27,6 +27,7 @@
+ class BBitmap;
+ class BRegion;
+ class DrawState;
++class FontCacheReference;
+ class RenderingBuffer;
+ class ServerBitmap;
+ class ServerFont;
+@@ -47,7 +48,6 @@
+ 									{ return fClippingRegion; }
+ 
+ 			void				SetDrawState(const DrawState* data,
+-											 bool updateFont = false,
+ 											 int32 xOffset = 0,
+ 											 int32 yOffset = 0);
+ 
+@@ -84,12 +84,9 @@
+ 			void				SetBlendingMode(source_alpha srcAlpha,
+ 									alpha_function alphaFunc);
+ 
+-			void				SetPenLocation(const BPoint&amp; location);
+-	inline	BPoint				PenLocation() const
+-									{ return fPenLocation; }
+ 			void				SetFont(const ServerFont&amp; font);
+ 	inline	const ServerFont&amp;	Font() const
+-									{ return fFont; }
++									{ return fTextRenderer.Font(); }
+ 
+ 								// painting functions
+ 
+@@ -178,13 +175,15 @@
+ 			BRect				DrawString(		const char* utf8String,
+ 												uint32 length,
+ 												BPoint baseLine,
+-												const escapement_delta* delta = NULL);
++												const escapement_delta* delta,
++												FontCacheReference* cacheReference = NULL);
+ 
+ 			BRect				BoundingBox(	const char* utf8String,
+ 												uint32 length,
+ 												BPoint baseLine,
+ 												BPoint* penLocation,
+-												const escapement_delta* delta = NULL) const;
++												const escapement_delta* delta,
++												FontCacheReference* cacheReference = NULL) const;
+ 
+ 			float				StringWidth(	const char* utf8String,
+ 												uint32 length,
+@@ -278,14 +277,12 @@
+ 	bool						fDrawingText;
+ 	source_alpha				fAlphaSrcMode;
+ 	alpha_function				fAlphaFncMode;
+-	BPoint						fPenLocation;
+ 	cap_mode					fLineCapMode;
+ 	join_mode					fLineJoinMode;
+ 	float						fMiterLimit;
+ 
+ 	PatternHandler				fPatternHandler;
+ 
+-	ServerFont					fFont;
+ 	// a class handling rendering and caching of glyphs
+ 	// it is setup to load from a specific Freetype supported
+ 	// font file which it gets from ServerFont
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003365.html">[Haiku-commits] r21821 - in haiku/trunk: headers/private/app	src/kits/interface src/servers/app
+</A></li>
+	<LI>Next message: <A HREF="003372.html">[Haiku-commits] r21822 - in haiku/trunk/src/servers/app: . drawing drawing/Painter
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3366">[ date ]</a>
+              <a href="thread.html#3366">[ thread ]</a>
+              <a href="subject.html#3366">[ subject ]</a>
+              <a href="author.html#3366">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

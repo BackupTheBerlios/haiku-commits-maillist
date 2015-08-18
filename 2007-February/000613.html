@@ -1,0 +1,1084 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20055 - in haiku/trunk/src/servers/app: . drawing
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20055%20-%20in%20haiku/trunk/src/servers/app%3A%20.%20drawing&In-Reply-To=%3C200702021916.l12JGJMI007262%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000611.html">
+   <LINK REL="Next"  HREF="000617.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20055 - in haiku/trunk/src/servers/app: . drawing</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20055%20-%20in%20haiku/trunk/src/servers/app%3A%20.%20drawing&In-Reply-To=%3C200702021916.l12JGJMI007262%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20055 - in haiku/trunk/src/servers/app: . drawing">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Feb  2 20:16:19 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000611.html">[Haiku-commits] r20054 - haiku/trunk/src/servers/app
+</A></li>
+        <LI>Next message: <A HREF="000617.html">[Haiku-commits] r20056 - haiku/trunk/src/tests/servers/registrar
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#613">[ date ]</a>
+              <a href="thread.html#613">[ thread ]</a>
+              <a href="subject.html#613">[ subject ]</a>
+              <a href="author.html#613">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-02-02 20:16:18 +0100 (Fri, 02 Feb 2007)
+New Revision: 20055
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20055&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20055&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/DesktopSettings.cpp
+   haiku/trunk/src/servers/app/MultiLocker.cpp
+   haiku/trunk/src/servers/app/MultiLocker.h
+   haiku/trunk/src/servers/app/drawing/HWInterface.h
+Log:
+* Replaced DEBUG MultiLocker with an implementation that actually helps debugging
+  locking problems (instead of debugging the locker class).
+* MultiLocker::IsReadLocked() is now only exported with DEBUG mode turned on, as
+  it only works correctly in this case.
+* Made MultiLocker safe against B_INTERRUPTED, ie. it now just tries to lock again
+  instead of failing for no obvious reason.
+* Removed bogus arguments to acquire_sem_etc() in MultiLocker (like B_DO_NOT_RESCHEDULE).
+* Applied coding style to MultiLocker.
+
+
+Modified: haiku/trunk/src/servers/app/DesktopSettings.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/DesktopSettings.cpp	2007-02-02 18:14:25 UTC (rev 20054)
++++ haiku/trunk/src/servers/app/DesktopSettings.cpp	2007-02-02 19:16:18 UTC (rev 20055)
+@@ -456,8 +456,11 @@
+ 	:
+ 	fSettings(desktop-&gt;fSettings)
+ {
+-	if (!desktop-&gt;fWindowLock.IsReadLocked() &amp;&amp; !desktop-&gt;fWindowLock.IsWriteLocked())
++#if DEBUG
++	if (!desktop-&gt;fWindowLock.IsWriteLocked()
++		&amp;&amp; !desktop-&gt;fWindowLock.IsReadLocked())
+ 		debugger(&quot;desktop not locked when trying to access settings&quot;);
++#endif
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/servers/app/MultiLocker.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/MultiLocker.cpp	2007-02-02 18:14:25 UTC (rev 20054)
++++ haiku/trunk/src/servers/app/MultiLocker.cpp	2007-02-02 19:16:18 UTC (rev 20055)
+@@ -1,41 +1,50 @@
+-/* MultiLocker.cpp */
+ /*
+-	Copyright 1999, Be Incorporated.   All Rights Reserved.
+-	This file may be used under the terms of the Be Sample Code License.
+-*/
++ * Copyright 2005-2007, Haiku, Inc. All Rights Reserved.
++ * Distributed under the terms of the MIT license.
++ *
++ * Copyright 1999, Be Incorporated.   All Rights Reserved.
++ * This file may be used under the terms of the Be Sample Code License.
++ */
+ 
++
+ #include &quot;MultiLocker.h&quot;
+ 
+ #include &lt;Debug.h&gt;
+ #include &lt;Errors.h&gt;
+ #include &lt;OS.h&gt;
+ 
+-//#define TIMING 1
+-//#define DEBUG 1
+ 
++#define TIMING	MULTI_LOCKER_TIMING
++#define DEBUG	MULTI_LOCKER_DEBUG
+ 
+-MultiLocker::MultiLocker(const char* semaphoreBaseName)
+-	:	fInit(B_NO_INIT),
+-		fReadCount(0),
+-		fReadSem(-1),
+-		fWriteCount(0),
+-		fWriteSem(-1),
+-		fLockCount(0),
+-		fWriterLock(-1),
+-		fWriterNest(0),
+-		fWriterThread(-1),
+-		fWriterStackBase(0),
+-		fDebugArray(NULL),
+-		fMaxThreads(0)
++
++const int32 LARGE_NUMBER = 100000;
++
++
++MultiLocker::MultiLocker(const char* baseName)
++	:
++#if DEBUG
++	fDebugArray(NULL),
++	fMaxThreads(0),
++#else
++	fReadCount(0),
++	fWriteCount(0),
++	fLockCount(0),
++#endif
++	fInit(B_NO_INIT),
++	fWriterNest(0),
++	fWriterThread(-1),
++	fWriterStackBase(0)
+ {
+-	//build the semaphores
+-	if (semaphoreBaseName) {
++	// build the semaphores
++#if !DEBUG
++	if (baseName) {
+ 		char name[128];
+-		sprintf(name, &quot;%s-%s&quot;, semaphoreBaseName, &quot;ReadSem&quot;);
++		sprintf(name, &quot;%s-%s&quot;, baseName, &quot;ReadSem&quot;);
+ 		fReadSem = create_sem(0, name);
+-		sprintf(name, &quot;%s-%s&quot;, semaphoreBaseName, &quot;WriteSem&quot;);
++		sprintf(name, &quot;%s-%s&quot;, baseName, &quot;WriteSem&quot;);
+ 		fWriteSem = create_sem(0, name);
+-		sprintf(name, &quot;%s-%s&quot;, semaphoreBaseName, &quot;WriterLock&quot;);
++		sprintf(name, &quot;%s-%s&quot;, baseName, &quot;WriterLock&quot;);
+ 		fWriterLock = create_sem(0, name);
+ 	} else {
+ 		fReadSem = create_sem(0, &quot;MultiLocker_ReadSem&quot;);
+@@ -45,383 +54,474 @@
+ 
+ 	if (fReadSem &gt;= 0 &amp;&amp; fWriteSem &gt;=0 &amp;&amp; fWriterLock &gt;= 0)
+ 		fInit = B_OK;
+-		
++#else
++	fLock = create_sem(LARGE_NUMBER, baseName != NULL ? baseName : &quot;MultiLocker&quot;);
++	if (fLock &gt;= 0)
++		fInit = B_OK;
++
++	// we are in debug mode!
++	// create the reader tracking list
++	// the array needs to be large enough to hold all possible threads
++	system_info sys;
++	get_system_info(&amp;sys);
++	fMaxThreads = sys.max_threads;
++	fDebugArray = (int32 *) malloc(fMaxThreads * sizeof(int32));
++	for (int32 i = 0; i &lt; fMaxThreads; i++) {
++		fDebugArray[i] = 0;
++	}
++#endif
++#if TIMING
++	//initialize the counter variables
++	rl_count = ru_count = wl_count = wu_count = islock_count = 0;
++	rl_time = ru_time = wl_time = wu_time = islock_time = 0;
+ 	#if DEBUG
+-		//we are in debug mode!
+-		//create the reader tracking list
+-		//the array needs to be large enough to hold all possible threads
+-		system_info sys;
+-		get_system_info(&amp;sys);
+-		fMaxThreads = sys.max_threads;
+-		fDebugArray = (int32 *) malloc(fMaxThreads * sizeof(int32));
+-		for (int32 i = 0; i &lt; fMaxThreads; i++) {
+-			fDebugArray[i] = 0;
+-		}
+-		
++		reg_count = unreg_count = 0;
++		reg_time = unreg_time = 0;
+ 	#endif
+-	#if TIMING
+-		//initialize the counter variables
+-		rl_count = ru_count = wl_count = wu_count = islock_count = 0;
+-		rl_time = ru_time = wl_time = wu_time = islock_time = 0;
+-		#if DEBUG
+-			reg_count = unreg_count = 0;
+-			reg_time = unreg_time = 0;
+-		#endif
+-	#endif
++#endif
+ }
+ 
+ 
+ MultiLocker::~MultiLocker()
+ {
+-	//become the writer
+-	if (!IsWriteLocked()) WriteLock();
+-	
+-	//set locker to be uninitialized
++	// become the writer
++	if (!IsWriteLocked())
++		WriteLock();
++
++	// set locker to be uninitialized
+ 	fInit = B_NO_INIT;
+ 
+-	//delete the semaphores
++#if !DEBUG
++	// delete the semaphores
+ 	delete_sem(fReadSem);
+ 	delete_sem(fWriteSem);
+ 	delete_sem(fWriterLock);
+-	
+-	#if DEBUG
+-		//we are in debug mode!
+-		//clear and delete the reader tracking list
+-		free(fDebugArray);
+-	#endif
+-	#if TIMING	
+-		//let's produce some performance numbers
+-		printf(&quot;MultiLocker Statistics:\n&quot;
+-				&quot;Avg ReadLock: %lld\n&quot;
+-				&quot;Avg ReadUnlock: %lld\n&quot;
+-				&quot;Avg WriteLock: %lld\n&quot;
+-				&quot;Avg WriteUnlock: %lld\n&quot;
+-				&quot;Avg IsWriteLocked: %lld\n&quot;,
+-				rl_count &gt; 0 ? rl_time / rl_count : 0,
+-				ru_count &gt; 0 ? ru_time / ru_count : 0,
+-				wl_count &gt; 0 ? wl_time / wl_count : 0,
+-				wu_count &gt; 0 ? wu_time / wu_count : 0,
+-				islock_count &gt; 0 ? islock_time / islock_count : 0
+-		);
+-		#if DEBUG
+-			printf(	&quot;Avg register_thread: %lld\n&quot;
+-					&quot;Avg unregister_thread: %lld\n&quot;,
+-					reg_count &gt; 0 ? reg_time / reg_count : 0,
+-					unreg_count &gt; 0 ? unreg_time / unreg_count : 0
+-			);
+-		#endif
+-	#endif	
++#else
++	delete_sem(fLock);
++	free(fDebugArray);
++#endif
++#if TIMING	
++	// let's produce some performance numbers
++	printf(&quot;MultiLocker Statistics:\n&quot;
++		&quot;Avg ReadLock: %lld\n&quot;
++		&quot;Avg ReadUnlock: %lld\n&quot;
++		&quot;Avg WriteLock: %lld\n&quot;
++		&quot;Avg WriteUnlock: %lld\n&quot;
++		&quot;Avg IsWriteLocked: %lld\n&quot;,
++		rl_count &gt; 0 ? rl_time / rl_count : 0,
++		ru_count &gt; 0 ? ru_time / ru_count : 0,
++		wl_count &gt; 0 ? wl_time / wl_count : 0,
++		wu_count &gt; 0 ? wu_time / wu_count : 0,
++		islock_count &gt; 0 ? islock_time / islock_count : 0);
++#endif
+ }
+ 
+-status_t 
++
++status_t
+ MultiLocker::InitCheck()
+ {
+ 	return fInit;
+ }
+ 
+-bool 
++
++/*!
++	This function demonstrates a nice method of determining if the current thread
++	is the writer or not.  The method involves caching the index of the page in memory
++	where the thread's stack is located.  Each time a new writer acquires the lock,
++	its thread_id and stack_page are recorded.  IsWriteLocked gets the stack_page of the
++	current thread and sees if it is a match.  If the stack_page matches you are guaranteed
++	to have the matching thread.  If the stack page doesn't match the more traditional 
++	find_thread(NULL) method of matching the thread_ids is used.
++
++	This technique is very useful when dealing with a lock that is acquired in a nested fashion.
++	It could be expanded to cache the information of the last thread in the lock, and then if
++	the same thread returns while there is no one in the lock, it could save some time, if the
++	same thread is likely to acquire the lock again and again.
++	I should note another shortcut that could be implemented here
++	If fWriterThread is set to -1 then there is no writer in the lock, and we could
++	return from this function much faster.  However the function is currently set up
++	so all of the stack_base and thread_id info is determined here.  WriteLock passes
++	in some variables so that if the lock is not held it does not have to get the thread_id
++	and stack base again.  Instead this function returns that information.  So this shortcut
++	would only move this information gathering outside of this function, and I like it all
++	contained.
++*/
++bool
++MultiLocker::IsWriteLocked(uint32* _stackBase, thread_id* _thread)
++{
++#if TIMING
++	bigtime_t start = system_time();
++#endif
++
++	// get a variable on the stack
++	bool writeLockHolder = false;
++
++	if (fInit == B_OK) {
++		// determine which page in memory this stack represents
++		// this is managed by taking the address of the item on the
++		// stack and dividing it by the size of the memory pages
++		// if it is the same as the cached stack_page, there is a match 
++		uint32 stackBase = (uint32)&amp;writeLockHolder / B_PAGE_SIZE;
++		thread_id thread = 0;
++
++		if (fWriterStackBase == stackBase) {
++			writeLockHolder = true;
++		} else {
++			// as there was no stack page match we resort to the
++			// tried and true methods
++			thread = find_thread(NULL);
++			if (fWriterThread == thread)
++				writeLockHolder = true;
++		}
++
++		// if someone wants this information, give it to them
++		if (_stackBase != NULL)
++			*_stackBase = stackBase;
++		if (_thread != NULL)
++			*_thread = thread;
++	}
++
++#if TIMING
++	bigtime_t end = system_time();
++	islock_time += (end - start);
++	islock_count++;
++#endif
++
++	return writeLockHolder;
++}
++
++
++#if !DEBUG
++//	#pragma mark - Standard versions
++
++
++bool
+ MultiLocker::ReadLock()
+ {
+-	#if TIMING
+-		bigtime_t start = system_time();
+-	#endif
++#if TIMING
++	bigtime_t start = system_time();
++#endif
+ 
+ 	bool locked = false;	
+ 
+-	//the lock must be initialized
++	// the lock must be initialized
+ 	if (fInit == B_OK) {
+ 		if (IsWriteLocked()) {
+-			//the writer simply increments the nesting
+-			#if DEBUG
+-			if (fWriterNest &lt; 0)
+-				debugger(&quot;ReadLock() - negative writer nest count\n&quot;);
+-			#endif
+-	
++			// the writer simply increments the nesting
+ 			fWriterNest++;
+ 			locked = true;
+ 		} else {
+-			//increment and retrieve the current count of readers
+-			int32 current_count = atomic_add(&amp;fReadCount, 1);	
+-			if (current_count &lt; 0) {
+-				//a writer holds the lock so wait for fReadSem to be released
+-				locked = (acquire_sem_etc(fReadSem, 1, B_DO_NOT_RESCHEDULE,
+-										  B_INFINITE_TIMEOUT) == B_OK);
+-			} else locked = true;			
+-		#if DEBUG
+-			//register if we acquired the lock
+-			if (locked) register_thread();
+-		#endif
++			// increment and retrieve the current count of readers
++			int32 currentCount = atomic_add(&amp;fReadCount, 1);	
++			if (currentCount &lt; 0) {
++				// a writer holds the lock so wait for fReadSem to be released
++				status_t status;
++				do {
++					status = acquire_sem(fReadSem);
++				} while (status == B_INTERRUPTED);
++
++				locked = status == B_OK;
++			} else
++				locked = true;			
+ 		}
+-		
+ 	}
+-	
+-	#if TIMING
+-		bigtime_t end = system_time();
+-		rl_time += (end - start);
+-		rl_count++;
+-	#endif
+ 
++#if TIMING
++	bigtime_t end = system_time();
++	rl_time += (end - start);
++	rl_count++;
++#endif
++
+ 	return locked;	
+ }
+ 
+-bool 
++
++bool
+ MultiLocker::WriteLock()
+ {
+-	#if TIMING
+-		bigtime_t start = system_time();
+-	#endif
++#if TIMING
++	bigtime_t start = system_time();
++#endif
+ 
+ 	bool locked = false;
+-	
++
+ 	if (fInit == B_OK) {
+-		uint32 stack_base = 0;
++		uint32 stackBase = 0;
+ 		thread_id thread = -1;
+ 
+-		if (IsWriteLocked(&amp;stack_base, &amp;thread)) {
+-			//already the writer - increment the nesting count
+-			#if DEBUG
+-			if (fWriterNest &lt; 0)
+-				debugger(&quot;WriteLock() - negative nest count\n&quot;);
+-			#endif
+-
++		if (IsWriteLocked(&amp;stackBase, &amp;thread)) {
++			// already the writer - increment the nesting count
+ 			fWriterNest++;
+ 			locked = true;
+ 		} else {
+-			//new writer acquiring the lock
+-			#if DEBUG
+-				// NOTE: IsReadLocked() tells you
+-				// if this thread really holds the
+-				// &quot;read lock&quot; only in DEBUG mode!
+-				if (IsReadLocked())
+-					debugger(&quot;Reader wants to become writer!&quot;);
+-			#endif
++			// new writer acquiring the lock
+ 			if (atomic_add(&amp;fLockCount, 1) &gt;= 1) {
+-				//another writer in the lock - acquire the semaphore
+-				locked = (acquire_sem_etc(fWriterLock, 1, B_DO_NOT_RESCHEDULE,
+-						B_INFINITE_TIMEOUT) == B_OK);
+-			} else locked = true;
+-			
++				// another writer in the lock - acquire the semaphore
++				status_t status;
++				do {
++					status = acquire_sem(fWriterLock);
++				} while (status == B_INTERRUPTED);
++
++				locked = status == B_OK;
++			} else
++				locked = true;
++
+ 			if (locked) {
+-				//new holder of the lock
++				// new holder of the lock
+ 
+-				//decrement fReadCount by a very large number
+-				//this will cause new readers to block on fReadSem
++				// decrement fReadCount by a very large number
++				// this will cause new readers to block on fReadSem
+ 				int32 readers = atomic_add(&amp;fReadCount, -LARGE_NUMBER);
+-				
+-				if (readers &gt; 0) {				
+-					//readers hold the lock - acquire fWriteSem
+-					locked = (acquire_sem_etc(fWriteSem, readers,
+-									B_DO_NOT_RESCHEDULE,
+-									B_INFINITE_TIMEOUT) == B_OK);
+-					}
++				if (readers &gt; 0) {
++					// readers hold the lock - acquire fWriteSem
++					status_t status;
++					do {
++						status = acquire_sem_etc(fWriteSem, readers, 0, 0);
++					} while (status == B_INTERRUPTED);
++
++					locked = status == B_OK;
++				}
+ 				if (locked) {
+ 					ASSERT(fWriterThread == -1);
+-					//record thread information
++					// record thread information
+ 					fWriterThread = thread;
+-					fWriterStackBase = stack_base;
++					fWriterStackBase = stackBase;
+ 				}
+ 			}
+ 		}
+ 	}
+ 
+-	#if TIMING
+-		bigtime_t end = system_time();
+-		wl_time += (end - start);
+-		wl_count++;
+-	#endif
++#if TIMING
++	bigtime_t end = system_time();
++	wl_time += (end - start);
++	wl_count++;
++#endif
+ 	
+ 	return locked;
+ }
+ 
+-bool 
++
++bool
+ MultiLocker::ReadUnlock()
+ {
+-	#if TIMING
+-		bigtime_t start = system_time();
+-	#endif
++#if TIMING
++	bigtime_t start = system_time();
++#endif
+ 
+ 	bool unlocked = false;
+ 
+ 	if (IsWriteLocked()) {
+-		//writers simply decrement the nesting count
++		// writers simply decrement the nesting count
+ 		fWriterNest--;
+-
+-		#if DEBUG
+-		if (fWriterNest &lt; 0)
+-			debugger(&quot;ReadUnlock() - negative writer nest count\n&quot;);
+-		#endif
+-
+ 		unlocked = true;	
+ 	} else {
+-		//decrement and retrieve the read counter
++		// decrement and retrieve the read counter
+ 		int32 current_count = atomic_add(&amp;fReadCount, -1);
+ 		if (current_count &lt; 0) {
+-			//a writer is waiting for the lock so release fWriteSem
+-			unlocked = (release_sem_etc(fWriteSem, 1,
+-										B_DO_NOT_RESCHEDULE) == B_OK);
+-		} else unlocked = true;
+-	
+-		#if DEBUG
+-			//unregister if we released the lock
+-			if (unlocked) unregister_thread();
+-		#endif
++			// a writer is waiting for the lock so release fWriteSem
++			unlocked = release_sem_etc(fWriteSem, 1, B_DO_NOT_RESCHEDULE) == B_OK;
++		} else
++			unlocked = true;
+ 	}
+-	
+-	#if TIMING
+-		bigtime_t end = system_time();
+-		ru_time += (end - start);
+-		ru_count++;
+-	#endif
+ 
++#if TIMING
++	bigtime_t end = system_time();
++	ru_time += (end - start);
++	ru_count++;
++#endif
++
+ 	return unlocked;	
+ }
+ 
+-bool 
++
++bool
+ MultiLocker::WriteUnlock()
+ {
+-	#if TIMING
+-		bigtime_t start = system_time();
+-	#endif
++#if TIMING
++	bigtime_t start = system_time();
++#endif
+ 
+ 	bool unlocked = false;
+ 
+ 	if (IsWriteLocked()) {
+-		//if this is a nested lock simply decrement the nest count
++		// if this is a nested lock simply decrement the nest count
+ 		if (fWriterNest &gt; 0) {
+ 			fWriterNest--;
+-
+-			#if DEBUG
+-			if (fWriterNest &lt; 0)
+-				debugger(&quot;WriteUnlock(): nest count now negative\n&quot;);
+-			#endif
+-
+ 			unlocked = true;
+ 		} else {
+-			//writer finally unlocking
++			// writer finally unlocking
+ 
+-			//increment fReadCount by a large number
+-			//this will let new readers acquire the read lock
+-			//retrieve the number of current waiters
++			// increment fReadCount by a large number
++			// this will let new readers acquire the read lock
++			// retrieve the number of current waiters
+ 			int32 readersWaiting = atomic_add(&amp;fReadCount, LARGE_NUMBER)
+ 				+ LARGE_NUMBER;
+-			
++
+ 			if (readersWaiting &gt; 0) {
+-				//readers are waiting to acquire the lock
+-				unlocked = (release_sem_etc(fReadSem, readersWaiting,
+-						B_DO_NOT_RESCHEDULE) == B_OK);
+-			} else unlocked = true;
+-			
++				// readers are waiting to acquire the lock
++				unlocked = release_sem_etc(fReadSem, readersWaiting,
++					B_DO_NOT_RESCHEDULE) == B_OK;
++			} else
++				unlocked = true;
++
+ 			if (unlocked) {
+-				//clear the information
++				// clear the information
+ 				fWriterThread = -1;
+ 				fWriterStackBase = 0;
+-				
+-				//decrement and retrieve the lock count
++
++				// decrement and retrieve the lock count
+ 				if (atomic_add(&amp;fLockCount, -1) &gt; 1) {
+-					//other writers are waiting so release fWriterLock
+-					unlocked = (release_sem_etc(fWriterLock, 1,
+-							B_DO_NOT_RESCHEDULE) == B_OK);
++					// other writers are waiting so release fWriterLock
++					unlocked = release_sem_etc(fWriterLock, 1,
++						B_DO_NOT_RESCHEDULE) == B_OK;
+ 				}
+ 			}
+ 		}
+-		
+-	} else debugger(&quot;Non-writer attempting to WriteUnlock()\n&quot;);
++	} else
++		debugger(&quot;Non-writer attempting to WriteUnlock()&quot;);
+ 
+-	#if TIMING
+-		bigtime_t end = system_time();
+-		wu_time += (end - start);
+-		wu_count++;
+-	#endif
++#if TIMING
++	bigtime_t end = system_time();
++	wu_time += (end - start);
++	wu_count++;
++#endif
+ 
+ 	return unlocked;
+ }
+ 
+-/* this function demonstrates a nice method of determining if the current thread */
+-/* is the writer or not.  The method involves caching the index of the page in memory */
+-/* where the thread's stack is located.  Each time a new writer acquires the lock, */
+-/* its thread_id and stack_page are recorded.  IsWriteLocked gets the stack_page of the */
+-/* current thread and sees if it is a match.  If the stack_page matches you are guaranteed */
+-/* to have the matching thread.  If the stack page doesn't match the more traditional  */
+-/* find_thread(NULL) method of matching the thread_ids is used. */
+ 
+-/* This technique is very useful when dealing with a lock that is acquired in a nested fashion. */
+-/* It could be expanded to cache the information of the last thread in the lock, and then if */
+-/* the same thread returns while there is no one in the lock, it could save some time, if the */
+-/* same thread is likely to acquire the lock again and again. */
+-/* I should note another shortcut that could be implemented here */
+-/* If fWriterThread is set to -1 then there is no writer in the lock, and we could */
+-/* return from this function much faster.  However the function is currently set up */
+-/* so all of the stack_base and thread_id info is determined here.  WriteLock passes */
+-/* in some variables so that if the lock is not held it does not have to get the thread_id */
+-/* and stack base again.  Instead this function returns that information.  So this shortcut */
+-/* would only move this information gathering outside of this function, and I like it all */
+-/* contained. */
++#else	// DEBUG
++//	#pragma mark - Debug versions
+ 
+-bool 
+-MultiLocker::IsWriteLocked(uint32 *the_stack_base, thread_id *the_thread)
++
++bool
++MultiLocker::ReadLock()
+ {
+-	#if TIMING
+-		bigtime_t start = system_time();
+-	#endif
++	bool locked = false;	
+ 
+-	//get a variable on the stack
+-	bool write_lock_holder = false;
++	if (fInit != B_OK)
++		debugger(&quot;lock not initialized&quot;);
+ 
+-	if (fInit == B_OK) {
+-		uint32 stack_base;
+-		thread_id thread = 0;	
+-		
+-		//determine which page in memory this stack represents
+-		//this is managed by taking the address of the item on the
+-		//stack and dividing it by the size of the memory pages
+-		//if it is the same as the cached stack_page, there is a match 
+-		stack_base = (uint32)&amp;write_lock_holder / B_PAGE_SIZE;
+-		if (fWriterStackBase == stack_base) {
+-			write_lock_holder = true;
++	if (IsWriteLocked()) {
++		if (fWriterNest &lt; 0)
++			debugger(&quot;ReadLock() - negative writer nest count&quot;);
++
++		fWriterNest++;
++		locked = true;
++	} else {
++		status_t status;
++		do {
++			status = acquire_sem(fLock);
++		} while (status == B_INTERRUPTED);
++
++		locked = status == B_OK;
++
++		if (locked)
++			_RegisterThread();
++	}
++
++	return locked;
++}
++
++
++bool
++MultiLocker::WriteLock()
++{
++	bool locked = false;	
++
++	if (fInit != B_OK)
++		debugger(&quot;lock not initialized&quot;);
++
++	uint32 stackBase = 0;
++	thread_id thread = -1;
++
++	if (IsWriteLocked(&amp;stackBase, &amp;thread)) {
++		if (fWriterNest &lt; 0)
++			debugger(&quot;WriteLock() - negative writer nest count&quot;);
++
++		fWriterNest++;
++		locked = true;
++	} else {
++		// new writer acquiring the lock
++		if (IsReadLocked())
++			debugger(&quot;Reader wants to become writer!&quot;);
++
++		status_t status;
++		do {
++			status = acquire_sem_etc(fLock, LARGE_NUMBER, 0, 0);
++		} while (status == B_INTERRUPTED);
++
++		locked = status == B_OK;
++		if (locked) {
++			// record thread information
++			fWriterThread = thread;
++			fWriterStackBase = stackBase;
++		}
++	}
++
++	return locked;
++}
++
++
++bool
++MultiLocker::ReadUnlock()
++{
++	bool unlocked = false;
++
++	if (IsWriteLocked()) {
++		// writers simply decrement the nesting count
++		fWriterNest--;
++		if (fWriterNest &lt; 0)
++			debugger(&quot;ReadUnlock() - negative writer nest count&quot;);
++
++		unlocked = true;	
++	} else {
++		// decrement and retrieve the read counter
++		unlocked = release_sem_etc(fLock, 1, B_DO_NOT_RESCHEDULE) == B_OK;
++		if (unlocked)
++			_UnregisterThread();
++	}
++
++	return unlocked;	
++}
++
++
++bool
++MultiLocker::WriteUnlock()
++{
++	bool unlocked = false;
++
++	if (IsWriteLocked()) {
++		// if this is a nested lock simply decrement the nest count
++		if (fWriterNest &gt; 0) {
++			fWriterNest--;
++			unlocked = true;
+ 		} else {
+-			//as there was no stack_page match we resort to the
+-			//tried and true methods
+-			thread = find_thread(NULL);
+-			if (fWriterThread == thread) {
+-				write_lock_holder = true;
++			unlocked = release_sem_etc(fLock, LARGE_NUMBER, B_DO_NOT_RESCHEDULE) == B_OK;
++			if (unlocked) {
++				// clear the information
++				fWriterThread = -1;
++				fWriterStackBase = 0;
+ 			}
+ 		}
+-		
+-		//if someone wants this information, give it to them
+-		if (the_stack_base != NULL) {
+-			*the_stack_base = stack_base;
+-		}
+-		if (the_thread != NULL) {
+-			*the_thread = thread;
+-		}
++	} else {
++		debug_printf(&quot;write holder %ld\n&quot;, fWriterThread);
++		debugger(&quot;Non-writer attempting to WriteUnlock()&quot;);
+ 	}
+ 
+-	#if TIMING
+-		bigtime_t end = system_time();
+-		islock_time += (end - start);
+-		islock_count++;
+-	#endif
+-
+-	return write_lock_holder;
++	return unlocked;
+ }
+ 
+-bool 
++
++bool
+ MultiLocker::IsReadLocked()
+ {
+-	//a properly initialized MultiLocker in non-debug always returns true
+-	bool locked = true;
+-	if (fInit == B_NO_INIT) locked = false;
+-	
+-	#if DEBUG
+-		//determine if the lock is actually held
+-		thread_id thread = find_thread(NULL);
+-		if (fDebugArray[thread % fMaxThreads] &gt; 0)
+-			locked = true;
+-		else
+-			locked = false;
+-	#endif
+-	
+-	return locked;
++	if (fInit == B_NO_INIT)
++		return false;
++
++	// determine if the lock is actually held
++	thread_id thread = find_thread(NULL);
++	return fDebugArray[thread % fMaxThreads] &gt; 0;
+ }
+ 
+ 
+@@ -446,54 +546,25 @@
+ /* traversing a list of cached information.  As this is only for a debug mode, the extra memory */
+ /* was not deemed to be a problem */
+ 
+-void 
+-MultiLocker::register_thread()
++void
++MultiLocker::_RegisterThread()
+ {
+-	#if DEBUG	
+-		#if TIMING
+-			bigtime_t start = system_time();
+-		#endif
++	thread_id thread = find_thread(NULL);
+ 
+-		thread_id thread = find_thread(NULL);
+-		
+-		if (fDebugArray[thread%fMaxThreads] != 0)
+-			debugger(&quot;Nested ReadLock!\n&quot;);
++	if (fDebugArray[thread % fMaxThreads] != 0)
++		debugger(&quot;Nested ReadLock!&quot;);
+ 
+-		fDebugArray[thread%fMaxThreads]++;
+-	
+-		#if TIMING
+-			bigtime_t end = system_time();
+-			reg_time += (end - start);
+-			reg_count++;
+-		#endif
+-	#else
+-		debugger(&quot;register_thread should never be called unless in DEBUG mode!\n&quot;);
+-	#endif
++	fDebugArray[thread % fMaxThreads]++;
+ }
+ 
+-void 
+-MultiLocker::unregister_thread()
++
++void
++MultiLocker::_UnregisterThread()
+ {
+-	#if DEBUG	
+-		#if TIMING
+-			bigtime_t start = system_time();
+-		#endif
++	thread_id thread = find_thread(NULL);
+ 
+-		thread_id thread = find_thread(NULL);
+-		
+-		ASSERT(fDebugArray[thread%fMaxThreads] == 1);
+-		fDebugArray[thread%fMaxThreads]--;
+-	
+-		#if TIMING
+-			bigtime_t end = system_time();
+-			unreg_time += (end - start);
+-			unreg_count++;
+-		#endif
+-	#else
+-		debugger(&quot;unregister_thread should never be called unless in DEBUG mode!\n&quot;);
+-	#endif
+-
++	ASSERT(fDebugArray[thread % fMaxThreads] == 1);
++	fDebugArray[thread % fMaxThreads]--;
+ }
+ 
+-
+-
++#endif	// DEBUG
+
+Modified: haiku/trunk/src/servers/app/MultiLocker.h
+===================================================================
+--- haiku/trunk/src/servers/app/MultiLocker.h	2007-02-02 18:14:25 UTC (rev 20054)
++++ haiku/trunk/src/servers/app/MultiLocker.h	2007-02-02 19:16:18 UTC (rev 20055)
+@@ -1,14 +1,13 @@
+-/* MultiLocker.h */
+ /*
+-	Copyright 2005-2006, Haiku.
+-	Distributed under the terms of the MIT license.
++ * Copyright 2005-2007, Haiku, Inc. All Rights Reserved.
++ * Distributed under the terms of the MIT license.
++ *
++ * Copyright 1999, Be Incorporated.   All Rights Reserved.
++ * This file may be used under the terms of the Be Sample Code License.
++ */
+ 
+-	Copyright 1999, Be Incorporated.   All Rights Reserved.
+-	This file may be used under the terms of the Be Sample Code License.
+-*/
++/*! multiple-reader single-writer locking class */
+ 
+-/** multiple-reader single-writer locking class */
+-
+ // IMPORTANT:
+ //             * nested read locks are not supported
+ //             * a reader becomming the write is not supported
+@@ -19,125 +18,142 @@
+ #ifndef MULTI_LOCKER_H
+ #define MULTI_LOCKER_H
+ 
+-//#define TIMING 1
+ 
+ #include &lt;OS.h&gt;
+ 
+-const int32 LARGE_NUMBER = 100000;
+ 
++#define MULTI_LOCKER_TIMING	0
++#if DEBUG
++#	define MULTI_LOCKER_DEBUG	DEBUG
++#else
++#	define MULTI_LOCKER_DEBUG	0
++#endif
++
+ class MultiLocker {
+ 	public:
+-								MultiLocker(const char* semaphoreBaseName);
+-		virtual					~MultiLocker();
++		MultiLocker(const char* baseName);
++		virtual	~MultiLocker();
++
++		status_t		InitCheck();
+ 		
+-		status_t				InitCheck();
+-		
+-		//locking for reading or writing
+-		bool					ReadLock();
+-		bool					WriteLock();
++		// locking for reading or writing
++		bool			ReadLock();
++		bool			WriteLock();
+ 
+-		//unlocking after reading or writing
+-		bool					ReadUnlock();
+-		bool					WriteUnlock();
++		// unlocking after reading or writing
++		bool			ReadUnlock();
++		bool			WriteUnlock();
+ 
+-		//does the current thread hold a write lock ?
+-		bool					IsWriteLocked(uint32 *stack_base = NULL,
+-											  thread_id *thread = NULL);
+-		//in DEBUG mode returns whether the lock is held
+-		//in non-debug mode returns true
+-		bool					IsReadLocked();
++		// does the current thread hold a write lock ?
++		bool			IsWriteLocked(uint32 *stackBase = NULL,
++							thread_id *thread = NULL);
+ 
++#if MULTI_LOCKER_DEBUG
++		// in DEBUG mode returns whether the lock is held
++		// in non-debug mode returns true
++		bool			IsReadLocked();
++#endif
++
+ 	private:
+-		//functions for managing the DEBUG reader array
+-		void					register_thread();
+-		void					unregister_thread();
+-		
+-		status_t				fInit;
+-		//readers adjust count and block on fReadSem when a writer
+-		//hold the lock
+-		int32					fReadCount;
+-		sem_id					fReadSem;
+-		//writers adjust the count and block on fWriteSem
+-		//when readers hold the lock
+-		int32					fWriteCount;
+-		sem_id 					fWriteSem;
+-		//writers must acquire fWriterLock when acquiring a write lock
+
+[... truncated: 186 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000611.html">[Haiku-commits] r20054 - haiku/trunk/src/servers/app
+</A></li>
+	<LI>Next message: <A HREF="000617.html">[Haiku-commits] r20056 - haiku/trunk/src/tests/servers/registrar
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#613">[ date ]</a>
+              <a href="thread.html#613">[ thread ]</a>
+              <a href="subject.html#613">[ subject ]</a>
+              <a href="author.html#613">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

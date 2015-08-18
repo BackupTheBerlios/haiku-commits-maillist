@@ -1,0 +1,327 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21516 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21516%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200706272140.l5RLetTb006157%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002906.html">
+   <LINK REL="Next"  HREF="002911.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21516 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21516%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200706272140.l5RLetTb006157%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21516 - haiku/trunk/src/add-ons/kernel/busses/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Wed Jun 27 23:40:55 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002906.html">[Haiku-commits] r21515 - in haiku/trunk: headers/build/os/app	headers/build/private/app src/build/libbe/app
+</A></li>
+        <LI>Next message: <A HREF="002911.html">[Haiku-commits] r21516 -	haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2907">[ date ]</a>
+              <a href="thread.html#2907">[ thread ]</a>
+              <a href="subject.html#2907">[ subject ]</a>
+              <a href="author.html#2907">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2007-06-27 23:40:54 +0200 (Wed, 27 Jun 2007)
+New Revision: 21516
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21516&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21516&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+Log:
+Fixing bug #1284.
+
+* Rearranged isochronous finishing to happen from within the finisher thread
+* Removed the separate isochronous finishing thread
+
+Since the finisher thread blocks when no transfers are complete this should bring down CPU load.
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2007-06-27 20:33:51 UTC (rev 21515)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.cpp	2007-06-27 21:40:54 UTC (rev 21516)
+@@ -180,9 +180,9 @@
+ 	fStrayDescriptor-&gt;status = 0;
+ 	fStrayDescriptor-&gt;this_phy = (addr_t)physicalAddress;
+ 	fStrayDescriptor-&gt;link_phy = TD_TERMINATE;
+-	fStrayDescriptor-&gt;link_log = 0;
++	fStrayDescriptor-&gt;link_log = NULL;
+ 	fStrayDescriptor-&gt;buffer_phy = 0;
+-	fStrayDescriptor-&gt;buffer_log = 0;
++	fStrayDescriptor-&gt;buffer_log = NULL;
+ 	fStrayDescriptor-&gt;buffer_size = 0;
+ 	fStrayDescriptor-&gt;token = TD_TOKEN_NULL_DATA
+ 		| (0x7f &lt;&lt; TD_TOKEN_DEVADDR_SHIFT) | TD_TOKEN_IN;
+@@ -304,8 +304,6 @@
+ 		fStopFinishThread(false),
+ 		fFirstIsochronousTransfer(NULL),
+ 		fLastIsochronousTransfer(NULL),
+-		fFinishIsochronousThread(-1),
+-		fStopFinishIsochronousThread(false),
+ 		fRootHub(NULL),
+ 		fRootHubAddress(0),
+ 		fPortResetChange(0)
+@@ -426,12 +424,6 @@
+ 		return;
+ 	}
+ 
+-	// Create the isochronous finisher service thread
+-	fFinishIsochronousThread = spawn_kernel_thread(FinishIsochronousThread,
+-		&quot;uhci isochronous finish thread&quot;, B_URGENT_DISPLAY_PRIORITY,
+-		(void *)this);
+-	resume_thread(fFinishIsochronousThread);
+-
+ 	// Install the interrupt handler
+ 	TRACE((&quot;usb_uhci: installing interrupt handler\n&quot;));
+ 	install_io_interrupt_handler(fPCIInfo-&gt;u.h0.interrupt_line,
+@@ -450,10 +442,8 @@
+ {
+ 	int32 result = 0;
+ 	fStopFinishThread = true;
+-	fStopFinishIsochronousThread = true;
+ 	delete_sem(fFinishTransfersSem);
+ 	wait_for_thread(fFinishThread, &amp;result);
+-	wait_for_thread(fFinishIsochronousThread, &amp;result);
+ 
+ 	LockIsochronous();
+ 	isochronous_transfer_data *isoTransfer = fFirstIsochronousTransfer;
+@@ -635,7 +625,7 @@
+ 			// Set the active bit off on every descriptor in order to prevent
+ 			// the controller from processing them. Then set off the is_active
+ 			// field of the transfer in order to make the finisher thread skip
+-			// the transfer. The FinishIsochronousThread will do the rest.
++			// the transfer. FinishIsochronousTransfers will do the rest.
+ 			for (int32 i = 0; i &lt; packetCount; i++)
+ 				current-&gt;descriptors[i]-&gt;status &amp;= ~TD_STATUS_ACTIVE;
+ 			current-&gt;is_active = false;
+@@ -999,6 +989,9 @@
+ 		if (semCount &gt; 0)
+ 			acquire_sem_etc(fFinishTransfersSem, semCount, B_RELATIVE_TIMEOUT, 0);
+ 
++		// give the isochronous transfers a chance
++		FinishIsochronousTransfers();
++
+ 		if (!Lock())
+ 			continue;
+ 
+@@ -1160,89 +1153,82 @@
+ }
+ 
+ 
+-int32
+-UHCI::FinishIsochronousThread(void *data)
+-{
+-	((UHCI *)data)-&gt;FinishIsochronousTransfers();
+-	return B_OK;
+-}
+-
+-
+ void
+ UHCI::FinishIsochronousTransfers()
+ {
+-	/* This thread stays one position behind the controller and processes every
+-	 * isochronous descriptor. Once it finds the last isochronous descriptor
+-	 * of a transfer, it processes the entire transfer.
+-	 */
+-	uint16 currentFrame = ReadReg16(UHCI_FRNUM);
++	if (!LockIsochronous())
++		return;
+ 
+-	while (!fStopFinishIsochronousThread) {
+-		// wait 1ms in order to be sure to be one position behind
+-		// the controller
+-		if (currentFrame == ReadReg16(UHCI_FRNUM))
+-			snooze(1000);
++	for (uint16 frame = 0; frame &lt; NUMBER_OF_FRAMES; frame++) {
++		uhci_td *current = fFirstIsochronousDescriptor[frame];
+ 
+-		// Process the frame till it has isochronous descriptors in it.
+-		while (!(fFrameList[currentFrame] &amp; FRAMELIST_NEXT_IS_QH)) {
+-			uhci_td *current = fFirstIsochronousDescriptor[currentFrame];
+-			UnlinkIsochronousDescriptor(current, currentFrame);
++		while (current) {
++			if (current-&gt;status &amp; TD_STATUS_ACTIVE) {
++				// The transfer descriptor is still active
++				current = (uhci_td *)current-&gt;link_log;
++				continue;
++			}
+ 
++			UnlinkIsochronousDescriptor(current, frame);
++			if (!(current-&gt;status &amp; TD_CONTROL_IOC)) {
++				current = (uhci_td *)current-&gt;link_log;
++				continue;
++			}
++
+ 			// Process the transfer if we found the last descriptor
+-			if (current-&gt;status &amp; TD_CONTROL_IOC) {
+-				isochronous_transfer_data *transfer
+-					= FindIsochronousTransfer(current);
++			isochronous_transfer_data *transfer
++				= FindIsochronousTransfer(current);
+ 
+-				// The following should NEVER happen
+-				if (!transfer)
+-					TRACE_ERROR((&quot;usb_uhci: Isochronous transfer not found in&quot;
+-						&quot; the finisher thread!\n&quot;));
++			// The following should NEVER happen
++			if (!transfer) {
++				TRACE_ERROR((&quot;usb_uhci: Isochronous transfer not found in&quot;
++					&quot; the finisher thread!\n&quot;));
++				return;
++			} else if (transfer-&gt;is_active
++				&amp;&amp; (current-&gt;status &amp; TD_TOKEN_IN)) {
++				// Process the descriptors only if it is still active and
++				// belongs to an inbound transfer. If the transfer is not
++				// active, it means the request has been removed, so simply
++				// remove the descriptors.
++				iovec *vector = transfer-&gt;transfer-&gt;Vector();
++				transfer-&gt;transfer-&gt;PrepareKernelAccess();
++				ReadIsochronousDescriptorChain(transfer, vector);
+ 
+-				// Process the transfer only if it is still active and belongs
+-				// to an INPUT transfer. If the transfer is not active, it
+-				// means the request has been removed, so simply remove the
+-				// descriptors.
+-				else if (transfer-&gt;is_active &amp;&amp; (current-&gt;status &amp; TD_TOKEN_IN)) {
+-					iovec *vector = transfer-&gt;transfer-&gt;Vector();
+-					transfer-&gt;transfer-&gt;PrepareKernelAccess();
+-					ReadIsochronousDescriptorChain(transfer, vector);
++				// Remove the transfer
++				if (transfer == fFirstIsochronousTransfer) {
++					fFirstIsochronousTransfer = transfer-&gt;link;
++				} else {
++					isochronous_transfer_data *temp
++						= fFirstIsochronousTransfer;
++					while (transfer != temp-&gt;link)
++						temp = temp-&gt;link;
+ 
+-					// Remove the transfer
+-					if (LockIsochronous()) {
+-						if (transfer == fFirstIsochronousTransfer)
+-							fFirstIsochronousTransfer = transfer-&gt;link;
+-						else {
+-							isochronous_transfer_data *temp
+-								= fFirstIsochronousTransfer;
+-							while (transfer != temp-&gt;link)
+-								temp = temp-&gt;link;
++					if (transfer == fLastIsochronousTransfer)
++						fLastIsochronousTransfer = temp;
++					temp-&gt;link = temp-&gt;link-&gt;link;
++				}
+ 
+-							if (transfer == fLastIsochronousTransfer)
+-								fLastIsochronousTransfer = temp;
+-							temp-&gt;link = temp-&gt;link-&gt;link;
+-						}
++				transfer-&gt;transfer-&gt;Finished(B_OK, 0);
++			} else if (!transfer-&gt;is_active)
++				transfer-&gt;transfer-&gt;Finished(B_CANCELED, 0);
+ 
+-						UnlockIsochronous();
+-					}
++			uint32 packetCount =
++				transfer-&gt;transfer-&gt;IsochronousData()-&gt;packet_count;
++			for (uint32 i = 0; i &lt; packetCount; i++)
++				FreeDescriptor(transfer-&gt;descriptors[i]);
+ 
+-					transfer-&gt;transfer-&gt;Finished(B_OK, 0);
+-				}
++			uint16 bandwidth = transfer-&gt;transfer-&gt;Bandwidth() / packetCount;
++			fFrameBandwidth[frame] += bandwidth;
+ 
+-				uint32 packetCount =
+-					transfer-&gt;transfer-&gt;IsochronousData()-&gt;packet_count;
+-				for (uint32 i = 0; i &lt; packetCount; i++)
+-					FreeDescriptor(transfer-&gt;descriptors[i]);
++			delete [] transfer-&gt;descriptors;
++			delete transfer-&gt;transfer;
++			delete transfer;
+ 
+-				delete [] transfer-&gt;descriptors;
+-				delete transfer-&gt;transfer;
+-				delete transfer;
+-			}
++			current = (uhci_td *)current-&gt;link_log;
+ 		}
+-
+-		// Make sure to reset the frame bandwidth
+-		fFrameBandwidth[currentFrame] = MAX_AVAILABLE_BANDWIDTH;
+-		currentFrame = (currentFrame + 1) % NUMBER_OF_FRAMES;
+ 	}
++
++	UnlockIsochronous();
+ }
+ 
+ 
+@@ -1578,7 +1564,7 @@
+ 
+ 	lastDescriptor-&gt;status |= TD_CONTROL_IOC;
+ 	lastDescriptor-&gt;link_phy = TD_TERMINATE;
+-	lastDescriptor-&gt;link_log = 0;
++	lastDescriptor-&gt;link_log = NULL;
+ 
+ 	if (!directionIn) {
+ 		WriteDescriptorChain(firstDescriptor, transfer-&gt;Vector(),
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2007-06-27 20:33:51 UTC (rev 21515)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/uhci.h	2007-06-27 21:40:54 UTC (rev 21516)
+@@ -133,7 +133,6 @@
+ 										uhci_qh **_transferQueue);
+ 
+ 		// Isochronous transfer functions
+-static	int32						FinishIsochronousThread(void *data);
+ 		void						FinishIsochronousTransfers();
+ 		isochronous_transfer_data	*FindIsochronousTransfer(uhci_td *descriptor);
+ 
+@@ -220,9 +219,7 @@
+ 		// Maintain a linked list of isochronous transfers
+ 		isochronous_transfer_data	*fFirstIsochronousTransfer;
+ 		isochronous_transfer_data	*fLastIsochronousTransfer;
+-		thread_id					fFinishIsochronousThread;
+ 		benaphore					fIsochronousLock;
+-		bool						fStopFinishIsochronousThread;
+ 
+ 		// Root hub
+ 		UHCIRootHub					*fRootHub;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002906.html">[Haiku-commits] r21515 - in haiku/trunk: headers/build/os/app	headers/build/private/app src/build/libbe/app
+</A></li>
+	<LI>Next message: <A HREF="002911.html">[Haiku-commits] r21516 -	haiku/trunk/src/add-ons/kernel/busses/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2907">[ date ]</a>
+              <a href="thread.html#2907">[ thread ]</a>
+              <a href="subject.html#2907">[ subject ]</a>
+              <a href="author.html#2907">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,413 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31313 - in haiku/trunk/src:	add-ons/kernel/file_systems/bfs tests/system/libroot/os
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31313%20-%20in%20haiku/trunk/src%3A%0A%09add-ons/kernel/file_systems/bfs%20tests/system/libroot/os&In-Reply-To=%3C200906291040.n5TAeEjv020941%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017564.html">
+   <LINK REL="Next"  HREF="017568.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31313 - in haiku/trunk/src:	add-ons/kernel/file_systems/bfs tests/system/libroot/os</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31313%20-%20in%20haiku/trunk/src%3A%0A%09add-ons/kernel/file_systems/bfs%20tests/system/libroot/os&In-Reply-To=%3C200906291040.n5TAeEjv020941%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31313 - in haiku/trunk/src:	add-ons/kernel/file_systems/bfs tests/system/libroot/os">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Jun 29 12:40:14 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017564.html">[Haiku-commits] r31312 - haiku/trunk/src/system/libroot/os
+</A></li>
+        <LI>Next message: <A HREF="017568.html">[Haiku-commits] r31314 - haiku/trunk
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17566">[ date ]</a>
+              <a href="thread.html#17566">[ thread ]</a>
+              <a href="subject.html#17566">[ subject ]</a>
+              <a href="author.html#17566">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-06-29 12:40:01 +0200 (Mon, 29 Jun 2009)
+New Revision: 31313
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31313&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31313&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/tests/system/libroot/os/fs_attr_test.cpp
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+   haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.h
+   haiku/trunk/src/tests/system/libroot/os/Jamfile
+Log:
+* Inode::_AddSmallData() now supports writing at an arbitrary position.
+  However, Inode::WriteAttribute() still has a number of problems when this is
+  actually used; contents could get lost when an attribute is moved from the
+  small data section to an attribute file, and the index might not be updated
+  correctly when you write within the first 256 bytes, but not at position 0.
+  Since these problems aren't exposed with how we're using BFS right now, it's
+  not that bad, though (Inode::WriteAttribute() supports everything correctly
+  that it had to under BeOS).
+* Added test application for certain fs_attr functions.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2009-06-29 09:56:22 UTC (rev 31312)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.cpp	2009-06-29 10:40:01 UTC (rev 31313)
+@@ -663,9 +663,9 @@
+ */
+ status_t
+ Inode::_AddSmallData(Transaction&amp; transaction, NodeGetter&amp; nodeGetter,
+-	const char* name, uint32 type, const uint8* data, size_t length, bool force)
++	const char* name, uint32 type, off_t pos, const uint8* data, size_t length,
++	bool force)
+ {
+-	// TODO: support new write attr semantics and write offset!
+ 	bfs_inode* node = nodeGetter.WritableNode();
+ 
+ 	if (node == NULL || name == NULL || data == NULL)
+@@ -673,7 +673,7 @@
+ 
+ 	// reject any requests that can't fit into the small_data section
+ 	uint32 nameLength = strlen(name);
+-	uint32 spaceNeeded = sizeof(small_data) + nameLength + 3 + length + 1;
++	uint32 spaceNeeded = sizeof(small_data) + nameLength + 3 + pos + length + 1;
+ 	if (spaceNeeded &gt; fVolume-&gt;InodeSize() - sizeof(bfs_inode))
+ 		return B_DEVICE_FULL;
+ 
+@@ -697,22 +697,22 @@
+ 			last = last-&gt;Next();
+ 
+ 		// try to change the attributes value
+-		if (item-&gt;data_size &gt; length
++		if (item-&gt;data_size &gt; pos + length
+ 			|| force
+-			|| ((uint8*)last + length - item-&gt;DataSize())
++			|| ((uint8*)last + pos + length - item-&gt;DataSize())
+ 					&lt;= ((uint8*)node + fVolume-&gt;InodeSize())) {
+ 			// Make room for the new attribute if needed (and we are forced
+ 			// to do so)
+-			if (force &amp;&amp; ((uint8*)last + length - item-&gt;DataSize())
++			if (force &amp;&amp; ((uint8*)last + pos + length - item-&gt;DataSize())
+ 					&gt; ((uint8*)node + fVolume-&gt;InodeSize())) {
+ 				// We also take the free space at the end of the small_data
+ 				// section into account, and request only what's really needed
+-				uint32 needed = length - item-&gt;DataSize() -
++				uint32 needed = pos + length - item-&gt;DataSize() -
+ 					(uint32)((uint8*)node + fVolume-&gt;InodeSize()
+ 						- (uint8*)last);
+ 
+ 				if (_MakeSpaceForSmallData(transaction, node, name, needed)
+-						&lt; B_OK)
++						!= B_OK)
+ 					return B_ERROR;
+ 
+ 				// reset our pointers
+@@ -728,9 +728,11 @@
+ 					last = last-&gt;Next();
+ 			}
+ 
++			size_t oldDataSize = item-&gt;DataSize();
++
+ 			// Normally, we can just overwrite the attribute data as the size
+ 			// is specified by the type and does not change that often
+-			if (length != item-&gt;DataSize()) {
++			if (pos + length != item-&gt;DataSize()) {
+ 				// move the attributes after the current one
+ 				small_data* next = item-&gt;Next();
+ 				if (!next-&gt;IsLast(node)) {
+@@ -747,13 +749,18 @@
+ 						- (uint8*)last);
+ 				}
+ 
+-				item-&gt;data_size = HOST_ENDIAN_TO_BFS_INT16(length);
++				item-&gt;data_size = HOST_ENDIAN_TO_BFS_INT16(pos + length);
+ 			}
+ 
+ 			item-&gt;type = HOST_ENDIAN_TO_BFS_INT32(type);
+-			memcpy(item-&gt;Data(), data, length);
+-			item-&gt;Data()[length] = '\0';
+ 
++			if (oldDataSize &lt; pos) {
++				// Fill gap with zeros
++				memset(item-&gt;Data() + oldDataSize, 0, pos - oldDataSize);
++			}
++			memcpy(item-&gt;Data() + pos, data, length);
++			item-&gt;Data()[pos + length] = '\0';
++
+ 			return B_OK;
+ 		}
+ 
+@@ -785,7 +792,7 @@
+ 	item-&gt;name_size = HOST_ENDIAN_TO_BFS_INT16(nameLength);
+ 	item-&gt;data_size = HOST_ENDIAN_TO_BFS_INT16(length);
+ 	strcpy(item-&gt;Name(), name);
+-	memcpy(item-&gt;Data(), data, length);
++	memcpy(item-&gt;Data() + pos, data, length);
+ 
+ 	// correctly terminate the small_data section
+ 	item = item-&gt;Next();
+@@ -911,7 +918,7 @@
+ 	NodeGetter node(fVolume, transaction, this);
+ 	const char nameTag[2] = {FILE_NAME_NAME, 0};
+ 
+-	return _AddSmallData(transaction, node, nameTag, FILE_NAME_TYPE,
++	return _AddSmallData(transaction, node, nameTag, FILE_NAME_TYPE, 0,
+ 		(uint8*)name, strlen(name), true);
+ }
+ 
+@@ -1021,8 +1028,12 @@
+ Inode::WriteAttribute(Transaction&amp; transaction, const char* name, int32 type,
+ 	off_t pos, const uint8* buffer, size_t* _length)
+ {
++	if (pos &lt; 0)
++		return B_BAD_VALUE;
++
+ 	// needed to maintain the index
+-	uint8 oldBuffer[BPLUSTREE_MAX_KEY_LENGTH], *oldData = NULL;
++	uint8 oldBuffer[BPLUSTREE_MAX_KEY_LENGTH];
++	uint8* oldData = NULL;
+ 	size_t oldLength = 0;
+ 
+ 	// TODO: we actually depend on that the contents of &quot;buffer&quot; are constant.
+@@ -1038,7 +1049,9 @@
+ 	Inode* attribute = NULL;
+ 	status_t status = B_OK;
+ 
+-	if (GetAttribute(name, &amp;attribute) &lt; B_OK) {
++	if (GetAttribute(name, &amp;attribute) != B_OK) {
++		// No attribute inode exists yet
++
+ 		// save the old attribute data
+ 		NodeGetter node(fVolume, transaction, this);
+ 		recursive_lock_lock(&amp;fSmallDataLock);
+@@ -1057,7 +1070,8 @@
+ 		// if the attribute doesn't exist yet (as a file), try to put it in the
+ 		// small_data section first - if that fails (due to insufficent space),
+ 		// create a real attribute file
+-		status = _AddSmallData(transaction, node, name, type, buffer, *_length);
++		status = _AddSmallData(transaction, node, name, type, pos, buffer,
++			*_length);
+ 		if (status == B_DEVICE_FULL) {
+ 			if (smallData != NULL) {
+ 				// remove the old attribute from the small data section - there
+@@ -1068,7 +1082,7 @@
+ 
+ 			if (status == B_OK)
+ 				status = CreateAttribute(transaction, name, type, &amp;attribute);
+-			if (status &lt; B_OK)
++			if (status != B_OK)
+ 				RETURN_ERROR(status);
+ 		} else if (status == B_OK)
+ 			status = WriteBack(transaction);
+@@ -1087,7 +1101,7 @@
+ 
+ 			// check if the data fits into the small_data section again
+ 			NodeGetter node(fVolume, transaction, this);
+-			status = _AddSmallData(transaction, node, name, type, buffer,
++			status = _AddSmallData(transaction, node, name, type, pos, buffer,
+ 				*_length);
+ 
+ 			if (status == B_OK) {
+@@ -1166,6 +1180,10 @@
+ }
+ 
+ 
++/*!	Returns the attribute inode with the specified \a name, in case it exists.
++	This method can only return real attribute files; the attributes in the
++	small data section are ignored.
++*/
+ status_t
+ Inode::GetAttribute(const char* name, Inode** _attribute)
+ {
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.h	2009-06-29 09:56:22 UTC (rev 31312)
++++ haiku/trunk/src/add-ons/kernel/file_systems/bfs/Inode.h	2009-06-29 10:40:01 UTC (rev 31313)
+@@ -196,7 +196,7 @@
+ 								NodeGetter&amp; node, const char* name);
+ 			status_t		_AddSmallData(Transaction&amp; transaction,
+ 								NodeGetter&amp; node, const char* name, uint32 type,
+-								const uint8* data, size_t length,
++								off_t pos, const uint8* data, size_t length,
+ 								bool force = false);
+ 			status_t		_GetNextSmallData(bfs_inode* node,
+ 								small_data** _smallData) const;
+
+Modified: haiku/trunk/src/tests/system/libroot/os/Jamfile
+===================================================================
+--- haiku/trunk/src/tests/system/libroot/os/Jamfile	2009-06-29 09:56:22 UTC (rev 31312)
++++ haiku/trunk/src/tests/system/libroot/os/Jamfile	2009-06-29 10:40:01 UTC (rev 31313)
+@@ -1,22 +1,23 @@
+ SubDir HAIKU_TOP src tests system libroot os ;
+ 
+-SetSubDirSupportedPlatforms libbe_test ;
++SimpleTest DriverSettingsTest :
++	DriverSettingsTest.cpp
++	driver_settings.c
++	: be
++;
+ 
+-#SubDirCcFlags -fcheck-memory-usage -O0 -D_NO_INLINE_ASM ;
++SimpleTest ParseDateTest :
++	ParseDateTest.cpp parsedate.cpp
++;
+ 
+-SimpleTest DriverSettingsTest
+-	: DriverSettingsTest.cpp driver_settings.c
+-	: be
+-	;
++SimpleTest FindDirectoryTest :
++	FindDirectoryTest.cpp
++;
+ 
+-SimpleTest ParseDateTest
+-	: ParseDateTest.cpp parsedate.cpp
+-	;
++SimpleTest fs_attr_test :
++	fs_attr_test.cpp
++;
+ 
+-SimpleTest FindDirectoryTest
+-	: FindDirectoryTest.cpp
+-	;
+-
+ # Tell Jam where to find these sources
+ SEARCH on [ FGristFiles
+ 		driver_settings.c
+
+Added: haiku/trunk/src/tests/system/libroot/os/fs_attr_test.cpp
+===================================================================
+--- haiku/trunk/src/tests/system/libroot/os/fs_attr_test.cpp	2009-06-29 09:56:22 UTC (rev 31312)
++++ haiku/trunk/src/tests/system/libroot/os/fs_attr_test.cpp	2009-06-29 10:40:01 UTC (rev 31313)
+@@ -0,0 +1,96 @@
++/*
++ * Copyright 2009, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * This file may be used under the terms of the MIT License.
++ */
++
++
++#include &lt;errno.h&gt;
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++
++#include &lt;fs_attr.h&gt;
++#include &lt;TypeConstants.h&gt;
++
++
++const char* kTestFileName = &quot;/tmp/fs_attr_test&quot;;
++
++
++void
++test_read(int fd, const char* attribute, type_code type, const char* data,
++	size_t length)
++{
++	attr_info info;
++	if (fs_stat_attr(fd, attribute, &amp;info) != 0) {
++		fprintf(stderr, &quot;Could not stat attribute \&quot;%s\&quot;: %s\n&quot;, attribute,
++			strerror(errno));
++		exit(1);
++	}
++
++	if (info.size != length) {
++		fprintf(stderr, &quot;Length does not match for \&quot;%s\&quot;: should be %ld, is &quot;
++			&quot;%lld\n&quot;, data, length, info.size);
++		exit(1);
++	}
++
++	if (info.type != type) {
++		fprintf(stderr, &quot;Type does not match B_RAW_TYPE!\n&quot;);
++		exit(1);
++	}
++
++	char buffer[4096];
++	ssize_t bytesRead = fs_read_attr(fd, attribute, B_RAW_TYPE, 0, buffer,
++		length);
++	if (bytesRead != (ssize_t)length) {
++		fprintf(stderr, &quot;Bytes read does not match: should be %ld, is %ld\n&quot;,
++			length, bytesRead);
++		exit(1);
++	}
++
++	if (memcmp(data, buffer, length)) {
++		fprintf(stderr, &quot;Bytes do not match: should be \&quot;%s\&quot;, is \&quot;%s\&quot;\n&quot;,
++			data, buffer);
++		exit(1);
++	}
++}
++
++
++int
++main(int argc, char** argv)
++{
++	int fd = open(kTestFileName, O_CREAT | O_TRUNC | O_WRONLY);
++	if (fd &lt; 0) {
++		fprintf(stderr, &quot;Creating test file \&quot;%s\&quot; failed: %s\n&quot;, kTestFileName,
++			strerror(errno));
++		return 1;
++	}
++
++	// Test the old BeOS API
++
++	fs_write_attr(fd, &quot;TEST&quot;, B_STRING_TYPE, 0, &quot;Hello BeOS&quot;, 11);
++	test_read(fd, &quot;TEST&quot;, B_STRING_TYPE, &quot;Hello BeOS&quot;, 11);
++
++	// TODO: this shows a bug in BFS; the index is not updated correctly
++	fs_write_attr(fd, &quot;TEST&quot;, B_STRING_TYPE, 6, &quot;Haiku&quot;, 6);
++	test_read(fd, &quot;TEST&quot;, B_STRING_TYPE, &quot;Hello Haiku&quot;, 12);
++
++	fs_write_attr(fd, &quot;TESTraw&quot;, B_RAW_TYPE, 16, &quot;Haiku&quot;, 6);
++	test_read(fd, &quot;TESTraw&quot;, B_RAW_TYPE, &quot;\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0Haiku&quot;,
++		22);
++
++	fs_write_attr(fd, &quot;TESTraw&quot;, B_RAW_TYPE, 0, &quot;Haiku&quot;, 6);
++	test_read(fd, &quot;TESTraw&quot;, B_RAW_TYPE, &quot;Haiku&quot;, 6);
++
++	char buffer[4096];
++	memset(buffer, 0, sizeof(buffer));
++	strcpy(buffer, &quot;Hello&quot;);
++	fs_write_attr(fd, &quot;TESTswitch&quot;, B_RAW_TYPE, 0, buffer,
++		strlen(buffer) + 1);
++	test_read(fd, &quot;TESTswitch&quot;, B_RAW_TYPE, buffer, strlen(buffer) + 1);
++
++	strcpy(buffer + 4000, &quot;Haiku&quot;);
++	fs_write_attr(fd, &quot;TESTswitch&quot;, B_RAW_TYPE, 0, buffer, 4006);
++	test_read(fd, &quot;TESTswitch&quot;, B_RAW_TYPE, buffer, 4006);
++
++	return 0;
++}
++
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017564.html">[Haiku-commits] r31312 - haiku/trunk/src/system/libroot/os
+</A></li>
+	<LI>Next message: <A HREF="017568.html">[Haiku-commits] r31314 - haiku/trunk
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17566">[ date ]</a>
+              <a href="thread.html#17566">[ thread ]</a>
+              <a href="subject.html#17566">[ subject ]</a>
+              <a href="author.html#17566">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

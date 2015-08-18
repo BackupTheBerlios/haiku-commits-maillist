@@ -1,0 +1,252 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20913 - in haiku/trunk: headers/private/kernel	src/system/kernel/slab src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20913%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/slab%20src/system/kernel/vm&In-Reply-To=%3C200704292259.l3TMxHIX022793%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001938.html">
+   <LINK REL="Next"  HREF="001940.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20913 - in haiku/trunk: headers/private/kernel	src/system/kernel/slab src/system/kernel/vm</H1>
+    <B>hugosantos at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20913%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/slab%20src/system/kernel/vm&In-Reply-To=%3C200704292259.l3TMxHIX022793%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20913 - in haiku/trunk: headers/private/kernel	src/system/kernel/slab src/system/kernel/vm">hugosantos at mail.berlios.de
+       </A><BR>
+    <I>Mon Apr 30 00:59:17 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001938.html">[Haiku-commits] r20912 - in haiku/trunk:	headers/private/kernel/slab src/system/kernel/slab
+</A></li>
+        <LI>Next message: <A HREF="001940.html">[Haiku-commits] r20914 - haiku/trunk/src/system/kernel/slab
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1939">[ date ]</a>
+              <a href="thread.html#1939">[ thread ]</a>
+              <a href="subject.html#1939">[ subject ]</a>
+              <a href="author.html#1939">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: hugosantos
+Date: 2007-04-30 00:58:46 +0200 (Mon, 30 Apr 2007)
+New Revision: 20913
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20913&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20913&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm.h
+   haiku/trunk/src/system/kernel/slab/Slab.cpp
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+cache/slab: when CACHE_DURING_BOOT is specified, use vm_allocate_early to obtain pages for slabs, and create the associated areas on post bootup.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm.h	2007-04-29 21:45:23 UTC (rev 20912)
++++ haiku/trunk/headers/private/kernel/vm.h	2007-04-29 22:58:46 UTC (rev 20913)
+@@ -32,7 +32,8 @@
+ 			size_t physicalSize, uint32 attributes);
+ 
+ 
+-void slab_init(addr_t initialBase, size_t initialSize);
++void slab_init(struct kernel_args *args, addr_t initialBase,
++	size_t initialSize);
+ void slab_init_post_sem();
+ 
+ // to protect code regions with interrupts turned on
+
+Modified: haiku/trunk/src/system/kernel/slab/Slab.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/slab/Slab.cpp	2007-04-29 21:45:23 UTC (rev 20912)
++++ haiku/trunk/src/system/kernel/slab/Slab.cpp	2007-04-29 22:58:46 UTC (rev 20913)
+@@ -72,6 +72,10 @@
+ 	object_cache_destructor destructor;
+ 	object_cache_reclaimer reclaimer;
+ 
++	status_t (*allocate_pages)(object_cache *cache, void **pages,
++		uint32 flags);
++	void (*free_pages)(object_cache *cache, void *pages);
++
+ 	object_depot depot;
+ 
+ 	virtual slab *CreateSlab(uint32 flags) = 0;
+@@ -156,6 +160,7 @@
+ static benaphore sObjectCacheListLock;
+ 
+ static uint8 *sInitialBegin, *sInitialLimit, *sInitialPointer;
++static kernel_args *sKernelArgs;
+ 
+ 
+ static status_t object_cache_reserve_internal(object_cache *cache,
+@@ -258,7 +263,7 @@
+ 
+ 
+ static status_t
+-allocate_pages(object_cache *cache, void **pages, uint32 flags)
++area_allocate_pages(object_cache *cache, void **pages, uint32 flags)
+ {
+ 	TRACE_CACHE(cache, &quot;allocate pages (%lu, 0x0%lx)&quot;, cache-&gt;slab_size, flags);
+ 
+@@ -283,7 +288,7 @@
+ 
+ 
+ static void
+-free_pages(object_cache *cache, void *pages)
++area_free_pages(object_cache *cache, void *pages)
+ {
+ 	area_id id = area_for(pages);
+ 
+@@ -298,7 +303,25 @@
+ }
+ 
+ 
++static status_t
++early_allocate_pages(object_cache *cache, void **pages, uint32 flags)
++{
++	addr_t base = vm_allocate_early(sKernelArgs, cache-&gt;slab_size,
++		cache-&gt;slab_size, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++
++	*pages = (void *)base;
++	return B_OK;
++}
++
++
+ static void
++early_free_pages(object_cache *cache, void *pages)
++{
++	panic(&quot;memory pressure on bootup?&quot;);
++}
++
++
++static void
+ object_cache_low_memory(void *_self, int32 level)
+ {
+ 	if (level == B_NO_LOW_MEMORY)
+@@ -409,6 +432,14 @@
+ 	cache-&gt;destructor = destructor;
+ 	cache-&gt;reclaimer = reclaimer;
+ 
++	if (cache-&gt;flags &amp; CACHE_DURING_BOOT) {
++		cache-&gt;allocate_pages = early_allocate_pages;
++		cache-&gt;free_pages = early_free_pages;
++	} else {
++		cache-&gt;allocate_pages = area_allocate_pages;
++		cache-&gt;free_pages = area_free_pages;
++	}
++
+ 	register_low_memory_handler(object_cache_low_memory, cache, 0);
+ 
+ 	BenaphoreLocker _(sObjectCacheListLock);
+@@ -433,6 +464,36 @@
+ 
+ 
+ static void
++object_cache_commit_slab(object_cache *cache, slab *slab)
++{
++	void *pages = (void *)ROUNDOWN((addr_t)slab-&gt;pages, B_PAGE_SIZE);
++	if (create_area(cache-&gt;name, &amp;pages, B_EXACT_ADDRESS, cache-&gt;slab_size,
++		B_ALREADY_WIRED, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA) &lt; B_OK)
++		panic(&quot;failed to create_area()&quot;);
++}
++
++
++static void
++object_cache_commit_pre_pages(object_cache *cache)
++{
++	SlabList::Iterator it = cache-&gt;full.GetIterator();
++	while (it.HasNext())
++		object_cache_commit_slab(cache, it.Next());
++
++	it = cache-&gt;partial.GetIterator();
++	while (it.HasNext())
++		object_cache_commit_slab(cache, it.Next());
++
++	it = cache-&gt;empty.GetIterator();
++	while (it.HasNext())
++		object_cache_commit_slab(cache, it.Next());
++
++	cache-&gt;allocate_pages = area_allocate_pages;
++	cache-&gt;free_pages = area_free_pages;
++}
++
++
++static void
+ delete_cache(object_cache *cache)
+ {
+ 	cache-&gt;~object_cache();
+@@ -1202,12 +1263,14 @@
+ 
+ 
+ void
+-slab_init(addr_t initialBase, size_t initialSize)
++slab_init(kernel_args *args, addr_t initialBase, size_t initialSize)
+ {
+ 	sInitialBegin = (uint8 *)initialBase;
+ 	sInitialLimit = sInitialBegin + initialSize;
+ 	sInitialPointer = sInitialBegin;
+ 
++	sKernelArgs = args;
++
+ 	new (&amp;sObjectCaches) ObjectCacheList();
+ 
+ 	block_allocator_init_boot();
+@@ -1228,8 +1291,11 @@
+ 	ObjectCacheList::Iterator it = sObjectCaches.GetIterator();
+ 
+ 	while (it.HasNext()) {
+-		if (object_cache_init_locks(it.Next()) &lt; B_OK)
++		object_cache *cache = it.Next();
++		if (object_cache_init_locks(cache) &lt; B_OK)
+ 			panic(&quot;slab_init: failed to create sems&quot;);
++		if (cache-&gt;allocate_pages == early_allocate_pages)
++			object_cache_commit_pre_pages(cache);
+ 	}
+ 
+ 	block_allocator_init_rest();
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-04-29 21:45:23 UTC (rev 20912)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-04-29 22:58:46 UTC (rev 20913)
+@@ -2894,7 +2894,7 @@
+ 	size_t slabInitialSize = 2 * B_PAGE_SIZE;
+ 	addr_t slabInitialBase = vm_allocate_early(args, slabInitialSize,
+ 		slabInitialSize, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+-	slab_init(slabInitialBase, slabInitialSize);
++	slab_init(args, slabInitialBase, slabInitialSize);
+ 
+ 	// initialize the free page list and physical page mapper
+ 	vm_page_init(args);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001938.html">[Haiku-commits] r20912 - in haiku/trunk:	headers/private/kernel/slab src/system/kernel/slab
+</A></li>
+	<LI>Next message: <A HREF="001940.html">[Haiku-commits] r20914 - haiku/trunk/src/system/kernel/slab
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1939">[ date ]</a>
+              <a href="thread.html#1939">[ thread ]</a>
+              <a href="subject.html#1939">[ subject ]</a>
+              <a href="author.html#1939">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,899 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22348 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22348%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200709281550.l8SFoRMC022582%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004033.html">
+   <LINK REL="Next"  HREF="004034.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22348 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22348%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200709281550.l8SFoRMC022582%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22348 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Sep 28 17:50:27 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004033.html">[Haiku-commits] r22347 - in haiku/trunk: headers/os/drivers/bus headers/private/drivers  src/add-ons/kernel/bus_managers/ide src/add-ons/kernel/bus_managers/scsi src/add-ons/kernel/busses/ide/generic_ide_pci src/add-ons/kernel/busses/ide/ide_isa src/add-ons/kernel/busses/ide/legacy_sata src/add-ons/kernel/busses/ide/promise_tx2 src/add-ons/kernel/busses/ide/silicon_image_3112 src/add-ons/kernel/drivers/disk/scsi/scsi_cd src/add-ons/kernel/drivers/disk/scsi/scsi_dsk src/add-ons/kernel/file_systems/cdda src/add-ons/kernel/generic/ide_adapter src/add-ons/kernel/generic/scsi_periph src/bin/ideinfo
+</A></li>
+        <LI>Next message: <A HREF="004034.html">[Haiku-commits] (no subject)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4032">[ date ]</a>
+              <a href="thread.html#4032">[ thread ]</a>
+              <a href="subject.html#4032">[ subject ]</a>
+              <a href="author.html#4032">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-09-28 17:50:26 +0200 (Fri, 28 Sep 2007)
+New Revision: 22348
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22348&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22348&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/system/kernel/vm/PageCacheLocker.h
+Modified:
+   haiku/trunk/headers/private/kernel/vm.h
+   haiku/trunk/headers/private/kernel/vm_page.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+   haiku/trunk/src/system/kernel/vm/vm_page.cpp
+Log:
+bonefish+axeld:
+* We now have a page writer that takes some pages from the modified queue
+  and writes it back every few seconds. It can be triggered by the page
+  scanner to do that more often, though. That mechanism can be greatly
+  improved once we have our I/O scheduler working.
+* Removed vm_page_write_modified_page() again - it was all &quot;eaten up&quot; by
+  the page writer.
+* Reworked vm_page_write_modified_pages() a bit: it now uses
+  vm_test_map_modification() and vm_clear_map_flags() instead of the
+  iterating over all areas which wouldn't even work correctly.
+  The code is much simpler now, too.
+* You usually put something to the tail of a queue, and remove the contents
+  from the head, not vice versa - changed queue implementation to reflect this.
+* Additionally, there is now a enqueue_page_to_head() if you actually want the
+  opposite.
+* vm_page_requeue() allows you to move a page in a queue to the head or tail.
+* Replaced vm_clear_map_activation() with vm_clear_map_flags() which allows
+  you to clear other flags than PAGE_ACCESSED.
+* The page scanner dumps now some arguments with each run.
+* Removed the old disabled pageout_daemon() from NewOS.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm.h	2007-09-28 14:53:42 UTC (rev 22347)
++++ haiku/trunk/headers/private/kernel/vm.h	2007-09-28 15:50:26 UTC (rev 22348)
+@@ -89,7 +89,6 @@
+ addr_t vm_allocate_early(struct kernel_args *args, size_t virtualSize,
+ 			size_t physicalSize, uint32 attributes);
+ 
+-
+ void slab_init(struct kernel_args *args, addr_t initialBase,
+ 	size_t initialSize);
+ void slab_init_post_sem();
+@@ -128,8 +127,9 @@
+ 			addr_t address);
+ status_t vm_set_area_memory_type(area_id id, addr_t physicalBase, uint32 type);
+ status_t vm_get_page_mapping(team_id team, addr_t vaddr, addr_t *paddr);
++bool vm_test_map_modification(struct vm_page *page);
+ int32 vm_test_map_activation(struct vm_page *page, bool *_modified);
+-void vm_clear_map_activation(struct vm_page *page);
++void vm_clear_map_flags(struct vm_page *page, uint32 flags);
+ void vm_remove_all_page_mappings(struct vm_page *page);
+ status_t vm_unmap_pages(struct vm_area *area, addr_t base, size_t length);
+ status_t vm_map_page(struct vm_area *area, struct vm_page *page, addr_t address,
+
+Modified: haiku/trunk/headers/private/kernel/vm_page.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_page.h	2007-09-28 14:53:42 UTC (rev 22347)
++++ haiku/trunk/headers/private/kernel/vm_page.h	2007-09-28 15:50:26 UTC (rev 22348)
+@@ -27,14 +27,14 @@
+ status_t vm_mark_page_inuse(addr_t page);
+ status_t vm_mark_page_range_inuse(addr_t startPage, addr_t length);
+ status_t vm_page_set_state(struct vm_page *page, int state);
++void vm_page_requeue(struct vm_page *page, bool tail);
+ 
+ // get some data about the number of pages in the system
+ size_t vm_page_num_pages(void);
+ size_t vm_page_num_free_pages(void);
+ 
+-status_t vm_page_write_modified_page(struct vm_cache *cache,
+-	struct vm_page *page, bool fsReenter);
+ status_t vm_page_write_modified_pages(struct vm_cache *cache, bool fsReenter);
++void vm_page_schedule_write_page(struct vm_page *page);
+ 
+ void vm_page_unreserve_pages(uint32 count);
+ void vm_page_reserve_pages(uint32 count);
+
+Added: haiku/trunk/src/system/kernel/vm/PageCacheLocker.h
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/PageCacheLocker.h	2007-09-28 14:53:42 UTC (rev 22347)
++++ haiku/trunk/src/system/kernel/vm/PageCacheLocker.h	2007-09-28 15:50:26 UTC (rev 22348)
+@@ -0,0 +1,30 @@
++/*
++ * Copyright 2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A> All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef PAGE_CACHE_LOCKER_H
++#define PAGE_CACHE_LOCKER_H
++
++
++#include &lt;null.h&gt;
++
++struct vm_page;
++
++
++class PageCacheLocker {
++public:
++	PageCacheLocker(vm_page* page);
++	~PageCacheLocker();
++
++	bool IsLocked() { return fPage != NULL; }
++
++	bool Lock(vm_page* page);
++	void Unlock();
++
++private:
++	bool _IgnorePage(vm_page* page);
++
++	vm_page*	fPage;
++};
++
++#endif	// PAGE_CACHE_LOCKER_H
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-09-28 14:53:42 UTC (rev 22347)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-09-28 15:50:26 UTC (rev 22348)
+@@ -2354,6 +2354,32 @@
+ }
+ 
+ 
++bool
++vm_test_map_modification(vm_page *page)
++{
++	MutexLocker locker(sMappingLock);
++
++	vm_page_mappings::Iterator iterator = page-&gt;mappings.GetIterator();
++	vm_page_mapping *mapping;
++	while ((mapping = iterator.Next()) != NULL) {
++		vm_area *area = mapping-&gt;area;
++		vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
++
++		addr_t physicalAddress;
++		uint32 flags;
++		map-&gt;ops-&gt;lock(map);
++		addr_t address = area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
++		map-&gt;ops-&gt;query_interrupt(map, address, &amp;physicalAddress, &amp;flags);
++		map-&gt;ops-&gt;unlock(map);
++
++		if (flags &amp; PAGE_MODIFIED)
++			return true;
++	}
++
++	return false;
++}
++
++
+ int32
+ vm_test_map_activation(vm_page *page, bool *_modified)
+ {
+@@ -2389,7 +2415,7 @@
+ 
+ 
+ void
+-vm_clear_map_activation(vm_page *page)
++vm_clear_map_flags(vm_page *page, uint32 flags)
+ {
+ 	MutexLocker locker(sMappingLock);
+ 
+@@ -2401,7 +2427,7 @@
+ 
+ 		map-&gt;ops-&gt;lock(map);
+ 		addr_t address = area-&gt;base + (page-&gt;cache_offset &lt;&lt; PAGE_SHIFT);
+-		map-&gt;ops-&gt;clear_flags(map, address, PAGE_ACCESSED);
++		map-&gt;ops-&gt;clear_flags(map, address, flags);
+ 		map-&gt;ops-&gt;unlock(map);
+ 	}
+ }
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-09-28 14:53:42 UTC (rev 22347)
++++ haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-09-28 15:50:26 UTC (rev 22348)
+@@ -4,6 +4,8 @@
+  */
+ 
+ 
++#include &quot;PageCacheLocker.h&quot;
++
+ #include &lt;signal.h&gt;
+ 
+ #include &lt;OS.h&gt;
+@@ -25,23 +27,6 @@
+ static uint32 sNumPages;
+ 
+ 
+-class PageCacheLocker {
+-public:
+-	PageCacheLocker(vm_page* page);
+-	~PageCacheLocker();
+-
+-	bool IsLocked() { return fPage != NULL; }
+-
+-	bool Lock(vm_page* page);
+-	void Unlock();
+-
+-private:
+-	bool _IgnorePage(vm_page* page);
+-
+-	vm_page*	fPage;
+-};
+-
+-
+ PageCacheLocker::PageCacheLocker(vm_page* page)
+ 	:
+ 	fPage(NULL)
+@@ -118,7 +103,7 @@
+ 		return;
+ 
+ 	if (page-&gt;state == PAGE_STATE_ACTIVE)
+-		vm_clear_map_activation(page);
++		vm_clear_map_flags(page, PAGE_ACCESSED);
+ }
+ 
+ 
+@@ -155,9 +140,9 @@
+ 
+ 	if (page-&gt;usage_count &lt; 0) {
+ 		vm_remove_all_page_mappings(page);
+-		if (page-&gt;state == PAGE_STATE_MODIFIED) {
+-			// TODO: schedule to write back!
+-		} else
++		if (page-&gt;state == PAGE_STATE_MODIFIED)
++			vm_page_schedule_write_page(page);
++		else
+ 			vm_page_set_state(page, PAGE_STATE_INACTIVE);
+ 		//dprintf(&quot;page %p -&gt; move to inactive\n&quot;, page);
+ 	}
+@@ -193,6 +178,8 @@
+ 			* pagesLeft / sLowPagesCount;
+ 		uint32 leftToFree = 32 + (scanPagesCount - 32)
+ 			* pagesLeft / sLowPagesCount;
++dprintf(&quot;wait interval %Ld, scan pages %lu, free %lu, target %lu\n&quot;,
++	scanWaitInterval, scanPagesCount, pagesLeft, leftToFree);
+ 
+ 		for (uint32 i = 0; i &lt; scanPagesCount &amp;&amp; leftToFree &gt; 0; i++) {
+ 			if (clearPage == 0)
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_page.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-09-28 14:53:42 UTC (rev 22347)
++++ haiku/trunk/src/system/kernel/vm/vm_page.cpp	2007-09-28 15:50:26 UTC (rev 22348)
+@@ -27,7 +27,9 @@
+ #include &lt;vm_page.h&gt;
+ #include &lt;vm_cache.h&gt;
+ 
++#include &quot;PageCacheLocker.h&quot;
+ 
++
+ //#define TRACE_VM_PAGE
+ #ifdef TRACE_VM_PAGE
+ #	define TRACE(x) dprintf x
+@@ -59,23 +61,23 @@
+ static ConditionVariable&lt;page_queue&gt; sFreePageCondition;
+ static spinlock sPageLock;
+ 
+-static sem_id modified_pages_available;
++static sem_id sWriterWaitSem;
+ 
+ 
+-/*!	Dequeues a page from the tail of the given queue */
++/*!	Dequeues a page from the head of the given queue */
+ static vm_page *
+ dequeue_page(page_queue *queue)
+ {
+ 	vm_page *page;
+ 
+-	page = queue-&gt;tail;
++	page = queue-&gt;head;
+ 	if (page != NULL) {
+-		if (queue-&gt;head == page)
+-			queue-&gt;head = NULL;
+-		if (page-&gt;queue_prev != NULL)
+-			page-&gt;queue_prev-&gt;queue_next = NULL;
++		if (queue-&gt;tail == page)
++			queue-&gt;tail = NULL;
++		if (page-&gt;queue_next != NULL)
++			page-&gt;queue_next-&gt;queue_prev = NULL;
+ 
+-		queue-&gt;tail = page-&gt;queue_prev;
++		queue-&gt;head = page-&gt;queue_next;
+ 		queue-&gt;count--;
+ 
+ #ifdef DEBUG_PAGE_QUEUE
+@@ -92,7 +94,7 @@
+ }
+ 
+ 
+-/*!	Enqueues a page to the head of the given queue */
++/*!	Enqueues a page to the tail of the given queue */
+ static void
+ enqueue_page(page_queue *queue, vm_page *page)
+ {
+@@ -103,6 +105,32 @@
+ 	}
+ #endif	// DEBUG_PAGE_QUEUE
+ 
++	if (queue-&gt;tail != NULL)
++		queue-&gt;tail-&gt;queue_next = page;
++	page-&gt;queue_prev = queue-&gt;tail;
++	queue-&gt;tail = page;
++	page-&gt;queue_next = NULL;
++	if (queue-&gt;head == NULL)
++		queue-&gt;head = page;
++	queue-&gt;count++;
++
++#ifdef DEBUG_PAGE_QUEUE
++	page-&gt;queue = queue;
++#endif
++}
++
++
++/*!	Enqueues a page to the head of the given queue */
++static void
++enqueue_page_to_head(page_queue *queue, vm_page *page)
++{
++#ifdef DEBUG_PAGE_QUEUE
++	if (page-&gt;queue != NULL) {
++		panic(&quot;enqueue_page_to_head(queue: %p, page: %p): page thinks it is &quot;
++			&quot;already in queue %p&quot;, queue, page, page-&gt;queue);
++	}
++#endif	// DEBUG_PAGE_QUEUE
++
+ 	if (queue-&gt;head != NULL)
+ 		queue-&gt;head-&gt;queue_prev = page;
+ 	page-&gt;queue_next = queue-&gt;head;
+@@ -128,16 +156,16 @@
+ 	}
+ #endif	// DEBUG_PAGE_QUEUE
+ 
+-	if (page-&gt;queue_prev != NULL)
+-		page-&gt;queue_prev-&gt;queue_next = page-&gt;queue_next;
+-	else
+-		queue-&gt;head = page-&gt;queue_next;
+-
+ 	if (page-&gt;queue_next != NULL)
+ 		page-&gt;queue_next-&gt;queue_prev = page-&gt;queue_prev;
+ 	else
+ 		queue-&gt;tail = page-&gt;queue_prev;
+ 
++	if (page-&gt;queue_prev != NULL)
++		page-&gt;queue_prev-&gt;queue_next = page-&gt;queue_next;
++	else
++		queue-&gt;head = page-&gt;queue_next;
++
+ 	queue-&gt;count--;
+ 
+ #ifdef DEBUG_PAGE_QUEUE
+@@ -610,85 +638,6 @@
+ }
+ 
+ 
+-#if 0
+-static int pageout_daemon()
+-{
+-	int state;
+-	vm_page *page;
+-	vm_region *region;
+-	IOVECS(vecs, 1);
+-	ssize_t err;
+-
+-	dprintf(&quot;pageout daemon starting\n&quot;);
+-
+-	for (;;) {
+-		acquire_sem(modified_pages_available);
+-
+-		dprintf(&quot;here\n&quot;);
+-
+-		state = disable_interrupts();
+-		acquire_spinlock(&amp;sPageLock);
+-		page = dequeue_page(&amp;sModifiedPageQueue);
+-		page-&gt;state = PAGE_STATE_BUSY;
+-		vm_cache_acquire_ref(page-&gt;cache_ref, true);
+-		release_spinlock(&amp;sPageLock);
+-		restore_interrupts(state);
+-
+-		dprintf(&quot;got page %p\n&quot;, page);
+-
+-		if (page-&gt;cache_ref-&gt;cache-&gt;temporary &amp;&amp; !trimming_cycle) {
+-			// unless we're in the trimming cycle, dont write out pages
+-			// that back anonymous stores
+-			state = disable_interrupts();
+-			acquire_spinlock(&amp;sPageLock);
+-			enqueue_page(&amp;sModifiedPageQueue, page);
+-			page-&gt;state = PAGE_STATE_MODIFIED;
+-			release_spinlock(&amp;sPageLock);
+-			restore_interrupts(state);
+-			vm_cache_release_ref(page-&gt;cache_ref);
+-			continue;
+-		}
+-
+-		/* clear the modified flag on this page in all it's mappings */
+-		mutex_lock(&amp;page-&gt;cache_ref-&gt;lock);
+-		for (region = page-&gt;cache_ref-&gt;region_list; region; region = region-&gt;cache_next) {
+-			if (page-&gt;offset &gt; region-&gt;cache_offset
+-			  &amp;&amp; page-&gt;offset &lt; region-&gt;cache_offset + region-&gt;size) {
+-				vm_translation_map *map = &amp;region-&gt;aspace-&gt;translation_map;
+-				map-&gt;ops-&gt;lock(map);
+-				map-&gt;ops-&gt;clear_flags(map, page-&gt;offset - region-&gt;cache_offset + region-&gt;base, PAGE_MODIFIED);
+-				map-&gt;ops-&gt;unlock(map);
+-			}
+-		}
+-		mutex_unlock(&amp;page-&gt;cache_ref-&gt;lock);
+-
+-		/* write the page out to it's backing store */
+-		vecs-&gt;num = 1;
+-		vecs-&gt;total_len = PAGE_SIZE;
+-		vm_get_physical_page(page-&gt;physical_page_number * PAGE_SIZE, (addr_t *)&amp;vecs-&gt;vec[0].iov_base, PHYSICAL_PAGE_CAN_WAIT);
+-		vecs-&gt;vec[0].iov_len = PAGE_SIZE;
+-
+-		err = page-&gt;cache_ref-&gt;cache-&gt;store-&gt;ops-&gt;write(page-&gt;cache_ref-&gt;cache-&gt;store, page-&gt;offset, vecs);
+-
+-		vm_put_physical_page((addr_t)vecs-&gt;vec[0].iov_base);
+-
+-		state = disable_interrupts();
+-		acquire_spinlock(&amp;sPageLock);
+-		if (page-&gt;ref_count &gt; 0) {
+-			page-&gt;state = PAGE_STATE_ACTIVE;
+-		} else {
+-			page-&gt;state = PAGE_STATE_INACTIVE;
+-		}
+-		enqueue_page(&amp;sActivePageQueue, page);
+-		release_spinlock(&amp;sPageLock);
+-		restore_interrupts(state);
+-
+-		vm_cache_release_ref(page-&gt;cache_ref);
+-	}
+-}
+-#endif
+-
+-
+ static status_t
+ write_page(vm_page *page, bool fsReenter)
+ {
+@@ -719,6 +668,97 @@
+ }
+ 
+ 
++status_t
++page_writer(void* /*unused*/)
++{
++	while (true) {
++		acquire_sem_etc(sWriterWaitSem, 1, B_RELATIVE_TIMEOUT, 3000000);
++			// all 3 seconds when no one triggers us
++
++		const uint32 kNumPages = 32;
++		ConditionVariable&lt;vm_page&gt; busyConditions[kNumPages];
++		vm_page *pages[kNumPages];
++		uint32 numPages = 0;
++
++		// TODO: once the I/O scheduler is there, we should write back
++		// a lot more pages back.
++		// TODO: make this laptop friendly, too (ie. only start doing
++		// something if someone else did something or there is really
++		// enough to do).
++
++		// collect pages to be written
++
++		while (numPages &lt; kNumPages) {
++			InterruptsSpinLocker locker(sPageLock);
++
++			vm_page *page = sModifiedPageQueue.head;
++			while (page != NULL &amp;&amp; page-&gt;state == PAGE_STATE_BUSY) {
++				// skip busy pages
++				page = page-&gt;queue_next;
++			}
++			if (page == NULL)
++				break;
++
++			locker.Unlock();
++
++			PageCacheLocker cacheLocker(page);
++			if (!cacheLocker.IsLocked())
++				continue;
++
++			locker.Lock();
++			remove_page_from_queue(&amp;sModifiedPageQueue, page);
++			page-&gt;state = PAGE_STATE_BUSY;
++
++			busyConditions[numPages].Publish(page, &quot;page&quot;);
++
++			locker.Unlock();
++
++			//dprintf(&quot;write page %p\n&quot;, page);
++			vm_clear_map_flags(page, PAGE_MODIFIED);
++			vm_cache_acquire_ref(page-&gt;cache);
++			pages[numPages++] = page;
++		}
++
++		if (numPages == 0)
++			continue;
++
++		// write pages to disk
++
++		// TODO: put this as requests into the I/O scheduler
++		status_t writeStatus[kNumPages];
++		for (uint32 i = 0; i &lt; numPages; i++) {
++			writeStatus[i] = write_page(pages[i], false);
++		}
++
++		// mark pages depending on if they could be written or not
++
++		for (uint32 i = 0; i &lt; numPages; i++) {
++			vm_cache *cache = pages[i]-&gt;cache;
++			mutex_lock(&amp;cache-&gt;lock);
++
++			if (writeStatus[i] == B_OK) {
++				// put it into the active queue
++				InterruptsSpinLocker locker(sPageLock);
++				move_page_to_active_or_inactive_queue(pages[i], true);
++			} else {
++				// We don't have to put the PAGE_MODIFIED bit back, as it's
++				// still in the modified pages list.
++				InterruptsSpinLocker locker(sPageLock);
++				pages[i]-&gt;state = PAGE_STATE_MODIFIED;
++				enqueue_page(&amp;sModifiedPageQueue, pages[i]);
++			}
++
++			busyConditions[i].Unpublish();
++
++			mutex_unlock(&amp;cache-&gt;lock);
++			vm_cache_release_ref(cache);
++		}
++	}
++
++	return B_OK;
++}
++
++
+ static void
+ page_thief(void* /*unused*/, int32 level)
+ {
+@@ -751,7 +791,7 @@
+ 		// find a candidate to steal from the inactive queue
+ 
+ 		for (int32 i = sActivePageQueue.count; i-- &gt; 0;) {
+-			// move page to the head of the queue so that we don't
++			// move page to the tail of the queue so that we don't
+ 			// scan it again directly
+ 			page = dequeue_page(&amp;sActivePageQueue);
+ 			enqueue_page(&amp;sActivePageQueue, page);
+@@ -800,96 +840,29 @@
+ 
+ /*!
+ 	You need to hold the vm_cache lock when calling this function.
+-	And \a page must obviously be in that cache.
+ 	Note that the cache lock is released in this function.
+ */
+ status_t
+-vm_page_write_modified_page(vm_cache *cache, vm_page *page, bool fsReenter)
+-{
+-	ASSERT(page-&gt;state == PAGE_STATE_MODIFIED);
+-	ASSERT(page-&gt;cache == cache);
+-
+-	ConditionVariable&lt;vm_page&gt; busyCondition;
+-	InterruptsSpinLocker locker(&amp;sPageLock);
+-
+-	remove_page_from_queue(&amp;sModifiedPageQueue, page);
+-	page-&gt;state = PAGE_STATE_BUSY;
+-
+-	busyCondition.Publish(page, &quot;page&quot;);
+-
+-	locker.Unlock();
+-
+-	off_t pageOffset = (off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT;
+-
+-	for (vm_area *area = cache-&gt;areas; area; area = area-&gt;cache_next) {
+-		if (pageOffset &gt;= area-&gt;cache_offset
+-			&amp;&amp; pageOffset &lt; area-&gt;cache_offset + area-&gt;size) {
+-			vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
+-			// clear the modified flag
+-			map-&gt;ops-&gt;lock(map);
+-			map-&gt;ops-&gt;clear_flags(map, pageOffset - area-&gt;cache_offset
+-				+ area-&gt;base, PAGE_MODIFIED);
+-			map-&gt;ops-&gt;unlock(map);
+-		}
+-	}
+-
+-	mutex_unlock(&amp;cache-&gt;lock);
+-
+-	status_t status = write_page(page, fsReenter);
+-
+-	mutex_lock(&amp;cache-&gt;lock);
+-
+-	locker.Lock();
+-
+-	if (status == B_OK) {
+-		// put it into the active queue
+-		move_page_to_active_or_inactive_queue(page, true);
+-	} else {
+-		// We don't have to put the PAGE_MODIFIED bit back, as it's still
+-		// in the modified pages list.
+-		page-&gt;state = PAGE_STATE_MODIFIED;
+-		enqueue_page(&amp;sModifiedPageQueue, page);
+-	}
+-
+-	busyCondition.Unpublish();
+-
+-	return status;
+-}
+-
+-
+-/*!
+-	You need to hold the vm_cache lock when calling this function.
+-	Note that the cache lock is released in this function.
+-*/
+-status_t
+ vm_page_write_modified_pages(vm_cache *cache, bool fsReenter)
+ {
+-	vm_page *page = cache-&gt;page_list;
+-
+ 	// ToDo: join adjacent pages into one vec list
+ 
+-	for (; page; page = page-&gt;cache_next) {
+-		bool gotPage = false;
+-		bool dequeuedPage = true;
+-		off_t pageOffset;
+-		status_t status;
+-		vm_area *area;
+-		ConditionVariable&lt;vm_page&gt; busyCondition;
++	for (vm_page *page = cache-&gt;page_list; page; page = page-&gt;cache_next) {
++		bool dequeuedPage = false;
+ 
+-		cpu_status state = disable_interrupts();
+-		acquire_spinlock(&amp;sPageLock);
+-
+ 		if (page-&gt;state == PAGE_STATE_MODIFIED) {
++			InterruptsSpinLocker locker(&amp;sPageLock);
+ 			remove_page_from_queue(&amp;sModifiedPageQueue, page);
+-			page-&gt;state = PAGE_STATE_BUSY;
+-			busyCondition.Publish(page, &quot;page&quot;);
+-			gotPage = true;
+-		}
++			dequeuedPage = true;
++		} else if (!vm_test_map_modification(page))
++			continue;
+ 
+-		release_spinlock(&amp;sPageLock);
+-		restore_interrupts(state);
++		page-&gt;state = PAGE_STATE_BUSY;
+ 
+-		// We may have a modified page - however, while we're writing it back,
++		ConditionVariable&lt;vm_page&gt; busyCondition;
++		busyCondition.Publish(page, &quot;page&quot;);
++
++		// We have a modified page - however, while we're writing it back,
+ 		// the page is still mapped. In order not to lose any changes to the
+ 		// page, we mark it clean before actually writing it back; if writing
+ 		// the page fails for some reason, we just keep it in the modified page
+@@ -899,80 +872,54 @@
+ 		// had the chance to write it back, then we'll write it again later -
+ 		// that will probably not happen that often, though.
+ 
+-		pageOffset = (off_t)page-&gt;cache_offset &lt;&lt; PAGE_SHIFT;
++		// clear the modified flag
++		vm_clear_map_flags(page, PAGE_MODIFIED);
+ 
+-		for (area = cache-&gt;areas; area; area = area-&gt;cache_next) {
+-			if (pageOffset &gt;= area-&gt;cache_offset
+-				&amp;&amp; pageOffset &lt; area-&gt;cache_offset + area-&gt;size) {
+-				vm_translation_map *map = &amp;area-&gt;address_space-&gt;translation_map;
+-				map-&gt;ops-&gt;lock(map);
+-
+-				if (!gotPage) {
+-					// Check if the PAGE_MODIFIED bit hasn't been propagated yet
+-					addr_t physicalAddress;
+-					uint32 flags;
+-					map-&gt;ops-&gt;query(map, pageOffset - area-&gt;cache_offset + area-&gt;base,
+-						&amp;physicalAddress, &amp;flags);
+-					if (flags &amp; PAGE_MODIFIED) {
+-						page-&gt;state = PAGE_STATE_BUSY;
+-						busyCondition.Publish(page, &quot;page&quot;);
+-						gotPage = true;
+-						dequeuedPage = false;
+-					}
+-				}
+-				if (gotPage) {
+-					// clear the modified flag
+-					map-&gt;ops-&gt;clear_flags(map, pageOffset - area-&gt;cache_offset
+-						+ area-&gt;base, PAGE_MODIFIED);
+-				}
+-				map-&gt;ops-&gt;unlock(map);
+-			}
+-		}
+-
+-		if (!gotPage)
+-			continue;
+-
+ 		mutex_unlock(&amp;cache-&gt;lock);
+ 
+-		status = write_page(page, fsReenter);
++		status_t status = write_page(page, fsReenter);
+ 
+ 		mutex_lock(&amp;cache-&gt;lock);
+ 
++		InterruptsSpinLocker locker(&amp;sPageLock);
++
+ 		if (status == B_OK) {
+ 			// put it into the active/inactive queue
+-
+-			state = disable_interrupts();
+-			acquire_spinlock(&amp;sPageLock);
+-
+ 			move_page_to_active_or_inactive_queue(page, dequeuedPage);
+-			busyCondition.Unpublish();
+-
+-			release_spinlock(&amp;sPageLock);
+-			restore_interrupts(state);
+ 		} else {
+ 			// We don't have to put the PAGE_MODIFIED bit back, as it's still
+ 			// in the modified pages list.
+-			state = disable_interrupts();
+-			acquire_spinlock(&amp;sPageLock);
+-
+ 			if (dequeuedPage) {
+ 				page-&gt;state = PAGE_STATE_MODIFIED;
+ 				enqueue_page(&amp;sModifiedPageQueue, page);
+ 			} else
+ 				set_page_state_nolock(page, PAGE_STATE_MODIFIED);
+-
+-			busyCondition.Unpublish();
+-
+-			release_spinlock(&amp;sPageLock);
+-			restore_interrupts(state);
+ 		}
++
++		busyCondition.Unpublish();
+ 	}
+ 
+ 	return B_OK;
+ }
+ 
+ 
++/*!	Schedules the page writer to write back the specified \a page.
++	Note, however, that it doesn't do this immediately, and it might
++	take several seconds until the page is actually written out.
++*/
+ void
++vm_page_schedule_write_page(vm_page *page)
++{
++	ASSERT(page-&gt;state == PAGE_STATE_MODIFIED);
++
++	vm_page_requeue(page, false);
++
++	release_sem_etc(sWriterWaitSem, 1,
++		B_RELEASE_IF_WAITING_ONLY | B_DO_NOT_RESCHEDULE);
++}
++
++
++void
+ vm_page_init_num_pages(kernel_args *args)
+ {
+ 	uint32 i;
+@@ -1086,17 +1033,17 @@
+ 	thread = spawn_kernel_thread(&amp;page_scrubber, &quot;page scrubber&quot;, B_LOWEST_ACTIVE_PRIORITY, NULL);
+ 	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 
+-	modified_pages_available = create_sem(0, &quot;modified_pages_avail_sem&quot;);
+-#if 0
+-	// create a kernel thread to schedule modified pages to write
+-	tid = thread_create_kernel_thread(&quot;pageout daemon&quot;, &amp;pageout_daemon, B_FIRST_REAL_TIME_PRIORITY + 1);
+-	thread_resume_thread(tid);
+-#endif
+-
+ 	new (&amp;sFreePageCondition) ConditionVariable&lt;page_queue&gt;;
+ 	sFreePageCondition.Publish(&amp;sFreePageQueue, &quot;free page&quot;);
+ 
+ 	register_low_memory_handler(page_thief, NULL, 0);
++
++	sWriterWaitSem = create_sem(0, &quot;page writer&quot;);
++
++	thread = spawn_kernel_thread(&amp;page_writer, &quot;page writer&quot;,
++		B_LOW_PRIORITY, NULL);
++	send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
++
+ 	return B_OK;
+ }
+ 
+@@ -1374,15 +1321,47 @@
+ status_t
+ vm_page_set_state(vm_page *page, int pageState)
+ {
+-	cpu_status state = disable_interrupts();
+-	acquire_spinlock(&amp;sPageLock);
++	InterruptsSpinLocker _(sPageLock);
+ 
+-	status_t status = set_page_state_nolock(page, pageState);
++	return set_page_state_nolock(page, pageState);
++}
+ 
+-	release_spinlock(&amp;sPageLock);
+-	restore_interrupts(state);
+ 
+-	return status;
++void
++vm_page_requeue(struct vm_page *page, bool tail)
++{
++	InterruptsSpinLocker _(sPageLock);
++	page_queue *queue = NULL;
++
++	switch (page-&gt;state) {
++		case PAGE_STATE_BUSY:
++		case PAGE_STATE_ACTIVE:
++		case PAGE_STATE_INACTIVE:
++		case PAGE_STATE_WIRED:
++		case PAGE_STATE_UNUSED:
++			queue = &sActivePageQueue;
++			break;
++		case PAGE_STATE_MODIFIED:
++			queue = &sModifiedPageQueue;
++			break;
++		case PAGE_STATE_FREE:
++			queue = &sFreePageQueue;
++			break;
++		case PAGE_STATE_CLEAR:
++			queue = &sClearPageQueue;
++			break;
++		default:
++			panic(&quot;vm_page_touch: vm_page %p in invalid state %d\n&quot;,
++				page, page-&gt;state);
++			break;
++	}
++
++	remove_page_from_queue(queue, page);
++
++	if (tail)
++		enqueue_page(queue, page);
++	else
++		enqueue_page_to_head(queue, page);
+ }
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004033.html">[Haiku-commits] r22347 - in haiku/trunk: headers/os/drivers/bus headers/private/drivers  src/add-ons/kernel/bus_managers/ide src/add-ons/kernel/bus_managers/scsi src/add-ons/kernel/busses/ide/generic_ide_pci src/add-ons/kernel/busses/ide/ide_isa src/add-ons/kernel/busses/ide/legacy_sata src/add-ons/kernel/busses/ide/promise_tx2 src/add-ons/kernel/busses/ide/silicon_image_3112 src/add-ons/kernel/drivers/disk/scsi/scsi_cd src/add-ons/kernel/drivers/disk/scsi/scsi_dsk src/add-ons/kernel/file_systems/cdda src/add-ons/kernel/generic/ide_adapter src/add-ons/kernel/generic/scsi_periph src/bin/ideinfo
+</A></li>
+	<LI>Next message: <A HREF="004034.html">[Haiku-commits] (no subject)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4032">[ date ]</a>
+              <a href="thread.html#4032">[ thread ]</a>
+              <a href="subject.html#4032">[ subject ]</a>
+              <a href="author.html#4032">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

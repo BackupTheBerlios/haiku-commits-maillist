@@ -1,0 +1,221 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28930 -	haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28930%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk&In-Reply-To=%3C200901180134.n0I1YQqZ003599%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013955.html">
+   <LINK REL="Next"  HREF="013926.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28930 -	haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28930%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk&In-Reply-To=%3C200901180134.n0I1YQqZ003599%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28930 -	haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun Jan 18 02:34:26 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013955.html">[Haiku-commits] r28929 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+        <LI>Next message: <A HREF="013926.html">[Haiku-commits] r28930 - haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13925">[ date ]</a>
+              <a href="thread.html#13925">[ thread ]</a>
+              <a href="subject.html#13925">[ subject ]</a>
+              <a href="author.html#13925">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-01-18 02:34:22 +0100 (Sun, 18 Jan 2009)
+New Revision: 28930
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28930&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28930&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp
+Log:
+* The close hook did trigger a synchronize without locking the device. This
+  could have messed up the state of other transfers currently running on that
+  device. Since devices are regularly opened/closed for enumeration/scanning
+  from different threads, this could've easily lead to bad situations. I've
+  removed the sync completely as it's not our task to issue it and because
+  a close doesn't always correspond with an unmount at all.
+* Retry receiving the command status wrapper also when another error than a
+  stall is returned. The specs aren't too specific, but the graphic suggests
+  this is a general recovery path.
+* Do a reset in case there is an error during data transfer to start the next
+  command from a clean state.
+* Make sure we never acknowledge more data than we actually transfered. This
+  is to make sure devices that return broken residue values do not mess up our
+  transfers.
+* Detect a few more cases of invalid and non-meaningful command status wrappers.
+* If the device explicitly tells us that the sync command isn't supported don't
+  try it a few more times. Only retry at most five times if an unspecific error
+  is returned that could also come from another (temporary) error case.
+* Add a bit more trace output.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp	2009-01-18 01:13:17 UTC (rev 28929)
++++ haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk/usb_disk.cpp	2009-01-18 01:34:22 UTC (rev 28930)
+@@ -186,6 +186,11 @@
+ 	uint32 logicalBlockAddress, uint16 transferLength, void *data,
+ 	uint32 *dataLength, bool directionIn)
+ {
++	TRACE(&quot;operation: lun: %u; op: %u; oplen: %u; lba: %lu; tlen: %u; data: %p; dlen: %p (%lu); in: %c\n&quot;,
++		lun-&gt;logical_unit_number, operation, opLength, logicalBlockAddress,
++		transferLength, data, dataLength, dataLength ? *dataLength : 0,
++		directionIn ? 'y' : 'n');
++
+ 	disk_device *device = lun-&gt;device;
+ 	command_block_wrapper command;
+ 	command.signature = CBW_SIGNATURE;
+@@ -232,13 +237,15 @@
+ 		return B_ERROR;
+ 	}
+ 
++	size_t transferedData = 0;
+ 	if (data != NULL &amp;&amp; dataLength != NULL &amp;&amp; *dataLength &gt; 0) {
+ 		// we have data to transfer in a data stage
+ 		result = usb_disk_transfer_data(device, directionIn, data, *dataLength);
+ 		if (result != B_OK)
+ 			return result;
+ 
+-		if (device-&gt;status != B_OK || device-&gt;actual_length != *dataLength) {
++		transferedData = device-&gt;actual_length;
++		if (device-&gt;status != B_OK || transferedData != *dataLength) {
+ 			// sending or receiving of the data failed
+ 			if (device-&gt;status == B_DEV_STALLED) {
+ 				TRACE(&quot;stall while transfering data\n&quot;);
+@@ -246,6 +253,7 @@
+ 					: device-&gt;bulk_out, USB_FEATURE_ENDPOINT_HALT);
+ 			} else {
+ 				TRACE_ALWAYS(&quot;sending or receiving of the data failed\n&quot;);
++				usb_disk_reset_recovery(device);
+ 				return B_ERROR;
+ 			}
+ 		}
+@@ -253,8 +261,8 @@
+ 
+ 	command_status_wrapper status;
+ 	result =  usb_disk_receive_csw(device, &amp;status);
+-	if (result != B_OK &amp;&amp; device-&gt;status == B_DEV_STALLED) {
+-		// in case of a stall clear the stall and try again
++	if (result != B_OK) {
++		// in case of a stall or error clear the stall and try again
+ 		gUSBModule-&gt;clear_feature(device-&gt;bulk_in, USB_FEATURE_ENDPOINT_HALT);
+ 		result = usb_disk_receive_csw(device, &amp;status);
+ 	}
+@@ -275,34 +283,47 @@
+ 	switch (status.status) {
+ 		case CSW_STATUS_COMMAND_PASSED:
+ 		case CSW_STATUS_COMMAND_FAILED: {
+-			if (dataLength != NULL &amp;&amp; status.data_residue &lt;= *dataLength)
++			if (status.data_residue &gt; command.data_transfer_length) {
++				// command status wrapper is not meaningful
++				TRACE_ALWAYS(&quot;command status wrapper has invalid residue\n&quot;);
++				usb_disk_reset_recovery(device);
++				return B_ERROR;
++			}
++
++			if (dataLength != NULL) {
+ 				*dataLength -= status.data_residue;
++				if (transferedData &lt; *dataLength) {
++					TRACE_ALWAYS(&quot;less data transfered than indicated\n&quot;);
++					*dataLength = transferedData;
++				}
++			}
+ 
+ 			if (status.status == CSW_STATUS_COMMAND_PASSED) {
+ 				// the operation is complete and has succeeded
+-				result = B_OK;
++				return B_OK;
+ 			} else {
+ 				// the operation is complete but has failed at the SCSI level
+ 				TRACE_ALWAYS(&quot;operation 0x%02x failed at the SCSI level\n&quot;,
+ 					operation);
+ 				result = usb_disk_request_sense(lun);
+-				if (result == B_OK)
+-					result = B_ERROR;
++				return result == B_OK ? B_ERROR : result;
+ 			}
+-			break;
+ 		}
+ 
+ 		case CSW_STATUS_PHASE_ERROR: {
+ 			// a protocol or device error occured
+ 			TRACE_ALWAYS(&quot;phase error in operation 0x%02x\n&quot;, operation);
+ 			usb_disk_reset_recovery(device);
+-			if (dataLength != NULL)
+-				*dataLength = 0;
+-			result = B_ERROR;
++			return B_ERROR;
+ 		}
++
++		default: {
++			// command status wrapper is not meaningful
++			TRACE_ALWAYS(&quot;command status wrapper has invalid status\n&quot;);
++			usb_disk_reset_recovery(device);
++			return B_ERROR;
++		}
+ 	}
+-
+-	return result;
+ }
+ 
+ 
+@@ -472,7 +493,10 @@
+ 		if (result == B_OK)
+ 			lun-&gt;device-&gt;sync_support = SYNC_SUPPORT_RELOAD;
+ 		else if (result == B_DEV_INVALID_IOCTL)
++			lun-&gt;device-&gt;sync_support = 0;
++		else
+ 			lun-&gt;device-&gt;sync_support--;
++
+ 		return result;
+ 	}
+ 
+@@ -790,8 +814,6 @@
+ usb_disk_close(void *cookie)
+ {
+ 	TRACE(&quot;close()\n&quot;);
+-	device_lun *lun = (device_lun *)cookie;
+-	usb_disk_synchronize(lun, false);
+ 	return B_OK;
+ }
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013955.html">[Haiku-commits] r28929 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+	<LI>Next message: <A HREF="013926.html">[Haiku-commits] r28930 - haiku/trunk/src/add-ons/kernel/drivers/disk/usb/usb_disk
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13925">[ date ]</a>
+              <a href="thread.html#13925">[ thread ]</a>
+              <a href="subject.html#13925">[ subject ]</a>
+              <a href="author.html#13925">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

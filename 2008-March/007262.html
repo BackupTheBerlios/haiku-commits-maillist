@@ -1,0 +1,352 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24701 - haiku/trunk/src/system/kernel/fs
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24701%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200803302235.m2UMZgY6030547%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007261.html">
+   <LINK REL="Next"  HREF="007267.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24701 - haiku/trunk/src/system/kernel/fs</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24701%20-%20haiku/trunk/src/system/kernel/fs&In-Reply-To=%3C200803302235.m2UMZgY6030547%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24701 - haiku/trunk/src/system/kernel/fs">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Mar 31 00:35:42 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007261.html">[Haiku-commits] r24700 - haiku/trunk/src/servers/bluetooth
+</A></li>
+        <LI>Next message: <A HREF="007267.html">[Haiku-commits] r24702 - haiku/trunk/src/kits/bluetooth
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7262">[ date ]</a>
+              <a href="thread.html#7262">[ thread ]</a>
+              <a href="subject.html#7262">[ subject ]</a>
+              <a href="author.html#7262">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-03-31 00:35:41 +0200 (Mon, 31 Mar 2008)
+New Revision: 24701
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24701&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24701&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/fs/pipefs.cpp
+Log:
+* Since writers also might have to wait when there is still some room
+  in the buffer, they need to be notified after a read when their
+  minimal write size requirement has just become satisfied. We were
+  notifying only when there was no space in the buffer before, which
+  caused bug #1755.
+* Removed Inode::NotifyWriteDone(). It's not needed anymore, since we
+  don't queue writers. They are always all notified, so that one doesn't
+  have to notify the next one, when it's done.
+* Renamed *Request* to *ReadRequest, since we do have WriteRequests now
+  as well.
+
+
+Modified: haiku/trunk/src/system/kernel/fs/pipefs.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/fs/pipefs.cpp	2008-03-30 21:53:37 UTC (rev 24700)
++++ haiku/trunk/src/system/kernel/fs/pipefs.cpp	2008-03-30 22:35:41 UTC (rev 24701)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2007, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">bonefish at cs.tu-berlin.de.</A>
++ * Copyright 2007-2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
+  * Copyright 2003-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  */
+@@ -66,6 +66,7 @@
+ 		struct ring_buffer	*fBuffer;
+ };
+ 
++
+ class ReadRequest : public DoublyLinkedListLinkImpl&lt;ReadRequest&gt; {
+ 	public:
+ 		void SetUnnotified()	{ fNotified = false; }
+@@ -85,8 +86,29 @@
+ 		bool				fNotified;
+ };
+ 
+-typedef DoublyLinkedList&lt;ReadRequest&gt; RequestList;
+ 
++class WriteRequest : public DoublyLinkedListLinkImpl&lt;WriteRequest&gt; {
++	public:
++		WriteRequest(size_t minimalWriteCount)
++			:
++			fMinimalWriteCount(minimalWriteCount)
++		{
++		}
++
++		size_t MinimalWriteCount() const
++		{
++			return fMinimalWriteCount;
++		}
++
++	private:
++		size_t	fMinimalWriteCount;
++};
++
++
++typedef DoublyLinkedList&lt;ReadRequest&gt; ReadRequestList;
++typedef DoublyLinkedList&lt;WriteRequest&gt; WriteRequestList;
++
++
+ class Volume {
+ 	public:
+ 		Volume(dev_t id);
+@@ -161,22 +183,21 @@
+ 		void		SetNext(Inode *inode) { fNext = inode; }
+ 
+ 		benaphore	*RequestLock() { return &fRequestLock; }
+-		RequestList	&amp;Requests() { return fRequests; }
+ 
+ 		status_t	WriteDataToBuffer(const void *data, size_t *_length,
+ 						bool nonBlocking);
+ 		status_t	ReadDataFromBuffer(void *data, size_t *_length,
+ 						bool nonBlocking, ReadRequest &amp;request);
+ 		size_t		BytesAvailable() const { return fBuffer.Readable(); }
++		size_t		BytesWritable() const { return fBuffer.Writable(); }
+ 
+-		void		AddRequest(ReadRequest &amp;request);
+-		void		RemoveRequest(ReadRequest &amp;request);
+-		status_t	WaitForRequest(ReadRequest &amp;request);
++		void		AddReadRequest(ReadRequest &amp;request);
++		void		RemoveReadRequest(ReadRequest &amp;request);
++		status_t	WaitForReadRequest(ReadRequest &amp;request);
+ 
+ 		void		NotifyBytesRead(size_t bytes);
+ 		void		NotifyReadDone();
+ 		void		NotifyBytesWritten(size_t bytes);
+-		void		NotifyWriteDone();
+ 		void		NotifyEndClosed(bool writer);
+ 
+ 		void		Open(int openMode);
+@@ -211,7 +232,8 @@
+ 
+ 		RingBuffer	fBuffer;
+ 
+-		RequestList	fRequests;
++		ReadRequestList		fReadRequests;
++		WriteRequestList	fWriteRequests;
+ 
+ 		benaphore	fRequestLock;
+ 
+@@ -562,6 +584,8 @@
+ 	:
+ 	fNext(NULL),
+ 	fHashNext(NULL),
++	fReadRequests(),
++	fWriteRequests(),
+ 	fReaderCount(0),
+ 	fWriterCount(0),
+ 	fReadSelectSyncPool(NULL),
+@@ -641,12 +665,15 @@
+ 			ConditionVariableEntry&lt;&gt; entry;
+ 			entry.Add(this);
+ 
++			WriteRequest request(minToWrite);
++			fWriteRequests.Add(&amp;request);
++
+ 			benaphore_unlock(&amp;fRequestLock);
+-
+ 			status_t status = entry.Wait(B_CAN_INTERRUPT);
+-
+ 			benaphore_lock(&amp;fRequestLock);
+ 
++			fWriteRequests.Remove(&amp;request);
++
+ 			if (status != B_OK)
+ 				return status;
+ 		}
+@@ -687,11 +714,11 @@
+ 
+ 	// wait until our request is first in queue
+ 	status_t error;
+-	if (fRequests.Head() != &amp;request) {
++	if (fReadRequests.Head() != &amp;request) {
+ 		if (nonBlocking)
+ 			return B_WOULD_BLOCK;
+ 
+-		error = WaitForRequest(request);
++		error = WaitForReadRequest(request);
+ 		if (error != B_OK)
+ 			return error;
+ 	}
+@@ -704,7 +731,7 @@
+ 		if (fWriterCount == 0)
+ 			return B_OK;
+ 
+-		error = WaitForRequest(request);
++		error = WaitForReadRequest(request);
+ 		if (error != B_OK)
+ 			return error;
+ 	}
+@@ -726,27 +753,27 @@
+ 
+ 
+ void
+-Inode::AddRequest(ReadRequest &amp;request)
++Inode::AddReadRequest(ReadRequest &amp;request)
+ {
+-	fRequests.Add(&amp;request);
++	fReadRequests.Add(&amp;request);
+ }
+ 
+ 
+ void
+-Inode::RemoveRequest(ReadRequest &amp;request)
++Inode::RemoveReadRequest(ReadRequest &amp;request)
+ {
+-	fRequests.Remove(&amp;request);
++	fReadRequests.Remove(&amp;request);
+ }
+ 
+ 
+ status_t
+-Inode::WaitForRequest(ReadRequest &amp;request)
++Inode::WaitForReadRequest(ReadRequest &amp;request)
+ {
+ 	request.SetUnnotified();
+ 
+ 	// publish the condition variable
+ 	ConditionVariable&lt;&gt;&amp; conditionVariable = request.WaitCondition();
+-	conditionVariable.Publish(&amp;request, &quot;pipe read request&quot;);
++	conditionVariable.Publish(&amp;request, &quot;pipe request&quot;);
+ 
+ 	// add the entry to wait on
+ 	ConditionVariableEntry&lt;&gt; entry;
+@@ -768,11 +795,27 @@
+ Inode::NotifyBytesRead(size_t bytes)
+ {
+ 	// notify writer, if something can be written now
+-	if (bytes &gt; 0 &amp;&amp; fBuffer.Writable() == bytes) {
+-		if (fWriteSelectSyncPool)
+-			notify_select_event_pool(fWriteSelectSyncPool, B_SELECT_WRITE);
++	size_t writable = fBuffer.Writable();
++	if (bytes &gt; 0) {
++		// notify select()ors only, if nothing was writable before
++		if (writable == bytes) {
++			if (fWriteSelectSyncPool)
++				notify_select_event_pool(fWriteSelectSyncPool, B_SELECT_WRITE);
++		}
+ 
+-		fWriteCondition.NotifyOne();
++		// If any of the waiting writers has a minimal write count that has
++		// now become satisfied, we notify all of them (condition variables
++		// don't support doing that selectively).
++		WriteRequest *request;
++		WriteRequestList::Iterator iterator = fWriteRequests.GetIterator();
++		while ((request = iterator.Next()) != NULL) {
++			size_t minWriteCount = request-&gt;MinimalWriteCount();
++			if (minWriteCount &gt; 0 &amp;&amp; minWriteCount &lt;= writable
++					&amp;&amp; minWriteCount &gt; writable - bytes) {
++				fWriteCondition.NotifyAll();
++				break;
++			}
++		}
+ 	}
+ }
+ 
+@@ -782,7 +825,7 @@
+ {
+ 	// notify next reader, if there's still something to be read
+ 	if (fBuffer.Readable() &gt; 0) {
+-		if (ReadRequest* request = fRequests.First())
++		if (ReadRequest* request = fReadRequests.First())
+ 			request-&gt;Notify();
+ 	}
+ }
+@@ -796,22 +839,13 @@
+ 		if (fReadSelectSyncPool)
+ 			notify_select_event_pool(fReadSelectSyncPool, B_SELECT_READ);
+ 
+-		if (ReadRequest* request = fRequests.First())
++		if (ReadRequest* request = fReadRequests.First())
+ 			request-&gt;Notify();
+ 	}
+ }
+ 
+ 
+ void
+-Inode::NotifyWriteDone()
+-{
+-	// notify next writer, if there's still space for writing
+-	if (fBuffer.Writable() &gt; 0)
+-		fWriteCondition.NotifyOne();
+-}
+-
+-
+-void
+ Inode::NotifyEndClosed(bool writer)
+ {
+ 	if (writer) {
+@@ -819,7 +853,7 @@
+ 		// contains no data, unlock all waiting readers
+ 		if (fBuffer.Readable() == 0) {
+ 			ReadRequest *request;
+-			RequestList::Iterator iterator = fRequests.GetIterator();
++			ReadRequestList::Iterator iterator = fReadRequests.GetIterator();
+ 			while ((request = iterator.Next()) != NULL)
+ 				request-&gt;Notify();
+ 
+@@ -1316,13 +1350,13 @@
+ 	// issue read request
+ 
+ 	ReadRequest request;
+-	inode-&gt;AddRequest(request);
++	inode-&gt;AddReadRequest(request);
+ 
+ 	size_t length = *_length;
+ 	status_t status = inode-&gt;ReadDataFromBuffer(buffer, &amp;length,
+ 		(cookie-&gt;open_mode &amp; O_NONBLOCK) != 0, request);
+ 
+-	inode-&gt;RemoveRequest(request);
++	inode-&gt;RemoveReadRequest(request);
+ 	inode-&gt;NotifyReadDone();
+ 
+ 	if (length &gt; 0)
+@@ -1359,8 +1393,6 @@
+ 	status_t status = inode-&gt;WriteDataToBuffer(buffer, &amp;length,
+ 		(cookie-&gt;open_mode &amp; O_NONBLOCK) != 0);
+ 
+-	inode-&gt;NotifyWriteDone();
+-
+ 	if (length &gt; 0)
+ 		status = B_OK;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007261.html">[Haiku-commits] r24700 - haiku/trunk/src/servers/bluetooth
+</A></li>
+	<LI>Next message: <A HREF="007267.html">[Haiku-commits] r24702 - haiku/trunk/src/kits/bluetooth
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7262">[ date ]</a>
+              <a href="thread.html#7262">[ thread ]</a>
+              <a href="subject.html#7262">[ subject ]</a>
+              <a href="author.html#7262">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

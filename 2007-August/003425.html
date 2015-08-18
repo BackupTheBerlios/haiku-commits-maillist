@@ -1,0 +1,396 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r21862 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21862%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200708082238.l78Mcl7x012397%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003424.html">
+   <LINK REL="Next"  HREF="003426.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r21862 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r21862%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200708082238.l78Mcl7x012397%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r21862 - haiku/trunk/src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug  9 00:38:47 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003424.html">[Haiku-commits] r21861 - haiku/trunk/src/system/kernel
+</A></li>
+        <LI>Next message: <A HREF="003426.html">[Haiku-commits] r21863 - in haiku/trunk: headers/os/app src/kits/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3425">[ date ]</a>
+              <a href="thread.html#3425">[ thread ]</a>
+              <a href="subject.html#3425">[ subject ]</a>
+              <a href="author.html#3425">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-08-09 00:38:46 +0200 (Thu, 09 Aug 2007)
+New Revision: 21862
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=21862&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=21862&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+* get_memory_map() leaked vm_address_space references
+* fixes a dead lock in vm_soft_fault() - the locking scheme enforces you to
+  lock the address space before a vm_cache, not the other way, around. Since
+  we need to lock the cache that has our page in fault_get_page(), we violated
+  that scheme by relocking the address space in order to get access to the
+  vm_area. Now, we read lock the address space during the whole page fault;
+  added a TODO that explains why this might not really be desirable, if
+  we can avoid it (the only way would be to reverse that locking scheme
+  which would potentially cause the more busy vm_cache locks to be held
+  longer).
+* vm_copy_area() uses the MultiAddressSpaceLocker, but actually forget to
+  call Lock() on it...
+* delete_area() leaks vm_address_space references - but fixing this currently
+  causes other problems to be investigated; I'll open a bug for that.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-08 21:44:30 UTC (rev 21861)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-08-08 22:38:46 UTC (rev 21862)
+@@ -62,10 +62,12 @@
+ class AddressSpaceReadLocker {
+ public:
+ 	AddressSpaceReadLocker(team_id team);
++	AddressSpaceReadLocker(vm_address_space* space);
+ 	AddressSpaceReadLocker();
+ 	~AddressSpaceReadLocker();
+ 
+ 	status_t SetTo(team_id team);
++	void SetTo(vm_address_space* space);
+ 	status_t SetFromArea(area_id areaID, vm_area*&amp; area);
+ 
+ 	bool IsLocked() const { return fLocked; }
+@@ -123,6 +125,7 @@
+ private:
+ 	bool _ResizeIfNeeded();
+ 	vm_address_space*&amp; _CurrentItem() { return fSpaces[fCount]; }
++	bool _HasAddressSpace(vm_address_space* space) const;
+ 
+ 	static int _CompareItems(const void* _a, const void* _b);
+ 
+@@ -160,6 +163,16 @@
+ }
+ 
+ 
++//! Takes over the reference of the address space
++AddressSpaceReadLocker::AddressSpaceReadLocker(vm_address_space* space)
++	:
++	fSpace(NULL),
++	fLocked(false)
++{
++	SetTo(space);
++}
++
++
+ AddressSpaceReadLocker::AddressSpaceReadLocker()
+ 	:
+ 	fSpace(NULL),
+@@ -196,6 +209,16 @@
+ }
+ 
+ 
++//! Takes over the reference of the address space
++void
++AddressSpaceReadLocker::SetTo(vm_address_space* space)
++{
++	fSpace = space;
++	acquire_sem_etc(fSpace-&gt;sem, READ_COUNT, 0, 0);
++	fLocked = true;
++}
++
++
+ status_t
+ AddressSpaceReadLocker::SetFromArea(area_id areaID, vm_area*&amp; area)
+ {
+@@ -354,6 +377,7 @@
+ 	if (fLocked) {
+ 		release_sem_etc(fSpace-&gt;sem, fDegraded ? READ_COUNT : WRITE_COUNT, 0);
+ 		fLocked = false;
++		fDegraded = false;
+ 	}
+ }
+ 
+@@ -412,6 +436,18 @@
+ }
+ 
+ 
++bool
++MultiAddressSpaceLocker::_HasAddressSpace(vm_address_space* space) const
++{
++	for (int32 i = 0; i &lt; fCount; i++) {
++		if (fSpaces[i] == space)
++			return true;
++	}
++	
++	return false;
++}
++
++
+ status_t
+ MultiAddressSpaceLocker::AddTeam(team_id team, vm_address_space** _space)
+ {
+@@ -423,6 +459,15 @@
+ 	if (space == NULL)
+ 		return B_BAD_VALUE;
+ 
++	// check if we have already added this address space
++	if (_HasAddressSpace(space)) {
++		// no need to add it again
++		vm_put_address_space(space);
++		if (_space != NULL)
++			*_space = space;
++		return B_OK;
++	}
++
+ 	fCount++;
+ 
+ 	if (_space != NULL)
+@@ -444,14 +489,12 @@
+ 		return B_BAD_VALUE;
+ 
+ 	// check if we have already added this address space
+-	for (int32 i = 0; i &lt; fCount; i++) {
+-		if (fSpaces[i] == space) {
+-			// no need to add it again
+-			vm_put_address_space(space);
+-			if (_space != NULL)
+-				*_space = space;
+-			return B_OK;
+-		}
++	if (_HasAddressSpace(space)) {
++		// no need to add it again
++		vm_put_address_space(space);
++		if (_space != NULL)
++			*_space = space;
++		return B_OK;
+ 	}
+ 
+ 	fCount++;
+@@ -1683,7 +1726,7 @@
+ {
+ 	vm_area *newArea = NULL;
+ 	vm_area *sourceArea;
+-	
++
+ 	MultiAddressSpaceLocker locker;
+ 	vm_address_space *sourceAddressSpace;
+ 	status_t status = locker.AddArea(sourceID, &amp;sourceAddressSpace);
+@@ -1822,6 +1865,10 @@
+ 
+ 	arch_vm_unset_memory_type(area);
+ 	remove_area_from_address_space(addressSpace, area);
++	// TODO: the following line fixes an address space leak - however,
++	// there seems to be something wrong with the order in which teams
++	// are torn down, and the first shell command hangs on a pipe then
++	//vm_put_address_space(addressSpace);
+ 
+ 	vm_cache_remove_area(area-&gt;cache, area);
+ 	vm_cache_release_ref(area-&gt;cache);
+@@ -1948,25 +1995,26 @@
+ vm_copy_area(team_id team, const char *name, void **_address,
+ 	uint32 addressSpec, uint32 protection, area_id sourceID)
+ {
++	bool writableCopy = (protection &amp; (B_KERNEL_WRITE_AREA | B_WRITE_AREA)) != 0;
++
++	if ((protection &amp; B_KERNEL_PROTECTION) == 0) {
++		// set the same protection for the kernel as for userland
++		protection |= B_KERNEL_READ_AREA;
++		if (writableCopy)
++			protection |= B_KERNEL_WRITE_AREA;
++	}
++
+ 	MultiAddressSpaceLocker locker;
+-
+ 	vm_address_space *sourceAddressSpace = NULL;
+ 	vm_address_space *targetAddressSpace;
+ 	status_t status = locker.AddTeam(team, &amp;targetAddressSpace);
+ 	if (status == B_OK)
+ 		status = locker.AddArea(sourceID, &amp;sourceAddressSpace);
++	if (status == B_OK)
++		status = locker.Lock();
+ 	if (status != B_OK)
+ 		return status;
+ 
+-	bool writableCopy = (protection &amp; (B_KERNEL_WRITE_AREA | B_WRITE_AREA)) != 0;
+-
+-	if ((protection &amp; B_KERNEL_PROTECTION) == 0) {
+-		// set the same protection for the kernel as for userland
+-		protection |= B_KERNEL_READ_AREA;
+-		if (writableCopy)
+-			protection |= B_KERNEL_WRITE_AREA;
+-	}
+-
+ 	vm_area* source = lookup_area(sourceAddressSpace, sourceID);
+ 	if (source == NULL)
+ 		return B_BAD_VALUE;
+@@ -3865,16 +3913,14 @@
+ 		return B_BAD_ADDRESS;
+ 	}
+ 
++	AddressSpaceReadLocker locker(addressSpace);
++
+ 	atomic_add(&amp;addressSpace-&gt;fault_count, 1);
+ 
+ 	// Get the area the fault was in
+ 
+-	acquire_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0, 0);
+-
+ 	vm_area *area = vm_area_lookup(addressSpace, address);
+ 	if (area == NULL) {
+-		release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
+-		vm_put_address_space(addressSpace);
+ 		dprintf(&quot;vm_soft_fault: va 0x%lx not covered by area in address space\n&quot;,
+ 			originalAddress);
+ 		return B_BAD_ADDRESS;
+@@ -3882,14 +3928,10 @@
+ 
+ 	// check permissions
+ 	if (isUser &amp;&amp; (area-&gt;protection &amp; B_USER_PROTECTION) == 0) {
+-		release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
+-		vm_put_address_space(addressSpace);
+ 		dprintf(&quot;user access on kernel area 0x%lx at %p\n&quot;, area-&gt;id, (void *)originalAddress);
+ 		return B_PERMISSION_DENIED;
+ 	}
+ 	if (isWrite &amp;&amp; (area-&gt;protection &amp; (B_WRITE_AREA | (isUser ? 0 : B_KERNEL_WRITE_AREA))) == 0) {
+-		release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
+-		vm_put_address_space(addressSpace);
+ 		dprintf(&quot;write access attempted on read-only area 0x%lx at %p\n&quot;,
+ 			area-&gt;id, (void *)originalAddress);
+ 		return B_PERMISSION_DENIED;
+@@ -3905,8 +3947,6 @@
+ 	atomic_add(&amp;area-&gt;no_cache_change, 1);
+ 		// make sure the area's cache isn't replaced during the page fault
+ 
+-	release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
+-
+ 	// See if this cache has a fault handler - this will do all the work for us
+ 	{
+ 		vm_store *store = topCache-&gt;store;
+@@ -3917,7 +3957,6 @@
+ 			status_t status = store-&gt;ops-&gt;fault(store, addressSpace, cacheOffset);
+ 			if (status != B_BAD_HANDLER) {
+ 				vm_area_put_locked_cache(topCache);
+-				vm_put_address_space(addressSpace);
+ 				return status;
+ 			}
+ 		}
+@@ -3943,22 +3982,12 @@
+ 	vm_cache *copiedPageSource = NULL;
+ 	vm_cache *pageSource;
+ 	vm_page *page;
++	// TODO: We keep the address space read lock during the whole operation
++	// which might be rather expensive depending on where the data has to
++	// be retrieved from.
+ 	status_t status = fault_get_page(map, topCache, cacheOffset, isWrite,
+ 		dummyPage, &amp;pageSource, &amp;copiedPageSource, &amp;page);
+ 
+-	acquire_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0, 0);
+-	if (status == B_OK &amp;&amp; changeCount != addressSpace-&gt;change_count) {
+-		// something may have changed, see if the address is still valid
+-		area = vm_area_lookup(addressSpace, address);
+-		if (area == NULL
+-			|| area-&gt;cache != topCache
+-			|| (address - area-&gt;base + area-&gt;cache_offset) != cacheOffset
+-			|| address &gt; area-&gt;base + (area-&gt;size - 1)) {
+-			dprintf(&quot;vm_soft_fault: address space layout changed effecting ongoing soft fault\n&quot;);
+-			status = B_BAD_ADDRESS;
+-		}
+-	}
+-
+ 	if (status == B_OK) {
+ 		// All went fine, all there is left to do is to map the page into the address space
+ 
+@@ -3979,7 +4008,6 @@
+ 	}
+ 
+ 	atomic_add(&amp;area-&gt;no_cache_change, -1);
+-	release_sem_etc(addressSpace-&gt;sem, READ_COUNT, 0);
+ 
+ 	mutex_unlock(&amp;pageSource-&gt;lock);
+ 	vm_cache_release_ref(pageSource);
+@@ -3993,7 +4021,6 @@
+ 	}
+ 
+ 	vm_cache_release_ref(topCache);
+-	vm_put_address_space(addressSpace);
+ 
+ 	return status;
+ }
+@@ -4340,7 +4367,8 @@
+  */
+ 
+ long
+-get_memory_map(const void *address, ulong numBytes, physical_entry *table, long numEntries)
++get_memory_map(const void *address, ulong numBytes, physical_entry *table,
++	long numEntries)
+ {
+ 	vm_address_space *addressSpace;
+ 	addr_t virtualAddress = (addr_t)address;
+@@ -4351,7 +4379,8 @@
+ 	addr_t offset = 0;
+ 	bool interrupts = are_interrupts_enabled();
+ 
+-	TRACE((&quot;get_memory_map(%p, %lu bytes, %ld entries)\n&quot;, address, numBytes, numEntries));
++	TRACE((&quot;get_memory_map(%p, %lu bytes, %ld entries)\n&quot;, address, numBytes,
++		numEntries));
+ 
+ 	if (numEntries == 0 || numBytes == 0)
+ 		return B_BAD_VALUE;
+@@ -4385,6 +4414,7 @@
+ 			break;
+ 		if ((flags &amp; PAGE_PRESENT) == 0) {
+ 			panic(&quot;get_memory_map() called on unmapped memory!&quot;);
++			vm_put_address_space(addressSpace);
+ 			return B_BAD_ADDRESS;
+ 		}
+ 
+@@ -4415,6 +4445,8 @@
+ 	if (interrupts)
+ 		map-&gt;ops-&gt;unlock(map);
+ 
++	vm_put_address_space(addressSpace);
++
+ 	// close the entry list
+ 
+ 	if (status == B_OK) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003424.html">[Haiku-commits] r21861 - haiku/trunk/src/system/kernel
+</A></li>
+	<LI>Next message: <A HREF="003426.html">[Haiku-commits] r21863 - in haiku/trunk: headers/os/app src/kits/app
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3425">[ date ]</a>
+              <a href="thread.html#3425">[ thread ]</a>
+              <a href="subject.html#3425">[ subject ]</a>
+              <a href="author.html#3425">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

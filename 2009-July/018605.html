@@ -1,0 +1,162 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32028 - in haiku/trunk:	headers/private/kernel/arch/x86 src/system/kernel/arch/x86
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32028%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/arch/x86%20src/system/kernel/arch/x86&In-Reply-To=%3C200907311614.n6VGEKEM015914%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018602.html">
+   <LINK REL="Next"  HREF="018606.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32028 - in haiku/trunk:	headers/private/kernel/arch/x86 src/system/kernel/arch/x86</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32028%20-%20in%20haiku/trunk%3A%0A%09headers/private/kernel/arch/x86%20src/system/kernel/arch/x86&In-Reply-To=%3C200907311614.n6VGEKEM015914%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32028 - in haiku/trunk:	headers/private/kernel/arch/x86 src/system/kernel/arch/x86">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Jul 31 18:14:20 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018602.html">[Haiku-commits] r32027 - in haiku/trunk/src/apps: . haiku3d	haiku3d/data haiku3d/mesh haiku3d/texture
+</A></li>
+        <LI>Next message: <A HREF="018606.html">[Haiku-commits] r32029 - haiku/trunk/src/apps/haiku3d
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18605">[ date ]</a>
+              <a href="thread.html#18605">[ thread ]</a>
+              <a href="subject.html#18605">[ subject ]</a>
+              <a href="author.html#18605">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-07-31 18:14:18 +0200 (Fri, 31 Jul 2009)
+New Revision: 32028
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32028&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32028&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h
+   haiku/trunk/src/system/kernel/arch/x86/arch_cpu.cpp
+Log:
+* Allocate a separate double fault stack for each CPU.
+* Added x86_double_fault_get_cpu(), a save way to get the CPU index when in
+  the double fault handler. smp_get_current_cpu() requires at least a somewhat
+  intact thread structure, so we rather want to avoid it when handling a double
+  fault. There are a lot more of those dependencies in the KDL entry code.
+  Working on it...
+
+
+Modified: haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h	2009-07-31 15:38:12 UTC (rev 32027)
++++ haiku/trunk/headers/private/kernel/arch/x86/arch_cpu.h	2009-07-31 16:14:18 UTC (rev 32028)
+@@ -281,6 +281,7 @@
+ status_t x86_get_mtrr(uint32 index, uint64 *_base, uint64 *_length, uint8 *_type);
+ bool x86_check_feature(uint32 feature, enum x86_feature_type type);
+ void* x86_get_double_fault_stack(int32 cpu, size_t* _size);
++int x86_double_fault_get_cpu();
+ 
+ 
+ #define read_cr3(value) \
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_cpu.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_cpu.cpp	2009-07-31 15:38:12 UTC (rev 32027)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_cpu.cpp	2009-07-31 16:14:18 UTC (rev 32028)
+@@ -83,8 +83,8 @@
+ segment_descriptor *gGDT = NULL;
+ 
+ /* Some specials for the double fault handler */
+-//static struct tss sDoubleFaultTSS;
+-static uint32 sDoubleFaultStack[10240];
++static uint8* sDoubleFaultStacks;
++static const size_t kDoubleFaultStackSize = 4096;	// size per CPU
+ 
+ static x86_cpu_module_info *sCpuModule;
+ 
+@@ -251,7 +251,9 @@
+ 	struct tss *tss = &amp;gCPU[cpuNum].arch.double_fault_tss;
+ 
+ 	memset(tss, 0, sizeof(struct tss));
+-	tss-&gt;sp0 = (uint32)sDoubleFaultStack + sizeof(sDoubleFaultStack);
++	size_t stackSize;
++	tss-&gt;sp0 = (uint32)x86_get_double_fault_stack(cpuNum, &amp;stackSize);
++	tss-&gt;sp0 += stackSize;
+ 	tss-&gt;ss0 = KERNEL_DATA_SEG;
+ 	read_cr3(tss-&gt;cr3);
+ 		// copy the current cr3 to the double fault cr3
+@@ -501,11 +503,22 @@
+ void*
+ x86_get_double_fault_stack(int32 cpu, size_t* _size)
+ {
+-	*_size = sizeof(sDoubleFaultStack);
+-	return sDoubleFaultStack;
++	*_size = kDoubleFaultStackSize;
++	return sDoubleFaultStacks + kDoubleFaultStackSize * cpu;
+ }
+ 
+ 
++/*!	Returns the index of the current CPU. Can only be called from the double
++	fault handler.
++*/
++int
++x86_double_fault_get_cpu()
++{
++	uint32 stack = x86_read_ebp();
++	return (stack - (uint32)sDoubleFaultStacks) / kDoubleFaultStackSize;
++}
++
++
+ //	#pragma mark -
+ 
+ 
+@@ -569,7 +582,6 @@
+ 	uint32 i;
+ 
+ 	// account for the segment descriptors
+-
+ 	gGDT = (segment_descriptor *)args-&gt;arch_args.vir_gdt;
+ 	create_area(&quot;gdt&quot;, (void **)&amp;gGDT, B_EXACT_ADDRESS, B_PAGE_SIZE,
+ 		B_ALREADY_WIRED, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+@@ -578,6 +590,10 @@
+ 	// (a fixed number of used GDT entries)
+ 	//i386_selector_init(gGDT);  // pass the new gdt
+ 
++	// allocate an area for the double fault stacks
++	create_area(&quot;double fault stacks&quot;, (void**)&amp;sDoubleFaultStacks,
++		B_ANY_KERNEL_ADDRESS, kDoubleFaultStackSize * smp_get_num_cpus(),
++		B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+ 
+ 	vm_translation_map_arch_info* kernelArchTranslationMap
+ 		= vm_kernel_address_space()-&gt;translation_map.arch_data;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018602.html">[Haiku-commits] r32027 - in haiku/trunk/src/apps: . haiku3d	haiku3d/data haiku3d/mesh haiku3d/texture
+</A></li>
+	<LI>Next message: <A HREF="018606.html">[Haiku-commits] r32029 - haiku/trunk/src/apps/haiku3d
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18605">[ date ]</a>
+              <a href="thread.html#18605">[ thread ]</a>
+              <a href="subject.html#18605">[ subject ]</a>
+              <a href="author.html#18605">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

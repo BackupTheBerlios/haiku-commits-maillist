@@ -1,0 +1,1091 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r19860 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19860%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/usb&In-Reply-To=%3C200701182225.l0IMP5su009611%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000312.html">
+   <LINK REL="Next"  HREF="000358.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r19860 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb</H1>
+    <B>mmlr at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19860%20-%0A%09haiku/trunk/src/add-ons/kernel/bus_managers/usb&In-Reply-To=%3C200701182225.l0IMP5su009611%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r19860 -	haiku/trunk/src/add-ons/kernel/bus_managers/usb">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Thu Jan 18 23:25:05 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000312.html">[Haiku-commits] r19859 - haiku/trunk/build/jam
+</A></li>
+        <LI>Next message: <A HREF="000358.html">[Haiku-commits] r19860 - haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#313">[ date ]</a>
+              <a href="thread.html#313">[ thread ]</a>
+              <a href="subject.html#313">[ subject ]</a>
+              <a href="author.html#313">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2007-01-18 23:25:02 +0100 (Thu, 18 Jan 2007)
+New Revision: 19860
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=19860&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=19860&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Device.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb.cpp
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/usb_p.h
+   haiku/trunk/src/add-ons/kernel/bus_managers/usb/usbspec_p.h
+Log:
+* Revised locking of the USB stack classes
+* Implemented the Hub destructor to properly free all of its child devices
+* Added FreeDevice() and FreeAddress() to the BusManager class
+* Added timeout to ControlPipe::SendRequest()
+* Changed how the recursive device reporting works so that it respects the support descriptors of a driver
+* Enabled driver rescanning for drivers that are not currently loaded but still registered (R5 only as the devfs function is yet missing from Haiku)
+* Changed the way usb_ids are handed out so that free ones are reused instead of just running out of ids
+* Fixed driver registration so that each driver is only added once (and devices are reported once per driver)
+* Unified debug output and fixed some warnings with debug output turned on
+* Fixed some style issues and removed stray whitespaces
+
+Overall the USB stack should now be much more reliable. It should not crash on disconnects anymore and repluging of a device should be noticed by all drivers.
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/BusManager.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/BusManager.cpp	2007-01-18 21:30:38 UTC (rev 19859)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/BusManager.cpp	2007-01-18 22:25:02 UTC (rev 19860)
+@@ -15,7 +15,7 @@
+ 		fRootHub(NULL)
+ {
+ 	if (benaphore_init(&amp;fLock, &quot;usb busmanager lock&quot;) &lt; B_OK) {
+-		TRACE_ERROR((&quot;usb BusManager: failed to create busmanager lock\n&quot;));
++		TRACE_ERROR((&quot;USB BusManager: failed to create busmanager lock\n&quot;));
+ 		return;
+ 	}
+ 
+@@ -26,6 +26,7 @@
+ 	// Clear the device map
+ 	for (int32 i = 0; i &lt; 128; i++)
+ 		fDeviceMap[i] = false;
++	fDeviceIndex = 0;
+ 
+ 	// Set the default pipes to NULL (these will be created when needed)
+ 	for (int32 i = 0; i &lt;= USB_SPEED_MAX; i++)
+@@ -41,6 +42,7 @@
+ 	benaphore_destroy(&amp;fLock);
+ 	for (int32 i = 0; i &lt;= USB_SPEED_MAX; i++)
+ 		delete fDefaultPipes[i];
++	delete fRootObject;
+ }
+ 
+ 
+@@ -74,35 +76,60 @@
+ 	if (!Lock())
+ 		return -1;
+ 
+-	int8 deviceAddress = -1;
+-	for (int32 i = 1; i &lt; 128; i++) {
+-		if (fDeviceMap[i] == false) {
+-			deviceAddress = i;
+-			fDeviceMap[i] = true;
+-			break;
++	int8 tries = 127;
++	int8 address = fDeviceIndex;
++	while (tries-- &gt; 0) {
++		if (fDeviceMap[address] == false) {
++			fDeviceIndex = (address + 1) % 127;
++			fDeviceMap[address] = true;
++			Unlock();
++			return address + 1;
+ 		}
++
++		address = (address + 1) % 127;
+ 	}
+ 
++	TRACE_ERROR((&quot;USB BusManager: the busmanager has run out of device addresses\n&quot;));
+ 	Unlock();
+-	return deviceAddress;
++	return -1;
+ }
+ 
+ 
++void
++BusManager::FreeAddress(int8 address)
++{
++	address--;
++	if (address &lt; 0)
++		return;
++
++	if (!Lock())
++		return;
++
++	if (!fDeviceMap[address]) {
++		TRACE_ERROR((&quot;USB BusManager: freeing address %d which was not allocated\n&quot;, address));
++	}
++
++	fDeviceMap[address] = false;
++	Unlock();
++}
++
++
+ Device *
+-BusManager::AllocateNewDevice(Hub *parent, usb_speed speed)
++BusManager::AllocateDevice(Hub *parent, usb_speed speed)
+ {
+ 	// Check if there is a free entry in the device map (for the device number)
+ 	int8 deviceAddress = AllocateAddress();
+ 	if (deviceAddress &lt; 0) {
+-		TRACE_ERROR((&quot;usb BusManager::AllocateNewDevice(): could not get a new address\n&quot;));
++		TRACE_ERROR((&quot;USB BusManager: could not allocate an address\n&quot;));
+ 		return NULL;
+ 	}
+ 
+-	TRACE((&quot;usb BusManager::AllocateNewDevice(): setting device address to %d\n&quot;, deviceAddress));
++	TRACE((&quot;USB BusManager: setting device address to %d\n&quot;, deviceAddress));
+ 	ControlPipe *defaultPipe = _GetDefaultPipe(speed);
+-	
++
+ 	if (!defaultPipe) {
+-		TRACE((&quot;usb BusManager::AllocateNewDevice(): Error getting the default pipe for speed %d\n&quot;, (int)speed));
++		TRACE((&quot;USB BusManager: error getting the default pipe for speed %d\n&quot;, (int)speed));
++		FreeAddress(deviceAddress);
+ 		return NULL;
+ 	}
+ 
+@@ -126,7 +153,8 @@
+ 	}
+ 
+ 	if (result &lt; B_OK) {
+-		TRACE_ERROR((&quot;usb BusManager::AllocateNewDevice(): error while setting device address\n&quot;));
++		TRACE_ERROR((&quot;USB BusManager: error while setting device address\n&quot;));
++		FreeAddress(deviceAddress);
+ 		return NULL;
+ 	}
+ 
+@@ -143,19 +171,20 @@
+ 	size_t actualLength = 0;
+ 	usb_device_descriptor deviceDescriptor;
+ 
+-	TRACE((&quot;usb BusManager::AllocateNewDevice(): getting the device descriptor\n&quot;));
++	TRACE((&quot;USB BusManager: getting the device descriptor\n&quot;));
+ 	pipe.SendRequest(
+ 		USB_REQTYPE_DEVICE_IN | USB_REQTYPE_STANDARD,		// type
+ 		USB_REQUEST_GET_DESCRIPTOR,							// request
+ 		USB_DESCRIPTOR_DEVICE &lt;&lt; 8,							// value
+ 		0,													// index
+-		8,													// length										
++		8,													// length
+ 		(void *)&amp;deviceDescriptor,							// buffer
+ 		8,													// buffer length
+ 		&amp;actualLength);										// actual length
+ 
+ 	if (actualLength != 8) {
+-		TRACE_ERROR((&quot;usb BusManager::AllocateNewDevice(): error while getting the device descriptor\n&quot;));
++		TRACE_ERROR((&quot;USB BusManager: error while getting the device descriptor\n&quot;));
++		FreeAddress(deviceAddress);
+ 		return NULL;
+ 	}
+ 
+@@ -170,16 +199,18 @@
+ 
+ 	// Create a new instance based on the type (Hub or Device)
+ 	if (deviceDescriptor.device_class == 0x09) {
+-		TRACE((&quot;usb BusManager::AllocateNewDevice(): creating new hub\n&quot;));
++		TRACE((&quot;USB BusManager: creating new hub\n&quot;));
+ 		Hub *hub = new(std::nothrow) Hub(parent, deviceDescriptor,
+ 			deviceAddress, speed);
+ 		if (!hub) {
+-			TRACE_ERROR((&quot;usb BusManager::AllocateNewDevice(): no memory to allocate hub\n&quot;));
++			TRACE_ERROR((&quot;USB BusManager: no memory to allocate hub\n&quot;));
++			FreeAddress(deviceAddress);
+ 			return NULL;
+ 		}
+ 
+ 		if (hub-&gt;InitCheck() &lt; B_OK) {
+-			TRACE_ERROR((&quot;usb BusManager::AllocateNewDevice(): hub failed init check\n&quot;));
++			TRACE_ERROR((&quot;USB BusManager: hub failed init check\n&quot;));
++			FreeAddress(deviceAddress);
+ 			delete hub;
+ 			return NULL;
+ 		}
+@@ -187,16 +218,18 @@
+ 		return (Device *)hub;
+ 	}
+ 
+-	TRACE((&quot;usb BusManager::AllocateNewDevice(): creating new device\n&quot;));
++	TRACE((&quot;USB BusManager: creating new device\n&quot;));
+ 	Device *device = new(std::nothrow) Device(parent, deviceDescriptor,
+ 		deviceAddress, speed);
+ 	if (!device) {
+-		TRACE_ERROR((&quot;usb BusManager::AllocateNewDevice(): no memory to allocate device\n&quot;));
++		TRACE_ERROR((&quot;USB BusManager: no memory to allocate device\n&quot;));
++		FreeAddress(deviceAddress);
+ 		return NULL;
+ 	}
+ 
+ 	if (device-&gt;InitCheck() &lt; B_OK) {
+-		TRACE_ERROR((&quot;usb BusManager::AllocateNewDevice(): device failed init check\n&quot;));
++		TRACE_ERROR((&quot;USB BusManager: device failed init check\n&quot;));
++		FreeAddress(deviceAddress);
+ 		delete device;
+ 		return NULL;
+ 	}
+@@ -205,6 +238,14 @@
+ }
+ 
+ 
++void
++BusManager::FreeDevice(Device *device)
++{
++	FreeAddress(device-&gt;DeviceAddress());
++	delete device;
++}
++
++
+ status_t
+ BusManager::Start()
+ {
+@@ -234,24 +275,22 @@
+ 	return B_ERROR;
+ }
+ 
++
+ ControlPipe *
+ BusManager::_GetDefaultPipe(usb_speed speed)
+ {
+ 	if (!Lock())
+ 		return NULL;
+ 
+-
+ 	if (fDefaultPipes[speed] == NULL) {
+ 		fDefaultPipes[speed] = new(std::nothrow) ControlPipe(fRootObject,
+-					0, 0, speed, 8);
+-		if (!fDefaultPipes[speed]) {
+-			TRACE_ERROR((&quot;usb BusManager: failed to allocate default pipe\n&quot;));
+-			Unlock();
+-			return NULL;
+-		}
++			0, 0, speed, 8);
+ 	}
+-	
++
++	if (!fDefaultPipes[speed]) {
++		TRACE_ERROR((&quot;USB BusManager: failed to allocate default pipe for speed %d\n&quot;, speed));
++	}
++
+ 	Unlock();
+-	
+ 	return fDefaultPipes[speed];
+ }
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Device.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Device.cpp	2007-01-18 21:30:38 UTC (rev 19859)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Device.cpp	2007-01-18 22:25:02 UTC (rev 19860)
+@@ -20,17 +20,15 @@
+ 		fSpeed(speed),
+ 		fDeviceAddress(deviceAddress)
+ {
+-	TRACE((&quot;USB Device: new device\n&quot;));
++	TRACE((&quot;USB Device %d: creating device\n&quot;, fDeviceAddress));
+ 
+ 	fDefaultPipe = new(std::nothrow) ControlPipe(this, deviceAddress, 0,
+ 		fSpeed, fDeviceDescriptor.max_packet_size_0);
+ 	if (!fDefaultPipe) {
+-		TRACE_ERROR((&quot;USB Device: could not allocate default pipe\n&quot;));
++		TRACE_ERROR((&quot;USB Device %d: could not allocate default pipe\n&quot;, fDeviceAddress));
+ 		return;
+ 	}
+ 
+-	fMaxPacketIn[0] = fMaxPacketOut[0] = fDeviceDescriptor.max_packet_size_0; 
+-
+ 	// Get the device descriptor
+ 	// We already have a part of it, but we want it all
+ 	size_t actualLength;
+@@ -38,7 +36,7 @@
+ 		(void *)&amp;fDeviceDescriptor, sizeof(fDeviceDescriptor), &amp;actualLength);
+ 
+ 	if (status &lt; B_OK || actualLength != sizeof(fDeviceDescriptor)) {
+-		TRACE_ERROR((&quot;USB Device: error while getting the device descriptor\n&quot;));
++		TRACE_ERROR((&quot;USB Device %d: error while getting the device descriptor\n&quot;, fDeviceAddress));
+ 		return;
+ 	}
+ 
+@@ -62,7 +60,7 @@
+ 	fConfigurations = (usb_configuration_info *)malloc(
+ 		fDeviceDescriptor.num_configurations * sizeof(usb_configuration_info));
+ 	if (fConfigurations == NULL) {
+-		TRACE_ERROR((&quot;USB Device: out of memory during config creations!\n&quot;));
++		TRACE_ERROR((&quot;USB Device %d: out of memory during config creations!\n&quot;, fDeviceAddress));
+ 		return;
+ 	}
+ 
+@@ -77,7 +75,7 @@
+ 			return;
+ 		}
+ 
+-		TRACE((&quot;USB Device %d: configuration %d\n&quot;, fDeviceAddress, i));
++		TRACE((&quot;USB Device %d: configuration %ld\n&quot;, fDeviceAddress, i));
+ 		TRACE((&quot;\tlength:..............%d\n&quot;, configDescriptor.length));
+ 		TRACE((&quot;\tdescriptor_type:.....0x%02x\n&quot;, configDescriptor.descriptor_type));
+ 		TRACE((&quot;\ttotal_length:........%d\n&quot;, configDescriptor.total_length));
+@@ -263,11 +261,11 @@
+ 		USB_REQUEST_GET_DESCRIPTOR,							// request
+ 		(descriptorType &lt;&lt; 8) | index,						// value
+ 		languageID,											// index
+-		dataLength,											// length										
++		dataLength,											// length
+ 		data,												// buffer
+ 		dataLength,											// buffer length
+ 		actualLength);										// actual length
+-}			
++}
+ 
+ 
+ const usb_configuration_info *
+@@ -320,7 +318,7 @@
+ 		USB_REQUEST_SET_CONFIGURATION,						// request
+ 		fConfigurations[index].descr-&gt;configuration_value,	// value
+ 		0,													// index
+-		0,													// length										
++		0,													// length
+ 		NULL,												// buffer
+ 		0,													// buffer length
+ 		NULL);												// actual length
+@@ -388,7 +386,7 @@
+ 			USB_REQUEST_SET_CONFIGURATION,					// request
+ 			0,												// value
+ 			0,												// index
+-			0,												// length										
++			0,												// length
+ 			NULL,											// buffer
+ 			0,												// buffer length
+ 			NULL);											// actual length
+@@ -404,7 +402,7 @@
+ 
+ 	usb_interface_info *interfaceInfo = fCurrentConfiguration-&gt;interface[0].active;
+ 	for (size_t i = 0; i &lt; interfaceInfo-&gt;endpoint_count; i++) {
+-		usb_endpoint_info *endpoint = &amp;interfaceInfo-&gt;endpoint[i];		
++		usb_endpoint_info *endpoint = &amp;interfaceInfo-&gt;endpoint[i];
+ 		delete (Pipe *)GetStack()-&gt;GetObject(endpoint-&gt;handle);
+ 		endpoint-&gt;handle = 0;
+ 	}
+@@ -426,11 +424,7 @@
+ 	uint32 supportDescriptorCount, const usb_notify_hooks *hooks,
+ 	usb_driver_cookie **cookies, bool added)
+ {
+-	TRACE((&quot;USB Device ReportDevice\n&quot;));
+-	if ((added &amp;&amp; hooks-&gt;device_added == NULL)
+-		|| (!added &amp;&amp; hooks-&gt;device_removed == NULL))
+-		return B_BAD_VALUE;
+-
++	TRACE((&quot;USB Device %d: reporting device\n&quot;, fDeviceAddress));
+ 	bool supported = false;
+ 	if (supportDescriptorCount == 0 || supportDescriptors == NULL)
+ 		supported = true;
+@@ -441,7 +435,7 @@
+ 			|| (supportDescriptors[i].product != 0
+ 			&amp;&amp; fDeviceDescriptor.product_id != supportDescriptors[i].product))
+ 			continue;
+- 
++
+ 		if ((supportDescriptors[i].dev_class == 0
+ 			|| fDeviceDescriptor.device_class == supportDescriptors[i].dev_class)
+ 			&amp;&amp; (supportDescriptors[i].dev_subclass == 0
+@@ -469,17 +463,26 @@
+ 		}
+ 	}
+ 
+-	if (supported) {
+-		usb_id id = USBID();
+-		if (added) {
+-			usb_driver_cookie *cookie = new(std::nothrow) usb_driver_cookie;
+-			status_t result = hooks-&gt;device_added(id, &amp;cookie-&gt;cookie);
++	if (!supported)
++		return B_UNSUPPORTED;
++
++	if ((added &amp;&amp; hooks-&gt;device_added == NULL)
++		|| (!added &amp;&amp; hooks-&gt;device_removed == NULL)) {
++		// hooks are not installed, but report success to indicate that
++		// the driver supports the device
++		return B_OK;
++	}
++
++	usb_id id = USBID();
++	if (added) {
++		usb_driver_cookie *cookie = new(std::nothrow) usb_driver_cookie;
++		if (hooks-&gt;device_added(id, &amp;cookie-&gt;cookie) &gt;= B_OK) {
+ 			cookie-&gt;device = id;
+ 			cookie-&gt;link = *cookies;
+ 			*cookies = cookie;
+-			return result;
+-		}
+-
++		} else
++			delete cookie;
++	} else {
+ 		usb_driver_cookie **pointer = cookies;
+ 		usb_driver_cookie *cookie = *cookies;
+ 		while (cookie) {
+@@ -489,15 +492,18 @@
+ 			cookie = cookie-&gt;link;
+ 		}
+ 
+-		if (cookie) {
+-			hooks-&gt;device_removed(cookie-&gt;cookie);
+-			*pointer = cookie-&gt;link;
+-			delete cookie;
++		if (!cookie) {
++			// the device is supported, but there is no cookie. this most
++			// probably means that the device_added hook above failed.
+ 			return B_OK;
+ 		}
++
++		hooks-&gt;device_removed(cookie-&gt;cookie);
++		*pointer = cookie-&gt;link;
++		delete cookie;
+ 	}
+ 
+-	return B_UNSUPPORTED;
++	return B_OK;
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp	2007-01-18 21:30:38 UTC (rev 19859)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Hub.cpp	2007-01-18 22:25:02 UTC (rev 19860)
+@@ -15,36 +15,41 @@
+ 	usb_speed speed)
+ 	:	Device(parent, desc, deviceAddress, speed)
+ {
+-	TRACE((&quot;USB Hub is being initialised\n&quot;));
++	TRACE((&quot;USB Hub %d: creating hub\n&quot;, DeviceAddress()));
+ 
+ 	if (!fInitOK) {
+-		TRACE_ERROR((&quot;USB Hub: Device failed to initialize\n&quot;));
++		TRACE_ERROR((&quot;USB Hub %d: device failed to initialize\n&quot;, DeviceAddress()));
+ 		return;
+ 	}
+ 
+ 	// Set to false again for the hub init.
+ 	fInitOK = false;
+ 
++	if (benaphore_init(&amp;fLock, &quot;usb hub lock&quot;) &lt; B_OK) {
++		TRACE_ERROR((&quot;USB Hub %d: failed to create hub lock\n&quot;, DeviceAddress()));
++		return;
++	}
++
+ 	for (int32 i = 0; i &lt; 8; i++)
+ 		fChildren[i] = NULL;
+ 
+ 	if (fDeviceDescriptor.device_class != 9) {
+-		TRACE_ERROR((&quot;USB Hub: wrong class! Bailing out\n&quot;));
++		TRACE_ERROR((&quot;USB Hub %d: wrong class! bailing out\n&quot;, DeviceAddress()));
+ 		return;
+ 	}
+ 
+-	TRACE((&quot;USB Hub: Getting hub descriptor...\n&quot;));
++	TRACE((&quot;USB Hub %d: Getting hub descriptor...\n&quot;, DeviceAddress()));
+ 	size_t actualLength;
+ 	status_t status = GetDescriptor(USB_DESCRIPTOR_HUB, 0, 0,
+ 		(void *)&amp;fHubDescriptor, sizeof(usb_hub_descriptor), &amp;actualLength);
+ 
+ 	// we need at least 8 bytes
+ 	if (status &lt; B_OK || actualLength &lt; 8) {
+-		TRACE_ERROR((&quot;USB Hub: Error getting hub descriptor\n&quot;));
++		TRACE_ERROR((&quot;USB Hub %d: Error getting hub descriptor\n&quot;, DeviceAddress()));
+ 		return;
+ 	}
+ 
+-	TRACE((&quot;USB Hub: Hub descriptor (%d bytes):\n&quot;, actualLength));
++	TRACE((&quot;USB Hub %d: hub descriptor (%ld bytes):\n&quot;, DeviceAddress(), actualLength));
+ 	TRACE((&quot;\tlength:..............%d\n&quot;, fHubDescriptor.length));
+ 	TRACE((&quot;\tdescriptor_type:.....0x%02x\n&quot;, fHubDescriptor.descriptor_type));
+ 	TRACE((&quot;\tnum_ports:...........%d\n&quot;, fHubDescriptor.num_ports));
+@@ -55,7 +60,7 @@
+ 
+ 	Object *object = GetStack()-&gt;GetObject(Configuration()-&gt;interface-&gt;active-&gt;endpoint[0].handle);
+ 	if (!object || (object-&gt;Type() &amp; USB_OBJECT_INTERRUPT_PIPE) == 0) {
+-		TRACE_ERROR((&quot;USB Hub: no interrupt pipe found\n&quot;));
++		TRACE_ERROR((&quot;USB Hub %d: no interrupt pipe found\n&quot;, DeviceAddress()));
+ 		return;
+ 	}
+ 
+@@ -72,17 +77,50 @@
+ 			USB_REQUEST_SET_FEATURE, PORT_POWER, i + 1, 0, NULL, 0, NULL);
+ 
+ 		if (status &lt; B_OK)
+-			TRACE_ERROR((&quot;USB Hub: power up failed on port %ld\n&quot;, i));
++			TRACE_ERROR((&quot;USB Hub %d: power up failed on port %ld\n&quot;, DeviceAddress(), i));
+ 	}
+ 
+ 	// Wait for power to stabilize
+ 	snooze(fHubDescriptor.power_on_to_power_good * 2000);
+ 
+ 	fInitOK = true;
+-	TRACE((&quot;USB Hub: initialised ok\n&quot;));
++	TRACE((&quot;USB Hub %d: initialised ok\n&quot;, DeviceAddress()));
+ }
+ 
+ 
++Hub::~Hub()
++{
++	Lock();
++	benaphore_destroy(&amp;fLock);
++
++	// Remove all child devices
++	for (int32 i = 0; i &lt; fHubDescriptor.num_ports; i++) {
++		if (!fChildren[i])
++			continue;
++
++		TRACE((&quot;USB Hub %d: removing device 0x%08lx\n&quot;, DeviceAddress(), fChildren[i]));
++		GetStack()-&gt;NotifyDeviceChange(fChildren[i], false);
++		GetBusManager()-&gt;FreeDevice(fChildren[i]);
++	}
++
++	delete fInterruptPipe;
++}
++
++
++bool
++Hub::Lock()
++{
++	return (benaphore_lock(&amp;fLock) == B_OK);
++}
++
++
++void
++Hub::Unlock()
++{
++	benaphore_unlock(&amp;fLock);
++}
++
++
+ status_t
+ Hub::UpdatePortStatus(uint8 index)
+ {
+@@ -93,7 +131,7 @@
+ 		4, &amp;actualLength);
+ 
+ 	if (result &lt; B_OK || actualLength &lt; 4) {
+-		TRACE_ERROR((&quot;USB Hub: error updating port status\n&quot;));
++		TRACE_ERROR((&quot;USB Hub %d: error updating port status\n&quot;, DeviceAddress()));
+ 		return B_ERROR;
+ 	}
+ 
+@@ -124,7 +162,7 @@
+ 	}
+ 
+ 	if ((fPortStatus[index].change &amp; C_PORT_RESET) == 0) {
+-		TRACE_ERROR((&quot;USB Hub: port %d won't reset\n&quot;, index));
++		TRACE_ERROR((&quot;USB Hub %d: port %d won't reset\n&quot;, DeviceAddress(), index));
+ 		return B_ERROR;
+ 	}
+ 
+@@ -136,7 +174,7 @@
+ 
+ 	// wait for reset recovery
+ 	snooze(USB_DELAY_PORT_RESET_RECOVERY);
+-	TRACE((&quot;USB Hub: port %d was reset successfully\n&quot;, index));
++	TRACE((&quot;USB Hub %d: port %d was reset successfully\n&quot;, DeviceAddress(), index));
+ 	return B_OK;
+ }
+ 
+@@ -146,7 +184,7 @@
+ {
+ 	for (int32 i = 0; i &lt; fHubDescriptor.num_ports; i++) {
+ 		if (i &gt;= 8) {
+-			TRACE((&quot;USB Hub: hub supports more ports than we do (%d)\n&quot;, fHubDescriptor.num_ports));
++			TRACE((&quot;USB Hub %d: hub supports more ports than we do (%d)\n&quot;, DeviceAddress(), fHubDescriptor.num_ports));
+ 			fHubDescriptor.num_ports = 8;
+ 			continue;
+ 		}
+@@ -157,8 +195,8 @@
+ 
+ #ifdef TRACE_USB
+ 		if (fPortStatus[i].change) {
+-			TRACE((&quot;USB Hub: port %d: status: 0x%04x; change: 0x%04x\n&quot;, i, fPortStatus[i].status, fPortStatus[i].change));
+-			TRACE((&quot;USB Hub: device at port %d: 0x%08x\n&quot;, i, fChildren[i]));
++			TRACE((&quot;USB Hub %d: port %ld: status: 0x%04x; change: 0x%04x\n&quot;, DeviceAddress(), i, fPortStatus[i].status, fPortStatus[i].change));
++			TRACE((&quot;USB Hub %d: device at port %ld: 0x%08lx\n&quot;, DeviceAddress(), i, fChildren[i]));
+ 		}
+ #endif
+ 
+@@ -170,7 +208,7 @@
+ 
+ 			if (fPortStatus[i].status &amp; PORT_STATUS_CONNECTION) {
+ 				// new device attached!
+-				TRACE((&quot;USB Hub: Explore(): New device connected\n&quot;));
++				TRACE((&quot;USB Hub %d: new device connected\n&quot;, DeviceAddress()));
+ 
+ 				// wait some time for the device to power up
+ 				snooze(USB_DELAY_DEVICE_POWER_UP);
+@@ -186,7 +224,7 @@
+ 
+ 				if ((fPortStatus[i].status &amp; PORT_STATUS_CONNECTION) == 0) {
+ 					// device has vanished after reset, ignore
+-					TRACE((&quot;USB Hub: device disappeared on reset\n&quot;));
++					TRACE((&quot;USB Hub %d: device disappeared on reset\n&quot;, DeviceAddress()));
+ 					continue;
+ 				}
+ 
+@@ -196,13 +234,16 @@
+ 				if (fPortStatus[i].status &amp; PORT_STATUS_HIGH_SPEED)
+ 					speed = USB_SPEED_HIGHSPEED;
+ 
+-				Device *newDevice = GetBusManager()-&gt;AllocateNewDevice(this,
+-					speed);
++				Device *newDevice = GetBusManager()-&gt;AllocateDevice(this, speed);
+ 
+-				if (newDevice) {
++				if (newDevice &amp;&amp; Lock()) {
+ 					fChildren[i] = newDevice;
++					Unlock();
+ 					GetStack()-&gt;NotifyDeviceChange(fChildren[i], true);
+ 				} else {
++					if (newDevice)
++						GetBusManager()-&gt;FreeDevice(newDevice);
++
+ 					// the device failed to setup correctly, disable the port
+ 					// so that the device doesn't get in the way of future
+ 					// addressing.
+@@ -212,40 +253,44 @@
+ 				}
+ 			} else {
+ 				// Device removed...
+-				TRACE((&quot;USB Hub Explore(): Device removed\n&quot;));
++				TRACE((&quot;USB Hub %d: device removed\n&quot;, DeviceAddress()));
+ 				if (fChildren[i]) {
+-					TRACE((&quot;USB Hub: removing device 0x%08x\n&quot;, fChildren[i]));
++					TRACE((&quot;USB Hub %d: removing device 0x%08lx\n&quot;, DeviceAddress(), fChildren[i]));
+ 					GetStack()-&gt;NotifyDeviceChange(fChildren[i], false);
+-					delete fChildren[i];
+-					fChildren[i] = NULL;
++
++					if (Lock()) {
++						GetBusManager()-&gt;FreeDevice(fChildren[i]);
++						fChildren[i] = NULL;
++						Unlock();
++					}
+ 				}
+ 			}
+ 		}
+ 
+ 		// other port changes we do not really handle, report and clear them
+ 		if (fPortStatus[i].change &amp; PORT_STATUS_ENABLE) {
+-			TRACE_ERROR((&quot;USB Hub Explore(): port %ld %sabled\n&quot;, i, (fPortStatus[i].status &amp; PORT_STATUS_ENABLE) ? &quot;en&quot; : &quot;dis&quot;));
++			TRACE_ERROR((&quot;USB Hub %d: port %ld %sabled\n&quot;, DeviceAddress(), i, (fPortStatus[i].status &amp; PORT_STATUS_ENABLE) ? &quot;en&quot; : &quot;dis&quot;));
+ 			DefaultPipe()-&gt;SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
+ 				USB_REQUEST_CLEAR_FEATURE, C_PORT_ENABLE, i + 1,
+ 				0, NULL, 0, NULL);
+ 		}
+ 
+ 		if (fPortStatus[i].change &amp; PORT_STATUS_SUSPEND) {
+-			TRACE_ERROR((&quot;USB Hub Explore(): port %ld is %ssuspended\n&quot;, i, (fPortStatus[i].status &amp; PORT_STATUS_SUSPEND) ? &quot;&quot; : &quot;not &quot;));			
++			TRACE_ERROR((&quot;USB Hub %d: port %ld is %ssuspended\n&quot;, DeviceAddress(), i, (fPortStatus[i].status &amp; PORT_STATUS_SUSPEND) ? &quot;&quot; : &quot;not &quot;));
+ 			DefaultPipe()-&gt;SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
+ 				USB_REQUEST_CLEAR_FEATURE, C_PORT_SUSPEND, i + 1,
+ 				0, NULL, 0, NULL);
+ 		}
+ 
+ 		if (fPortStatus[i].change &amp; PORT_STATUS_OVER_CURRENT) {
+-			TRACE_ERROR((&quot;USB Hub Explore(): port %ld is %sin an over current state\n&quot;, i, (fPortStatus[i].status &amp; PORT_STATUS_OVER_CURRENT) ? &quot;&quot; : &quot;not &quot;));			
++			TRACE_ERROR((&quot;USB Hub %d: port %ld is %sin an over current state\n&quot;, DeviceAddress(), i, (fPortStatus[i].status &amp; PORT_STATUS_OVER_CURRENT) ? &quot;&quot; : &quot;not &quot;));
+ 			DefaultPipe()-&gt;SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
+ 				USB_REQUEST_CLEAR_FEATURE, C_PORT_OVER_CURRENT, i + 1,
+ 				0, NULL, 0, NULL);
+ 		}
+ 
+ 		if (fPortStatus[i].change &amp; PORT_RESET) {
+-			TRACE_ERROR((&quot;USB Hub Explore(): port %ld was reset\n&quot;, i));
++			TRACE_ERROR((&quot;USB Hub %d: port %ld was reset\n&quot;, DeviceAddress(), i));
+ 			DefaultPipe()-&gt;SendRequest(USB_REQTYPE_CLASS | USB_REQTYPE_OTHER_OUT,
+ 				USB_REQUEST_CLEAR_FEATURE, C_PORT_RESET, i + 1,
+ 				0, NULL, 0, NULL);
+@@ -266,7 +311,7 @@
+ Hub::InterruptCallback(void *cookie, status_t status, void *data,
+ 	size_t actualLength)
+ {
+-	TRACE((&quot;USB Hub: interrupt callback!\n&quot;));
++	TRACE((&quot;USB Hub %d: interrupt callback!\n&quot;, ((Hub *)data)-&gt;DeviceAddress()));
+ }
+ 
+ 
+@@ -279,11 +324,11 @@
+ 		USB_REQUEST_GET_DESCRIPTOR,							// request
+ 		(descriptorType &lt;&lt; 8) | index,						// value
+ 		languageID,											// index
+-		dataLength,											// length										
++		dataLength,											// length
+ 		data,												// buffer
+ 		dataLength,											// buffer length
+ 		actualLength);										// actual length
+-}			
++}
+ 
+ 
+ status_t
+@@ -291,13 +336,16 @@
+ 	uint32 supportDescriptorCount, const usb_notify_hooks *hooks,
+ 	usb_driver_cookie **cookies, bool added)
+ {
+-	TRACE((&quot;USB Hub ReportDevice\n&quot;));
++	TRACE((&quot;USB Hub %d: reporting hub\n&quot;, DeviceAddress()));
+ 
+ 	// Report ourselfs first
+ 	status_t result = Device::ReportDevice(supportDescriptors,
+ 		supportDescriptorCount, hooks, cookies, added);
+ 
+ 	// Then report all of our children
++	if (!Lock())
++		return B_ERROR;
++
+ 	for (int32 i = 0; i &lt; fHubDescriptor.num_ports; i++) {
+ 		if (!fChildren[i])
+ 			continue;
+@@ -307,6 +355,7 @@
+ 			result = B_OK;
+ 	}
+ 
++	Unlock();
+ 	return result;
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp	2007-01-18 21:30:38 UTC (rev 19859)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Pipe.cpp	2007-01-18 22:25:02 UTC (rev 19860)
+@@ -41,7 +41,7 @@
+ status_t
+ Pipe::CancelQueuedTransfers()
+ {
+-	TRACE_ERROR((&quot;Pipe: cancelling transfers is not implemented!\n&quot;));
++	TRACE_ERROR((&quot;USB Pipe: cancelling transfers is not implemented!\n&quot;));
+ 	return B_ERROR;
+ }
+ 
+@@ -120,7 +120,7 @@
+ 	transfer-&gt;SetData((uint8 *)data, dataLength);
+ 	transfer-&gt;SetCallback(callback, callbackCookie);
+ 
+-	status_t result = SubmitTransfer(transfer);
++	status_t result = GetBusManager()-&gt;SubmitTransfer(transfer);
+ 	if (result &lt; B_OK)
+ 		delete transfer;
+ 	return result;
+@@ -151,7 +151,7 @@
+ 	transfer-&gt;SetData((uint8 *)data, dataLength);
+ 	transfer-&gt;SetCallback(callback, callbackCookie);
+ 
+-	status_t result = SubmitTransfer(transfer);
++	status_t result = GetBusManager()-&gt;SubmitTransfer(transfer);
+ 	if (result &lt; B_OK)
+ 		delete transfer;
+ 	return result;
+@@ -169,7 +169,7 @@
+ 	transfer-&gt;SetVector(vector, vectorCount);
+ 	transfer-&gt;SetCallback(callback, callbackCookie);
+ 
+-	status_t result = SubmitTransfer(transfer);
++	status_t result = GetBusManager()-&gt;SubmitTransfer(transfer);
+ 	if (result &lt; B_OK)
+ 		delete transfer;
+ 	return result;
+@@ -261,7 +261,7 @@
+ 	size_t *actualLength)
+ {
+ 	transfer_result_data transferResult;
+-	transferResult.notify_sem = create_sem(0, &quot;Send Request Notify Sem&quot;);
++	transferResult.notify_sem = create_sem(0, &quot;usb send request notify&quot;);
+ 	if (transferResult.notify_sem &lt; B_OK)
+ 		return B_NO_MORE_SEMS;
+ 
+@@ -272,11 +272,21 @@
+ 		return result;
+ 	}
+ 
+-	// the sem will be released in the callback after
+-	// the result data was filled into the provided struct
+-	acquire_sem(transferResult.notify_sem);
++	// the sem will be released in the callback after the result data was
++	// filled into the provided struct. use a 5 seconds timeout to avoid
++	// hanging applications.
++	if (acquire_sem_etc(transferResult.notify_sem, 1, B_RELATIVE_TIMEOUT, 5000000) &lt; B_OK) {
++		TRACE_ERROR((&quot;USB ControlPipe: timeout waiting for queued request to complete\n&quot;));
++
++		delete_sem(transferResult.notify_sem);
++		if (actualLength)
++			*actualLength = 0;
++
++		// ToDo: cancel the transfer at the bus manager
++		return B_TIMED_OUT;
++	}
++
+ 	delete_sem(transferResult.notify_sem);
+-
+ 	if (actualLength)
+ 		*actualLength = transferResult.actual_length;
+ 
+@@ -320,7 +330,7 @@
+ 	transfer-&gt;SetData((uint8 *)data, dataLength);
+ 	transfer-&gt;SetCallback(callback, callbackCookie);
+ 
+-	status_t result = SubmitTransfer(transfer);
++	status_t result = GetBusManager()-&gt;SubmitTransfer(transfer);
+ 	if (result &lt; B_OK)
+ 		delete transfer;
+ 	return result;
+
+Modified: haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp	2007-01-18 21:30:38 UTC (rev 19859)
++++ haiku/trunk/src/add-ons/kernel/bus_managers/usb/Stack.cpp	2007-01-18 22:25:02 UTC (rev 19860)
+@@ -13,6 +13,9 @@
+ #include &quot;usb_p.h&quot;
+ #include &quot;PhysicalMemoryAllocator.h&quot;
+ 
++#ifdef HAIKU_TARGET_PLATFORM_HAIKU
++#include &lt;fs/devfs.h&gt;
++#endif
+ 
+ Stack::Stack()
+ 	:	fExploreThread(-1),
+@@ -23,10 +26,10 @@
+ 		fObjectArray(NULL),
+ 		fDriverList(NULL)
+ {
+-	TRACE((&quot;usb stack: stack init\n&quot;));
++	TRACE((&quot;USB Stack: stack init\n&quot;));
+ 
+-	if (benaphore_init(&amp;fLock, &quot;USB Stack Master Lock&quot;) &lt; B_OK) {
+-		TRACE_ERROR((&quot;usb stack: failed to create benaphore lock\n&quot;));
++	if (benaphore_init(&amp;fLock, &quot;usb stack lock&quot;) &lt; B_OK) {
++		TRACE_ERROR((&quot;USB Stack: failed to create benaphore lock\n&quot;));
+ 		return;
+ 	}
+ 
+@@ -37,7 +40,7 @@
+ 	fAllocator = new(std::nothrow) PhysicalMemoryAllocator(&quot;USB Stack Allocator&quot;,
+ 		8, B_PAGE_SIZE * 4, 64);
+ 	if (!fAllocator || fAllocator-&gt;InitCheck() &lt; B_OK) {
+-		TRACE_ERROR((&quot;usb stack: failed to allocate the allocator\n&quot;));
++		TRACE_ERROR((&quot;USB Stack: failed to allocate the allocator\n&quot;));
+ 		delete fAllocator;
+ 		return;
+ 	}
+@@ -47,10 +50,10 @@
+ 	char moduleName[B_PATH_NAME_LENGTH];
+ 	size_t bufferSize = sizeof(moduleName);
+ 
+-	TRACE((&quot;usb stack: Looking for host controller modules\n&quot;));
++	TRACE((&quot;USB Stack: looking for host controller modules\n&quot;));
+ 	while(read_next_module_name(moduleList, moduleName, &amp;bufferSize) == B_OK) {
+ 		bufferSize = sizeof(moduleName);
+-		TRACE((&quot;usb stack: Found module %s\n&quot;, moduleName));
++		TRACE((&quot;USB Stack: found module %s\n&quot;, moduleName));
+ 
+ 		host_controller_info *module = NULL;
+ 		if (get_module(moduleName, (module_info **)&amp;module) != B_OK)
+@@ -59,19 +62,14 @@
+ 		if (module-&gt;add_to(this) &lt; B_OK)
+ 			continue;
+ 
+-		TRACE((&quot;usb stack: module %s successfully loaded\n&quot;, moduleName));
++		TRACE((&quot;USB Stack: module %s successfully loaded\n&quot;, moduleName));
+ 	}
+ 
+ 	if (fBusManagers.Count() == 0) {
+-		TRACE_ERROR((&quot;usb stack: no bus managers available\n&quot;));
++		TRACE_ERROR((&quot;USB Stack: no bus managers available\n&quot;));
+ 		return;
+ 	}
+ 
+-	if (benaphore_init(&amp;fExploreLock, &quot;usb explore lock&quot;) &lt; B_OK) {
+-		TRACE_ERROR((&quot;usb stack: failed to create benaphore explore lock\n&quot;));
+-		return;
+-	}
+-
+ 	fExploreThread = spawn_kernel_thread(ExploreThread, &quot;usb explore&quot;,
+ 		B_LOW_PRIORITY, this);
+ 	resume_thread(fExploreThread);
+@@ -99,7 +97,7 @@
+ 	}
+ 
+ 	delete fAllocator;
+-}	
++}
+ 
+ 
+ status_t
+@@ -132,16 +130,22 @@
+ 	if (!Lock())
+ 		return 0;
+ 
+-	if (fObjectIndex &gt;= fObjectMaxCount) {
+-		Unlock();
+-		return 0;
++	uint32 id = fObjectIndex;
++	uint32 tries = fObjectMaxCount;
++	while (tries-- &gt; 0) {
++		if (fObjectArray[id] == NULL) {
++			fObjectIndex = (id + 1) % fObjectMaxCount;
++			fObjectArray[id] = object;
++			Unlock();
++			return (usb_id)id;
++		}
++
++		id = (id + 1) % fObjectMaxCount;
+ 	}
+ 
+-	uint32 id = fObjectIndex++;
+-	fObjectArray[id] = object;
++	TRACE_ERROR((&quot;USB Stack: the stack did run out of usb_ids\n&quot;));
+ 	Unlock();
+-
+-	return (usb_id)id;
++	return 0;
+ }
+ 
+ 
+@@ -152,7 +156,7 @@
+ 		return;
+ 
+ 	if (id &gt;= fObjectMaxCount) {
+-		TRACE_ERROR((&quot;usb stack: tried to put invalid usb_id!\n&quot;));
++		TRACE_ERROR((&quot;USB Stack: tried to put an invalid usb_id\n&quot;));
+ 		Unlock();
+ 		return;
+ 	}
+@@ -169,14 +173,14 @@
+ 		return NULL;
+ 
+ 	if (id &gt;= fObjectMaxCount) {
+-		TRACE_ERROR((&quot;usb stack: tried to get object with invalid id\n&quot;));
++		TRACE_ERROR((&quot;USB Stack: tried to get object with invalid usb_id\n&quot;));
+ 		Unlock();
+ 		return NULL;
+ 	}
+ 
+ 	Object *result = fObjectArray[id];
++
+ 	Unlock();
+-
+ 	return result;
+ }
+ 
+@@ -187,9 +191,6 @@
+ 	Stack *stack = (Stack *)data;
+ 
+ 	while (!stack-&gt;fStopThreads) {
+-		if (benaphore_lock(&amp;stack-&gt;fExploreLock) != B_OK)
+-			continue;
+-
+ 		for (int32 i = 0; i &lt; stack-&gt;fBusManagers.Count(); i++) {
+ 			Hub *rootHub = stack-&gt;fBusManagers.ElementAt(i)-&gt;GetRootHub();
+ 			if (rootHub)
+@@ -197,7 +198,6 @@
+ 		}
+ 
+ 		stack-&gt;fFirstExploreDone = true;
+-		benaphore_unlock(&amp;stack-&gt;fExploreLock);
+ 		snooze(USB_DELAY_HUB_EXPLORE);
+ 	}
+ 
+@@ -228,7 +228,7 @@
+ 
+ status_t
+ Stack::FreeChunk(void *logicalAddress, void *physicalAddress, size_t size)
+-{	
++{
+ 	return fAllocator-&gt;Deallocate(size, logicalAddress, physicalAddress);
+ }
+ 
+@@ -237,7 +237,7 @@
+ Stack::AllocateArea(void **logicalAddress, void **physicalAddress, size_t size,
+ 	const char *name)
+ {
+-	TRACE((&quot;usb stack: allocating %ld bytes for %s\n&quot;, size, name));
++	TRACE((&quot;USB Stack: allocating %ld bytes for %s\n&quot;, size, name));
+ 
+ 	void *logAddress;
+ 	size = (size + B_PAGE_SIZE - 1) &amp; ~(B_PAGE_SIZE - 1);
+@@ -245,7 +245,7 @@
+ 		B_FULL_LOCK | B_CONTIGUOUS, 0);
+ 
+ 	if (area &lt; B_OK) {
+-		TRACE_ERROR((&quot;usb stack: couldn't allocate area %s\n&quot;, name));
++		TRACE_ERROR((&quot;USB Stack: couldn't allocate area %s\n&quot;, name));
+ 		return B_ERROR;
+ 	}
+ 
+@@ -253,7 +253,7 @@
+ 	status_t result = get_memory_map(logAddress, size, &amp;physicalEntry, 1);
+ 	if (result &lt; B_OK) {
+ 		delete_area(area);
+-		TRACE_ERROR((&quot;usb stack: couldn't map area %s\n&quot;, name));
++		TRACE_ERROR((&quot;USB Stack: couldn't map area %s\n&quot;, name));
+ 		return B_ERROR;
+ 	}
+ 
+@@ -264,7 +264,7 @@
+ 	if (physicalAddress)
+ 		*physicalAddress = physicalEntry.address;
+ 
+-	TRACE((&quot;usb stack: area = 0x%08x, size = %ld, log = 0x%08x, phy = 0x%08x\n&quot;,
++	TRACE((&quot;USB Stack: area = 0x%08lx, size = %ld, log = 0x%08lx, phy = 0x%08lx\n&quot;,
+ 		area, size, logAddress, physicalEntry.address));
+ 	return area;
+ }
+@@ -273,24 +273,33 @@
+ void
+ Stack::NotifyDeviceChange(Device *device, bool added)
+ {
+-	TRACE((&quot;usb stack: device %s\n&quot;, added ? &quot;added&quot; : &quot;removed&quot;));
++	TRACE((&quot;USB Stack: device %s\n&quot;, added ? &quot;added&quot; : &quot;removed&quot;));
+ 
+ 	usb_driver_info *element = fDriverList;
+ 	while (element) {
+-		if ((added &amp;&amp; element-&gt;notify_hooks.device_added != NULL)
+-			|| (!added &amp;&amp; element-&gt;notify_hooks.device_removed != NULL)) {
+
+[... truncated: 434 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000312.html">[Haiku-commits] r19859 - haiku/trunk/build/jam
+</A></li>
+	<LI>Next message: <A HREF="000358.html">[Haiku-commits] r19860 - haiku/trunk/src/add-ons/kernel/bus_managers/usb
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#313">[ date ]</a>
+              <a href="thread.html#313">[ thread ]</a>
+              <a href="subject.html#313">[ subject ]</a>
+              <a href="author.html#313">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

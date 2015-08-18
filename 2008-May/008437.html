@@ -1,0 +1,257 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25294 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25294%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200805021736.m42HaSZQ001135%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008436.html">
+   <LINK REL="Next"  HREF="008441.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25294 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25294%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200805021736.m42HaSZQ001135%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25294 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri May  2 19:36:28 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008436.html">[Haiku-commits] r25293 - in haiku/trunk: build/config_headers	src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+        <LI>Next message: <A HREF="008441.html">[Haiku-commits] r25295 - haiku/trunk/src/apps/showimage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8437">[ date ]</a>
+              <a href="thread.html#8437">[ thread ]</a>
+              <a href="subject.html#8437">[ subject ]</a>
+              <a href="author.html#8437">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-05-02 19:36:28 +0200 (Fri, 02 May 2008)
+New Revision: 25294
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25294&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25294&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+Log:
+* The WaitList now always notifies all waiters.
+* In SendData(), TCP will now split the buffer into smaller parts if it
+  can send data (ie. there is free space in the buffer queue left, but
+  not enough to send the whole buffer, and the free space is more than
+  the send low water mark of the socket).
+* Both of these changes together let TCP now pass the &quot;forwarding&quot; test
+  of the OpenSSH suite.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2008-05-02 17:02:41 UTC (rev 25293)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.cpp	2008-05-02 17:36:28 UTC (rev 25294)
+@@ -329,21 +329,20 @@
+ 
+ 
+ status_t
+-WaitList::Wait(MutexLocker&amp; locker, bigtime_t timeout, bool wakeNext)
++WaitList::Wait(MutexLocker&amp; locker, bigtime_t timeout)
+ {
+ 	locker.Unlock();
+ 
+ 	status_t status = B_OK;
+ 
+-	while (status == B_OK &amp;&amp; !atomic_test_and_set(&amp;fCondition, 0, 1)) {
++	while (!atomic_test_and_set(&amp;fCondition, 0, 1)) {
+ 		status = acquire_sem_etc(fSem, 1, B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT,
+ 			timeout);
++		if (status != B_OK)
++			break;
+ 	}
+ 
+ 	locker.Lock();
+-	if (status == B_OK &amp;&amp; wakeNext)
+-		Signal();
+-
+ 	return status;
+ }
+ 
+@@ -353,11 +352,11 @@
+ {
+ 	atomic_or(&amp;fCondition, 1);
+ #ifdef __HAIKU__
+-	release_sem_etc(fSem, 1, B_DO_NOT_RESCHEDULE | B_RELEASE_IF_WAITING_ONLY);
++	release_sem_etc(fSem, 1, B_DO_NOT_RESCHEDULE | B_RELEASE_ALL);
+ #else
+ 	int32 count;
+ 	if (get_sem_count(fSem, &amp;count) == B_OK &amp;&amp; count &lt; 0)
+-		release_sem_etc(fSem, 1, B_DO_NOT_RESCHEDULE);
++		release_sem_etc(fSem, -count, B_DO_NOT_RESCHEDULE);
+ #endif
+ }
+ 
+@@ -423,6 +422,9 @@
+ 	}
+ 
+ 	mutex_destroy(&amp;fLock);
++
++	// TODO: we need to wait for all timers to return
++	//_WaitForTimers();
+ }
+ 
+ 
+@@ -730,17 +732,18 @@
+ 		return EPIPE;
+ 	}
+ 
+-	if (buffer-&gt;size &gt; 0) {
+-		if (buffer-&gt;size &gt; fSendQueue.Size())
+-			return ENOBUFS;
++	uint32 flags = buffer-&gt;flags;
++	size_t left = buffer-&gt;size;
+ 
+-		bigtime_t timeout = absolute_timeout(socket-&gt;send.timeout);
+-		if (gStackModule-&gt;is_restarted_syscall())
+-			timeout = gStackModule-&gt;restore_syscall_restart_timeout();
+-		else
+-			gStackModule-&gt;store_syscall_restart_timeout(timeout);
++	bigtime_t timeout = absolute_timeout(socket-&gt;send.timeout);
++	if (gStackModule-&gt;is_restarted_syscall())
++		timeout = gStackModule-&gt;restore_syscall_restart_timeout();
++	else
++		gStackModule-&gt;store_syscall_restart_timeout(timeout);
+ 
+-		while (fSendQueue.Free() &lt; buffer-&gt;size) {
++	while (left &gt; 0) {
++		while (fSendQueue.Free() &lt; socket-&gt;send.low_water_mark) {
++			// wait until enough space is available
+ 			status_t status = fSendList.Wait(lock, timeout);
+ 			if (status &lt; B_OK) {
+ 				TRACE(&quot;  SendData() returning %s (%d)&quot;,
+@@ -749,19 +752,42 @@
+ 			}
+ 		}
+ 
+-		fSendQueue.Add(buffer);
++		size_t size = fSendQueue.Free();
++		if (size &lt; left) {
++			// we need to split the original buffer
++			net_buffer* clone = gBufferModule-&gt;clone(buffer, false);
++				// TODO: add offset/size parameter to net_buffer::clone() or
++				// even a move_data() function, as this is a bit inefficient
++			if (clone == NULL)
++				return ENOBUFS;
++
++			status_t status = gBufferModule-&gt;trim(clone, size);
++			if (status != B_OK) {
++				gBufferModule-&gt;free(clone);
++				return status;
++			}
++
++			gBufferModule-&gt;remove_header(buffer, size);
++			left -= size;
++			fSendQueue.Add(clone);
++		} else {
++			left -= buffer-&gt;size;
++			fSendQueue.Add(buffer);
++		}
+ 	}
+ 
+ 	TRACE(&quot;  SendData(): %lu bytes used.&quot;, fSendQueue.Used());
+ 
+ 	bool force = false;
+-	if ((buffer-&gt;flags &amp; MSG_OOB) != 0) {
++	if ((flags &amp; MSG_OOB) != 0) {
+ 		fSendUrgentOffset = fSendQueue.LastSequence();
+ 			// RFC 961 specifies that the urgent offset points to the last
+ 			// byte of urgent data. However, this is commonly implemented as
+ 			// here, ie. it points to the first byte after the urgent data.
+ 		force = true;
+ 	}
++	if ((flags &amp; MSG_EOF) != 0)
++		_Disconnect(false);
+ 
+ 	if (fState == ESTABLISHED || fState == FINISH_RECEIVED)
+ 		_SendQueued(force);
+@@ -857,7 +883,7 @@
+ 		if ((flags &amp; MSG_DONTWAIT) != 0 || socket-&gt;receive.timeout == 0)
+ 			return B_WOULD_BLOCK;
+ 
+-		status_t status = fReceiveList.Wait(locker, timeout, false);
++		status_t status = fReceiveList.Wait(locker, timeout);
+ 		if (status &lt; B_OK) {
+ 			// The Open Group base specification mentions that EINTR should be
+ 			// returned if the recv() is interrupted before _any data_ is
+@@ -876,7 +902,7 @@
+ 	if (numBytes &lt; fReceiveQueue.Available())
+ 		fReceiveList.Signal();
+ 
+-	bool clone = (flags &amp; MSG_PEEK);
++	bool clone = (flags &amp; MSG_PEEK) != 0;
+ 
+ 	ssize_t receivedBytes = fReceiveQueue.Get(numBytes, !clone, _buffer);
+ 
+@@ -2159,6 +2185,17 @@
+ 	TCPEndpoint* endpoint = (TCPEndpoint*)_endpoint;
+ 	T(Timer(endpoint, &quot;time-wait&quot;));
+ 
++	MutexLocker locker(endpoint-&gt;fLock);
++	if (!locker.IsLocked())
++		return;
++
++	if ((endpoint-&gt;fFlags &amp; FLAG_CLOSED) == 0) {
++		endpoint-&gt;fFlags |= FLAG_DELETE_ON_CLOSE;
++		return;
++	}
++
++	locker.Unlock();
++
+ 	gSocketModule-&gt;delete_socket(endpoint-&gt;socket);
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2008-05-02 17:02:41 UTC (rev 25293)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/TCPEndpoint.h	2008-05-02 17:36:28 UTC (rev 25294)
+@@ -32,7 +32,7 @@
+ 
+ 	status_t InitCheck() const;
+ 
+-	status_t Wait(MutexLocker &amp;, bigtime_t timeout, bool wakeNext = true);
++	status_t Wait(MutexLocker &amp;, bigtime_t timeout);
+ 	void Signal();
+ 
+ private:
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008436.html">[Haiku-commits] r25293 - in haiku/trunk: build/config_headers	src/add-ons/kernel/busses/scsi/ahci
+</A></li>
+	<LI>Next message: <A HREF="008441.html">[Haiku-commits] r25295 - haiku/trunk/src/apps/showimage
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8437">[ date ]</a>
+              <a href="thread.html#8437">[ thread ]</a>
+              <a href="subject.html#8437">[ subject ]</a>
+              <a href="author.html#8437">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

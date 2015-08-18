@@ -1,0 +1,148 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29555 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29555%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on&In-Reply-To=%3C200903160330.n2G3Urfs024479%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014890.html">
+   <LINK REL="Next"  HREF="014892.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29555 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29555%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on&In-Reply-To=%3C200903160330.n2G3Urfs024479%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29555 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Mar 16 04:30:53 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014890.html">[Haiku-commits] r29554 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on
+</A></li>
+        <LI>Next message: <A HREF="014892.html">[Haiku-commits] r29556 -	haiku/trunk/src/tests/add-ons/kernel/kernelland_emu
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14891">[ date ]</a>
+              <a href="thread.html#14891">[ thread ]</a>
+              <a href="subject.html#14891">[ subject ]</a>
+              <a href="author.html#14891">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-03-16 04:30:52 +0100 (Mon, 16 Mar 2009)
+New Revision: 29555
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29555&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29555&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/KernelRequestHandler.cpp
+Log:
+* FileCacheReadRequest: Implemented work-around for the problem that
+  file_cache_read() will reenter the file system which will overwrite the
+  buffer associated with the port, so we can't allocate space in the buffer
+  before calling it.
+* FileCacheWriteRequest still has a similar problem, though it's probably better
+  to rethink the kernel-userland communication completely.
+
+BFS basically seems to work in userland, now. Didn't really test write
+operations though. They will probably run into problems due to the issue above.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/KernelRequestHandler.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/KernelRequestHandler.cpp	2009-03-16 03:21:04 UTC (rev 29554)
++++ haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on/KernelRequestHandler.cpp	2009-03-16 03:30:52 UTC (rev 29555)
+@@ -14,6 +14,9 @@
+ 
+ #include &lt;NodeMonitor.h&gt;
+ 
++#include &lt;AutoDeleter.h&gt;
++
++
+ // VolumePutter
+ class VolumePutter {
+ public:
+@@ -644,6 +647,10 @@
+ 
+ 	size_t size = request-&gt;size;
+ 
++// TODO: Allocating the reply and the buffer first now would save an allocation
++// and copying the buffer, but since Volume::ReadFileCache() will reenter the
++// file system (io() hook) our allocation would be overwritten.
++#if 0
+ 	// allocate the reply
+ 	RequestAllocator allocator(fPort-&gt;GetPort());
+ 	FileCacheReadReply* reply;
+@@ -662,7 +669,32 @@
+ 		result = volume-&gt;ReadFileCache(request-&gt;vnid, request-&gt;cookie,
+ 			request-&gt;pos, buffer, &amp;size);
+ 	}
++#else
++	// allocate a buffer
++	void* buffer = malloc(size);
++		// TODO: Limit size!
++	if (buffer == NULL)
++		result = B_NO_MEMORY;
++	MemoryDeleter _2(buffer);
+ 
++	// execute the request
++	if (result == B_OK) {
++		result = volume-&gt;ReadFileCache(request-&gt;vnid, request-&gt;cookie,
++			request-&gt;pos, buffer, &amp;size);
++	}
++
++	// allocate the reply
++	RequestAllocator allocator(fPort-&gt;GetPort());
++	FileCacheReadReply* reply;
++	status_t error = AllocateRequest(allocator, &amp;reply);
++	if (error != B_OK)
++		RETURN_ERROR(error);
++
++	error = allocator.AllocateData(reply-&gt;buffer, buffer, size, 1, false);
++	if (error != B_OK)
++		return error;
++#endif
++
+ 	// prepare the reply
+ 	reply-&gt;error = result;
+ 	reply-&gt;bytesRead = size;
+@@ -689,6 +721,8 @@
+ 	size_t size = 0;
+ 	if (result == B_OK) {
+ 		size = request-&gt;buffer.GetSize();
++// TODO: WriteFileCache() will reenter the file system (io() hook) which will
++// overwrite the request and the buffer!
+ 		result = volume-&gt;WriteFileCache(request-&gt;vnid, request-&gt;cookie,
+ 			request-&gt;pos, request-&gt;buffer.GetData(), &amp;size);
+ 	}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014890.html">[Haiku-commits] r29554 -	haiku/trunk/src/add-ons/kernel/file_systems/userlandfs/kernel_add_on
+</A></li>
+	<LI>Next message: <A HREF="014892.html">[Haiku-commits] r29556 -	haiku/trunk/src/tests/add-ons/kernel/kernelland_emu
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14891">[ date ]</a>
+              <a href="thread.html#14891">[ thread ]</a>
+              <a href="subject.html#14891">[ subject ]</a>
+              <a href="author.html#14891">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

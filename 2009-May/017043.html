@@ -1,0 +1,188 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30927 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30927%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay&In-Reply-To=%3C200905301721.n4UHLCtm014852%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017041.html">
+   <LINK REL="Next"  HREF="017044.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30927 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30927%20-%0A%09haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay&In-Reply-To=%3C200905301721.n4UHLCtm014852%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30927 -	haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sat May 30 19:21:12 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017041.html">[Haiku-commits] r30926 - haiku/trunk/src/apps/sudoku
+</A></li>
+        <LI>Next message: <A HREF="017044.html">[Haiku-commits] r30928 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17043">[ date ]</a>
+              <a href="thread.html#17043">[ thread ]</a>
+              <a href="subject.html#17043">[ subject ]</a>
+              <a href="author.html#17043">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-05-30 19:21:10 +0200 (Sat, 30 May 2009)
+New Revision: 30927
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30927&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30927&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp
+Log:
+Make reading the write_overlay more efficient. Instead of always reading the
+original file and then overwriting it with what we have in memory, just linearly
+fill the buffer, closing gaps between our buffers with original file content as
+needed.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp	2009-05-30 17:04:44 UTC (rev 30926)
++++ haiku/trunk/src/add-ons/kernel/file_systems/layers/write_overlay/write_overlay.cpp	2009-05-30 17:21:10 UTC (rev 30927)
+@@ -451,54 +451,71 @@
+ OverlayInode::Read(void *_cookie, off_t position, void *buffer, size_t *length,
+ 	bool readPages)
+ {
+-	if (position &gt;= fStat.st_size) {
+-		*length = 0;
+-		return B_OK;
+-	}
++	uint8 *pointer = (uint8 *)buffer;
++	write_buffer *element = fWriteBuffers;
++	size_t bytesLeft = MIN(fStat.st_size - position, *length);
++	*length = bytesLeft;
+ 
+-	if (position &lt; fOriginalNodeLength) {
+-		void *superCookie = NULL;
+-		if (_cookie != NULL)
+-			superCookie = ((open_cookie *)_cookie)-&gt;super_cookie;
++	void *superCookie = NULL;
++	if (!fIsVirtual &amp;&amp; _cookie != NULL)
++		superCookie = ((open_cookie *)_cookie)-&gt;super_cookie;
+ 
+-		size_t readLength = MIN(fOriginalNodeLength - position, *length);
+-		status_t result = B_ERROR;
++	while (bytesLeft &gt; 0) {
++		size_t gapSize = bytesLeft;
++		if (element != NULL) {
++			gapSize = MIN(bytesLeft, element-&gt;position &gt; position ?
++				element-&gt;position - position : 0);
++		}
+ 
+-		if (readPages) {
+-			iovec vector;
+-			vector.iov_base = buffer;
+-			vector.iov_len = readLength;
++		if (gapSize &gt; 0 &amp;&amp; !fIsVirtual &amp;&amp; position &lt; fOriginalNodeLength) {
++			// there's a part missing between the read position and our
++			// next position, fill the gap with original file content
++			size_t readLength = MIN(fOriginalNodeLength - position, gapSize);
++			status_t result = B_ERROR;
++			if (readPages) {
++				iovec vector;
++				vector.iov_base = pointer;
++				vector.iov_len = readLength;
+ 
+-			result = fSuperVnode.ops-&gt;read_pages(SuperVolume(),
+-				&amp;fSuperVnode, superCookie, position, &amp;vector, 1, &amp;readLength);
+-		} else {
+-			result = fSuperVnode.ops-&gt;read(SuperVolume(), &amp;fSuperVnode,
+-				superCookie, position, buffer, &amp;readLength);
++				result = fSuperVnode.ops-&gt;read_pages(SuperVolume(),
++					&amp;fSuperVnode, superCookie, position, &amp;vector, 1,
++					&amp;readLength);
++			} else {
++				result = fSuperVnode.ops-&gt;read(SuperVolume(), &amp;fSuperVnode,
++					superCookie, position, pointer, &amp;readLength);
++			}
++
++			if (result != B_OK)
++				return result;
++
++			pointer += readLength;
++			position += readLength;
++			bytesLeft -= readLength;
++			gapSize -= readLength;
+ 		}
+ 
+-		if (result != B_OK)
+-			return result;
++		if (gapSize &gt; 0) {
++			// there's a gap before our next position which we cannot
++			// fill with original file content, zero it out
++			memset(pointer, 0, gapSize);
++			bytesLeft -= gapSize;
++			position += gapSize;
++			pointer += gapSize;
++		}
+ 
+-		if (readLength &lt; *length)
+-			memset((uint8 *)buffer + readLength, 0, *length - readLength);
+-	} else
+-		memset(buffer, 0, *length);
+-
+-	// overlay the read with whatever chunks we have written
+-	write_buffer *element = fWriteBuffers;
+-	*length = MIN(fStat.st_size - position, *length);
+-	off_t end = position + *length;
+-	while (element) {
+-		if (element-&gt;position &gt; end)
++		// we've reached the end
++		if (bytesLeft == 0 || element == NULL)
+ 			break;
+ 
+ 		off_t elementEnd = element-&gt;position + element-&gt;length;
+ 		if (elementEnd &gt; position) {
+-			off_t copyPosition = MAX(position, element-&gt;position);
+-			size_t copyLength = MIN(elementEnd - position, *length);
+-			memcpy((uint8 *)buffer + (copyPosition - position),
+-				element-&gt;buffer + (copyPosition - element-&gt;position),
++			size_t copyLength = MIN(elementEnd - position, bytesLeft);
++			memcpy(pointer, element-&gt;buffer + (position - element-&gt;position),
+ 				copyLength);
++
++			bytesLeft -= copyLength;
++			position += copyLength;
++			pointer += copyLength;
+ 		}
+ 
+ 		element = element-&gt;next;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017041.html">[Haiku-commits] r30926 - haiku/trunk/src/apps/sudoku
+</A></li>
+	<LI>Next message: <A HREF="017044.html">[Haiku-commits] r30928 - haiku/trunk/src/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17043">[ date ]</a>
+              <a href="thread.html#17043">[ thread ]</a>
+              <a href="subject.html#17043">[ subject ]</a>
+              <a href="author.html#17043">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

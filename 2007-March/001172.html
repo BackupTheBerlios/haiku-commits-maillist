@@ -1,0 +1,277 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r20393 - haiku/trunk/src/apps/terminal
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-March/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20393%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200703191825.l2JIPvkb008617%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001171.html">
+   <LINK REL="Next"  HREF="001173.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r20393 - haiku/trunk/src/apps/terminal</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r20393%20-%20haiku/trunk/src/apps/terminal&In-Reply-To=%3C200703191825.l2JIPvkb008617%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r20393 - haiku/trunk/src/apps/terminal">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Mon Mar 19 19:25:57 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001171.html">[Haiku-commits] r20392 - in haiku/trunk/docs/user: . support
+</A></li>
+        <LI>Next message: <A HREF="001173.html">[Haiku-commits] r20394 - in	haiku/trunk/src/add-ons/kernel/drivers/audio/echo: . generic	generic/ASIC generic/DSP
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1172">[ date ]</a>
+              <a href="thread.html#1172">[ thread ]</a>
+              <a href="subject.html#1172">[ subject ]</a>
+              <a href="author.html#1172">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-03-19 19:25:56 +0100 (Mon, 19 Mar 2007)
+New Revision: 20393
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=20393&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=20393&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/terminal/spawn.cpp
+Log:
+For some reason a Terminal started by Tracker or Deskbar does not have a
+valid stderr. Thus one of the FDs for the pipes created for the initial
+handshake with the fork()ed child process exec()ing the shell would have
+number 2 and would be closed when the child process set up the
+stdin/out/err environment for the shell, leading to the child and the
+parent being killed by a SIGPIPE when they tried to access the pipes.
+
+This change replaces the pipes mechanism by one using send/receive_data(),
+which is probably even faster. I also reduced the handshake_t::msg field
+to 128 bytes and replaced the sprintf()s writing to it by snprintf()s.
+
+Fixes bug #627. Although they looked related, bugs #113 and #928 still
+persist.
+
+
+
+Modified: haiku/trunk/src/apps/terminal/spawn.cpp
+===================================================================
+--- haiku/trunk/src/apps/terminal/spawn.cpp	2007-03-19 09:38:47 UTC (rev 20392)
++++ haiku/trunk/src/apps/terminal/spawn.cpp	2007-03-19 18:25:56 UTC (rev 20393)
+@@ -96,15 +96,11 @@
+  *  execute SHELL program.
+  */
+ 
+-/* This pipe use handshake on exec. */
+-int pc_pipe[2]; /* this pipe is used for parent to child transfer */
+-int cp_pipe[2]; /* this pipe is used for child to parent transfer */
+-
+ /* handshake interface */
+ typedef struct 
+ {
+ 	int status;		/* status of child */
+-	char msg[256];	/* error message */
++	char msg[128];	/* error message */
+ 	int row;		/* terminal rows */
+ 	int col;		/* Terminal columns */
+ } handshake_t;
+@@ -118,6 +114,22 @@
+ 
+ pid_t sh_pid;
+ 
++
++static status_t
++send_handshake_message(thread_id target, const handshake_t&amp; handshake)
++{
++	return send_data(target, 0, &amp;handshake, sizeof(handshake_t));
++}
++
++
++static void
++receive_handshake_message(handshake_t&amp; handshake)
++{
++	thread_id sender;
++	receive_data(&amp;sender, &amp;handshake, sizeof(handshake_t));
++}
++
++
+ int
+ spawn_shell(int row, int col, const char *command, const char *coding)
+ {
+@@ -128,7 +140,7 @@
+ 	signal(SIGTTOU, SIG_IGN);
+ 	
+ 	/*
+-	 * Get a psuedo-tty. We do this by cycling through files in the
++	 * Get a pseudo-tty. We do this by cycling through files in the
+ 	 * directory. The oparationg system will not allow us to open a master
+ 	 * which is already in use, so we simply go until the open succeeds.
+ 	 */
+@@ -160,8 +172,8 @@
+ 	}
+ 
+ 	if (master &lt; 0) {
+-    		printf(&quot;didn't find any available pesudo ttys.&quot;);
+-    		return -1;
++    	printf(&quot;didn't find any available pesudo ttys.&quot;);
++    	return -1;
+ 	}
+ 
+    /*
+@@ -169,11 +181,7 @@
+ 	* on the pseudo terminal.
+ 	*/
+ 
+-	/* Create pipe that be use to handshake */
+-	if (pipe(pc_pipe) || pipe(cp_pipe)) {
+-		printf (&quot;Could not create handshake pipe.&quot;);
+-		return -1;
+-	}
++	thread_id terminalThread = find_thread(NULL);
+ 
+ 	/* Fork a child process. */
+ 	if ((sh_pid = fork()) &lt; 0) {
+@@ -189,15 +197,12 @@
+ 		 * we cleared our original controlling terminal above.
+ 		 */
+ 
+-		// ToDo: why two of them in the first place?
+-		close(cp_pipe[0]);
+-		close(pc_pipe[1]);
+-
+ 		/* Set process session leader */
+ 		if (setsid() &lt; 0) {
+ 			handshake.status = PTY_NG;
+-			sprintf(handshake.msg, &quot;could not set session leader.&quot;);
+-			write(cp_pipe[1], (char *)&amp;handshake, sizeof (handshake));
++			snprintf(handshake.msg, sizeof(handshake.msg),
++				&quot;could not set session leader.&quot;);
++			send_handshake_message(terminalThread, handshake);
+ 			exit(1);
+ 		}
+ 
+@@ -209,8 +214,9 @@
+ 		int slave = -1;
+ 		if ((slave = open(tty_name, O_RDWR)) &lt; 0) {
+ 			handshake.status = PTY_NG;
+-			sprintf(handshake.msg, &quot;can't open tty (%s).&quot;, tty_name);
+-			write(cp_pipe[1], (char *)&amp;handshake, sizeof (handshake));
++			snprintf(handshake.msg, sizeof(handshake.msg),
++				&quot;can't open tty (%s).&quot;, tty_name);
++			send_handshake_message(terminalThread, handshake);
+ 			exit(1);
+ 		}
+ 
+@@ -295,8 +301,9 @@
+ 		 */
+ 		if (tcsetattr (0, TCSANOW, &amp;tio) == -1) {
+ 			handshake.status = PTY_NG;
+-			sprintf(handshake.msg, &quot;failed set terminal interface (TERMIOS).&quot;);
+-			write(cp_pipe[1], (char *)&amp;handshake, sizeof (handshake));
++			snprintf(handshake.msg, sizeof(handshake.msg),
++				&quot;failed set terminal interface (TERMIOS).&quot;);
++			send_handshake_message(terminalThread, handshake);
+ 			exit(1);
+ 		}
+ 
+@@ -305,13 +312,14 @@
+ 		 */
+ 
+ 		handshake.status = PTY_WS;
+-		write(cp_pipe[1], (char *)&amp;handshake, sizeof (handshake));
+-		read(pc_pipe[0], (char *)&amp;handshake, sizeof (handshake));
++		send_handshake_message(terminalThread, handshake);
++		receive_handshake_message(handshake);
+ 
+ 		if (handshake.status != PTY_WS) {
+ 			handshake.status = PTY_NG;
+-			sprintf(handshake.msg, &quot;missmatch handshake.&quot;);
+-			write(cp_pipe[1], (char *)&amp;handshake, sizeof (handshake));
++			snprintf(handshake.msg, sizeof(handshake.msg),
++				&quot;mismatch handshake.&quot;);
++			send_handshake_message(terminalThread, handshake);
+ 			exit(1);
+ 		}
+ 
+@@ -328,19 +336,16 @@
+ 		pid_t processGroup = getpid();
+ 		if (setpgid(processGroup, processGroup) &lt; 0) {
+ 			handshake.status = PTY_NG;
+-			sprintf(handshake.msg, &quot;can't set process group id.&quot;);
+-			write(cp_pipe[1], (char *)&amp;handshake, sizeof(handshake));
++			snprintf(handshake.msg, sizeof(handshake.msg),
++				&quot;can't set process group id.&quot;);
++			send_handshake_message(terminalThread, handshake);
+ 			exit(1);		
+ 		}
+ 		tcsetpgrp(0, processGroup);
+ 
+-		/* mark the pipes as close on exec */
+-		fcntl(cp_pipe[1], F_SETFD, FD_CLOEXEC);
+-		fcntl(pc_pipe[0], F_SETFD, FD_CLOEXEC);
+-
+ 		/* pty open and set termios successful. */
+ 		handshake.status = PTY_OK;
+-		write(cp_pipe[1], (char *)&amp;handshake, sizeof (handshake));
++		send_handshake_message(terminalThread, handshake);
+ 
+ 		/*
+ 		 * setenv TERM and TTY.
+@@ -415,17 +420,13 @@
+ 	 * that they can write and read the pseudo terminal.
+ 	 */
+ 
+-	/* close childs's side of the pipe */
+-	close(cp_pipe[1]);
+-	close(pc_pipe[0]);
+-
+ 	/*
+ 	 * close parent control tty.
+ 	 */
+ 
+ 	int done = 0;
+ 	while (!done) {
+-		read (cp_pipe[0], (char *)&amp;handshake, sizeof (handshake));
++		receive_handshake_message(handshake);
+ 
+ 		switch (handshake.status) {
+ 			case PTY_OK:
+@@ -441,7 +442,7 @@
+ 				handshake.row = row;
+ 				handshake.col = col;
+ 				handshake.status = PTY_WS;
+-				write(pc_pipe[1], (char *)&amp;handshake, sizeof (handshake));
++				send_handshake_message(sh_pid, handshake);
+ 				break;
+ 		}
+ 	}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001171.html">[Haiku-commits] r20392 - in haiku/trunk/docs/user: . support
+</A></li>
+	<LI>Next message: <A HREF="001173.html">[Haiku-commits] r20394 - in	haiku/trunk/src/add-ons/kernel/drivers/audio/echo: . generic	generic/ASIC generic/DSP
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1172">[ date ]</a>
+              <a href="thread.html#1172">[ thread ]</a>
+              <a href="subject.html#1172">[ subject ]</a>
+              <a href="author.html#1172">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

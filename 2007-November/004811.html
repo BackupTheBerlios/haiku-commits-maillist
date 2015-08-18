@@ -1,0 +1,434 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22968 - haiku/trunk/src/add-ons/kernel/busses/usb
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22968%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200711202216.lAKMGhl7023327%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004810.html">
+   <LINK REL="Next"  HREF="004812.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22968 - haiku/trunk/src/add-ons/kernel/busses/usb</H1>
+    <B>sbenedetto at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22968%20-%20haiku/trunk/src/add-ons/kernel/busses/usb&In-Reply-To=%3C200711202216.lAKMGhl7023327%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22968 - haiku/trunk/src/add-ons/kernel/busses/usb">sbenedetto at mail.berlios.de
+       </A><BR>
+    <I>Tue Nov 20 23:16:43 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004810.html">[Haiku-commits] r22967 - haiku/trunk/src/servers/app
+</A></li>
+        <LI>Next message: <A HREF="004812.html">[Haiku-commits] r22969 - haiku/trunk/build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4811">[ date ]</a>
+              <a href="thread.html#4811">[ thread ]</a>
+              <a href="subject.html#4811">[ subject ]</a>
+              <a href="author.html#4811">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: sbenedetto
+Date: 2007-11-20 23:16:42 +0100 (Tue, 20 Nov 2007)
+New Revision: 22968
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22968&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22968&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+   haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+Log:
+* Remove SubmitAsyncTransfer and SubmitPeriodicTransfer
+* Added _SubmitControlRequest (almost implemented), _LinkDescriptors, _WriteDescriptorChain (basically copied from EHCI, and UHCI)
+* Renamed ohci_general_descriptor to ohci_general_td, and ohci_isochronous_descriptor to ohci_isochronous_td
+* Finished _CreateGeneralDescriptor and _FreeGeneralDescriptor
+* Added buffer_size member to ohci_general_td instead and removed last_logical_byte_address as it looked unnecessary
+* minor clean up
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2007-11-20 21:34:59 UTC (rev 22967)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.cpp	2007-11-20 22:16:42 UTC (rev 22968)
+@@ -410,16 +410,21 @@
+ 		return fRootHub-&gt;ProcessTransfer(this, transfer);
+ 
+ 	uint32 type = transfer-&gt;TransferPipe()-&gt;Type();
+-	if ((type &amp; USB_OBJECT_CONTROL_PIPE) || (type &amp; USB_OBJECT_BULK_PIPE)) {
+-		TRACE((&quot;usb_ohci: submitting async transfer\n&quot;));
+-		return _SubmitAsyncTransfer(transfer);
++	if ((type &amp; USB_OBJECT_CONTROL_PIPE)) {
++		TRACE((&quot;usb_ohci: submitting control request\n&quot;));
++		return _SubmitControlRequest(transfer);
+ 	}
+ 
+-	if ((type &amp; USB_OBJECT_INTERRUPT_PIPE) || (type &amp; USB_OBJECT_ISO_PIPE)) {
+-		TRACE((&quot;usb_ohci: submitting periodic transfer\n&quot;));
+-		return _SubmitPeriodicTransfer(transfer);
++	if ((type &amp; USB_OBJECT_INTERRUPT_PIPE) || (type &amp; USB_OBJECT_BULK_PIPE)) {
++		// TODO
++		return B_OK;
+ 	}
+ 
++	if ((type &amp; USB_OBJECT_ISO_PIPE)) {
++		TRACE((&quot;usb_ohci: submitting isochronous transfer\n&quot;));
++		return _SubmitIsochronousTransfer(transfer);
++	}
++
+ 	TRACE_ERROR((&quot;usb_ohci: tried to submit transfer for unknown pipe&quot;
+ 		&quot; type %lu\n&quot;, type));
+ 	return B_ERROR;
+@@ -427,19 +432,152 @@
+ 
+ 
+ status_t
+-OHCI::_SubmitAsyncTransfer(Transfer *transfer)
++OHCI::_SubmitControlRequest(Transfer *transfer)
+ {
++	usb_request_data *requestData = transfer-&gt;RequestData();
++	bool directionIn = (requestData-&gt;RequestType &amp; USB_REQTYPE_DEVICE_IN) &gt; 0;
++
++	ohci_general_td *setupDescriptor
++		= _CreateGeneralDescriptor(sizeof(usb_request_data));
++	if (!setupDescriptor) {
++		TRACE_ERROR((&quot;usb_ohci: failed to allocate setup descriptor\n&quot;));
++		return B_NO_MEMORY;
++	}
++	// Flags set up could be moved into _CreateGeneralDescriptor
++	setupDescriptor-&gt;flags |= OHCI_TD_DIRECTION_PID_SETUP
++		| OHCI_TD_NO_CONDITION_CODE
++		| OHCI_TD_TOGGLE_0
++		| OHCI_TD_SET_DELAY_INTERRUPT(6); // Not sure about this.
++
++	ohci_general_td *statusDescriptor
++		= _CreateGeneralDescriptor(0);
++	if (!statusDescriptor) {
++		TRACE_ERROR((&quot;usb_ohci: failed to allocate status descriptor\n&quot;));
++		_FreeGeneralDescriptor(setupDescriptor);
++		return B_NO_MEMORY;
++	}
++	statusDescriptor-&gt;flags 
++		|= (directionIn ? OHCI_TD_DIRECTION_PID_OUT : OHCI_TD_DIRECTION_PID_IN)
++		| OHCI_TD_NO_CONDITION_CODE
++		| OHCI_TD_TOGGLE_1
++		| OHCI_TD_SET_DELAY_INTERRUPT(1);
++
++	iovec vector;
++	vector.iov_base = requestData;
++	vector.iov_len = sizeof(usb_request_data);
++	_WriteDescriptorChain(setupDescriptor, &amp;vector, 1);
++
++	if (transfer-&gt;VectorCount() &gt; 0) {
++		ohci_general_td *dataDescriptor = NULL;
++		ohci_general_td *lastDescriptor = NULL;
++		status_t result = _CreateDescriptorChain(&amp;dataDescriptor,
++			&amp;lastDescriptor,
++			directionIn ? OHCI_TD_DIRECTION_PID_OUT : OHCI_TD_DIRECTION_PID_IN,
++			transfer-&gt;VectorLength());
++		if (result &lt; B_OK) {
++			_FreeGeneralDescriptor(setupDescriptor);
++			_FreeGeneralDescriptor(statusDescriptor);
++			return result;
++		}
++
++		if (!directionIn) {
++			_WriteDescriptorChain(dataDescriptor, transfer-&gt;Vector(),
++				transfer-&gt;VectorCount());
++		}
++
++		_LinkDescriptors(setupDescriptor, dataDescriptor);
++		_LinkDescriptors(lastDescriptor, statusDescriptor);
++	} else {
++		_LinkDescriptors(setupDescriptor, statusDescriptor);
++	}
++
++	// TODO
++	// 1. Insert the chain descriptors to the endpoint
++	// 2. Clear the Skip bit in the enpoint
++	_WriteReg(OHCI_COMMAND_STATUS, OHCI_CONTROL_LIST_FILLED);
++
++	return B_OK;
++}
++
++
++status_t
++OHCI::_SubmitIsochronousTransfer(Transfer *transfer)
++{
+ 	return B_ERROR;
+ }
+ 
+ 
++void
++OHCI::_LinkDescriptors(ohci_general_td *first, ohci_general_td *second)
++{
++	first-&gt;next_physical_descriptor = second-&gt;physical_address;
++	first-&gt;next_logical_descriptor = second;
++}
++
++
+ status_t
+-OHCI::_SubmitPeriodicTransfer(Transfer *transfer)
++OHCI::_CreateDescriptorChain(ohci_general_td **_firstDescriptor,
++	ohci_general_td **_lastDescriptor, uint8 direction, size_t bufferSize)
+ {
+ 	return B_ERROR;
+ }
+ 
+ 
++size_t
++OHCI::_WriteDescriptorChain(ohci_general_td *topDescriptor, iovec *vector,
++	size_t vectorCount)
++{
++	ohci_general_td *current = topDescriptor;
++	size_t actualLength = 0;
++	size_t vectorIndex = 0;
++	size_t vectorOffset = 0;
++	size_t bufferOffset = 0;
++
++	while (current) {
++		if (!current-&gt;buffer_logical)
++			break;
++
++		while (true) {
++			size_t length = min_c(current-&gt;buffer_size - bufferOffset,
++				vector[vectorIndex].iov_len - vectorOffset);
++
++			TRACE((&quot;usb_ohci: copying %ld bytes to bufferOffset %ld from&quot;
++				&quot; vectorOffset %ld at index %ld of %ld\n&quot;, length, bufferOffset,
++				vectorOffset, vectorIndex, vectorCount));
++			memcpy((uint8 *)current-&gt;buffer_logical + bufferOffset,
++				(uint8 *)vector[vectorIndex].iov_base + vectorOffset, length);
++
++			actualLength += length;
++			vectorOffset += length;
++			bufferOffset += length;
++
++			if (vectorOffset &gt;= vector[vectorIndex].iov_len) {
++				if (++vectorIndex &gt;= vectorCount) {
++					TRACE((&quot;usb_ohci: wrote descriptor chain (%ld bytes, no&quot;
++						&quot; more vectors)\n&quot;, actualLength));
++					return actualLength;
++				}
++
++				vectorOffset = 0;
++			}
++
++			if (bufferOffset &gt;= current-&gt;buffer_size) {
++				bufferOffset = 0;
++				break;
++			}
++		}
++
++		if (!current-&gt;next_logical_descriptor)
++			break;
++
++		current = (ohci_general_td *)current-&gt;next_logical_descriptor;
++	}
++
++	TRACE((&quot;usb_ohci: wrote descriptor chain (%ld bytes)\n&quot;, actualLength));
++	return actualLength;
++}
++
++
+ status_t
+ OHCI::NotifyPipeChange(Pipe *pipe, usb_change change)
+ {
+@@ -665,34 +803,54 @@
+ }
+ 
+ 
+-ohci_general_descriptor*
+-OHCI::_CreateGeneralDescriptor()
++ohci_general_td*
++OHCI::_CreateGeneralDescriptor(size_t bufferSize)
+ {
+-	ohci_general_descriptor *descriptor;
++	ohci_general_td *descriptor;
+ 	void *physicalAddress;
+ 
+ 	if (fStack-&gt;AllocateChunk((void **)&amp;descriptor, &amp;physicalAddress,
+-		sizeof(ohci_general_descriptor)) != B_OK) {
++		sizeof(ohci_general_td)) != B_OK) {
+ 		TRACE_ERROR((&quot;usb_ohci: failed to allocate general descriptor\n&quot;));
+ 		return NULL;
+ 	}
+-
+-	// TODO: Finish methods
+-	memset((void *)descriptor, 0, sizeof(ohci_general_descriptor));
++	memset((void *)descriptor, 0, sizeof(ohci_general_td));
+ 	descriptor-&gt;physical_address = (addr_t)physicalAddress;
+ 
++	if (!bufferSize) {
++		descriptor-&gt;buffer_physical = 0;
++		descriptor-&gt;buffer_logical = NULL;
++		descriptor-&gt;last_physical_byte_address = 0;
++		return descriptor;
++	}
++
++	if (fStack-&gt;AllocateChunk(&amp;descriptor-&gt;buffer_logical,
++		(void **)&amp;descriptor-&gt;buffer_physical, bufferSize) != B_OK) {
++		TRACE_ERROR((&quot;usb_ohci: failed to allocate space for buffer\n&quot;));
++		fStack-&gt;FreeChunk(descriptor, (void *)descriptor-&gt;physical_address,
++			sizeof(ohci_general_td));
++		return NULL;
++	}
++	descriptor-&gt;last_physical_byte_address
++		= descriptor-&gt;buffer_physical + bufferSize - 1;
++
+ 	return descriptor;
+-}	
++}
+ 
+ 
+ void
+-OHCI::_FreeGeneralDescriptor(ohci_general_descriptor *descriptor)
++OHCI::_FreeGeneralDescriptor(ohci_general_td *descriptor)
+ {
+ 	if (!descriptor)
+ 		return;
+ 
++	if (descriptor-&gt;buffer_logical) {
++		fStack-&gt;FreeChunk(descriptor-&gt;buffer_logical,
++			(void *)descriptor-&gt;buffer_physical, descriptor-&gt;buffer_size);
++	}
++
+ 	fStack-&gt;FreeChunk((void *)descriptor, (void *)descriptor-&gt;physical_address,
+-		sizeof(ohci_general_descriptor));
++		sizeof(ohci_general_td));
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2007-11-20 21:34:59 UTC (rev 22967)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci.h	2007-11-20 22:16:42 UTC (rev 22968)
+@@ -31,7 +31,7 @@
+ // --------------------------------------
+ typedef struct hcd_soft_itransfer
+ {
+-	ohci_isochronous_descriptor	itd;
++	ohci_isochronous_td	itd;
+ 	struct hcd_soft_itransfer			*nextitd; 	// mirrors nexttd in ITD
+ 	struct hcd_soft_itransfer			*dnext; 	// next in done list
+ 	addr_t 								physaddr;	// physical address to the host controller isonchronous transfer
+@@ -83,27 +83,44 @@
+ static	int32						_FinishThread(void *data);
+ 		void						_FinishTransfer();
+ 
+-		status_t					_SubmitAsyncTransfer(Transfer *transfer);
+-		status_t					_SubmitPeriodicTransfer(Transfer *transfer);
++		status_t					_SubmitControlRequest(Transfer *transfer);
++		status_t					_SubmitIsochronousTransfer(
++										Transfer *transfer);
+ 
+ 		// Endpoint related methods
++		ohci_endpoint_descriptor	*_AllocateEndpoint();
++		void						_FreeEndpoint(
++										ohci_endpoint_descriptor *endpoint);
+ 		status_t					_InsertEndpointForPipe(Pipe *pipe);
+ 		status_t					_RemoveEndpointForPipe(Pipe *pipe);
+-		status_t					_CreateEndpoint(Pipe *pipe,
+-										bool isIsochronous);
+ 		ohci_endpoint_descriptor	*_FindInterruptEndpoint(uint8 interval);
+-		ohci_endpoint_descriptor	*_AllocateEndpoint();
+-		void						_FreeEndpoint(
+-										ohci_endpoint_descriptor *endpoint);
+ 
+ 		// Transfer descriptor related methods
+-		ohci_general_descriptor		*_CreateGeneralDescriptor();
++		ohci_general_td				*_CreateGeneralDescriptor(
++										size_t bufferSize);
++		status_t					_CreateDescriptorChain(
++										ohci_general_td **firstDescriptor,
++										ohci_general_td **lastDescriptor,
++										uint8 direction,
++										size_t bufferSize);
++
+ 		void						_FreeGeneralDescriptor(
+-										ohci_general_descriptor *descriptor);
+-		ohci_isochronous_descriptor	*_CreateIsochronousDescriptor();
++										ohci_general_td *descriptor);
++		void						_FreeDescriptorChain(
++										ohci_general_td *topDescriptor);
++
++		void						_LinkDescriptors(ohci_general_td *first,
++										ohci_general_td *second);
++
++		ohci_isochronous_td			*_CreateIsochronousDescriptor();
+ 		void						_FreeIsochronousDescriptor(
+-										ohci_isochronous_descriptor *descriptor);
++										ohci_isochronous_td *descriptor);
+ 
++		size_t						_WriteDescriptorChain(
++										ohci_general_td *topDescriptor,
++										iovec *vector,
++										size_t vectorCount);
++
+ 		// Register functions
+ inline	void						_WriteReg(uint32 reg, uint32 value);
+ inline	uint32						_ReadReg(uint32 reg);
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2007-11-20 21:34:59 UTC (rev 22967)
++++ haiku/trunk/src/add-ons/kernel/busses/usb/ohci_hardware.h	2007-11-20 22:16:42 UTC (rev 22968)
+@@ -333,7 +333,7 @@
+ //	General transfer descriptor structure (section 4.3.1)
+ // --------------------------------
+ 
+-typedef struct ohci_general_descriptor
++typedef struct ohci_general_td
+ {
+ 	// Hardware part
+ 	uint32	flags;						// Flags field
+@@ -344,7 +344,7 @@
+ 	addr_t	physical_address;			// Physical pointer to this address
+ 	void	*buffer_logical;			// Logical pointer to the buffer
+ 	void	*next_logical_descriptor;	// Logical pointer next descriptor
+-	void	*last_logical_byte_address;	// Logical pointer buffer end
++	size_t	buffer_size;				// Size of the buffer
+ };
+ 
+ #define	OHCI_BUFFER_ROUNDING			0x00040000
+@@ -371,7 +371,7 @@
+ // --------------------------------
+ 
+ #define OHCI_ITD_NOFFSET 8
+-typedef struct ohci_isochronous_descriptor
++typedef struct ohci_isochronous_td
+ {
+ 	uint32		flags;
+ 	uint32		buffer_page_byte_0;			// Physical page number of byte 0
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004810.html">[Haiku-commits] r22967 - haiku/trunk/src/servers/app
+</A></li>
+	<LI>Next message: <A HREF="004812.html">[Haiku-commits] r22969 - haiku/trunk/build/jam
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4811">[ date ]</a>
+              <a href="thread.html#4811">[ thread ]</a>
+              <a href="subject.html#4811">[ subject ]</a>
+              <a href="author.html#4811">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

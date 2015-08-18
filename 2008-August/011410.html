@@ -1,0 +1,479 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27258 - haiku/trunk/src/apps/deskbar
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27258%20-%20haiku/trunk/src/apps/deskbar&In-Reply-To=%3C200808311840.m7VIeSgT022438%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011409.html">
+   <LINK REL="Next"  HREF="011411.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27258 - haiku/trunk/src/apps/deskbar</H1>
+    <B>aldeck at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27258%20-%20haiku/trunk/src/apps/deskbar&In-Reply-To=%3C200808311840.m7VIeSgT022438%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27258 - haiku/trunk/src/apps/deskbar">aldeck at mail.berlios.de
+       </A><BR>
+    <I>Sun Aug 31 20:40:28 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011409.html">[Haiku-commits] r27257 - haiku/trunk/src/system/kernel/posix
+</A></li>
+        <LI>Next message: <A HREF="011411.html">[Haiku-commits] r27258 - haiku/trunk/src/apps/deskbar
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11410">[ date ]</a>
+              <a href="thread.html#11410">[ thread ]</a>
+              <a href="subject.html#11410">[ subject ]</a>
+              <a href="author.html#11410">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: aldeck
+Date: 2008-08-31 20:40:27 +0200 (Sun, 31 Aug 2008)
+New Revision: 27258
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27258&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27258&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/apps/deskbar/LongClickTracker.cpp
+   haiku/trunk/src/apps/deskbar/LongClickTracker.h
+Modified:
+   haiku/trunk/src/apps/deskbar/Jamfile
+   haiku/trunk/src/apps/deskbar/TimeView.cpp
+   haiku/trunk/src/apps/deskbar/TimeView.h
+Log:
+* Rewrote long click mouse tracking. This avoids busy looping in TimeView::MouseDown and fixes 
+#591. The helper class could be reused for similar situations (ex: Tracker context menu and 
+drag detection). See the brief doc in the code. Comments welcomed!
+
+
+Modified: haiku/trunk/src/apps/deskbar/Jamfile
+===================================================================
+--- haiku/trunk/src/apps/deskbar/Jamfile	2008-08-31 16:01:19 UTC (rev 27257)
++++ haiku/trunk/src/apps/deskbar/Jamfile	2008-08-31 18:40:27 UTC (rev 27258)
+@@ -34,6 +34,7 @@
+ 	CalendarMenuItem.cpp
+ 	DeskBarUtils.cpp
+ 	ExpandoMenuBar.cpp
++	LongClickTracker.cpp
+ 	ShowHideMenuItem.cpp
+ 	StatusView.cpp
+ 	StatusViewShelf.cpp
+
+Added: haiku/trunk/src/apps/deskbar/LongClickTracker.cpp
+===================================================================
+--- haiku/trunk/src/apps/deskbar/LongClickTracker.cpp	2008-08-31 16:01:19 UTC (rev 27257)
++++ haiku/trunk/src/apps/deskbar/LongClickTracker.cpp	2008-08-31 18:40:27 UTC (rev 27258)
+@@ -0,0 +1,139 @@
++/*
++ * Copyright 2008, Haiku, Inc. All Rights Reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * Authors:
++ *		Alexandre Deckner &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">alex at zappotek.com</A>&gt;
++ */
++
++#include &quot;LongClickTracker.h&quot;
++
++#include &lt;View.h&gt;
++
++
++LongClickTracker::LongClickTracker(BView *view, uint32 messageWhat)
++	: fView(view),
++	fMessenger(NULL),
++	fMessageWhat(messageWhat),
++	fThread(B_ERROR),
++	fQuit(false)
++{
++	// use the doubleClickSpeed as a threshold
++	get_click_speed(&amp;fLongClickThreshold);
++}
++
++
++LongClickTracker::~LongClickTracker()
++{
++	if (fThread != B_NO_ERROR)
++    	return;
++
++	fQuit = true;
++
++	status_t ret;
++	wait_for_thread(fThread, &amp;ret);
++
++	delete fMessenger;
++}
++
++
++// Must be called _after_ the view has been attached to a window
++status_t
++LongClickTracker::Start()
++{
++	status_t err;
++
++	if (!fView-&gt;Window())
++		return B_ERROR;
++
++	fMessenger = new BMessenger(fView, NULL, &amp;err);
++	if (err != B_OK)
++		return err;
++
++	fThread = spawn_thread(LongClickTracker::_ThreadEntry, &quot;clickTracker&quot;,
++		 B_NORMAL_PRIORITY,	this);
++
++	err = resume_thread(fThread);
++
++	if (err != B_NO_ERROR) {
++		kill_thread(fThread);
++		fThread = B_ERROR;
++	} else {
++		fQuit = false;
++	}
++
++	return err;
++}
++
++
++int32
++LongClickTracker::_ThreadEntry(void *pointer)
++{
++	LongClickTracker *that = reinterpret_cast&lt;LongClickTracker*&gt;(pointer);
++	that-&gt;_Track();
++
++	return B_OK;
++}
++
++
++void
++LongClickTracker::_Track()
++{
++	uint32 buttons;
++	BPoint position;
++
++	bool timing = false;
++		//when true, we are currently timing the last click duration
++	bool ready = true;
++		//when true, button has been released, we can start timing on next click
++
++	bigtime_t clickTime = 0;
++
++	BRect bounds;
++	fView-&gt;LockLooper();
++	bounds = fView-&gt;Bounds();
++	fView-&gt;UnlockLooper();
++
++	while (!fQuit) {
++		snooze(20000);
++
++		if (fView-&gt;Window()) {
++			fView-&gt;LockLooper();
++			fView-&gt;GetMouse(&amp;position, &amp;buttons, false);
++			fView-&gt;UnlockLooper();
++		}
++
++		if (timing) {
++			if (!bounds.Contains(position)) {
++				//mouse exited the view, stop timing
++				timing = false;
++				ready = false; //not ready yet, the button might be still down
++			}
++
++			if (buttons != B_PRIMARY_MOUSE_BUTTON) {
++				//button has been released, stop timing, set ready
++				timing = false;
++				ready = true;
++
++			} else if ((system_time() - clickTime) &gt; fLongClickThreshold){
++				BMessage message(fMessageWhat);
++      			message.AddPoint(&quot;where&quot;, position);
++				fMessenger-&gt;SendMessage(&amp;message);
++				timing = false;
++				ready = false;
++			}
++		}
++
++		if (!ready &amp;&amp; !timing &amp;&amp; (buttons != B_PRIMARY_MOUSE_BUTTON)) {
++			//mouse released, ready to time on next click
++			ready = true;
++		}
++
++		if (ready &amp;&amp; !timing &amp;&amp; buttons == B_PRIMARY_MOUSE_BUTTON
++			&amp;&amp; bounds.Contains(position)) {
++			//mouse clicked in view, start timing
++			timing = true;
++			clickTime = system_time();
++		}
++	}
++}
+
+Added: haiku/trunk/src/apps/deskbar/LongClickTracker.h
+===================================================================
+--- haiku/trunk/src/apps/deskbar/LongClickTracker.h	2008-08-31 16:01:19 UTC (rev 27257)
++++ haiku/trunk/src/apps/deskbar/LongClickTracker.h	2008-08-31 18:40:27 UTC (rev 27258)
+@@ -0,0 +1,52 @@
++/*
++ * Copyright 2007-2008, Haiku, Inc. All Rights Reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * Authors:
++ *		Alexandre Deckner &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">alex at zappotek.com</A>&gt;
++ */
++
++/*
++ * LongClickTracker:
++ * This class provides a way to track long clicks asynchronously.
++ * Set the view to track and the code of the message you want to receive.
++ * When a long click occurs in the view, a message will be sent to the view.
++ * It contains the coordinates of the click (last postion) in a BPoint:&quot;where&quot;
++ * 
++ * Could be extended to be more parametrable and/or support other kind of
++ * complex mouse tracking. This could also be done on the input server side 
++ * eventually, and use this class for R5 backward compatibility.
++ * 
++ * Call Start() after the view has been attached to a window.
++ */
++
++#ifndef _LONG_CLICK_TRACKER_H_
++#define _LONG_CLICK_TRACKER_H_
++
++#include &lt;Messenger.h&gt;
++#include &lt;OS.h&gt;
++
++class BView;
++class BMessenger;
++
++class LongClickTracker
++{
++	public:
++							LongClickTracker(BView *view, uint32 messageWhat);
++							~LongClickTracker();
++
++			status_t		Start();
++
++	protected:
++			static int32	_ThreadEntry(void *that);
++			void			_Track();
++
++			BView*			fView;
++			BMessenger* 	fMessenger;
++			int32			fMessageWhat;
++			thread_id		fThread;
++			bool			fQuit;
++			bigtime_t		fLongClickThreshold;
++};
++
++#endif // _LONG_CLICK_TRACKER_H_
+
+Modified: haiku/trunk/src/apps/deskbar/TimeView.cpp
+===================================================================
+--- haiku/trunk/src/apps/deskbar/TimeView.cpp	2008-08-31 16:01:19 UTC (rev 27257)
++++ haiku/trunk/src/apps/deskbar/TimeView.cpp	2008-08-31 18:40:27 UTC (rev 27258)
+@@ -65,7 +65,8 @@
+ enum {
+ 	kMsgShowClock,
+ 	kMsgChangeClock,
+-	kMsgHide
++	kMsgHide,
++	kMsgLongClick
+ };
+ 
+ 
+@@ -82,7 +83,8 @@
+ 	fEuroDate(euroDate),
+ 	fMaxWidth(maxWidth),
+ 	fHeight(height),
+-	fOrientation(true)
++	fOrientation(true),
++	fLongClickTracker(this, kMsgLongClick)
+ {
+ 	fShowingDate = false;
+ 	fTime = fLastTime = time(NULL);
+@@ -154,6 +156,8 @@
+ 
+ 	ResizeToPreferred();
+ 	CalculateTextPlacement();
++	
++	fLongClickTracker.Start();
+ }
+ 
+ 
+@@ -230,7 +234,50 @@
+ 		case 'time':
+ 			Window()-&gt;PostMessage(message, Parent());
+ 			break;
++			
++		case kMsgLongClick:
++		{
++			BPoint where;
++			message-&gt;FindPoint(&quot;where&quot;, &amp;where);			
++			
++			//TODO: do nothing if the calendar is already shown			
+ 
++#ifdef _SHOW_CALENDAR_MENU_ITEM
++
++			BPopUpMenu *menu = new BPopUpMenu(&quot;&quot;, false, false);
++			menu-&gt;SetFont(be_plain_font);
++
++			menu-&gt;AddItem(new CalendarMenuItem());
++			menu-&gt;ResizeToPreferred();			
++			
++			BPoint point = where;
++			BScreen screen;
++			where.y = Bounds().bottom + 4;
++
++			// make sure the menu is visible and doesn't hide the date
++			ConvertToScreen(&amp;where);
++			if (where.y + menu-&gt;Bounds().Height() &gt; screen.Frame().bottom)
++				where.y -= menu-&gt;Bounds().Height() + 2 * Bounds().Height();
++
++			ConvertToScreen(&amp;point);
++			menu-&gt;Go(where, true, true, BRect(point.x - 4, point.y - 4,
++				point.x + 4, point.y + 4), true);
++				
++#elif _SHOW_CALENDAR_MENU_WINDOW
++
++			where.y = Bounds().bottom + 4.0;
++			ConvertToScreen(&amp;where);
++
++			if (where.y &gt;= BScreen().Frame().bottom)
++				where.y -= (Bounds().Height() + 4.0);
++
++			CalendarMenuWindow* window = new CalendarMenuWindow(where, fEuroDate);
++			window-&gt;Show();			
++#endif		
++				
++			break;
++		}
++
+ 		default:
+ 			BView::MessageReceived(message);
+ 	}
+@@ -326,71 +373,6 @@
+ 	fLastDateStr[0] = '\0';
+ 	fLastTimeStr[0] = '\0';
+ 	Pulse();
+-
+-#ifdef _SHOW_CALENDAR_MENU_ITEM
+-	// see if the user holds down the button long enough to show him the calendar
+-
+-	bigtime_t startTime = system_time();
+-
+-	// use the doubleClickSpeed as a treshold
+-	bigtime_t doubleClickSpeed;
+-	get_click_speed(&amp;doubleClickSpeed);
+-
+-	while (buttons) {
+-		BPoint where;
+-		GetMouse(&amp;where, &amp;buttons, false);
+-
+-		if ((system_time() - startTime) &gt; doubleClickSpeed) {
+-			BPopUpMenu *menu = new BPopUpMenu(&quot;&quot;, false, false);
+-			menu-&gt;SetFont(be_plain_font);
+-
+-			menu-&gt;AddItem(new CalendarMenuItem());
+-			menu-&gt;ResizeToPreferred();
+-
+-			point = where;
+-			BScreen screen;
+-			where.y = Bounds().bottom + 4;
+-
+-			// make sure the menu is visible at doesn't hide the date
+-			ConvertToScreen(&amp;where);
+-			if (where.y + menu-&gt;Bounds().Height() &gt; screen.Frame().bottom)
+-				where.y -= menu-&gt;Bounds().Height() + 2 * Bounds().Height();
+-
+-			ConvertToScreen(&amp;point);
+-			menu-&gt;Go(where, true, true, BRect(point.x - 4, point.y - 4,
+-				point.x + 4, point.y + 4), true);
+-			return;
+-		}
+-
+-		snooze(15000);
+-	}
+-#elif _SHOW_CALENDAR_MENU_WINDOW
+-	bigtime_t startTime = system_time();
+-
+-	// use the doubleClickSpeed as a treshold
+-	bigtime_t doubleClickSpeed;
+-	get_click_speed(&amp;doubleClickSpeed);
+-
+-	while (buttons) {
+-		BPoint where;
+-		GetMouse(&amp;where, &amp;buttons, false);
+-
+-		if ((system_time() - startTime) &gt; doubleClickSpeed) {
+-			where.y = Bounds().bottom + 4.0;
+-			ConvertToScreen(&amp;where);
+-
+-			if (where.y &gt;= BScreen().Frame().bottom)
+-				where.y -= (Bounds().Height() + 4.0);
+-
+-			CalendarMenuWindow* window = new CalendarMenuWindow(where, fEuroDate);
+-			window-&gt;Show();
+-
+-			return;
+-		}
+-
+-		snooze(15000);
+-	}
+-#endif
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/apps/deskbar/TimeView.h
+===================================================================
+--- haiku/trunk/src/apps/deskbar/TimeView.h	2008-08-31 16:01:19 UTC (rev 27257)
++++ haiku/trunk/src/apps/deskbar/TimeView.h	2008-08-31 18:40:27 UTC (rev 27258)
+@@ -34,11 +34,10 @@
+ #ifndef TIME_VIEW_H
+ #define TIME_VIEW_H
+ 
+-
+ #include &lt;OS.h&gt;
+ #include &lt;View.h&gt;
++#include &quot;LongClickTracker.h&quot;
+ 
+-
+ const uint32 kMsgShowSeconds = 'ShSc';
+ const uint32 kMsgMilTime = 'MilT';
+ const uint32 kMsgFullDate = 'FDat';
+@@ -124,6 +123,8 @@
+ 		bool		fOrientation;		// vertical = true
+ 		BPoint		fTimeLocation;
+ 		BPoint		fDateLocation;
++		
++		LongClickTracker fLongClickTracker;
+ };
+ 
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011409.html">[Haiku-commits] r27257 - haiku/trunk/src/system/kernel/posix
+</A></li>
+	<LI>Next message: <A HREF="011411.html">[Haiku-commits] r27258 - haiku/trunk/src/apps/deskbar
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11410">[ date ]</a>
+              <a href="thread.html#11410">[ thread ]</a>
+              <a href="subject.html#11410">[ subject ]</a>
+              <a href="author.html#11410">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

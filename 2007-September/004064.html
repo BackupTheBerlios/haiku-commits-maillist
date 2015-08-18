@@ -1,0 +1,317 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22376 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22376%20-%0A%09haiku/trunk/src/add-ons/kernel/busses/scsi/ahci&In-Reply-To=%3C200709291711.l8THBP2D028985%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004063.html">
+   <LINK REL="Next"  HREF="004065.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22376 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci</H1>
+    <B>marcusoverhagen at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22376%20-%0A%09haiku/trunk/src/add-ons/kernel/busses/scsi/ahci&In-Reply-To=%3C200709291711.l8THBP2D028985%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22376 -	haiku/trunk/src/add-ons/kernel/busses/scsi/ahci">marcusoverhagen at mail.berlios.de
+       </A><BR>
+    <I>Sat Sep 29 19:11:25 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004063.html">[Haiku-commits] r22375 - in haiku/trunk/src/system/kernel: fs vm
+</A></li>
+        <LI>Next message: <A HREF="004065.html">[Haiku-commits] r22377 - haiku/trunk/src/tests/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4064">[ date ]</a>
+              <a href="thread.html#4064">[ thread ]</a>
+              <a href="subject.html#4064">[ subject ]</a>
+              <a href="author.html#4064">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: marcusoverhagen
+Date: 2007-09-29 19:11:24 +0200 (Sat, 29 Sep 2007)
+New Revision: 22376
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22376&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22376&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp
+   haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h
+Log:
+Cleanup, device present detection improved.
+Added support for non-48-bit LBA, added write support.
+Proper error handling still missing, write support disabled for your protection.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp	2007-09-29 15:48:11 UTC (rev 22375)
++++ haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.cpp	2007-09-29 17:11:24 UTC (rev 22376)
+@@ -25,7 +25,10 @@
+ 	, fRequestSem(-1)
+ 	, fResponseSem(-1)
+ 	, fCommandActive(false)
+-	, fHarddiskSize(0)
++	, fDevicePresent(false)
++	, fUse48BitCommands(false)
++	, fSectorSize(0)
++	, fSectorCount(0)
+ {
+ 	fRequestSem = create_sem(1, &quot;ahci request&quot;);
+ 	fResponseSem = create_sem(1, &quot;ahci response&quot;);
+@@ -127,6 +130,8 @@
+ 	TRACE(&quot;sact 0x%08lx\n&quot;, fRegs-&gt;sact);
+ 	TRACE(&quot;tfd  0x%08lx\n&quot;, fRegs-&gt;tfd);
+ 
++	fDevicePresent = (fRegs-&gt;ssts &amp; 0xf) == 0x3;
++
+ 	return B_OK;
+ }
+ 
+@@ -439,10 +444,7 @@
+ AHCIPort::ScsiTestUnitReady(scsi_ccb *request)
+ {
+ 	TRACE(&quot;AHCIPort::ScsiTestUnitReady port %d\n&quot;, fIndex);
+-	if ((fRegs-&gt;ssts &amp; 0xf) == 0x3)
+-		request-&gt;subsys_status = SCSI_REQ_CMP;
+-	else
+-		request-&gt;subsys_status = SCSI_DEV_NOT_THERE;
++	request-&gt;subsys_status = SCSI_REQ_CMP;
+ 	gSCSI-&gt;finished(request, 1);
+ }
+ 
+@@ -479,7 +481,6 @@
+ 
+ 	fCommandList-&gt;prdtl_flags_cfl = 0;
+ 	fCommandList-&gt;prdtl = prdEntrys;
+-//	fCommandList-&gt;c = 1;
+ 	fCommandList-&gt;cfl = 5;
+ 	fCommandList-&gt;prdbc = 0;
+ 
+@@ -535,8 +536,17 @@
+ 	bool lba48			= (ataData.words[83] &amp; (1 &lt;&lt; 10)) != 0;
+ 	uint32 sectors		= *(uint32*)&amp;ataData.words[60];
+ 	uint64 sectors48	= *(uint64*)&amp;ataData.words[100];
+-	fHarddiskSize		= !(lba || sectors) ? 0 : lba48 ? (sectors48 * 512) : (sectors * 512ull);
++	fUse48BitCommands   = lba &amp;&amp; lba48;
++	fSectorSize			= 512;
++	fSectorCount		= !(lba || sectors) ? 0 : lba48 ? sectors48 : sectors;
+ 
++#if 1
++	if (fSectorCount &lt; 0x0fffffff) {
++		TRACE(&quot;disabling 48 bit commands\n&quot;);
++		fUse48BitCommands = 0;
++	}
++#endif
++
+ 	swap_words(ataData.model_number, sizeof(ataData.model_number));
+ 	swap_words(ataData.serial_number, sizeof(ataData.serial_number));
+ 	swap_words(ataData.firmware_revision, sizeof(ataData.firmware_revision));
+@@ -544,12 +554,9 @@
+ 	TRACE(&quot;model_number: %.40s\n&quot;, ataData.model_number);
+ 	TRACE(&quot;serial_number: %.20s\n&quot;, ataData.serial_number);
+ 	TRACE(&quot;firmware_revision: %.8s\n&quot;, ataData.firmware_revision);
+-	TRACE(&quot;lba %d, lba48 %d, sectors %lu, sectors48 %llu, size %llu\n&quot;,
+-		lba, lba48, sectors, sectors48, fHarddiskSize);
++	TRACE(&quot;lba %d, lba48 %d, fUse48BitCommands %d, sectors %lu, sectors48 %llu, size %llu\n&quot;,
++		lba, lba48, fUse48BitCommands, sectors, sectors48, fSectorCount * fSectorSize);
+ 
+-	if (fHarddiskSize &gt;= (512ull * 0xffffffff))
+-		panic(&quot;ahci: SCSI emulation doesn't support harddisks larger than 2TB&quot;);
+-
+ 	if (sg_memcpy(request-&gt;sg_list, request-&gt;sg_count, &amp;scsiData, sizeof(scsiData)) &lt; B_OK) {
+ 		request-&gt;subsys_status = SCSI_DATA_RUN_ERR;
+ 	} else {
+@@ -578,20 +585,14 @@
+ 		return;
+ 	}
+ 
+-	uint64 sectorCount = fHarddiskSize / 512;
+-	uint32 sectorSize = 512;
+-	TRACE(&quot;sectorCount 0x%llx, sectorSize %lu\n&quot;, sectorCount, sectorSize);
+-/*
+-	while (sectorCount &gt; 0xffffffff) {
+-		sectorCount /= 2;
+-		sectorSize *= 2;
+-	}
+-	TRACE(&quot;sectorCount 0x%llx, sectorSize %lu\n&quot;, sectorCount, sectorSize);
+-*/
++	TRACE(&quot;SectorSize %lu, SectorCount 0x%llx\n&quot;, fSectorSize, fSectorCount);
+ 
+-	scsiData.block_size = B_HOST_TO_BENDIAN_INT32(sectorSize);
+-	scsiData.lba = B_HOST_TO_BENDIAN_INT32(sectorCount - 1);
++	if (fSectorCount &gt; 0xffffffff)
++		panic(&quot;ahci: SCSI emulation doesn't support harddisks larger than 2TB&quot;);
+ 
++	scsiData.block_size = B_HOST_TO_BENDIAN_INT32(fSectorSize);
++	scsiData.lba = B_HOST_TO_BENDIAN_INT32(fSectorCount - 1);
++
+ 	if (sg_memcpy(request-&gt;sg_list, request-&gt;sg_count, &amp;scsiData, sizeof(scsiData)) &lt; B_OK) {
+ 		request-&gt;subsys_status = SCSI_DATA_RUN_ERR;
+ 	} else {
+@@ -608,6 +609,16 @@
+ {
+ 	TRACE(&quot;ScsiReadWrite: pos %llu, size %lu, isWrite %d\n&quot;, position, length, isWrite);
+ 
++#if 1
++	if (isWrite) {
++		TRACE(&quot;write request ignored\n&quot;);
++		request-&gt;subsys_status = SCSI_REQ_CMP;
++		request-&gt;data_resid = 0;
++		gSCSI-&gt;finished(request, 1);
++		return;
++	}
++#endif
++
+ 	StartTransfer();
+ 
+ 	int prdEntrys;
+@@ -616,22 +627,37 @@
+ 	TRACE(&quot;prdEntrys %d\n&quot;, prdEntrys);
+ 	
+ 	memset((void *)fCommandTable-&gt;cfis, 0, 5 * 4);
+-	fCommandTable-&gt;cfis[0] = 0x27;
+-	fCommandTable-&gt;cfis[1] = 0x80;
+-	fCommandTable-&gt;cfis[2] = 0x25;
+-	fCommandTable-&gt;cfis[4] = position &amp; 0xff;
+-	fCommandTable-&gt;cfis[5] = (position &gt;&gt; 8) &amp; 0xff;
+-	fCommandTable-&gt;cfis[6] = (position &gt;&gt; 16) &amp; 0xff;
+-	fCommandTable-&gt;cfis[7] = 0x40; 
+-	fCommandTable-&gt;cfis[8] = (position &gt;&gt; 24) &amp; 0xff;
+-	fCommandTable-&gt;cfis[9] = (position &gt;&gt; 32) &amp; 0xff;
+-	fCommandTable-&gt;cfis[10] = (position &gt;&gt; 40) &amp; 0xff;
+-	fCommandTable-&gt;cfis[12] = length &amp; 0xff;
+-	fCommandTable-&gt;cfis[13] = (length &gt;&gt; 8) &amp; 0xff;
+ 
++	if (fUse48BitCommands) {
++		fCommandTable-&gt;cfis[0] = 0x27;
++		fCommandTable-&gt;cfis[1] = 0x80;
++		fCommandTable-&gt;cfis[2] = isWrite ? 0x35 : 0x25;
++		fCommandTable-&gt;cfis[4] = position &amp; 0xff;
++		fCommandTable-&gt;cfis[5] = (position &gt;&gt; 8) &amp; 0xff;
++		fCommandTable-&gt;cfis[6] = (position &gt;&gt; 16) &amp; 0xff;
++		fCommandTable-&gt;cfis[7] = 0x40; 
++		fCommandTable-&gt;cfis[8] = (position &gt;&gt; 24) &amp; 0xff;
++		fCommandTable-&gt;cfis[9] = (position &gt;&gt; 32) &amp; 0xff;
++		fCommandTable-&gt;cfis[10] = (position &gt;&gt; 40) &amp; 0xff;
++		fCommandTable-&gt;cfis[12] = length &amp; 0xff;
++		fCommandTable-&gt;cfis[13] = (length &gt;&gt; 8) &amp; 0xff;
++	} else {
++		if (length &gt; 256)
++			panic(&quot;ahci: ScsiReadWrite length too large&quot;);
++		if (position &gt; 0x0fffffff)
++			panic(&quot;achi: ScsiReadWrite position too large for non-48-bit LBA\n&quot;);
++		fCommandTable-&gt;cfis[0] = 0x27;
++		fCommandTable-&gt;cfis[1] = 0x80;
++		fCommandTable-&gt;cfis[2] = isWrite ? 0xca : 0xc8;
++		fCommandTable-&gt;cfis[4] = position &amp; 0xff;
++		fCommandTable-&gt;cfis[5] = (position &gt;&gt; 8) &amp; 0xff;
++		fCommandTable-&gt;cfis[6] = (position &gt;&gt; 16) &amp; 0xff;
++		fCommandTable-&gt;cfis[7] = 0x40 | ((position &gt;&gt; 24) &amp; 0x0f);
++		fCommandTable-&gt;cfis[12] = length &amp; 0xff;
++	}
++
+ 	fCommandList-&gt;prdtl_flags_cfl = 0;
+ 	fCommandList-&gt;prdtl = prdEntrys;
+-//	fCommandList-&gt;c = 1;
+ 	fCommandList-&gt;cfl = 5;
+ 	fCommandList-&gt;prdbc = 0;
+ 
+@@ -664,13 +690,11 @@
+ 	TRACE(&quot;AHCIPort::ScsiExecuteRequest port %d, opcode 0x%02x, length %u\n&quot;, fIndex, request-&gt;cdb[0], request-&gt;cdb_length);
+ 
+ 	if (request-&gt;cdb[0] == SCSI_OP_REQUEST_SENSE) {
+-		TRACE(&quot;SCSI_OP_REQUEST_SENSE\n&quot;);
+-		request-&gt;subsys_status = SCSI_DEV_NOT_THERE;
+-		gSCSI-&gt;finished(request, 1);
++		panic(&quot;ahci: SCSI_OP_REQUEST_SENSE not yet supported\n&quot;);
+ 		return;
+ 	}
+ 
+-	if ((fRegs-&gt;ssts &amp; 0xf) != 0x3) {
++	if (!fDevicePresent) {
+ 		TRACE(&quot;no such device!\n&quot;);
+ 		request-&gt;subsys_status = SCSI_DEV_NOT_THERE;
+ 		gSCSI-&gt;finished(request, 1);
+@@ -710,7 +734,7 @@
+ 				ScsiReadWrite(request, position, length, isWrite);
+ 			} else {
+ 				TRACE(&quot;AHCIPort::ScsiExecuteRequest error: transfer without data!\n&quot;);
+-				request-&gt;subsys_status = SCSI_DEV_NOT_THERE;
++				request-&gt;subsys_status = SCSI_REQ_INVALID;
+ 				gSCSI-&gt;finished(request, 1);
+ 			}
+ 			break;
+@@ -726,15 +750,15 @@
+ 				ScsiReadWrite(request, position, length, isWrite);
+ 			} else {
+ 				TRACE(&quot;AHCIPort::ScsiExecuteRequest error: transfer without data!\n&quot;);
+-				request-&gt;subsys_status = SCSI_DEV_NOT_THERE;
++				request-&gt;subsys_status = SCSI_REQ_INVALID;
+ 				gSCSI-&gt;finished(request, 1);
+ 			}
+ 			break;
+ 		}
+-
+ 		default:
+-		request-&gt;subsys_status = SCSI_DEV_NOT_THERE;
+-		gSCSI-&gt;finished(request, 1);
++			TRACE(&quot;AHCIPort::ScsiExecuteRequest port %d unsupported request opcode 0x%02x\n&quot;, fIndex, request-&gt;cdb[0]);
++			request-&gt;subsys_status = SCSI_REQ_ABORTED;
++			gSCSI-&gt;finished(request, 1);
+ 	}
+ }
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h	2007-09-29 15:48:11 UTC (rev 22375)
++++ haiku/trunk/src/add-ons/kernel/busses/scsi/ahci/ahci_port.h	2007-09-29 17:11:24 UTC (rev 22376)
+@@ -53,12 +53,15 @@
+ 	sem_id							fRequestSem;
+ 	sem_id							fResponseSem;
+ 	volatile bool					fCommandActive;
++	bool							fDevicePresent;
++	bool							fUse48BitCommands;
++	uint32							fSectorSize;
++	uint64							fSectorCount;
+ 
+ 	volatile fis *					fFIS;
+ 	volatile command_list_entry *	fCommandList;
+ 	volatile command_table *		fCommandTable;
+ 	volatile prd *					fPRDTable;
+-	uint64							fHarddiskSize;
+ };
+ 
+ inline void
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004063.html">[Haiku-commits] r22375 - in haiku/trunk/src/system/kernel: fs vm
+</A></li>
+	<LI>Next message: <A HREF="004065.html">[Haiku-commits] r22377 - haiku/trunk/src/tests/kits/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4064">[ date ]</a>
+              <a href="thread.html#4064">[ thread ]</a>
+              <a href="subject.html#4064">[ subject ]</a>
+              <a href="author.html#4064">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

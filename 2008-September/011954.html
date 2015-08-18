@@ -1,0 +1,662 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27603 - haiku/trunk/src/bin/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27603%20-%20haiku/trunk/src/bin/debug&In-Reply-To=%3C200809172255.m8HMtQ2R007871%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011953.html">
+   <LINK REL="Next"  HREF="011955.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27603 - haiku/trunk/src/bin/debug</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27603%20-%20haiku/trunk/src/bin/debug&In-Reply-To=%3C200809172255.m8HMtQ2R007871%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27603 - haiku/trunk/src/bin/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Sep 18 00:55:26 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011953.html">[Haiku-commits] r27602 - haiku/trunk/src/system/kernel/debug
+</A></li>
+        <LI>Next message: <A HREF="011955.html">[Haiku-commits] r27604 - haiku/trunk/src/system/runtime_loader
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11954">[ date ]</a>
+              <a href="thread.html#11954">[ thread ]</a>
+              <a href="subject.html#11954">[ subject ]</a>
+              <a href="author.html#11954">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-18 00:55:21 +0200 (Thu, 18 Sep 2008)
+New Revision: 27603
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27603&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27603&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/bin/debug/profile.cpp
+Log:
+Refactored quite a bit. In theory the tool does support profiling child
+processes recursively. In practice that doesn't really work, though, for
+mainly two reasons:
+* The runtime loader doesn't update it's image IDs, so the symbol lookup
+  doesn't work. Even, if the runtime loader would do that, we are
+  notified before it had a chance to do it.
+* We're not tracking image creation/deletion yet, particularly fork()
+  + exec*() leaves us totally clueless. Tracking images is quite unhandy
+  with the current profiling API, though.
+
+
+Modified: haiku/trunk/src/bin/debug/profile.cpp
+===================================================================
+--- haiku/trunk/src/bin/debug/profile.cpp	2008-09-17 22:38:17 UTC (rev 27602)
++++ haiku/trunk/src/bin/debug/profile.cpp	2008-09-17 22:55:21 UTC (rev 27603)
+@@ -55,29 +55,233 @@
+ };
+ 
+ 
+-struct Team {
+-	team_info	info;
+-};
++struct Team;
+ 
+ 
+ struct Thread {
+ 	thread_info	info;
++	Team*		team;
+ 
+ 	thread_id ID() const		{ return info.thread; }
+ 	const char* Name() const	{ return info.name; }
+ };
+ 
+ 
++class Team {
++public:
++	Team()
++		:
++		fNubPort(-1),
++		fSymbols(1000, true),
++		fStartProfilerSize(0),
++		fStartProfiler(NULL)
++	{
++		fInfo.team = -1;
++		fDebugContext.nub_port = -1;
++	}
++
++	~Team()
++	{
++		free(fStartProfiler);
++
++		if (fDebugContext.nub_port &gt;= 0)
++			destroy_debug_context(&amp;fDebugContext);
++
++		if (fNubPort &gt;= 0)
++			remove_team_debugger(fInfo.team);
++	}
++
++	status_t Init(team_id teamID, port_id debuggerPort)
++	{
++		// get team info
++		status_t error = get_team_info(teamID, &amp;fInfo);
++		if (error != B_OK)
++			return error;
++
++		// install ourselves as the team debugger
++		fNubPort = install_team_debugger(teamID, debuggerPort);
++		if (fNubPort &lt; 0) {
++			fprintf(stderr, &quot;%s: Failed to install as debugger for team %ld: &quot;
++				&quot;%s\n&quot;, kCommandName, teamID, strerror(fNubPort));
++			return fNubPort;
++		}
++
++		// init debug context
++		error = init_debug_context(&amp;fDebugContext, teamID, fNubPort);
++		if (error != B_OK) {
++			fprintf(stderr, &quot;%s: Failed to init debug context for team %ld: &quot;
++				&quot;%s\n&quot;, kCommandName, teamID, strerror(error));
++			return error;
++		}
++
++		// create symbol lookup context
++		debug_symbol_lookup_context* lookupContext;
++		error = debug_create_symbol_lookup_context(&amp;fDebugContext,
++			&amp;lookupContext);
++		if (error != B_OK) {
++			fprintf(stderr, &quot;%s: Failed to create symbol lookup context for &quot;
++				&quot;team %ld: %s\n&quot;, kCommandName, teamID, strerror(error));
++			return error;
++		}
++
++		error = _LoadSymbols(lookupContext);
++		debug_delete_symbol_lookup_context(lookupContext);
++		if (error != B_OK)
++			return error;
++
++		// prepare the start profiler message
++		int32 symbolCount = fSymbols.CountItems();
++		if (symbolCount == 0) {
++			fprintf(stderr, &quot;%s: Got no symbols at all...\n&quot;, kCommandName);
++			return B_ERROR;
++		}
++
++		printf(&quot;Found %ld functions.\n&quot;, symbolCount);
++
++		fStartProfilerSize = sizeof(debug_nub_start_profiler)
++			+ (symbolCount - 1) * sizeof(debug_profile_function);
++printf(&quot;start profiler message size: %lu\n&quot;, fStartProfilerSize);
++		fStartProfiler = (debug_nub_start_profiler*)malloc(fStartProfilerSize);
++		if (fStartProfiler == NULL) {
++			fprintf(stderr, &quot;%s: Out of memory\n&quot;, kCommandName);
++			exit(1);
++		}
++
++		fStartProfiler-&gt;reply_port = fDebugContext.reply_port;
++		fStartProfiler-&gt;interval = 1000;
++		fStartProfiler-&gt;function_count = symbolCount;
++
++		for (int32 i = 0; i &lt; symbolCount; i++) {
++			Symbol* symbol = fSymbols.ItemAt(i);
++			debug_profile_function&amp; function = fStartProfiler-&gt;functions[i];
++			function.base = symbol-&gt;base;
++			function.size = symbol-&gt;size;
++		}
++
++		// set team debugging flags
++		int32 teamDebugFlags = B_TEAM_DEBUG_THREADS
++			| B_TEAM_DEBUG_TEAM_CREATION;
++		set_team_debugging_flags(fNubPort, teamDebugFlags);
++
++		return B_OK;
++	}
++
++	status_t InitThread(Thread* thread)
++	{
++		// set thread debugging flags and start profiling
++		int32 threadDebugFlags = 0;
++//		if (!traceTeam) {
++//			threadDebugFlags = B_THREAD_DEBUG_POST_SYSCALL
++//				| (traceChildThreads
++//					? B_THREAD_DEBUG_SYSCALL_TRACE_CHILD_THREADS : 0);
++//		}
++		set_thread_debugging_flags(fNubPort, thread-&gt;ID(), threadDebugFlags);
++
++		// start profiling
++		fStartProfiler-&gt;thread = thread-&gt;ID();
++		debug_nub_start_profiler_reply reply;
++		status_t error = send_debug_message(&amp;fDebugContext,
++			B_DEBUG_START_PROFILER, fStartProfiler, fStartProfilerSize, &amp;reply,
++			sizeof(reply));
++		if (error != B_OK || (error = reply.error) != B_OK) {
++			fprintf(stderr, &quot;%s: Failed to start profiler for thread %ld: %s\n&quot;,
++				kCommandName, thread-&gt;ID(), strerror(error));
++			return error;
++		}
++
++		// resume the target thread to be sure, it's running
++		resume_thread(thread-&gt;ID());
++
++		thread-&gt;team = this;
++
++		return B_OK;
++	}
++
++	team_id ID() const
++	{
++		return fInfo.team;
++	}
++
++	BObjectList&lt;Symbol&gt;&amp; Symbols()
++	{
++		return fSymbols;
++	}
++
++	int32 SymbolCount() const
++	{
++		return fSymbols.CountItems();
++	}
++
++private:
++	status_t _LoadSymbols(debug_symbol_lookup_context* lookupContext)
++	{
++		// iterate through the team's images and collect the symbols
++		image_info imageInfo;
++		int32 cookie = 0;
++		while (get_next_image_info(fInfo.team, &amp;cookie, &amp;imageInfo) == B_OK) {
++			printf(&quot;Loading symbols of image \&quot;%s\&quot; (%ld)...\n&quot;,
++				imageInfo.name, imageInfo.id);
++
++			// create symbol iterator
++			debug_symbol_iterator* iterator;
++			status_t error = debug_create_image_symbol_iterator(lookupContext,
++				imageInfo.id, &amp;iterator);
++			if (error != B_OK) {
++				printf(&quot;Failed to init symbol iterator: %s\n&quot;, strerror(error));
++				continue;
++			}
++
++			// iterate through the images
++			char symbolName[1024];
++			int32 symbolType;
++			void* symbolLocation;
++			size_t symbolSize;
++			while (debug_next_image_symbol(iterator, symbolName, sizeof(symbolName),
++					&amp;symbolType, &amp;symbolLocation, &amp;symbolSize) == B_OK) {
++	//			printf(&quot;  %s %p (%6lu) %s\n&quot;,
++	//				symbolType == B_SYMBOL_TYPE_TEXT ? &quot;text&quot; : &quot;data&quot;,
++	//				symbolLocation, symbolSize, symbolName);
++				if (symbolSize &gt; 0 &amp;&amp; symbolType == B_SYMBOL_TYPE_TEXT) {
++					Symbol* symbol = new(std::nothrow) Symbol(
++						(addr_t)symbolLocation, symbolSize, symbolName);
++					if (symbol == NULL || !fSymbols.AddItem(symbol)) {
++						delete symbol;
++						fprintf(stderr, &quot;%s: Out of memory\n&quot;, kCommandName);
++						debug_delete_image_symbol_iterator(iterator);
++						return B_NO_MEMORY;
++					}
++				}
++			}
++
++			debug_delete_image_symbol_iterator(iterator);
++		}
++
++		return B_OK;
++	}
++
++private:
++	team_info					fInfo;
++	port_id						fNubPort;
++	debug_context				fDebugContext;
++	BObjectList&lt;Symbol&gt;			fSymbols;
++	size_t						fStartProfilerSize;
++	debug_nub_start_profiler*	fStartProfiler;
++};
++
++
+ class ThreadManager {
+ public:
+-	ThreadManager()
++	ThreadManager(port_id debuggerPort)
+ 		:
+ 		fTeams(20, true),
+-		fThreads(20, true)
++		fThreads(20, true),
++		fDebuggerPort(debuggerPort),
++		fDebuggerMessage(NULL),
++		fMaxDebuggerMessageSize(0)
+ 	{
+ 	}
+ 
+-	status_t AddTeam(team_id teamID)
++	status_t AddTeam(team_id teamID, Team** _team = NULL)
+ 	{
+ 		if (FindTeam(teamID) != NULL)
+ 			return B_BAD_VALUE;
+@@ -86,13 +290,20 @@
+ 		if (team == NULL)
+ 			return B_NO_MEMORY;
+ 
+-		status_t error = get_team_info(teamID, &amp;team-&gt;info);
++		status_t error = team-&gt;Init(teamID, fDebuggerPort);
++		if (error == B_OK)
++			error = _ReallocateDebuggerMessage(team-&gt;SymbolCount());
++
+ 		if (error != B_OK) {
+ 			delete team;
+ 			return error;
+ 		}
+ 
+ 		fTeams.AddItem(team);
++
++		if (_team != NULL)
++			*_team = team;
++
+ 		return B_OK;
+ 	}
+ 
+@@ -101,11 +312,22 @@
+ 		if (FindThread(threadID) != NULL)
+ 			return B_BAD_VALUE;
+ 
++		thread_info threadInfo;
++		status_t error = get_thread_info(threadID, &amp;threadInfo);
++		if (error != B_OK)
++			return error;
++
++		Team* team = FindTeam(threadInfo.team);
++		if (team == NULL)
++			return B_BAD_TEAM_ID;
++
+ 		Thread* thread = new(std::nothrow) Thread;
+ 		if (thread == NULL)
+ 			return B_NO_MEMORY;
+ 
+-		status_t error = get_thread_info(threadID, &amp;thread-&gt;info);
++		thread-&gt;info = threadInfo;
++
++		error = team-&gt;InitThread(thread);
+ 		if (error != B_OK) {
+ 			delete thread;
+ 			return error;
+@@ -130,7 +352,7 @@
+ 	Team* FindTeam(team_id teamID) const
+ 	{
+ 		for (int32 i = 0; Team* team = fTeams.ItemAt(i); i++) {
+-			if (team-&gt;info.team == teamID)
++			if (team-&gt;ID() == teamID)
+ 				return team;
+ 		}
+ 		return NULL;
+@@ -145,9 +367,44 @@
+ 		return NULL;
+ 	}
+ 
++	debug_debugger_message_data* DebuggerMessage() const
++	{
++		return fDebuggerMessage;
++	}
++
++	size_t MaxDebuggerMessageSize() const
++	{
++		return fMaxDebuggerMessageSize;
++	}
++
+ private:
+-	BObjectList&lt;Team&gt;	fTeams;
+-	BObjectList&lt;Thread&gt;	fThreads;
++	status_t _ReallocateDebuggerMessage(int32 symbolCount)
++	{
++		// allocate memory for the reply
++		size_t maxMessageSize = max_c(sizeof(debug_debugger_message_data),
++			sizeof(debug_profiler_stopped) + 8 * symbolCount);
++		if (maxMessageSize &lt;= fMaxDebuggerMessageSize)
++			return B_OK;
++
++		debug_debugger_message_data* message = (debug_debugger_message_data*)
++			realloc(fDebuggerMessage, maxMessageSize);
++		if (message == NULL) {
++			fprintf(stderr, &quot;%s: Out of memory\n&quot;, kCommandName);
++			return B_NO_MEMORY;
++		}
++
++		fDebuggerMessage = message;
++		fMaxDebuggerMessageSize = maxMessageSize;
++
++		return B_OK;
++	}
++
++private:
++	BObjectList&lt;Team&gt;				fTeams;
++	BObjectList&lt;Thread&gt;				fThreads;
++	port_id							fDebuggerPort;
++	debug_debugger_message_data*	fDebuggerMessage;
++	size_t							fMaxDebuggerMessageSize;
+ };
+ 
+ 
+@@ -267,151 +524,17 @@
+ 		exit(1);
+ 	}
+ 
+-	// install ourselves as the team debugger
+-	port_id nubPort = install_team_debugger(teamID, debuggerPort);
+-	if (nubPort &lt; 0) {
+-		fprintf(stderr, &quot;%s: Failed to install team debugger: %s\n&quot;,
+-			kCommandName, strerror(nubPort));
++	// add team and thread to the thread manager
++	ThreadManager threadManager(debuggerPort);
++	if (threadManager.AddTeam(teamID) != B_OK
++		|| threadManager.AddThread(threadID) != B_OK) {
+ 		exit(1);
+ 	}
+ 
+-	ThreadManager threadManager;
+-	threadManager.AddTeam(teamID);
+-	threadManager.AddThread(threadID);
+-
+-	// init debug context
+-	debug_context debugContext;
+-	status_t error = init_debug_context(&amp;debugContext, teamID, nubPort);
+-	if (error != B_OK) {
+-		fprintf(stderr, &quot;%s: Failed to init debug context: %s\n&quot;,
+-			kCommandName, strerror(error));
+-		exit(1);
+-	}
+-
+-	// create symbol lookup context
+-	debug_symbol_lookup_context* lookupContext;
+-	error = debug_create_symbol_lookup_context(&amp;debugContext,
+-		&amp;lookupContext);
+-	if (error != B_OK) {
+-		fprintf(stderr, &quot;%s: Failed to create symbol lookup context: %s\n&quot;,
+-			kCommandName, strerror(error));
+-		exit(1);
+-	}
+-
+-	// iterate through the team's images and collect the symbols
+-	BObjectList&lt;Symbol&gt; symbols(1000, true);
+-	image_info imageInfo;
+-	int32 cookie = 0;
+-	while (get_next_image_info(teamID, &amp;cookie, &amp;imageInfo) == B_OK) {
+-		printf(&quot;Loading symbols of image \&quot;%s\&quot; (%ld)...\n&quot;,
+-			imageInfo.name, imageInfo.id);
+-		// create symbol iterator
+-		debug_symbol_iterator* iterator;
+-		error = debug_create_image_symbol_iterator(lookupContext, imageInfo.id,
+-			&amp;iterator);
+-		if (error != B_OK) {
+-			printf(&quot;Failed to init symbol iterator: %s\n&quot;, strerror(error));
+-			continue;
+-		}
+-
+-		// iterate through the images
+-		char symbolName[1024];
+-		int32 symbolType;
+-		void* symbolLocation;
+-		size_t symbolSize;
+-		while (debug_next_image_symbol(iterator, symbolName, sizeof(symbolName),
+-				&amp;symbolType, &amp;symbolLocation, &amp;symbolSize) == B_OK) {
+-//			printf(&quot;  %s %p (%6lu) %s\n&quot;,
+-//				symbolType == B_SYMBOL_TYPE_TEXT ? &quot;text&quot; : &quot;data&quot;,
+-//				symbolLocation, symbolSize, symbolName);
+-			if (symbolSize &gt; 0 &amp;&amp; symbolType == B_SYMBOL_TYPE_TEXT) {
+-				Symbol* symbol = new(std::nothrow) Symbol(
+-					(addr_t)symbolLocation, symbolSize, symbolName);
+-				if (symbol == NULL || !symbols.AddItem(symbol)) {
+-					delete symbol;
+-					fprintf(stderr, &quot;%s: Out of memory\n&quot;, kCommandName);
+-					exit(1);
+-				}
+-			}
+-		}
+-
+-		debug_delete_image_symbol_iterator(iterator);
+-	}
+-
+-	debug_delete_symbol_lookup_context(lookupContext);
+-
+-	// prepare the start profiler message
+-	int32 symbolCount = symbols.CountItems();
+-	if (symbolCount == 0) {
+-		fprintf(stderr, &quot;%s: Got no symbols at all, exiting...\n&quot;,
+-			kCommandName);
+-		exit(1);
+-	}
+-
+-	printf(&quot;Found %ld functions.\n&quot;, symbolCount);
+-
+-	size_t startProfilerSize = sizeof(debug_nub_start_profiler)
+-		+ (symbolCount - 1) * sizeof(debug_profile_function);
+-printf(&quot;start profiler message size: %lu\n&quot;, startProfilerSize);
+-	debug_nub_start_profiler* startProfiler
+-		= (debug_nub_start_profiler*)malloc(startProfilerSize);
+-	if (startProfiler == NULL) {
+-		fprintf(stderr, &quot;%s: Out of memory\n&quot;, kCommandName);
+-		exit(1);
+-	}
+-
+-	startProfiler-&gt;reply_port = debugContext.reply_port;
+-	startProfiler-&gt;thread = threadID;
+-	startProfiler-&gt;interval = 1000;
+-	startProfiler-&gt;function_count = symbolCount;
+-
+-	for (int32 i = 0; i &lt; symbolCount; i++) {
+-		Symbol* symbol = symbols.ItemAt(i);
+-		debug_profile_function&amp; function = startProfiler-&gt;functions[i];
+-		function.base = symbol-&gt;base;
+-		function.size = symbol-&gt;size;
+-	}
+-
+-	// allocate memory for the reply
+-	size_t maxMessageSize = max_c(sizeof(debug_debugger_message_data),
+-		sizeof(debug_profiler_stopped) + 8 * symbolCount);
+-	debug_debugger_message_data* message = (debug_debugger_message_data*)
+-		malloc(maxMessageSize);
+-	if (message == NULL) {
+-		fprintf(stderr, &quot;%s: Out of memory\n&quot;, kCommandName);
+-		exit(1);
+-	}
+-
+-	// set team debugging flags
+-	int32 teamDebugFlags = B_TEAM_DEBUG_THREADS;
+-	set_team_debugging_flags(nubPort, teamDebugFlags);
+-
+-	// set thread debugging flags and start profiling
+-	if (threadID &gt;= 0) {
+-		int32 threadDebugFlags = 0;
+-//		if (!traceTeam) {
+-//			threadDebugFlags = B_THREAD_DEBUG_POST_SYSCALL
+-//				| (traceChildThreads
+-//					? B_THREAD_DEBUG_SYSCALL_TRACE_CHILD_THREADS : 0);
+-//		}
+-		set_thread_debugging_flags(nubPort, threadID, threadDebugFlags);
+-
+-		// start profiling
+-	 	debug_nub_start_profiler_reply reply;
+-		error = send_debug_message(&amp;debugContext, B_DEBUG_START_PROFILER,
+-            startProfiler, startProfilerSize, &amp;reply, sizeof(reply));
+-		if (error != B_OK || (error = reply.error) != B_OK) {
+-			fprintf(stderr, &quot;%s: Failed to start profiler: %s\n&quot;,
+-				kCommandName, strerror(error));
+-			exit(1);
+-		}
+-
+-		// resume the target thread to be sure, it's running
+-		resume_thread(threadID);
+-	}
+-
+ 	// debug loop
+ 	while (true) {
++		size_t maxMessageSize = threadManager.MaxDebuggerMessageSize();
++		debug_debugger_message_data* message = threadManager.DebuggerMessage();
+ 		bool quitLoop = false;
+ 		int32 code;
+ 		ssize_t messageSize = read_port(debuggerPort, &amp;code, message,
+@@ -434,6 +557,9 @@
+ 				if (thread == NULL)
+ 					break;
+ 
++				BObjectList&lt;Symbol&gt;&amp; symbols = thread-&gt;team-&gt;Symbols();
++				int32 symbolCount = symbols.CountItems();
++
+ 				int64 totalTicks = message-&gt;profiler_stopped.total_ticks;
+ 				int64 missedTicks = message-&gt;profiler_stopped.missed_ticks;
+ 				bigtime_t interval = message-&gt;profiler_stopped.interval;
+@@ -485,6 +611,20 @@
+ 				break;
+ 			}
+ 
++			case B_DEBUGGER_MESSAGE_TEAM_CREATED:
++				threadManager.AddTeam(message-&gt;team_created.new_team);
++				break;
++			case B_DEBUGGER_MESSAGE_TEAM_DELETED:
++				// a debugged team is gone -- quit, if it is our team
++				quitLoop = message-&gt;origin.team == teamID;
++				break;
++			case B_DEBUGGER_MESSAGE_THREAD_CREATED:
++				threadManager.AddThread(message-&gt;thread_created.new_thread);
++				break;
++			case B_DEBUGGER_MESSAGE_THREAD_DELETED:
++				threadManager.RemoveThread(message-&gt;origin.thread);
++				break;
++
+ 			case B_DEBUGGER_MESSAGE_POST_SYSCALL:
+ 			case B_DEBUGGER_MESSAGE_SIGNAL_RECEIVED:
+ 			case B_DEBUGGER_MESSAGE_THREAD_DEBUGGED:
+@@ -494,37 +634,9 @@
+ 			case B_DEBUGGER_MESSAGE_SINGLE_STEP:
+ 			case B_DEBUGGER_MESSAGE_PRE_SYSCALL:
+ 			case B_DEBUGGER_MESSAGE_EXCEPTION_OCCURRED:
+-			case B_DEBUGGER_MESSAGE_TEAM_CREATED:
+-			case B_DEBUGGER_MESSAGE_THREAD_CREATED:
+-			{
+-				thread_id newThread = message-&gt;thread_created.new_thread;
+-				if (threadManager.AddThread(newThread) == B_OK) {
+-					// start profiling
+-					startProfiler-&gt;thread = newThread;
+-					debug_nub_start_profiler_reply reply;
+-					error = send_debug_message(&amp;debugContext,
+-						B_DEBUG_START_PROFILER, startProfiler,
+-						startProfilerSize, &amp;reply, sizeof(reply));
+-					if (error != B_OK || (error = reply.error) != B_OK) {
+-						fprintf(stderr, &quot;%s: Failed to start profiler for &quot;
+-							&quot;thread %ld: %s\n&quot;, kCommandName, newThread,
+-							strerror(error));
+-						threadManager.RemoveThread(newThread);
+-					}
+-				}
+-				break;
+-			}
+-			case B_DEBUGGER_MESSAGE_THREAD_DELETED:
+-				threadManager.RemoveThread(message-&gt;origin.thread);
+-				break;
+ 			case B_DEBUGGER_MESSAGE_IMAGE_CREATED:
+ 			case B_DEBUGGER_MESSAGE_IMAGE_DELETED:
+ 				break;
+-
+-			case B_DEBUGGER_MESSAGE_TEAM_DELETED:
+-				// the debugged team is gone
+-				quitLoop = true;
+-				break;
+ 		}
+ 
+ 		if (quitLoop)
+@@ -536,7 +648,5 @@
+ 			continue_thread(message-&gt;origin.nub_port, message-&gt;origin.thread);
+ 	}
+ 
+-	destroy_debug_context(&amp;debugContext);
+-
+ 	return 0;
+ }
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011953.html">[Haiku-commits] r27602 - haiku/trunk/src/system/kernel/debug
+</A></li>
+	<LI>Next message: <A HREF="011955.html">[Haiku-commits] r27604 - haiku/trunk/src/system/runtime_loader
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11954">[ date ]</a>
+              <a href="thread.html#11954">[ thread ]</a>
+              <a href="subject.html#11954">[ subject ]</a>
+              <a href="author.html#11954">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

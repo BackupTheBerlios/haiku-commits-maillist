@@ -1,0 +1,852 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25256 -	haiku/trunk/src/add-ons/kernel/network/stack
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25256%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200804291949.m3TJniRP019301%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008319.html">
+   <LINK REL="Next"  HREF="008348.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25256 -	haiku/trunk/src/add-ons/kernel/network/stack</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25256%20-%0A%09haiku/trunk/src/add-ons/kernel/network/stack&In-Reply-To=%3C200804291949.m3TJniRP019301%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25256 -	haiku/trunk/src/add-ons/kernel/network/stack">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Apr 29 21:49:44 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008319.html">[Haiku-commits] r25255 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="008348.html">[Haiku-commits] r25256 - haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8320">[ date ]</a>
+              <a href="thread.html#8320">[ thread ]</a>
+              <a href="subject.html#8320">[ subject ]</a>
+              <a href="author.html#8320">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-04-29 21:49:43 +0200 (Tue, 29 Apr 2008)
+New Revision: 25256
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25256&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25256&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp
+Log:
+* Fixed free_data_header_space(). It would increase the header space
+  although it put the freed space in the free list. Alternating
+  invocations of alloc_...() and free_...() would thus increase the
+  header space unboundedly.
+* Unified the way a data_header and data_node access the header space.
+  Originally data_header::data_space and data_node::header_space had to
+  be kept in sync, which some functions failed to do. Introduced a
+  header_space structure, which is located in data_header and referenced
+  by data_node, so that accessing it either way does always keep both
+  structures in sync.
+* Removed the special handling for the data node created with a buffer.
+  Since remove_{header,trailer}() and trim() could remove it without
+  knowing, the last reference to the first data header would be freed
+  prematurely, causing operations on freed memory, and in the end a
+  second free which screwed the object cache's free list. This crashed
+  Haiku e.g. when running OpenSSH's &quot;forwarding&quot; test. Now the first
+  created node is just a node like any other. It's allocated in the data
+  header, too.
+* Changed the mechanism how data nodes are allocated. Now they will
+  always be allocated on a header associated with the buffer for which
+  they are created. This fixes a race condition when freeing them. They
+  would otherwise modify the free list of a header which might be
+  accessed by another thread at the same time (added a TODO explaining
+  how the old code could possibly be fixed). Also squashed several
+  TODOs related to running out of header space when allocating a node.
+  If the buffer runs out of header space, it will simply allocate a new
+  header, now.
+* Dealt with some TODOs regarding reverting the buffer to its previous
+  state when running out of memory after allocating a few nodes.
+* Added several TODOs.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp	2008-04-29 19:45:13 UTC (rev 25255)
++++ haiku/trunk/src/add-ons/kernel/network/stack/net_buffer.cpp	2008-04-29 19:49:43 UTC (rev 25256)
+@@ -1,12 +1,12 @@
+ /*
+- * Copyright 2006-2007, Haiku, Inc. All Rights Reserved.
++ * Copyright 2006-2008, Haiku, Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+  *		Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de</A>
++ *		Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de</A>
+  */
+ 
+-
+ #include &quot;utility.h&quot;
+ 
+ #include &lt;net_buffer.h&gt;
+@@ -17,12 +17,12 @@
+ #include &lt;ByteOrder.h&gt;
+ #include &lt;debug.h&gt;
+ #include &lt;KernelExport.h&gt;
+-#include &lt;util/AutoLock.h&gt;
+ #include &lt;util/DoublyLinkedList.h&gt;
+ 
+ #include &lt;algorithm&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
++#include &lt;sys/param.h&gt;
+ #include &lt;sys/uio.h&gt;
+ 
+ #include &quot;paranoia_config.h&quot;
+@@ -45,6 +45,11 @@
+ #include &lt;debug_paranoia.h&gt;
+ 
+ 
++struct header_space {
++	uint16	size;
++	uint16	free;
++};
++
+ struct data_node {
+ 	struct list_link link;
+ 	struct data_header *header;
+@@ -52,8 +57,25 @@
+ 	size_t		offset;			// the net_buffer-wide offset of this node
+ 	uint8		*start;			// points to the start of the data
+ 	uint16		used;			// defines how much memory is used by this node
+-	uint16		header_space;
+ 	uint16		tail_space;
++	header_space	own_header_space;
++	header_space	*used_header_space;	// For the &quot;first node&quot; this points to
++										// the header's space otherwise to
++										// own_header_space.
++
++	uint16	HeaderSpace() const	{ return used_header_space-&gt;free; }
++
++	void AddHeaderSpace(uint16 toAdd)
++	{
++		used_header_space-&gt;size += toAdd;
++		used_header_space-&gt;free += toAdd;
++	}
++
++	void SubtractHeaderSpace(uint16 toSubtract)
++	{
++		used_header_space-&gt;size -= toSubtract;
++		used_header_space-&gt;free -= toSubtract;
++	}
+ };
+ 
+ struct free_data {
+@@ -66,8 +88,7 @@
+ 	addr_t		physical_address;
+ 	free_data	*first_free;
+ 	uint8		*data_end;
+-	size_t		data_space;
+-	data_node	*first_node;
++	header_space	space;
+ };
+ 
+ #define MAX_ANCILLARY_DATA_SIZE	128
+@@ -89,11 +110,10 @@
+ 
+ typedef DoublyLinkedList&lt;ancillary_data&gt; ancillary_data_list;
+ 
+-#define MAX_FREE_BUFFER_SIZE (BUFFER_SIZE - sizeof(data_header))
+-
+ struct net_buffer_private : net_buffer {
+ 	struct list			buffers;
+-	data_node			first_node;
++	data_header			*allocation_header;	// the current place where we
++											// allocate header space (nodes,...)
+ 	ancillary_data_list	ancillary_data;
+ 
+ 	struct {
+@@ -103,6 +123,11 @@
+ };
+ 
+ 
++#define DATA_HEADER_SIZE				_ALIGN(sizeof(data_header))
++#define DATA_NODE_SIZE					_ALIGN(sizeof(data_node))
++#define MAX_FREE_BUFFER_SIZE			(BUFFER_SIZE - DATA_HEADER_SIZE)
++
++
+ static object_cache *sNetBufferCache;
+ static object_cache *sDataNodeCache;
+ 
+@@ -111,7 +136,12 @@
+ static status_t trim_data(net_buffer *_buffer, size_t newSize);
+ static status_t remove_header(net_buffer *_buffer, size_t bytes);
+ static status_t remove_trailer(net_buffer *_buffer, size_t bytes);
++static status_t append_cloned_data(net_buffer *_buffer, net_buffer *_source,
++					uint32 offset, size_t bytes);
++static status_t read_data(net_buffer *_buffer, size_t offset, void *data,
++					size_t size);
+ 
++
+ #if ENABLE_DEBUGGER_COMMANDS
+ static vint32 sAllocatedDataHeaderCount = 0;
+ static vint32 sAllocatedNetBufferCount = 0;
+@@ -132,10 +162,24 @@
+ 			:
+ 			fBuffer(buffer)
+ 		{
++#if NET_BUFFER_TRACING_STACK_TRACE
++		fStackTrace = capture_tracing_stack_trace(
++			NET_BUFFER_TRACING_STACK_TRACE, 0, false);
++#endif
+ 		}
+ 
++#if NET_BUFFER_TRACING_STACK_TRACE
++		virtual void DumpStackTrace(TraceOutput&amp; out)
++		{
++			out.PrintStackTrace(fStackTrace);
++		}
++#endif
++
+ 	protected:
+ 		net_buffer*	fBuffer;
++#if NET_BUFFER_TRACING_STACK_TRACE
++		tracing_stack_trace* fStackTrace;
++#endif
+ };
+ 
+ 
+@@ -523,7 +567,7 @@
+ 	data_node *node = NULL;
+ 	while ((node = (data_node *)list_get_next_item(&amp;buffer-&gt;buffers, node)) != NULL) {
+ 		dprintf(&quot;  node %p, offset %lu, used %u, header %u, tail %u, header %p\n&quot;,
+-			node, node-&gt;offset, node-&gt;used, node-&gt;header_space, node-&gt;tail_space, node-&gt;header);
++			node, node-&gt;offset, node-&gt;used, node-&gt;HeaderSpace(), node-&gt;tail_space, node-&gt;header);
+ 		//dump_block((char *)node-&gt;start, node-&gt;used, &quot;    &quot;);
+ 		dump_block((char *)node-&gt;start, min_c(node-&gt;used, 32), &quot;    &quot;);
+ 	}
+@@ -558,6 +602,11 @@
+ 
+ 	data_node *node = (data_node *)list_get_first_item(&amp;buffer-&gt;buffers);
+ 	while (node != NULL) {
++		if (node-&gt;offset != size) {
++			panic(&quot;net_buffer %p: bad node %p offset (%lu vs. %lu)&quot;,
++				buffer, node, node-&gt;offset, size);
++			return;
++		}
+ 		size += node-&gt;used;
+ 		node = (data_node *)list_get_next_item(&amp;buffer-&gt;buffers, node);
+ 	}
+@@ -565,9 +614,58 @@
+ 	if (size != buffer-&gt;size) {
+ 		panic(&quot;net_buffer %p size != sum of its data node sizes (%lu vs. %lu)&quot;,
+ 			buffer, buffer-&gt;size, size);
++		return;
+ 	}
+ }
+ 
++
++#if 0
++static void
++check_buffer_contents(net_buffer *buffer, size_t offset, const void* data,
++	size_t size)
++{
++	void* bufferData = malloc(size);
++	if (bufferData == NULL)
++		return;
++
++	if (read_data(buffer, offset, bufferData, size) == B_OK) {
++		if (memcmp(bufferData, data, size) != 0) {
++			int32 index = 0;
++			while (((uint8*)data)[index] == ((uint8*)bufferData)[index])
++				index++;
++			panic(&quot;check_buffer_contents(): contents check failed at index &quot;
++				&quot;%ld, buffer: %p, offset: %lu, size: %lu&quot;, index, buffer,
++				offset, size);
++		}
++	} else {
++		panic(&quot;failed to read from buffer %p, offset: %lu, size: %lu&quot;,
++			buffer, offset, size);
++	}
++
++	free(bufferData);
++}
++
++
++static void
++check_buffer_contents(net_buffer *buffer, size_t offset, net_buffer *source,
++	size_t sourceOffset, size_t size)
++{
++	void* bufferData = malloc(size);
++	if (bufferData == NULL)
++		return;
++
++	if (read_data(source, sourceOffset, bufferData, size) == B_OK) {
++		check_buffer_contents(buffer, offset, bufferData, size);
++	} else {
++		panic(&quot;failed to read from source buffer %p, offset: %lu, size: %lu&quot;,
++			source, sourceOffset, size);
++	}
++
++	free(bufferData);
++}
++#endif
++
++
+ # 	define CHECK_BUFFER(buffer)	check_buffer(buffer)
+ #else
+ # 	define CHECK_BUFFER(buffer)	do {} while (false)
+@@ -629,10 +727,10 @@
+ 	header-&gt;ref_count = 1;
+ 	header-&gt;physical_address = 0;
+ 		// TODO: initialize this correctly
+-	header-&gt;data_space = headerSpace;
+-	header-&gt;data_end = (uint8 *)header + sizeof(struct data_header);
++	header-&gt;space.size = headerSpace;
++	header-&gt;space.free = headerSpace;
++	header-&gt;data_end = (uint8 *)header + DATA_HEADER_SIZE;
+ 	header-&gt;first_free = NULL;
+-	header-&gt;first_node = NULL;
+ 
+ 	TRACE((&quot;%ld:   create new data header %p\n&quot;, find_thread(NULL), header));
+ 	T2(CreateDataHeader(header));
+@@ -673,8 +771,6 @@
+ 	freeData-&gt;size = size;
+ 
+ 	header-&gt;first_free = freeData;
+-	header-&gt;data_space += size;
+-	// TODO: the first node's header space could grow again
+ }
+ 
+ 
+@@ -686,15 +782,21 @@
+ {
+ 	if (size &lt; sizeof(free_data))
+ 		size = sizeof(free_data);
++	size = _ALIGN(size);
+ 
+ 	if (header-&gt;first_free != NULL &amp;&amp; header-&gt;first_free-&gt;size &gt;= size) {
+ 		// the first entry of the header space matches the allocation's needs
++// TODO: If the free space is greater than what shall be allocated, we leak
++// the remainder of the space. We should only allocate multiples of
++// _ALIGN(sizeof(free_data)) and split free space in this case. It's not that
++// pressing, since the only thing allocated ATM are data_nodes, and thus the
++// free space entries will always have the right size.
+ 		uint8 *data = (uint8 *)header-&gt;first_free;
+ 		header-&gt;first_free = header-&gt;first_free-&gt;next;
+ 		return data;
+ 	}
+ 
+-	if (header-&gt;data_space &lt; size) {
++	if (header-&gt;space.free &lt; size) {
+ 		// there is no free space left, search free list
+ 		free_data *freeData = header-&gt;first_free;
+ 		free_data *last = NULL;
+@@ -716,42 +818,73 @@
+ 
+ 	uint8 *data = header-&gt;data_end;
+ 	header-&gt;data_end += size;
+-	header-&gt;data_space -= size;
++	header-&gt;space.free -= size;
+ 
+-	if (header-&gt;first_node != NULL)
+-		header-&gt;first_node-&gt;header_space -= size;
+-
+ 	return data;
+ }
+ 
+ 
+-/*!
+-	Initializes the first data_node of a data_header.
+-	The node must have been assigned to the header already.
+-*/
+-static void
+-init_first_data_node(data_node *node)
++static uint8 *
++alloc_data_header_space(net_buffer_private *buffer, size_t size,
++	data_header **_header = NULL)
+ {
+-	data_header *header = node-&gt;header;
++	// try to allocate in our current allocation header
++	uint8 *allocated = alloc_data_header_space(buffer-&gt;allocation_header, size);
++	if (allocated == NULL) {
++		// not enough header space left -- create a fresh buffer for headers
++		data_header *header = create_data_header(MAX_FREE_BUFFER_SIZE);
++		if (header == NULL)
++			return NULL;
+ 
++		// release our reference to the old header -- it will will stay around
++		// until the last reference to it is released
++		release_data_header(buffer-&gt;allocation_header);
++		buffer-&gt;allocation_header = header;
++			// We keep the initial reference.
++
++		// now the allocation can only fail, if size is too big
++		allocated = alloc_data_header_space(buffer-&gt;allocation_header, size);
++	}
++
++	if (_header != NULL)
++		*_header = buffer-&gt;allocation_header;
++
++	return allocated;
++}
++
++
++static data_node *
++add_first_data_node(data_header *header)
++{
++	data_node *node = (data_node *)alloc_data_header_space(header,
++		sizeof(data_node));
++	if (node == NULL)
++		return NULL;
++
++	TRACE((&quot;%ld:   add first data node %p to header %p\n&quot;, find_thread(NULL),
++		node, header));
++
++	acquire_data_header(header);
++
++	memset(node, 0, sizeof(struct data_node));
++	node-&gt;located = header;
++	node-&gt;header = header;
+ 	node-&gt;offset = 0;
+-	node-&gt;start = header-&gt;data_end + header-&gt;data_space;
++	node-&gt;start = header-&gt;data_end + header-&gt;space.free;
+ 	node-&gt;used = 0;
+-	node-&gt;header_space = header-&gt;data_space;
++	node-&gt;used_header_space = &amp;header-&gt;space;
+ 	node-&gt;tail_space = (uint8 *)header + BUFFER_SIZE - node-&gt;start;
+ 
+-	header-&gt;first_node = node;
++	return node;
+ }
+ 
+ 
+ static data_node *
+-add_data_node(data_header *header, data_header *located = NULL)
++add_data_node(net_buffer_private *buffer, data_header *header)
+ {
+-	if (located == NULL)
+-		located = header;
+-
+-	data_node *node = (data_node *)alloc_data_header_space(located,
+-		sizeof(data_node));
++	data_header *located;
++	data_node *node = (data_node *)alloc_data_header_space(buffer,
++		sizeof(data_node), &amp;located);
+ 	if (node == NULL)
+ 		return NULL;
+ 
+@@ -765,6 +898,7 @@
+ 	memset(node, 0, sizeof(struct data_node));
+ 	node-&gt;located = located;
+ 	node-&gt;header = header;
++	node-&gt;used_header_space = &amp;node-&gt;own_header_space;
+ 	return node;
+ }
+ 
+@@ -777,6 +911,11 @@
+ 	TRACE((&quot;%ld:   remove data node %p from header %p (located %p)\n&quot;,
+ 		find_thread(NULL), node, node-&gt;header, located));
+ 
++	// Move all used and tail space to the header space, which is useful in case
++	// this is the first node of a buffer (i.e. the header is an allocation
++	// header).
++	node-&gt;used_header_space-&gt;size += node-&gt;used + node-&gt;tail_space;
++
+ 	if (located != node-&gt;header)
+ 		release_data_header(node-&gt;header);
+ 
+@@ -784,10 +923,6 @@
+ 		return;
+ 
+ 	free_data_header_space(located, (uint8 *)node, sizeof(data_node));
+-	if (located-&gt;first_node == node) {
+-		located-&gt;first_node = NULL;
+-		located-&gt;data_space = 0;
+-	}
+ 
+ 	release_data_header(located);
+ }
+@@ -836,18 +971,24 @@
+ 
+ 	TRACE((&quot;%ld: create buffer %p\n&quot;, find_thread(NULL), buffer));
+ 
++	// Make sure headerSpace is valid and at least the initial node fits.
++	headerSpace = _ALIGN(headerSpace);
++	if (headerSpace &lt; DATA_NODE_SIZE)
++		headerSpace = DATA_NODE_SIZE;
++	else if (headerSpace &gt; MAX_FREE_BUFFER_SIZE)
++		headerSpace = MAX_FREE_BUFFER_SIZE;
++
+ 	data_header *header = create_data_header(headerSpace);
+ 	if (header == NULL) {
+ 		free_net_buffer(buffer);
+ 		return NULL;
+ 	}
++	buffer-&gt;allocation_header = header;
+ 
+-	buffer-&gt;first_node.header = header;
+-	buffer-&gt;first_node.located = NULL;
+-	init_first_data_node(&amp;buffer-&gt;first_node);
++	data_node *node = add_first_data_node(header);
+ 
+ 	list_init(&amp;buffer-&gt;buffers);
+-	list_add_item(&amp;buffer-&gt;buffers, &amp;buffer-&gt;first_node);
++	list_add_item(&amp;buffer-&gt;buffers, node);
+ 
+ 	new(&amp;buffer-&gt;ancillary_data) ancillary_data_list;
+ 
+@@ -897,6 +1038,8 @@
+ 		free(data);
+ 	}
+ 
++	release_data_header(buffer-&gt;allocation_header);
++
+ 	free_net_buffer(buffer);
+ }
+ 
+@@ -913,7 +1056,10 @@
+ 
+ 	TRACE((&quot;%ld: duplicate_buffer(buffer %p)\n&quot;, find_thread(NULL), buffer));
+ 
+-	net_buffer *duplicate = create_buffer(buffer-&gt;first_node.header_space);
++	// TODO: We might want to choose a better header space. The minimal
++	// one doesn't allow to prepend any data without allocating a new header.
++	// The same holds for appending cloned data.
++	net_buffer *duplicate = create_buffer(DATA_NODE_SIZE);
+ 	if (duplicate == NULL)
+ 		return NULL;
+ 
+@@ -922,7 +1068,7 @@
+ 	// copy the data from the source buffer
+ 
+ 	data_node *node = (data_node *)list_get_first_item(&amp;buffer-&gt;buffers);
+-	while (true) {
++	while (node != NULL) {
+ 		if (append_data(duplicate, node-&gt;start, node-&gt;used) &lt; B_OK) {
+ 			free_buffer(duplicate);
+ 			CHECK_BUFFER(buffer);
+@@ -930,8 +1076,6 @@
+ 		}
+ 
+ 		node = (data_node *)list_get_next_item(&amp;buffer-&gt;buffers, node);
+-		if (node == NULL)
+-			break;
+ 	}
+ 
+ 	copy_metadata(duplicate, buffer);
+@@ -957,8 +1101,27 @@
+ static net_buffer *
+ clone_buffer(net_buffer *_buffer, bool shareFreeSpace)
+ {
++// TODO: See, if the commented out code can be fixed in a safe way. We could
++// probably place cloned nodes on a header not belonging to our buffer, if
++// we don't free the header space for the node when removing it. Otherwise we
++// mess with the header's free list which might at the same time be accessed
++// by another thread.
+ 	net_buffer_private *buffer = (net_buffer_private *)_buffer;
+ 
++	net_buffer *clone = create_buffer(MAX_FREE_BUFFER_SIZE);
++	if (clone == NULL)
++		return NULL;
++
++	if (append_cloned_data(clone, buffer, 0, buffer-&gt;size) != B_OK) {
++		free_buffer(clone);
++		return NULL;
++	}
++
++	copy_metadata(clone, buffer);
++
++	return clone;
++
++#if 0
+ 	ParanoiaChecker _(buffer);
+ 
+ 	TRACE((&quot;%ld: clone_buffer(buffer %p)\n&quot;, find_thread(NULL), buffer));
+@@ -986,6 +1149,7 @@
+ 	data_node *node = &amp;clone-&gt;first_node;
+ 	node-&gt;header = sourceNode-&gt;header;
+ 	node-&gt;located = NULL;
++	node-&gt;used_header_space = &amp;node-&gt;own_header_space;
+ 
+ 	while (sourceNode != NULL) {
+ 		node-&gt;start = sourceNode-&gt;start;
+@@ -995,11 +1159,12 @@
+ 		if (shareFreeSpace) {
+ 			// both buffers could claim the free space - note that this option
+ 			// has to be used carefully
+-			node-&gt;header_space = sourceNode-&gt;header_space;
++			node-&gt;used_header_space = &amp;sourceNode-&gt;header-&gt;space;
+ 			node-&gt;tail_space = sourceNode-&gt;tail_space;
+ 		} else {
+ 			// the free space stays with the original buffer
+-			node-&gt;header_space = 0;
++			node-&gt;used_header_space-&gt;size = 0;
++			node-&gt;used_header_space-&gt;free = 0;
+ 			node-&gt;tail_space = 0;
+ 		}
+ 
+@@ -1031,6 +1196,7 @@
+ 	T(Clone(buffer, shareFreeSpace, clone));
+ 
+ 	return clone;
++#endif
+ }
+ 
+ 
+@@ -1042,6 +1208,11 @@
+ static net_buffer *
+ split_buffer(net_buffer *from, uint32 offset)
+ {
++	// TODO: Copying the whole buffer becomes less and less efficient with
++	// greater size - offset differences. What we actually want is a method
++	// to copy data from one buffer to another. Then the following should be:
++	// create buffer, resize, copy data. An additional append_data_from_buffer()
++	// method would be even better.
+ 	net_buffer *buffer = duplicate_buffer(from);
+ 	if (buffer == NULL)
+ 		return NULL;
+@@ -1097,6 +1268,9 @@
+ 
+ 	data_node *before = NULL;
+ 
++// TODO: Do allocating nodes (the only part that can fail) upfront. Put them
++// in a list, so we can easily clean up, if necessary.
++
+ 	if (!after) {
+ 		// change offset of all nodes already in the buffer
+ 		data_node *node = NULL;
+@@ -1125,14 +1299,10 @@
+ 			list_remove_item(&amp;with-&gt;buffers, node);
+ 		} else {
+ 			// we need a new place for this node
+-			data_node *newNode = add_data_node(node-&gt;header);
+-			if (newNode == NULL) {
+-				// try again on the buffers own header
+-				newNode = add_data_node(node-&gt;header, buffer-&gt;first_node.header);
+-				if (newNode == NULL)
++			data_node *newNode = add_data_node(buffer, node-&gt;header);
++			if (newNode == NULL)
+ // TODO: try to revert buffers to their initial state!!
+-					return ENOBUFS;
+-			}
++				return ENOBUFS;
+ 
+ 			last = node;
+ 			*newNode = *node;
+@@ -1264,26 +1434,26 @@
+ 	ParanoiaChecker _(buffer);
+ 
+ 	TRACE((&quot;%ld: prepend_size(buffer %p, size %ld) [has %u]\n&quot;,
+-		find_thread(NULL), buffer, size, node-&gt;header_space));
++		find_thread(NULL), buffer, size, node-&gt;used_header_space.free));
+ 	//dump_buffer(buffer);
+ 
+-	if (node-&gt;header_space &lt; size) {
++	if (node-&gt;HeaderSpace() &lt; size) {
+ 		// we need to prepend new buffers
+ 
+ 		size_t bytesLeft = size;
++		size_t sizePrepended = 0;
+ 		do {
+-			if (node-&gt;header_space == 0) {
++			if (node-&gt;HeaderSpace() == 0) {
+ 				size_t headerSpace = MAX_FREE_BUFFER_SIZE;
+ 				data_header *header = create_data_header(headerSpace);
+ 				if (header == NULL) {
+-					// TODO: free up headers we already allocated!
++					remove_header(buffer, sizePrepended);
+ 					return B_NO_MEMORY;
+ 				}
+ 
+ 				data_node *previous = node;
+ 
+-				node = (data_node *)add_data_node(header);
+-				init_first_data_node(node);
++				node = (data_node *)add_first_data_node(header);
+ 
+ 				list_insert_item_before(&amp;buffer-&gt;buffers, previous, node);
+ 
+@@ -1292,12 +1462,13 @@
+ 				release_data_header(header);
+ 			}
+ 
+-			size_t willConsume = min_c(bytesLeft, node-&gt;header_space);
++			size_t willConsume = min_c(bytesLeft, node-&gt;HeaderSpace());
+ 
+-			node-&gt;header_space -= willConsume;
++			node-&gt;SubtractHeaderSpace(willConsume);
+ 			node-&gt;start -= willConsume;
+ 			node-&gt;used += willConsume;
+ 			bytesLeft -= willConsume;
++			sizePrepended += willConsume;
+ 		} while (bytesLeft &gt; 0);
+ 
+ 		// correct data offset in all nodes
+@@ -1314,7 +1485,7 @@
+ 			*_contiguousBuffer = NULL;
+ 	} else {
+ 		// the data fits into this buffer
+-		node-&gt;header_space -= size;
++		node-&gt;SubtractHeaderSpace(size);
+ 		node-&gt;start -= size;
+ 		node-&gt;used += size;
+ 
+@@ -1329,12 +1500,12 @@
+ 
+ 	buffer-&gt;size += size;
+ 
++	SET_PARANOIA_CHECK(PARANOIA_SUSPICIOUS, buffer, &amp;buffer-&gt;size,
++		sizeof(buffer-&gt;size));
++
+ 	//dprintf(&quot; prepend_size result:\n&quot;);
+ 	//dump_buffer(buffer);
+ 	CHECK_BUFFER(buffer);
+-	SET_PARANOIA_CHECK(PARANOIA_SUSPICIOUS, buffer, &amp;buffer-&gt;size,
+-		sizeof(buffer-&gt;size));
+-
+ 	return B_OK;
+ }
+ 
+@@ -1374,45 +1545,35 @@
+ 	//dump_buffer(buffer);
+ 
+ 	if (node-&gt;tail_space &lt; size) {
+-		// we need to append a new buffer
+-
+-		// compute how many buffers we're going to need
+-		// TODO: this doesn't leave any tail space, if that should be desired...
++		// we need to append at least one new buffer
+ 		uint32 previousTailSpace = node-&gt;tail_space;
+-		uint32 minimalHeaderSpace = sizeof(data_header) + 3 * sizeof(data_node);
+-		uint32 sizeNeeded = size - previousTailSpace;
+-		uint32 count = (sizeNeeded + BUFFER_SIZE - minimalHeaderSpace - 1)
+-			/ (BUFFER_SIZE - minimalHeaderSpace);
+-		uint32 headerSpace = BUFFER_SIZE - sizeNeeded / count - sizeof(data_header);
++		uint32 headerSpace = DATA_NODE_SIZE;
+ 		uint32 sizeUsed = MAX_FREE_BUFFER_SIZE - headerSpace;
+-		uint32 sizeAdded = previousTailSpace;
+ 
+ 		// allocate space left in the node
+ 		node-&gt;tail_space = 0;
+ 		node-&gt;used += previousTailSpace;
+ 		buffer-&gt;size += previousTailSpace;
++		uint32 sizeAdded = previousTailSpace;
+ 		SET_PARANOIA_CHECK(PARANOIA_SUSPICIOUS, buffer, &amp;buffer-&gt;size,
+ 			sizeof(buffer-&gt;size));
+ 
+ 		// allocate all buffers
+ 
+-		for (uint32 i = 0; i &lt; count; i++) {
+-			if (i == count - 1) {
+-				// last data_header - compensate rounding errors
++		while (sizeAdded &lt; size) {
++			if (sizeAdded + sizeUsed &gt; size) {
++				// last data_header and not all available space is used
+ 				sizeUsed = size - sizeAdded;
+-				headerSpace = MAX_FREE_BUFFER_SIZE - sizeUsed;
+ 			}
+ 
+ 			data_header *header = create_data_header(headerSpace);
+ 			if (header == NULL) {
+-				// TODO: free up headers we already allocated!
++				remove_trailer(buffer, sizeAdded);
+ 				return B_NO_MEMORY;
+ 			}
+ 
+-			node = (data_node *)add_data_node(header);
+-				// this can't fail as we made sure there will be enough header space
++			node = add_first_data_node(header);
+ 
+-			init_first_data_node(node);
+ 			node-&gt;tail_space -= sizeUsed;
+ 			node-&gt;used = sizeUsed;
+ 			node-&gt;offset = buffer-&gt;size;
+@@ -1524,7 +1685,7 @@
+ 		size_t cut = min_c(node-&gt;used, left);
+ 		node-&gt;offset = 0;
+ 		node-&gt;start += cut;
+-		node-&gt;header_space += cut;
++		node-&gt;AddHeaderSpace(cut);
+ 		node-&gt;used -= cut;
+ 
+ 		node = (data_node *)list_get_next_item(&amp;buffer-&gt;buffers, node);
+@@ -1615,7 +1776,7 @@
+ 	Appends data coming from buffer \a source to the buffer \a buffer. It only
+ 	clones the data, though, that is the data is not copied, just referenced.
+ */
+-status_t
++static status_t
+ append_cloned_data(net_buffer *_buffer, net_buffer *_source, uint32 offset,
+ 	size_t bytes)
+ {
+@@ -1641,17 +1802,12 @@
+ 		return B_BAD_VALUE;
+ 	}
+ 
++	size_t sizeAppended = 0;
++
+ 	while (node != NULL &amp;&amp; bytes &gt; 0) {
+-		data_node *clone = add_data_node(node-&gt;header, buffer-&gt;first_node.header);
+-		if (clone == NULL)
+-			clone = add_data_node(node-&gt;header);
++		data_node *clone = add_data_node(buffer, node-&gt;header);
+ 		if (clone == NULL) {
+-			// There is not enough space in the buffer for another node
+-			// TODO: handle this case!
+-			dump_buffer(buffer);
+-			dprintf(&quot;SOURCE:\n&quot;);
+-			dump_buffer(source);
+-			panic(&quot;appending clone buffer in new header not implemented\n&quot;);
++			remove_trailer(buffer, sizeAppended);
+ 			return ENOBUFS;
+ 		}
+ 
+@@ -1661,7 +1817,8 @@
+ 		clone-&gt;offset = buffer-&gt;size;
+ 		clone-&gt;start = node-&gt;start + offset;
+ 		clone-&gt;used = min_c(bytes, node-&gt;used - offset);
+-		clone-&gt;header_space = 0;
++		clone-&gt;used_header_space-&gt;size = 0;
++		clone-&gt;used_header_space-&gt;free = 0;
+ 		clone-&gt;tail_space = 0;
+ 
+ 		list_add_item(&amp;buffer-&gt;buffers, clone);
+@@ -1669,6 +1826,7 @@
+ 		offset = 0;
+ 		bytes -= clone-&gt;used;
+ 		buffer-&gt;size += clone-&gt;used;
++		sizeAppended += clone-&gt;used;
+ 		node = (data_node *)list_get_next_item(&amp;source-&gt;buffers, node);
+ 	}
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008319.html">[Haiku-commits] r25255 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="008348.html">[Haiku-commits] r25256 - haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8320">[ date ]</a>
+              <a href="thread.html#8320">[ thread ]</a>
+              <a href="subject.html#8320">[ subject ]</a>
+              <a href="author.html#8320">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

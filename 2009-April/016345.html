@@ -1,0 +1,201 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r30515 - in haiku/trunk/src/system/kernel: cache vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30515%20-%20in%20haiku/trunk/src/system/kernel%3A%20cache%20vm&In-Reply-To=%3C200904301553.n3UFrgbA010196%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="016344.html">
+   <LINK REL="Next"  HREF="016346.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r30515 - in haiku/trunk/src/system/kernel: cache vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r30515%20-%20in%20haiku/trunk/src/system/kernel%3A%20cache%20vm&In-Reply-To=%3C200904301553.n3UFrgbA010196%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r30515 - in haiku/trunk/src/system/kernel: cache vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Apr 30 17:53:42 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="016344.html">[Haiku-commits] r30514 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="016346.html">[Haiku-commits] r30516 - in haiku/trunk/src/kits/interface: .	textview_support
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16345">[ date ]</a>
+              <a href="thread.html#16345">[ thread ]</a>
+              <a href="subject.html#16345">[ subject ]</a>
+              <a href="author.html#16345">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-04-30 17:53:41 +0200 (Thu, 30 Apr 2009)
+New Revision: 30515
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=30515&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=30515&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+Fixed several problems of the prefetching code:
+* Did claim to have reserved pages when calling vm_page_allocate_page(), but
+  didn't have any (copy&amp;paste bug). We cannot use it without reserved pages,
+  as we need to call vm_page_allocate_page() with a cache locked.
+* No longer use low_resource_state() to determine whether to precache or not,
+  but use the new vm_page_num_used_pages() instead.
+* Also don't (try to) precache when the cache already has more than 2/3 of its
+  pages to safe some unnecessary work.
+* The size to precache was limited to the file size incorrectly.
+* When precaching failed, the cache reference was not released.
+* The precaching started one page too late, causing bug #3835.
+* Reenabled precaching.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2009-04-30 15:46:55 UTC (rev 30514)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2009-04-30 15:53:41 UTC (rev 30515)
+@@ -164,17 +164,16 @@
+ 	uint32 vecCount = 0;
+ 	uint32 i = 0;
+ 	for (size_t pos = 0; pos &lt; fSize; pos += B_PAGE_SIZE) {
+-		vm_page* page = fPages[i++] = vm_page_allocate_page(
+-			PAGE_STATE_FREE, true);
++		vm_page* page = vm_page_allocate_page(PAGE_STATE_FREE, true);
+ 		if (page == NULL)
+ 			break;
+ 
+-		fBusyConditions[i - 1].Publish(page, &quot;page&quot;);
+-
++		fBusyConditions[i].Publish(page, &quot;page&quot;);
+ 		fCache-&gt;InsertPage(page, fOffset + pos);
+ 
+ 		add_to_iovec(fVecs, vecCount, fPageCount,
+ 			page-&gt;physical_page_number * B_PAGE_SIZE, B_PAGE_SIZE);
++		fPages[i++] = page;
+ 	}
+ 
+ 	if (i != fPageCount) {
+@@ -903,10 +902,8 @@
+ extern &quot;C&quot; void
+ cache_prefetch_vnode(struct vnode *vnode, off_t offset, size_t size)
+ {
+-	if (low_resource_state(B_KERNEL_RESOURCE_PAGES) != B_NO_LOW_RESOURCE) {
+-		// don't do anything if we don't have the resources left
++	if (size == 0)
+ 		return;
+-	}
+ 
+ 	vm_cache *cache;
+ 	if (vfs_get_vnode_cache(vnode, &amp;cache, false) != B_OK)
+@@ -915,12 +912,17 @@
+ 	file_cache_ref *ref = ((VMVnodeCache*)cache)-&gt;FileCacheRef();
+ 	off_t fileSize = cache-&gt;virtual_end;
+ 
+-	if (offset &gt;= fileSize) {
++	if (offset + size &gt; fileSize)
++		size = fileSize - offset;
++	size_t reservePages = size / B_PAGE_SIZE;
++
++	// Don't do anything if we don't have the resources left, or the cache
++	// already contains more than 2/3 of its pages
++	if (offset &gt;= fileSize || vm_page_num_unused_pages() &lt; 2 * reservePages
++		|| 3 * cache-&gt;page_count &gt; 2 * fileSize / B_PAGE_SIZE) {
+ 		cache-&gt;ReleaseRef();
+ 		return;
+ 	}
+-	if (offset + size &gt; fileSize)
+-		size = offset - fileSize;
+ 
+ 	// &quot;offset&quot; and &quot;size&quot; are always aligned to B_PAGE_SIZE,
+ 	offset &amp;= ~(B_PAGE_SIZE - 1);
+@@ -929,8 +931,10 @@
+ 	size_t bytesToRead = 0;
+ 	off_t lastOffset = offset;
+ 
+-	AutoLocker&lt;VMCache&gt; locker(cache);
++	vm_page_reserve_pages(reservePages);
+ 
++	cache-&gt;Lock();
++
+ 	while (true) {
+ 		// check if this page is already in memory
+ 		if (size &gt; 0) {
+@@ -950,7 +954,7 @@
+ 				= new(std::nothrow) PrecacheIO(ref, lastOffset, bytesToRead);
+ 			if (io == NULL || io-&gt;Init() != B_OK || io-&gt;Start() != B_OK) {
+ 				delete io;
+-				return;
++				break;
+ 			}
+ 
+ 			bytesToRead = 0;
+@@ -961,10 +965,11 @@
+ 			break;
+ 		}
+ 
+-		lastOffset = offset + B_PAGE_SIZE;
++		lastOffset = offset;
+ 	}
+ 
+-	cache-&gt;ReleaseRefLocked();
++	cache-&gt;ReleaseRefAndUnlock();
++	vm_page_unreserve_pages(reservePages);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2009-04-30 15:46:55 UTC (rev 30514)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2009-04-30 15:53:41 UTC (rev 30515)
+@@ -2362,16 +2362,12 @@
+ 
+ 	cache-&gt;Unlock();
+ 
+-#if 0
+-// TODO: Fix ticket #3835 before enabling pre-fetching
+-// <A HREF="http://dev.haiku-os.org/ticket/3835">http://dev.haiku-os.org/ticket/3835</A>
+ 	if (status == B_OK) {
+ 		// TODO: this probably deserves a smarter solution, ie. don't always
+-		// prefetch stuff
++		// prefetch stuff, and also, probably don't trigger it at this place.
+ 		cache_prefetch_vnode(vnode, offset, min_c(size, 10LL * 1024 * 1024));
+ 			// prefetches at max 10 MB starting from &quot;offset&quot;
+ 	}
+-#endif
+ 
+ 	if (status != B_OK)
+ 		return status;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="016344.html">[Haiku-commits] r30514 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="016346.html">[Haiku-commits] r30516 - in haiku/trunk/src/kits/interface: .	textview_support
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16345">[ date ]</a>
+              <a href="thread.html#16345">[ thread ]</a>
+              <a href="subject.html#16345">[ subject ]</a>
+              <a href="author.html#16345">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

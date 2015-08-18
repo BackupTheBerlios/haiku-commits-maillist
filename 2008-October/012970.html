@@ -1,0 +1,721 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28301 - haiku/trunk/src/servers/app/drawing
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28301%20-%20haiku/trunk/src/servers/app/drawing&In-Reply-To=%3C200810231715.m9NHFrHr014191%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012969.html">
+   <LINK REL="Next"  HREF="012972.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28301 - haiku/trunk/src/servers/app/drawing</H1>
+    <B>stippi at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28301%20-%20haiku/trunk/src/servers/app/drawing&In-Reply-To=%3C200810231715.m9NHFrHr014191%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28301 - haiku/trunk/src/servers/app/drawing">stippi at mail.berlios.de
+       </A><BR>
+    <I>Thu Oct 23 19:15:53 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012969.html">[Haiku-commits] r28300 - haiku/trunk/src/servers/app/drawing
+</A></li>
+        <LI>Next message: <A HREF="012972.html">[Haiku-commits] r28301 - haiku/trunk/src/servers/app/drawing
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12970">[ date ]</a>
+              <a href="thread.html#12970">[ thread ]</a>
+              <a href="subject.html#12970">[ subject ]</a>
+              <a href="author.html#12970">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: stippi
+Date: 2008-10-23 19:15:39 +0200 (Thu, 23 Oct 2008)
+New Revision: 28301
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28301&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28301&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/drawing/AccelerantHWInterface.cpp
+   haiku/trunk/src/servers/app/drawing/AccelerantHWInterface.h
+   haiku/trunk/src/servers/app/drawing/BitmapHWInterface.cpp
+   haiku/trunk/src/servers/app/drawing/HWInterface.cpp
+   haiku/trunk/src/servers/app/drawing/HWInterface.h
+   haiku/trunk/src/servers/app/drawing/UpdateQueue.cpp
+   haiku/trunk/src/servers/app/drawing/UpdateQueue.h
+   haiku/trunk/src/servers/app/drawing/ViewHWInterface.cpp
+   haiku/trunk/src/servers/app/drawing/ViewHWInterface.h
+Log:
+* Rewrote the UpdateQueue class. It actually works now and would perform screen
+  updates during the vertical refresh, but it causes flickering again since
+  there is no guarantee that screen regions will stay clean from the time that
+  they were scheduled with the UpdateQueue until the UpdateQueue thread
+  transfers them. Therefor it is still disabled.
+* Refactored a bit the distinction between Invalidate() and CopyToFront().
+  Invalidate() used to be virtual, but now CopyToFront() is. This was mainly
+  needed for the app_server test environment, because the host window needs
+  to call Invalidate() when the front buffer bitmap is clean. When the
+  UpdateQueue is used, this needs to be CopyToFront(). Now the separation is
+  cleaner in combination with the UpdateQueue.
+* Fixed a problem in HWInterface::CopyToFront(): When separating the region
+  outside the cursor and the region with the cursor during a transfer, it
+  needs to hold the fFloatingOverlay lock to make sure the cursor is not
+  moved in the meantime. This fixes graphics glitches with remnants of the
+  cursor staying on screen. These could very rarely be observed, but much more
+  often with the accelerated double-buffer mode.
+* Enabled the accelerated double buffered mode, since it works now very well.
+  I was able to test it with the nVidea driver on an nVideo 7300. It works by
+  allocating a frame buffer twice the height of the configured screen mode.
+  Then all drawing goes into the offscreen portion, including accelerated
+  driver functions. AccelerantHWInterface::_CopyToFront() then uses acceleration
+  to blit the clean regions in the offscreen portion of the frame buffer into
+  the visible part. Please tell me if there are problems, for example when
+  if there is too few video memory, or if a driver does not handle it correctly.
+  To disable it, see src/servers/app/drawing/AccelerantHWInterface.cpp line 511.
+
+
+Modified: haiku/trunk/src/servers/app/drawing/AccelerantHWInterface.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/AccelerantHWInterface.cpp	2008-10-23 17:02:46 UTC (rev 28300)
++++ haiku/trunk/src/servers/app/drawing/AccelerantHWInterface.cpp	2008-10-23 17:15:39 UTC (rev 28301)
+@@ -508,7 +508,7 @@
+ 
+ 	bool tryOffscreenBackBuffer = false;
+ 	fOffscreenBackBuffer = false;
+-#if 0
++#if 1
+ 	if (fVGADevice &lt; 0 &amp;&amp; (color_space)newMode.space == B_RGB32) {
+ 		// we should have an accelerated graphics driver, try
+ 		// to allocate a frame buffer large enough to contain
+@@ -647,6 +647,11 @@
+ 			// clear out backbuffer, alpha is 255 this way
+ 			memset(fBackBuffer-&gt;Bits(), 255, fBackBuffer-&gt;BitsLength());
+ 		}
++#if 0
++// NOTE: Currently disabled, because it make the double buffered mode flicker
++// again. See HWInterface::Invalidate() for more information.
++		SetAsyncDoubleBuffered(doubleBuffered);
++#endif
+ 	}
+ 
+ 	// update color palette configuration if necessary
+@@ -1342,7 +1347,7 @@
+ 
+ 
+ void
+-AccelerantHWInterface::CopyBackToFront(/*const*/ BRegion&amp; region)
++AccelerantHWInterface::_CopyBackToFront(/*const*/ BRegion&amp; region)
+ {
+ 	if (fOffscreenBackBuffer) {
+ 		int32 xOffset = 0;
+@@ -1361,7 +1366,7 @@
+ 		return;
+ 	}
+ 
+-	return HWInterface::CopyBackToFront(region);
++	return HWInterface::_CopyBackToFront(region);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/servers/app/drawing/AccelerantHWInterface.h
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/AccelerantHWInterface.h	2008-10-23 17:02:46 UTC (rev 28300)
++++ haiku/trunk/src/servers/app/drawing/AccelerantHWInterface.h	2008-10-23 17:15:39 UTC (rev 28301)
+@@ -95,7 +95,7 @@
+ 	virtual	bool				IsDoubleBuffered() const;
+ 
+ protected:
+-	virtual	void				CopyBackToFront(/*const*/ BRegion&amp; region);
++	virtual	void				_CopyBackToFront(/*const*/ BRegion&amp; region);
+ 
+ 	virtual	void				_DrawCursor(IntRect area) const;
+ 
+
+Modified: haiku/trunk/src/servers/app/drawing/BitmapHWInterface.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/BitmapHWInterface.cpp	2008-10-23 17:02:46 UTC (rev 28300)
++++ haiku/trunk/src/servers/app/drawing/BitmapHWInterface.cpp	2008-10-23 17:15:39 UTC (rev 28301)
+@@ -23,7 +23,7 @@
+ 
+ 
+ BitmapHWInterface::BitmapHWInterface(ServerBitmap* bitmap)
+-	: HWInterface(),
++	: HWInterface(false, false),
+ 	  fBackBuffer(NULL),
+ 	  fFrontBuffer(new(nothrow) BitmapBuffer(bitmap))
+ {
+
+Modified: haiku/trunk/src/servers/app/drawing/HWInterface.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/HWInterface.cpp	2008-10-23 17:02:46 UTC (rev 28300)
++++ haiku/trunk/src/servers/app/drawing/HWInterface.cpp	2008-10-23 17:15:39 UTC (rev 28301)
+@@ -9,17 +9,21 @@
+ 
+ #include &quot;HWInterface.h&quot;
+ 
++#include &lt;new&gt;
++#include &lt;stdio.h&gt;
++#include &lt;string.h&gt;
++#include &lt;unistd.h&gt;
++
++#include &lt;vesa/vesa_info.h&gt;
++
+ #include &quot;drawing_support.h&quot;
+ 
+ #include &quot;RenderingBuffer.h&quot;
+ #include &quot;SystemPalette.h&quot;
+ #include &quot;UpdateQueue.h&quot;
+ 
+-#include &lt;vesa/vesa_info.h&gt;
+ 
+-#include &lt;stdio.h&gt;
+-#include &lt;string.h&gt;
+-#include &lt;unistd.h&gt;
++using std::nothrow;
+ 
+ 
+ HWInterfaceListener::HWInterfaceListener()
+@@ -35,7 +39,7 @@
+ // #pragma mark - HWInterface
+ 
+ 
+-HWInterface::HWInterface(bool doubleBuffered)
++HWInterface::HWInterface(bool doubleBuffered, bool enableUpdateQueue)
+ 	: MultiLocker(&quot;hw interface lock&quot;),
+ 	  fCursorAreaBackup(NULL),
+ 	  fFloatingOverlaysLock(&quot;floating overlays lock&quot;),
+@@ -48,22 +52,22 @@
+ 	  fCursorLocation(0, 0),
+ 	  fDoubleBuffered(doubleBuffered),
+ 	  fVGADevice(-1),
+-//	  fUpdateExecutor(new UpdateQueue(this))
+ 	  fUpdateExecutor(NULL),
+ 	  fListeners(20)
+ {
++	SetAsyncDoubleBuffered(doubleBuffered &amp;&amp; enableUpdateQueue);
+ }
+ 
+ // destructor
+ HWInterface::~HWInterface()
+ {
++	SetAsyncDoubleBuffered(false);
++
+ 	delete fCursorAreaBackup;
+ 
+ 	// The standard cursor doesn't belong us - the drag bitmap might
+ 	if (fCursor != fCursorAndDragBitmap)
+ 		delete fCursorAndDragBitmap;
+-
+-	delete fUpdateExecutor;
+ }
+ 
+ // Initialize
+@@ -286,6 +290,24 @@
+ }
+ 
+ 
++void
++HWInterface::SetAsyncDoubleBuffered(bool doubleBuffered)
++{
++	if (doubleBuffered) {
++		if (fUpdateExecutor != NULL)
++			return;
++		fUpdateExecutor = new (nothrow) UpdateQueue(this);
++		AddListener(fUpdateExecutor);
++	} else {
++		if (fUpdateExecutor == NULL)
++			return;
++		RemoveListener(fUpdateExecutor);
++		delete fUpdateExecutor;
++		fUpdateExecutor = NULL;
++	}
++}
++
++
+ bool
+ HWInterface::IsDoubleBuffered() const
+ {
+@@ -298,20 +320,21 @@
+ HWInterface::Invalidate(const BRect&amp; frame)
+ {
+ 	if (IsDoubleBuffered()) {
+-		return CopyBackToFront(frame);
+-
+-// TODO: the remaining problem is the immediate wake up of the
+-// thread carrying out the updates, when I enable it, there
+-// seems to be a deadlock, but I didn't figure it out yet.
+-// Maybe the same bug is there without the wakeup, only, triggered
+-// less often.... scarry, huh?
+-/*		if (frame.IsValid()) {
++#if 0
++// NOTE: The UpdateQueue works perfectly fine, but it screws the
++// flicker-free-ness of the double buffered rendering. The problem being the
++// asynchronous nature. The UpdateQueue will transfer regions of the screen
++// which have been clean at the time we are in this function, but which have
++// been damaged meanwhile by drawing into them again. All in all, the
++// UpdateQueue is good for reducing the number of times that the transfer
++// is performed, and makes it happen during refresh only, but until there
++// is a smarter way to synchronize this all better, I've disabled it.
++		if (fUpdateExecutor != NULL) {
+ 			fUpdateExecutor-&gt;AddRect(frame);
+ 			return B_OK;
+ 		}
+-		return B_BAD_VALUE;*/
+-	} else {
+-//		_DrawCursor(frame);
++#endif
++		return CopyBackToFront(frame);
+ 	}
+ 	return B_OK;
+ }
+@@ -336,14 +359,19 @@
+ 		// make sure we don't copy out of bounds
+ 		area = bufferClip &amp; area;
+ 
++		bool cursorLocked = fFloatingOverlaysLock.Lock();
++
+ 		BRegion region((BRect)area);
+ 		if (IsDoubleBuffered())
+ 			region.Exclude((clipping_rect)_CursorFrame());
+ 
+-		CopyBackToFront(region);
++		_CopyBackToFront(region);
+ 
+ 		_DrawCursor(area);
+ 
++		if (cursorLocked)
++			fFloatingOverlaysLock.Unlock();
++
+ 		return B_OK;
+ 	}
+ 	return B_BAD_VALUE;
+@@ -351,7 +379,7 @@
+ 
+ 
+ void
+-HWInterface::CopyBackToFront(/*const*/ BRegion&amp; region)
++HWInterface::_CopyBackToFront(/*const*/ BRegion&amp; region)
+ {
+ 	RenderingBuffer* backBuffer = BackBuffer();
+ 
+
+Modified: haiku/trunk/src/servers/app/drawing/HWInterface.h
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/HWInterface.h	2008-10-23 17:02:46 UTC (rev 28300)
++++ haiku/trunk/src/servers/app/drawing/HWInterface.h	2008-10-23 17:15:39 UTC (rev 28301)
+@@ -45,7 +45,8 @@
+ 
+ class HWInterface : protected MultiLocker {
+  public:
+-								HWInterface(bool doubleBuffered = false);
++								HWInterface(bool doubleBuffered = false,
++									bool enableUpdateQueue = true);
+ 	virtual						~HWInterface();
+ 
+ 	// locking
+@@ -138,16 +139,17 @@
+ 			RenderingBuffer*	DrawingBuffer() const;
+ 	virtual	RenderingBuffer*	FrontBuffer() const = 0;
+ 	virtual	RenderingBuffer*	BackBuffer() const = 0;
++			void				SetAsyncDoubleBuffered(bool doubleBuffered);
+ 	virtual	bool				IsDoubleBuffered() const;
+ 
+-	// Invalidate is planned to be used for scheduling an area for updating
+-	// you need to WriteLock!
+-	virtual	status_t			Invalidate(const BRect&amp; frame);
++	// Invalidate is used for scheduling an area for updating
++			status_t			Invalidate(const BRect&amp; frame);
+ 	// while as CopyBackToFront() actually performs the operation
+-			status_t			CopyBackToFront(const BRect&amp; frame);
++	// either directly or asynchronously by the UpdateQueue thread
++	virtual	status_t			CopyBackToFront(const BRect&amp; frame);
+ 
+ protected:
+-	virtual	void				CopyBackToFront(/*const*/ BRegion&amp; region);
++	virtual	void				_CopyBackToFront(/*const*/ BRegion&amp; region);
+ 
+ public:
+ 	// TODO: Just a quick and primitive way to get single buffered mode working.
+
+Modified: haiku/trunk/src/servers/app/drawing/UpdateQueue.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/UpdateQueue.cpp	2008-10-23 17:02:46 UTC (rev 28300)
++++ haiku/trunk/src/servers/app/drawing/UpdateQueue.cpp	2008-10-23 17:15:39 UTC (rev 28301)
+@@ -1,73 +1,119 @@
+-// UpdateQueue.cpp
++/*
++ * Copyright 2005-2008 Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
++#include &quot;UpdateQueue.h&quot;
+ 
+ #include &lt;new&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;string.h&gt;
+ 
+-#include &quot;HWInterface.h&quot;
+ 
+-#include &quot;UpdateQueue.h&quot;
++//#define TRACE_UPDATE_QUEUE
++#ifdef TRACE_UPDATE_QUEUE
++#	include &lt;FunctionTracer.h&gt;
++#	include &lt;String.h&gt;
+ 
++	static int32 sFunctionDepth = -1;
++#	define CALLED(x...)	FunctionTracer _ft(&quot;UpdateQueue&quot;, __FUNCTION__, \
++							sFunctionDepth)
++#	define TRACE(x...)	{ BString _to; \
++							_to.Append(' ', (sFunctionDepth + 1) * 2); \
++							printf(&quot;%s&quot;, _to.String()); printf(x); }
++#else
++#	define CALLED(x...)
++#	define TRACE(x...)
++#endif
++
++
+ // constructor
+ UpdateQueue::UpdateQueue(HWInterface* interface)
+- :	BLocker(&quot;AppServer_UpdateQueue&quot;),
++	:
++	BLocker(&quot;AppServer_UpdateQueue&quot;),
++	fQuitting(false),
+  	fInterface(interface),
+ 	fUpdateRegion(),
+-	fUpdateExecutor(-1),
+-	fThreadControl(-1),
+-	fStatus(B_ERROR)
++	fUpdateExecutor(B_BAD_THREAD_ID),
++	fRetraceSem(B_BAD_SEM_ID),
++	fRefreshDuration(1000000 / 60)
+ {
+-	fThreadControl = create_sem(0, &quot;update queue control&quot;);
+-	if (fThreadControl &gt;= B_OK)
+-		fStatus = B_OK;
+-	else
+-		fStatus = fThreadControl;
+-	if (fStatus == B_OK) {
+-		fUpdateExecutor = spawn_thread(_execute_updates_, &quot;update queue runner&quot;,
+-									   B_NORMAL_PRIORITY, this);
+-		if (fUpdateExecutor &gt;= B_OK) {
+-			fStatus = B_OK;
+-			resume_thread(fUpdateExecutor);
+-		} else
+-			fStatus = fUpdateExecutor;
+-	}
++	CALLED();
++	TRACE(&quot;this: %p\n&quot;, this);
++	TRACE(&quot;fInterface: %p\n&quot;, fInterface);
+ }
+ 
+ // destructor
+ UpdateQueue::~UpdateQueue()
+ {
+-	if (delete_sem(fThreadControl) == B_OK)
+-		wait_for_thread(fUpdateExecutor, &amp;fUpdateExecutor);
++	CALLED();
++
++	Shutdown();
+ }
+ 
+-// InitCheck
++// FrameBufferChanged
++void
++UpdateQueue::FrameBufferChanged()
++{
++	CALLED();
++
++	Init();
++}
++
++// Init
+ status_t
+-UpdateQueue::InitCheck()
++UpdateQueue::Init()
+ {
+-	return fStatus;
++	CALLED();
++
++	Shutdown();
++
++	fRetraceSem = fInterface-&gt;RetraceSemaphore();
++//	fRefreshDuration = fInterface-&gt;...
++
++	TRACE(&quot;fRetraceSem: %ld, fRefreshDuration: %lld\n&quot;,
++		fRetraceSem, fRefreshDuration);
++
++	fQuitting = false;
++	fUpdateExecutor = spawn_thread(_ExecuteUpdatesEntry, &quot;update queue runner&quot;,
++		B_REAL_TIME_PRIORITY, this);
++	if (fUpdateExecutor &lt; B_OK)
++		return fUpdateExecutor;
++		
++	return resume_thread(fUpdateExecutor);
+ }
+ 
++// Shutdown
++void
++UpdateQueue::Shutdown()
++{
++	CALLED();
++
++	if (fUpdateExecutor &lt; B_OK)
++		return;
++	fQuitting = true;
++	status_t exitValue;
++	wait_for_thread(fUpdateExecutor, &amp;exitValue);
++	fUpdateExecutor = B_BAD_THREAD_ID;
++}
++
+ // AddRect
+ void
+ UpdateQueue::AddRect(const BRect&amp; rect)
+ {
+-//	Lock();
+-//printf(&quot;UpdateQueue::AddRect()\n&quot;);
+-	// NOTE: The access to fUpdateRegion
+-	// is protected by the HWInterface lock.
+-	// When trying to access the fUpdateRegion,
+-	// our thread will first try to lock the
+-	// HWInterface, while on the other hand
+-	// HWInterface will always be locked when
+-	// it calls AddRect().
+-	fUpdateRegion.Include(rect);
+-//	_Reschedule();
+-//	Unlock();
++	if (!rect.IsValid())
++		return;
++
++	CALLED();
++
++	if (Lock()) {
++		fUpdateRegion.Include(rect);
++		Unlock();
++	}
+ }
+ 
+-// _execute_updates_
++// _ExecuteUpdatesEntry
+ int32
+-UpdateQueue::_execute_updates_(void* cookie)
++UpdateQueue::_ExecuteUpdatesEntry(void* cookie)
+ {
+ 	UpdateQueue *gc = (UpdateQueue*)cookie;
+ 	return gc-&gt;_ExecuteUpdates();
+@@ -77,51 +123,50 @@
+ int32
+ UpdateQueue::_ExecuteUpdates()
+ {
+-	bool running = true;
+-	while (running) {
+-		status_t err = acquire_sem_etc(fThreadControl, 1, B_RELATIVE_TIMEOUT,
+-									   20000);
++	while (!fQuitting) {
++		status_t err;
++		if (fRetraceSem &gt;= 0) {
++			bigtime_t timeout = system_time() + fRefreshDuration * 2;
++//			TRACE(&quot;acquire_sem_etc(%lld)\n&quot;, timeout);
++			do {
++				err = acquire_sem_etc(fRetraceSem, 1,
++					B_ABSOLUTE_TIMEOUT | B_CAN_INTERRUPT, timeout);
++			} while (err == B_INTERRUPTED &amp;&amp; !fQuitting);
++		} else {
++			bigtime_t timeout = system_time() + fRefreshDuration;
++//			TRACE(&quot;snooze_until(%lld)\n&quot;, timeout);
++			do {
++				err = snooze_until(timeout, B_SYSTEM_TIMEBASE);
++			} while (err == B_INTERRUPTED &amp;&amp; !fQuitting);
++		}
++		if (fQuitting)
++			return B_OK;
+ 		switch (err) {
+ 			case B_OK:
+ 			case B_TIMED_OUT:
+ 				// execute updates
+ 				if (fInterface-&gt;LockParallelAccess()) {
+-					int32 count = fUpdateRegion.CountRects();
+-					if (count &gt; 0) {
+-						for (int32 i = 0; i &lt; count; i++) {
+-							fInterface-&gt;CopyBackToFront(fUpdateRegion.RectAt(i));
++					if (Lock()) {
++						int32 count = fUpdateRegion.CountRects();
++						if (count &gt; 0) {
++							TRACE(&quot;CopyBackToFront() - rects: %ld\n&quot;, count);
++							// NOTE: not using the BRegion version, since that
++							// doesn't take care of leaving out and compositing
++							// the cursor.
++							for (int32 i = 0; i &lt; count; i++)
++								fInterface-&gt;CopyBackToFront(
++									fUpdateRegion.RectAt(i));
++							fUpdateRegion.MakeEmpty();
+ 						}
+-						fUpdateRegion.MakeEmpty();
++						Unlock();
+ 					}
+ 					fInterface-&gt;UnlockParallelAccess();
+ 				}
+ 				break;
+-			case B_BAD_SEM_ID:
+-				running = false;
+-				break;
+ 			default:
+-printf(&quot;other error: %s\n&quot;, strerror(err));
+-//running = false;
+-				snooze(20000);
+-				break;
++				return err;
+ 		}
+ 	}
+-	return 0;
++	return B_OK;
+ }
+ 
+-// _Reschedule
+-//
+-// PRE: The object must be locked.
+-void
+-UpdateQueue::_Reschedule()
+-{
+-	// TODO: _Reschedule() is supposed to cause the
+-	// immediate wake up of the update thread, but
+-	// the HWInterface is still locked when we get here.
+-	// Somehow this causes a deadlock, but I don't
+-	// see why yet...
+-	if (fStatus == B_OK) {
+-		release_sem(fThreadControl);
+-	}
+-}
+-
+
+Modified: haiku/trunk/src/servers/app/drawing/UpdateQueue.h
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/UpdateQueue.h	2008-10-23 17:02:46 UTC (rev 28300)
++++ haiku/trunk/src/servers/app/drawing/UpdateQueue.h	2008-10-23 17:15:39 UTC (rev 28301)
+@@ -1,5 +1,7 @@
+-// UpdateQueue.h
+-
++/*
++ * Copyright 2005-2008 Stephan A&#223;mus &lt;<A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">superstippi at gmx.de</A>&gt;. All rights reserved.
++ * Distributed under the terms of the MIT License.
++ */
+ #ifndef UPDATE_QUEUE_H
+ #define UPDATE_QUEUE_H
+ 
+@@ -8,29 +10,32 @@
+ #include &lt;OS.h&gt;
+ #include &lt;Region.h&gt;
+ 
+-class HWInterface;
++#include &quot;HWInterface.h&quot;
+ 
+-class UpdateQueue : public BLocker {
++
++class UpdateQueue : public BLocker, public HWInterfaceListener {
+  public:
+  								UpdateQueue(HWInterface* interface);
+  	virtual						~UpdateQueue();
+ 
+-			status_t			InitCheck();
++	virtual	void				FrameBufferChanged();
+ 
++			status_t			Init();
++			void				Shutdown();
++
+ 			void				AddRect(const BRect&amp; rect);
+ 
+  private:
+-	static	int32				_execute_updates_(void *cookie);
++	static	int32				_ExecuteUpdatesEntry(void *cookie);
+ 			int32				_ExecuteUpdates();
+ 
+-			void				_Reschedule();
+-
++	volatile bool				fQuitting;
+ 			HWInterface*		fInterface;
+ 
+ 			BRegion				fUpdateRegion;
+ 			thread_id			fUpdateExecutor;
+-			sem_id				fThreadControl;
+-			status_t			fStatus;
++			sem_id				fRetraceSem;
++			bigtime_t			fRefreshDuration;
+ };
+ 
+ #endif	// UPDATE_QUEUE_H
+
+Modified: haiku/trunk/src/servers/app/drawing/ViewHWInterface.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/ViewHWInterface.cpp	2008-10-23 17:02:46 UTC (rev 28300)
++++ haiku/trunk/src/servers/app/drawing/ViewHWInterface.cpp	2008-10-23 17:15:39 UTC (rev 28301)
+@@ -385,8 +385,11 @@
+ //	#pragma mark -
+ 
+ 
++static const bool kDefaultDoubleBuffered = true;
++
++
+ ViewHWInterface::ViewHWInterface()
+-	: HWInterface(),
++	: HWInterface(kDefaultDoubleBuffered),
+ 	  fBackBuffer(NULL),
+ 	  fFrontBuffer(NULL),
+ 	  fWindow(NULL)
+@@ -755,11 +758,11 @@
+ 	return HWInterface::IsDoubleBuffered();
+ }
+ 
+-// Invalidate
++// CopyBackToFront
+ status_t
+-ViewHWInterface::Invalidate(const BRect&amp; frame)
++ViewHWInterface::CopyBackToFront(const BRect&amp; frame)
+ {
+-	status_t ret = HWInterface::Invalidate(frame);
++	status_t ret = HWInterface::CopyBackToFront(frame);
+ 
+ 	if (ret &gt;= B_OK &amp;&amp; fWindow)
+ 		fWindow-&gt;Invalidate(frame);
+
+Modified: haiku/trunk/src/servers/app/drawing/ViewHWInterface.h
+===================================================================
+--- haiku/trunk/src/servers/app/drawing/ViewHWInterface.h	2008-10-23 17:02:46 UTC (rev 28300)
++++ haiku/trunk/src/servers/app/drawing/ViewHWInterface.h	2008-10-23 17:15:39 UTC (rev 28301)
+@@ -53,7 +53,7 @@
+ 	virtual	RenderingBuffer*	BackBuffer() const;
+ 	virtual	bool				IsDoubleBuffered() const;
+ 
+-	virtual	status_t			Invalidate(const BRect&amp; frame);
++	virtual	status_t			CopyBackToFront(const BRect&amp; frame);
+ 
+  private:
+ 			BBitmapBuffer*		fBackBuffer;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012969.html">[Haiku-commits] r28300 - haiku/trunk/src/servers/app/drawing
+</A></li>
+	<LI>Next message: <A HREF="012972.html">[Haiku-commits] r28301 - haiku/trunk/src/servers/app/drawing
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12970">[ date ]</a>
+              <a href="thread.html#12970">[ thread ]</a>
+              <a href="subject.html#12970">[ subject ]</a>
+              <a href="author.html#12970">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,613 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31194 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/debug
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31194%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel%20src/system/kernel/debug&In-Reply-To=%3C200906230139.n5N1drkO026771%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017410.html">
+   <LINK REL="Next"  HREF="017412.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31194 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/debug</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31194%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel%20src/system/kernel/debug&In-Reply-To=%3C200906230139.n5N1drkO026771%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31194 - in haiku/trunk: headers/private/kernel	src/system/kernel src/system/kernel/debug">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Jun 23 03:39:53 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017410.html">[Haiku-commits] r31193 - haiku/trunk/headers/private/kernel/util
+</A></li>
+        <LI>Next message: <A HREF="017412.html">[Haiku-commits] r31195 - haiku/trunk/src/bin/keymap
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17411">[ date ]</a>
+              <a href="thread.html#17411">[ thread ]</a>
+              <a href="subject.html#17411">[ subject ]</a>
+              <a href="author.html#17411">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-06-23 03:39:51 +0200 (Tue, 23 Jun 2009)
+New Revision: 31194
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31194&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31194&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/user_debugger.h
+   haiku/trunk/src/system/kernel/debug/user_debugger.cpp
+   haiku/trunk/src/system/kernel/thread.cpp
+Log:
+Added team_debug_info::debugger_changed_condition to serialize changes to the
+installed team debugger and adjusted the code accordingly. It's not needed yet,
+but I intend to add support for software breakpoints and those require a bit of
+uninitialization that needs to be synchronized with debugger changes and can't
+be done with interrupts disabled.
+
+
+Modified: haiku/trunk/headers/private/kernel/user_debugger.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/user_debugger.h	2009-06-23 01:32:46 UTC (rev 31193)
++++ haiku/trunk/headers/private/kernel/user_debugger.h	2009-06-23 01:39:51 UTC (rev 31194)
+@@ -20,6 +20,7 @@
+ #define	B_DEBUG_PROFILE_BUFFER_FLUSH_THRESHOLD	70			/* in % */
+ 
+ 
++struct ConditionVariable;
+ struct function_profile_info;
+ struct thread;
+ 
+@@ -61,6 +62,14 @@
+ 	vint32		image_event;
+ 		// counter incremented whenever an image is created/deleted
+ 
++	struct ConditionVariable* debugger_changed_condition;
++		// Set whenever someone is going (or planning) to change the debugger.
++		// If one wants to do the same, one has to wait for this condition.
++		// Both threads lock (outer) and team debug info lock (inner) have to
++		// be held when accessing this field. After setting to a condition
++		// variable the thread won't be deleted (until unsetting it) -- it might
++		// be removed from the team hash table, though.
++
+ 	struct arch_team_debug_info	arch_info;
+ };
+ 
+
+Modified: haiku/trunk/src/system/kernel/debug/user_debugger.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/debug/user_debugger.cpp	2009-06-23 01:32:46 UTC (rev 31193)
++++ haiku/trunk/src/system/kernel/debug/user_debugger.cpp	2009-06-23 01:39:51 UTC (rev 31194)
+@@ -223,8 +223,10 @@
+ 		info-&gt;causing_thread = -1;
+ 		info-&gt;image_event = 0;
+ 
+-		if (initLock)
++		if (initLock) {
+ 			B_INITIALIZE_SPINLOCK(&amp;info-&gt;lock);
++			info-&gt;debugger_changed_condition = NULL;
++		}
+ 	}
+ }
+ 
+@@ -348,6 +350,90 @@
+ }
+ 
+ 
++static status_t
++prepare_debugger_change(team_id teamID, ConditionVariable&amp; condition,
++	struct team*&amp; team)
++{
++	// We look up the team by ID, even in case of the current team, so we can be
++	// sure, that the team is not already dying.
++	if (teamID == B_CURRENT_TEAM)
++		teamID = thread_get_current_thread()-&gt;team-&gt;id;
++
++	while (true) {
++		// get the team
++		InterruptsSpinLocker teamLocker(gTeamSpinlock);
++
++		team = team_get_team_struct_locked(teamID);
++		if (team == NULL)
++			return B_BAD_TEAM_ID;
++
++		// don't allow messing with the kernel team
++		if (team == team_get_kernel_team())
++			return B_NOT_ALLOWED;
++
++		// check whether the condition is already set
++		SpinLocker threadLocker(gThreadSpinlock);
++		SpinLocker debugInfoLocker(team-&gt;debug_info.lock);
++
++		if (team-&gt;debug_info.debugger_changed_condition == NULL) {
++			// nobody there yet -- set our condition variable and be done
++			team-&gt;debug_info.debugger_changed_condition = &condition;
++			return B_OK;
++		}
++
++		// we'll have to wait
++		ConditionVariableEntry entry;
++		team-&gt;debug_info.debugger_changed_condition-&gt;Add(&amp;entry);
++
++		debugInfoLocker.Unlock();
++		threadLocker.Unlock();
++		teamLocker.Unlock();
++
++		entry.Wait();
++	}
++}
++
++
++static void
++prepare_debugger_change(struct team* team, ConditionVariable&amp; condition)
++{
++	while (true) {
++		// check whether the condition is already set
++		InterruptsSpinLocker threadLocker(gThreadSpinlock);
++		SpinLocker debugInfoLocker(team-&gt;debug_info.lock);
++
++		if (team-&gt;debug_info.debugger_changed_condition == NULL) {
++			// nobody there yet -- set our condition variable and be done
++			team-&gt;debug_info.debugger_changed_condition = &condition;
++			return;
++		}
++
++		// we'll have to wait
++		ConditionVariableEntry entry;
++		team-&gt;debug_info.debugger_changed_condition-&gt;Add(&amp;entry);
++
++		debugInfoLocker.Unlock();
++		threadLocker.Unlock();
++
++		entry.Wait();
++	}
++}
++
++
++static void
++finish_debugger_change(struct team* team)
++{
++	// unset our condition variable and notify all threads waiting on it
++	InterruptsSpinLocker threadLocker(gThreadSpinlock);
++	SpinLocker debugInfoLocker(team-&gt;debug_info.lock);
++
++	ConditionVariable* condition = team-&gt;debug_info.debugger_changed_condition;
++	team-&gt;debug_info.debugger_changed_condition = NULL;
++
++	condition-&gt;NotifyAll(true);
++}
++
++
+ void
+ user_debug_prepare_for_exec()
+ {
+@@ -1406,11 +1492,13 @@
+ 	TRACE((&quot;nub_thread_cleanup(%ld): debugger port: %ld\n&quot;, nubThread-&gt;id,
+ 		nubThread-&gt;team-&gt;debug_info.debugger_port));
+ 
++	ConditionVariable debugChangeCondition;
++	prepare_debugger_change(nubThread-&gt;team, debugChangeCondition);
++
+ 	team_debug_info teamDebugInfo;
+ 	bool destroyDebugInfo = false;
+ 
+ 	cpu_status state = disable_interrupts();
+-	GRAB_TEAM_LOCK();
+ 	GRAB_TEAM_DEBUG_INFO_LOCK(nubThread-&gt;team-&gt;debug_info);
+ 
+ 	team_debug_info &amp;info = nubThread-&gt;team-&gt;debug_info;
+@@ -1425,9 +1513,10 @@
+ 	update_threads_debugger_installed_flag(nubThread-&gt;team);
+ 
+ 	RELEASE_TEAM_DEBUG_INFO_LOCK(nubThread-&gt;team-&gt;debug_info);
+-	RELEASE_TEAM_LOCK();
+ 	restore_interrupts(state);
+ 
++	finish_debugger_change(nubThread-&gt;team);
++
+ 	if (destroyDebugInfo)
+ 		destroy_team_debug_info(&amp;teamDebugInfo);
+ 
+@@ -2526,14 +2615,24 @@
+ 	}
+ 	team_id debuggerTeam = debuggerPortInfo.team;
+ 
+-	// check the debugger team: It must neither be the kernel team nor the
+-	// debugged team
++	// Check the debugger team: It must neither be the kernel team nor the
++	// debugged team.
+ 	if (debuggerTeam == team_get_kernel_team_id() || debuggerTeam == teamID) {
+ 		TRACE((&quot;install_team_debugger(): Can't debug kernel or debugger team. &quot;
+ 			&quot;debugger: %ld, debugged: %ld\n&quot;, debuggerTeam, teamID));
+ 		return B_NOT_ALLOWED;
+ 	}
+ 
++	// get the team
++	struct team* team;
++	ConditionVariable debugChangeCondition;
++	error = prepare_debugger_change(teamID, debugChangeCondition, team);
++	if (error != B_OK)
++		return error;
++
++	// get the real team ID
++	teamID = team-&gt;id;
++
+ 	// check, if a debugger is already installed
+ 
+ 	bool done = false;
+@@ -2544,90 +2643,73 @@
+ 	port_id nubPort = -1;
+ 
+ 	cpu_status state = disable_interrupts();
+-	GRAB_TEAM_LOCK();
++	GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
+ 
+-	// get a real team ID
+-	// We look up the team by ID, even in case of the current team, so we can be
+-	// sure, that the team is not already dying.
+-	if (teamID == B_CURRENT_TEAM)
+-		teamID = thread_get_current_thread()-&gt;team-&gt;id;
++	int32 teamDebugFlags = team-&gt;debug_info.flags;
+ 
+-	struct team *team = team_get_team_struct_locked(teamID);
++	if (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {
++		// There's already a debugger installed.
++		if (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_HANDOVER) {
++			if (dontReplace) {
++				// We're fine with already having a debugger.
++				error = B_OK;
++				done = true;
++				result = team-&gt;debug_info.nub_port;
++			} else if (
++				teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_HANDING_OVER) {
++				// Another debugger is in the process of installing itself
++				// as the team's debugger.
++				error = (dontReplace ? B_OK : B_BAD_VALUE);
++				done = true;
++				result = team-&gt;debug_info.nub_port;
++			} else {
++				// a handover to another debugger is requested
++				// Set the handing-over flag -- we'll clear both flags after
++				// having sent the handed-over message to the new debugger.
++				atomic_or(&amp;team-&gt;debug_info.flags,
++					B_TEAM_DEBUG_DEBUGGER_HANDING_OVER);
+ 
+-	if (team) {
+-		GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
++				oldDebuggerPort = team-&gt;debug_info.debugger_port;
++				result = nubPort = team-&gt;debug_info.nub_port;
++				if (causingThread &lt; 0)
++					causingThread = team-&gt;debug_info.causing_thread;
+ 
+-		int32 teamDebugFlags = team-&gt;debug_info.flags;
++				// set the new debugger
++				install_team_debugger_init_debug_infos(team, debuggerTeam,
++					debuggerPort, nubPort, team-&gt;debug_info.nub_thread,
++					team-&gt;debug_info.debugger_write_lock, causingThread);
+ 
+-		if (team == team_get_kernel_team()) {
+-			// don't allow to debug the kernel
+-			error = B_NOT_ALLOWED;
+-		} else if (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {
+-			// There's already a debugger installed.
+-			if (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_HANDOVER) {
+-				if (dontReplace) {
+-					// We're fine with already having a debugger.
+-					error = B_OK;
+-					done = true;
+-					result = team-&gt;debug_info.nub_port;
+-				} else if (
+-					teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_HANDING_OVER) {
+-					// Another debugger is in the process of installing itself
+-					// as the team's debugger.
+-					error = (dontReplace ? B_OK : B_BAD_VALUE);
+-					done = true;
+-					result = team-&gt;debug_info.nub_port;
+-				} else {
+-					// a handover to another debugger is requested
+-					// Set the handing-over flag -- we'll clear both flags after
+-					// having sent the handed-over message to the new debugger.
+-					atomic_or(&amp;team-&gt;debug_info.flags,
+-						B_TEAM_DEBUG_DEBUGGER_HANDING_OVER);
++				releaseDebugInfoLock = false;
++				handOver = true;
++				done = true;
+ 
+-					oldDebuggerPort = team-&gt;debug_info.debugger_port;
+-					result = nubPort = team-&gt;debug_info.nub_port;
+-					if (causingThread &lt; 0)
+-						causingThread = team-&gt;debug_info.causing_thread;
+-
+-					// set the new debugger
+-					install_team_debugger_init_debug_infos(team, debuggerTeam,
+-						debuggerPort, nubPort, team-&gt;debug_info.nub_thread,
+-						team-&gt;debug_info.debugger_write_lock, causingThread);
+-
+-					releaseDebugInfoLock = false;
+-					handOver = true;
+-					done = true;
+-
+-					// finally set the new port owner
+-					if (set_port_owner(nubPort, debuggerTeam) != B_OK) {
+-						// The old debugger must just have died. Just proceed as
+-						// if there was no debugger installed. We may still be too
+-						// early, in which case we'll fail, but this race condition
+-						// should be unbelievably rare and relatively harmless.
+-						handOver = false;
+-						done = false;
+-					}
++				// finally set the new port owner
++				if (set_port_owner(nubPort, debuggerTeam) != B_OK) {
++					// The old debugger must just have died. Just proceed as
++					// if there was no debugger installed. We may still be too
++					// early, in which case we'll fail, but this race condition
++					// should be unbelievably rare and relatively harmless.
++					handOver = false;
++					done = false;
+ 				}
+-			} else {
+-				// there's already a debugger installed
+-				error = (dontReplace ? B_OK : B_BAD_VALUE);
+-				done = true;
+-				result = team-&gt;debug_info.nub_port;
+ 			}
+-		} else if ((teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_DISABLED) != 0
+-			&amp;&amp; useDefault) {
+-			// No debugger yet, disable_debugger() had been invoked, and we
+-			// would install the default debugger. Just fail.
+-			error = B_BAD_VALUE;
++		} else {
++			// there's already a debugger installed
++			error = (dontReplace ? B_OK : B_BAD_VALUE);
++			done = true;
++			result = team-&gt;debug_info.nub_port;
+ 		}
++	} else if ((teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_DISABLED) != 0
++		&amp;&amp; useDefault) {
++		// No debugger yet, disable_debugger() had been invoked, and we
++		// would install the default debugger. Just fail.
++		error = B_BAD_VALUE;
++	}
+ 
+-		// in case of a handover the lock has already been released
+-		if (releaseDebugInfoLock)
+-			RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
+-	} else
+-		error = B_BAD_TEAM_ID;
++	// in case of a handover the lock has already been released
++	if (releaseDebugInfoLock)
++		RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
+ 
+-	RELEASE_TEAM_LOCK();
+ 	restore_interrupts(state);
+ 
+ 	if (handOver) {
+@@ -2650,31 +2732,25 @@
+ 		}
+ 
+ 		// clear the handed-over and handing-over flags
+-		cpu_status state = disable_interrupts();
+-		GRAB_TEAM_LOCK();
++		state = disable_interrupts();
++		GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
+ 
+-		team = team_get_team_struct_locked(teamID);
++		int32 teamDebugFlags = team-&gt;debug_info.flags;
+ 
+-		if (team) {
+-			GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
+-
+-			int32 teamDebugFlags = team-&gt;debug_info.flags;
+-
+-			if ((teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) != 0
+-				&amp;&amp; (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_HANDING_OVER) != 0
+-				&amp;&amp; team-&gt;debug_info.debugger_port == debuggerPort) {
+-				// Everything is as we left it above, so just clear the flags.
+-				atomic_and(&amp;team-&gt;debug_info.flags,
+-					~(B_TEAM_DEBUG_DEBUGGER_HANDOVER
+-						| B_TEAM_DEBUG_DEBUGGER_HANDING_OVER));
+-			}
+-
+-			RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
++		if ((teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) != 0
++			&amp;&amp; (teamDebugFlags &amp; B_TEAM_DEBUG_DEBUGGER_HANDING_OVER) != 0
++			&amp;&amp; team-&gt;debug_info.debugger_port == debuggerPort) {
++			// Everything is as we left it above, so just clear the flags.
++			atomic_and(&amp;team-&gt;debug_info.flags,
++				~(B_TEAM_DEBUG_DEBUGGER_HANDOVER
++					| B_TEAM_DEBUG_DEBUGGER_HANDING_OVER));
+ 		}
+ 
+-		RELEASE_TEAM_LOCK();
++		RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
+ 		restore_interrupts(state);
+ 
++		finish_debugger_change(team);
++
+ 		// notify the nub thread
+ 		kill_interruptable_write_port(nubPort, B_DEBUG_MESSAGE_HANDED_OVER,
+ 			NULL, 0);
+@@ -2697,6 +2773,7 @@
+ 	if (done || error != B_OK) {
+ 		TRACE((&quot;install_team_debugger() done1: %ld\n&quot;,
+ 			(error == B_OK ? result : error)));
++		finish_debugger_change(team);
+ 		return (error == B_OK ? result : error);
+ 	}
+ 
+@@ -2736,33 +2813,26 @@
+ 	// now adjust the debug info accordingly
+ 	if (error == B_OK) {
+ 		state = disable_interrupts();
+-		GRAB_TEAM_LOCK();
++		GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
+ 
+-		// look up again, to make sure the team isn't dying
+-		team = team_get_team_struct_locked(teamID);
++		if (team-&gt;debug_info.flags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {
++			// there's already a debugger installed
++			error = (dontReplace ? B_OK : B_BAD_VALUE);
++			done = true;
++			result = team-&gt;debug_info.nub_port;
+ 
+-		if (team) {
+-			GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
++			RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
++		} else {
++			install_team_debugger_init_debug_infos(team, debuggerTeam,
++				debuggerPort, nubPort, nubThread, debuggerWriteLock,
++				causingThread);
++		}
+ 
+-			if (team-&gt;debug_info.flags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {
+-				// there's already a debugger installed
+-				error = (dontReplace ? B_OK : B_BAD_VALUE);
+-				done = true;
+-				result = team-&gt;debug_info.nub_port;
+-
+-				RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
+-			} else {
+-				install_team_debugger_init_debug_infos(team, debuggerTeam,
+-					debuggerPort, nubPort, nubThread, debuggerWriteLock,
+-					causingThread);
+-			}
+-		} else
+-			error = B_BAD_TEAM_ID;
+-
+-		RELEASE_TEAM_LOCK();
+ 		restore_interrupts(state);
+ 	}
+ 
++	finish_debugger_change(team);
++
+ 	// if everything went fine, resume the nub thread, otherwise clean up
+ 	if (error == B_OK &amp;&amp; !done) {
+ 		resume_thread(nubThread);
+@@ -2882,36 +2952,29 @@
+ status_t
+ _user_remove_team_debugger(team_id teamID)
+ {
+-	struct team_debug_info info;
++	struct team* team;
++	ConditionVariable debugChangeCondition;
++	status_t error = prepare_debugger_change(teamID, debugChangeCondition,
++		team);
++	if (error != B_OK)
++		return error;
+ 
+-	status_t error = B_OK;
++	InterruptsSpinLocker debugInfoLocker(team-&gt;debug_info.lock);
+ 
+-	cpu_status state = disable_interrupts();
+-	GRAB_TEAM_LOCK();
++	struct team_debug_info info;
++	if (team-&gt;debug_info.flags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {
++		// there's a debugger installed
++		info = team-&gt;debug_info;
++		clear_team_debug_info(&amp;team-&gt;debug_info, false);
++	} else {
++		// no debugger installed
++		error = B_BAD_VALUE;
++	}
+ 
+-	struct team *team = (teamID == B_CURRENT_TEAM
+-		? thread_get_current_thread()-&gt;team
+-		: team_get_team_struct_locked(teamID));
++	debugInfoLocker.Unlock();
+ 
+-	if (team) {
+-		GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
++	finish_debugger_change(team);
+ 
+-		if (team-&gt;debug_info.flags &amp; B_TEAM_DEBUG_DEBUGGER_INSTALLED) {
+-			// there's a debugger installed
+-			info = team-&gt;debug_info;
+-			clear_team_debug_info(&amp;team-&gt;debug_info, false);
+-		} else {
+-			// no debugger installed
+-			error = B_BAD_VALUE;
+-		}
+-
+-		RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
+-	} else
+-		error = B_BAD_TEAM_ID;
+-
+-	RELEASE_TEAM_LOCK();
+-	restore_interrupts(state);
+-
+ 	// clean up the info, if there was a debugger installed
+ 	if (error == B_OK)
+ 		destroy_team_debug_info(&amp;info);
+
+Modified: haiku/trunk/src/system/kernel/thread.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/thread.cpp	2009-06-23 01:32:46 UTC (rev 31193)
++++ haiku/trunk/src/system/kernel/thread.cpp	2009-06-23 01:39:51 UTC (rev 31194)
+@@ -1400,6 +1400,8 @@
+ 
+ 	struct job_control_entry *death = NULL;
+ 	struct death_entry* threadDeathEntry = NULL;
++	ConditionVariableEntry waitForDebuggerEntry;
++	bool waitForDebugger = false;
+ 
+ 	if (team != team_get_kernel_team()) {
+ 		user_debug_thread_exiting(thread);
+@@ -1430,6 +1432,16 @@
+ 		cachedDeathSem = team-&gt;death_sem;
+ 
+ 		if (deleteTeam) {
++			// If a debugger change is in progess for the team, we'll have to
++			// wait until it is done later.
++			GRAB_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
++			if (team-&gt;debug_info.debugger_changed_condition != NULL) {
++				team-&gt;debug_info.debugger_changed_condition-&gt;Add(
++					&amp;waitForDebuggerEntry);
++				waitForDebugger = true;
++			}
++			RELEASE_TEAM_DEBUG_INFO_LOCK(team-&gt;debug_info);
++
+ 			struct team *parent = team-&gt;parent;
+ 
+ 			// remember who our parent was so we can send a signal
+@@ -1500,6 +1512,10 @@
+ 
+ 	// delete the team if we're its main thread
+ 	if (deleteTeam) {
++		// wait for a debugger change to be finished first
++		if (waitForDebugger)
++			waitForDebuggerEntry.Wait();
++
+ 		team_delete_team(team);
+ 
+ 		// we need to delete any death entry that made it to here
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017410.html">[Haiku-commits] r31193 - haiku/trunk/headers/private/kernel/util
+</A></li>
+	<LI>Next message: <A HREF="017412.html">[Haiku-commits] r31195 - haiku/trunk/src/bin/keymap
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17411">[ date ]</a>
+              <a href="thread.html#17411">[ thread ]</a>
+              <a href="subject.html#17411">[ subject ]</a>
+              <a href="author.html#17411">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

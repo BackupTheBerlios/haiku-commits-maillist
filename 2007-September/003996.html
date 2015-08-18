@@ -1,0 +1,153 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22314 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22314%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200709260006.l8Q06JkZ022778%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003995.html">
+   <LINK REL="Next"  HREF="003997.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22314 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22314%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200709260006.l8Q06JkZ022778%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22314 - haiku/trunk/src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Wed Sep 26 02:06:19 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003995.html">[Haiku-commits] r22313 - haiku/trunk/src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="003997.html">[Haiku-commits] r22315 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/fs src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3996">[ date ]</a>
+              <a href="thread.html#3996">[ thread ]</a>
+              <a href="subject.html#3996">[ subject ]</a>
+              <a href="author.html#3996">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-09-26 02:06:18 +0200 (Wed, 26 Sep 2007)
+New Revision: 22314
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22314&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22314&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+Log:
+bonefish+axeld:
+* The page daemon now runs independently from the low memory state.
+* It now also increases its frequency and scanned pages, as well as decreases
+  the interval between runs with increasing memory pressure.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-09-25 23:58:31 UTC (rev 22313)
++++ haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-09-26 00:06:18 UTC (rev 22314)
+@@ -15,10 +15,14 @@
+ #include &lt;vm_page.h&gt;
+ 
+ 
++const static uint32 kMinScanPagesCount = 512;
++const static uint32 kMaxScanPagesCount = 8192;
++const static bigtime_t kMinScanWaitInterval = 50000LL;		// 50 ms
++const static bigtime_t kMaxScanWaitInterval = 1000000LL;	// 1 sec
++
++static uint32 sLowPagesCount;
+ static sem_id sPageDaemonSem;
+-static uint32 sScanPagesCount;
+ static uint32 sNumPages;
+-static bigtime_t sScanWaitInterval;
+ 
+ 
+ class PageCacheLocker {
+@@ -163,24 +167,34 @@
+ 
+ 
+ static status_t 
+-page_daemon(void *unused)
++page_daemon(void* /*unused*/)
+ {
++	bigtime_t scanWaitInterval = kMaxScanWaitInterval;
++	uint32 scanPagesCount = kMinScanPagesCount;
+ 	uint32 clearPage = 0;
+ 	uint32 checkPage = sNumPages / 2;
+ 
+ 	while (true) {
+ 		acquire_sem_etc(sPageDaemonSem, 1, B_RELATIVE_TIMEOUT,
+-			sScanWaitInterval);
++			scanWaitInterval);
+ 
+-		if (vm_low_memory_state() &lt; B_LOW_MEMORY_NOTE) {
++		// Compute next run time
++		uint32 pagesLeft = vm_page_num_free_pages();
++		if (pagesLeft &gt; sLowPagesCount) {
+ 			// don't do anything if we have enough free memory left
+ 			continue;
+ 		}
+ 
+-		uint32 leftToFree = 32;
+-			// TODO: make this depending on the low memory state
++		scanWaitInterval = kMinScanWaitInterval
++			+ (kMaxScanWaitInterval - kMinScanWaitInterval)
++			* pagesLeft / sLowPagesCount;
++		scanPagesCount = kMaxScanPagesCount
++			- (kMaxScanPagesCount - kMinScanPagesCount)
++			* pagesLeft / sLowPagesCount;
++		uint32 leftToFree = 32 + (scanPagesCount - 32)
++			* pagesLeft / sLowPagesCount;
+ 
+-		for (uint32 i = 0; i &lt; sScanPagesCount &amp;&amp; leftToFree &gt; 0; i++) {
++		for (uint32 i = 0; i &lt; scanPagesCount &amp;&amp; leftToFree &gt; 0; i++) {
+ 			if (clearPage == 0)
+ 				dprintf(&quot;clear through\n&quot;);
+ 			if (checkPage == 0)
+@@ -206,10 +220,11 @@
+ 	sPageDaemonSem = create_sem(0, &quot;page daemon&quot;);
+ 
+ 	sNumPages = vm_page_num_pages();
+-	// TODO: compute those depending on sNumPages and memory pressure!
+-	sScanPagesCount = 512;
+-	sScanWaitInterval = 1000000;
+ 
++	sLowPagesCount = sNumPages / 16;
++	if (sLowPagesCount &lt; 1024)
++		sLowPagesCount = 1024;
++
+ 	// create a kernel thread to select pages for pageout
+ 	thread_id thread = spawn_kernel_thread(&amp;page_daemon, &quot;page daemon&quot;,
+ 		B_LOW_PRIORITY, NULL);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003995.html">[Haiku-commits] r22313 - haiku/trunk/src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="003997.html">[Haiku-commits] r22315 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/fs src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3996">[ date ]</a>
+              <a href="thread.html#3996">[ thread ]</a>
+              <a href="subject.html#3996">[ subject ]</a>
+              <a href="author.html#3996">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

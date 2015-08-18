@@ -1,0 +1,280 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r22208 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22208%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200709091436.l89EaBks027316%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003851.html">
+   <LINK REL="Next"  HREF="003853.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r22208 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r22208%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200709091436.l89EaBks027316%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r22208 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Sep  9 16:36:11 CEST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003851.html">[Haiku-commits] r22207 - haiku/trunk/src/apps/codycam
+</A></li>
+        <LI>Next message: <A HREF="003853.html">[Haiku-commits] r22209 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3852">[ date ]</a>
+              <a href="thread.html#3852">[ thread ]</a>
+              <a href="subject.html#3852">[ subject ]</a>
+              <a href="author.html#3852">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2007-09-09 16:36:10 +0200 (Sun, 09 Sep 2007)
+New Revision: 22208
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=22208&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=22208&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_cache.h
+   haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+   haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+Log:
+* The method vm_cache_remove_consumer() and the page daemon used to get
+  a reference to a by them not yet referenced cache was not correct.
+  They only incremented the reference count, but a vnode cache reference
+  includes also a vnode reference. In case of the page daemon this would
+  cause vnode references to be lost (causing bug #1465).
+* The page daemon used an unsafe method to access a yet unreferenced
+  page cache. There was nothing that prevented the cache from being
+  deleted while the page daemon tried to get a reference. The
+  vm_page::cache field is now protected by the page cache table
+  spinlock, too, which the new function
+  vm_cache_acquire_page_cache_ref(), used by the page daemon, also
+  acquires while trying to get the reference.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_cache.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_cache.h	2007-09-09 14:26:48 UTC (rev 22207)
++++ haiku/trunk/headers/private/kernel/vm_cache.h	2007-09-09 14:36:10 UTC (rev 22208)
+@@ -23,6 +23,7 @@
+ vm_cache *vm_cache_create(vm_store *store);
+ void vm_cache_acquire_ref(vm_cache *cache);
+ void vm_cache_release_ref(vm_cache *cache);
++vm_cache *vm_cache_acquire_page_cache_ref(vm_page *page);
+ vm_page *vm_cache_lookup_page(vm_cache *cache, off_t page);
+ void vm_cache_insert_page(vm_cache *cache, vm_page *page, off_t offset);
+ void vm_cache_remove_page(vm_cache *cache, vm_page *page);
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-09-09 14:26:48 UTC (rev 22207)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.cpp	2007-09-09 14:36:10 UTC (rev 22208)
+@@ -11,6 +11,9 @@
+ #include &lt;stddef.h&gt;
+ #include &lt;stdlib.h&gt;
+ 
++#include &lt;util/khash.h&gt;
++#include &lt;util/AutoLock.h&gt;
++
+ #include &lt;arch/cpu.h&gt;
+ #include &lt;condition_variable.h&gt;
+ #include &lt;debug.h&gt;
+@@ -18,7 +21,6 @@
+ #include &lt;kernel.h&gt;
+ #include &lt;lock.h&gt;
+ #include &lt;smp.h&gt;
+-#include &lt;util/khash.h&gt;
+ #include &lt;vm.h&gt;
+ #include &lt;vm_page.h&gt;
+ #include &lt;vm_priv.h&gt;
+@@ -80,6 +82,28 @@
+ }
+ 
+ 
++/*!	Acquires a pseudo reference to a cache yet unreferenced by the caller. The
++	caller must make sure, that the cache is not deleted, e.g. by holding the
++	cache's source cache lock or by holding the page cache table lock while the
++	cache is still referred to by a page. To get a real reference, the caller
++	must subsequently call vm_cache_acquire_ref() and decrement the cache's ref
++	count manually afterwards.
++	Returns \c true, if the pseudo reference could be acquired.
++*/
++static inline bool
++acquire_unreferenced_cache_pseudo_ref(vm_cache* cache)
++{
++	while (true) {
++		int32 count = cache-&gt;ref_count;
++		if (count == 0)
++			return false;
++
++		if (atomic_test_and_set(&amp;cache-&gt;ref_count, count + 1, count) == count)
++			return true;
++	}
++}
++
++
+ status_t
+ vm_cache_init(kernel_args *args)
+ {
+@@ -275,6 +299,29 @@
+ }
+ 
+ 
++vm_cache*
++vm_cache_acquire_page_cache_ref(vm_page* page)
++{
++	InterruptsSpinLocker locker(sPageCacheTableLock);
++
++	vm_cache* cache = page-&gt;cache;
++	if (cache == NULL)
++		return NULL;
++
++	// get a pseudo reference
++	if (!acquire_unreferenced_cache_pseudo_ref(cache))
++		return NULL;
++
++	locker.Unlock();
++
++	// turn it into a real reference
++	vm_cache_acquire_ref(cache);
++	atomic_add(&amp;cache-&gt;ref_count, -1);
++
++	return cache;
++}
++
++
+ vm_page *
+ vm_cache_lookup_page(vm_cache *cache, off_t offset)
+ {
+@@ -326,12 +373,13 @@
+ 	cache-&gt;page_list = page;
+ 	cache-&gt;page_count++;
+ 
+-	page-&gt;cache = cache;
+ 	page-&gt;usage_count = 2;
+ 
+ 	state = disable_interrupts();
+ 	acquire_spinlock(&amp;sPageCacheTableLock);
+ 
++	page-&gt;cache = cache;
++
+ #if KDEBUG
+ 	struct page_lookup_key key;
+ 	key.offset = (uint32)(offset &gt;&gt; PAGE_SHIFT);
+@@ -373,6 +421,7 @@
+ 	acquire_spinlock(&amp;sPageCacheTableLock);
+ 
+ 	hash_remove(sPageCacheTable, page);
++	page-&gt;cache = NULL;
+ 
+ 	release_spinlock(&amp;sPageCacheTableLock);
+ 	restore_interrupts(state);
+@@ -388,7 +437,6 @@
+ 			page-&gt;cache_next-&gt;cache_prev = page-&gt;cache_prev;
+ 	}
+ 	cache-&gt;page_count--;
+-	page-&gt;cache = NULL;
+ }
+ 
+ 
+@@ -499,27 +547,23 @@
+ 		&amp;&amp; cache-&gt;consumers.link.next == cache-&gt;consumers.link.prev) {
+ 		// The cache is not really needed anymore - it can be merged with its only
+ 		// consumer left.
+-		bool merge = false;
+ 
+ 		consumer = (vm_cache *)list_get_first_item(&amp;cache-&gt;consumers);
+ 
+-		// Our cache doesn't have a ref to its consumer (only the other way around), 
+-		// so we cannot just acquire it here; it might be deleted right now
+-		while (true) {
+-			int32 count = consumer-&gt;ref_count;
+-			if (count == 0)
+-				break;
+-
+-			if (atomic_test_and_set(&amp;consumer-&gt;ref_count, count + 1, count) == count) {
+-				// We managed to grab a reference to the consumerRef.
+-				// Since this doesn't guarantee that we get the cache we wanted
+-				// to, we need to check if this cache is really the last
+-				// consumer of the cache we want to merge it with.
+-				merge = true;
+-				break;
+-			}
++		bool merge = acquire_unreferenced_cache_pseudo_ref(consumer);
++		if (merge) {
++			// We managed to increment the reference count, but that's not a
++			// full reference. We get a real one now and decrement the ref count
++			// again.
++			vm_cache_acquire_ref(consumer);
++			atomic_add(&amp;consumer-&gt;ref_count, -1);
+ 		}
+ 
++		// In case we managed to grab a reference to the consumerRef,
++		// this doesn't guarantee that we get the cache we wanted
++		// to, so we need to check if this cache is really the last
++		// consumer of the cache we want to merge it with.
++
+ 		ConditionVariable&lt;vm_cache&gt; busyCondition;
+ 
+ 		if (merge) {
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_daemons.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-09-09 14:26:48 UTC (rev 22207)
++++ haiku/trunk/src/system/kernel/vm/vm_daemons.cpp	2007-09-09 14:36:10 UTC (rev 22208)
+@@ -70,21 +70,8 @@
+ 	if (_IgnorePage(page))
+ 		return false;
+ 
+-	vm_cache* cache = page-&gt;cache;
+-
+-	// Grab a reference to this cache - the page does not own a reference
+-	// to its cache, so we can't just acquire it the easy way
+-	while (true) {
+-		int32 count = cache-&gt;ref_count;
+-		if (count == 0) {
+-			cache = NULL;
+-			break;
+-		}
+-
+-		if (atomic_test_and_set(&amp;cache-&gt;ref_count, count + 1, count) == count)
+-			break;
+-	}
+-
++	// Grab a reference to this cache.
++	vm_cache* cache = vm_cache_acquire_page_cache_ref(page);
+ 	if (cache == NULL)
+ 		return false;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003851.html">[Haiku-commits] r22207 - haiku/trunk/src/apps/codycam
+</A></li>
+	<LI>Next message: <A HREF="003853.html">[Haiku-commits] r22209 - haiku/trunk/src/system/kernel/fs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3852">[ date ]</a>
+              <a href="thread.html#3852">[ thread ]</a>
+              <a href="subject.html#3852">[ subject ]</a>
+              <a href="author.html#3852">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

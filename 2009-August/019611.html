@@ -1,0 +1,217 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r32537 - haiku/trunk/src/servers/app
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32537%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200908200945.n7K9jthI031112%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="019610.html">
+   <LINK REL="Next"  HREF="019612.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r32537 - haiku/trunk/src/servers/app</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r32537%20-%20haiku/trunk/src/servers/app&In-Reply-To=%3C200908200945.n7K9jthI031112%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r32537 - haiku/trunk/src/servers/app">axeld at mail.berlios.de
+       </A><BR>
+    <I>Thu Aug 20 11:45:55 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="019610.html">[Haiku-commits] r32536 - haiku/trunk/src/servers/app
+</A></li>
+        <LI>Next message: <A HREF="019612.html">[Haiku-commits] r32538 - haiku/trunk/src/kits/tracker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19611">[ date ]</a>
+              <a href="thread.html#19611">[ thread ]</a>
+              <a href="subject.html#19611">[ subject ]</a>
+              <a href="author.html#19611">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2009-08-20 11:45:54 +0200 (Thu, 20 Aug 2009)
+New Revision: 32537
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=32537&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=32537&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/servers/app/Desktop.cpp
+   haiku/trunk/src/servers/app/VirtualScreen.cpp
+   haiku/trunk/src/servers/app/VirtualScreen.h
+Log:
+* VirtualScreen::RestoreConfiguration() now also takes care of collecting the
+  screens that actually changed their resolution, which simplifies the code
+  in Desktop considerably.
+* Minor cleanup.
+
+
+Modified: haiku/trunk/src/servers/app/Desktop.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/Desktop.cpp	2009-08-20 09:18:32 UTC (rev 32536)
++++ haiku/trunk/src/servers/app/Desktop.cpp	2009-08-20 09:45:54 UTC (rev 32537)
+@@ -930,6 +930,7 @@
+ 	_SendFakeMouseMoved();
+ }
+ 
++
+ /*!	Changes the current workspace to the one specified by \a index.
+ 	You must hold the all window lock when calling this method.
+ */
+@@ -996,18 +997,18 @@
+ 	fPreviousWorkspace = fCurrentWorkspace;
+ 	fCurrentWorkspace = index;
+ 
+-	// Change the display mode, if needed
+-	// TODO: this needs to be done for all screens
+-	display_mode previousMode, newMode;
+-	fVirtualScreen.ScreenAt(0)-&gt;GetMode(&amp;previousMode);
++	// Change the display modes, if needed
++
++	uint32 changedScreens;
+ 	fVirtualScreen.RestoreConfiguration(*this,
+-		fSettings-&gt;WorkspacesMessage(index));
+-	fVirtualScreen.ScreenAt(0)-&gt;GetMode(&amp;newMode);
+-	// We only need to invalidate the entire desktop if we changed display modes
+-	if (memcmp(&amp;previousMode, &amp;newMode, sizeof(display_mode)))
+-		ScreenChanged(fVirtualScreen.ScreenAt(0), false);
++		fSettings-&gt;WorkspacesMessage(index), &amp;changedScreens);
+ 
+-	// show windows, and include them in the changed region - but only
++	for (int32 i = 0; changedScreens != 0; i++, changedScreens /= 2) {
++		if ((changedScreens &amp; (1 &lt;&lt; i)) != 0)
++			ScreenChanged(fVirtualScreen.ScreenAt(i), false);
++	}
++
++	// Show windows, and include them in the changed region - but only
+ 	// those that were not visible before (or whose position changed)
+ 
+ 	WindowList windows(kWorkingList);
+
+Modified: haiku/trunk/src/servers/app/VirtualScreen.cpp
+===================================================================
+--- haiku/trunk/src/servers/app/VirtualScreen.cpp	2009-08-20 09:18:32 UTC (rev 32536)
++++ haiku/trunk/src/servers/app/VirtualScreen.cpp	2009-08-20 09:45:54 UTC (rev 32537)
+@@ -53,8 +53,33 @@
+ 
+ 
+ status_t
+-VirtualScreen::RestoreConfiguration(Desktop&amp; desktop, const BMessage* settings)
++VirtualScreen::RestoreConfiguration(Desktop&amp; desktop, const BMessage* settings,
++	uint32* _changedScreens)
+ {
++	// Remember previous screen modes
++
++	typedef std::map&lt;Screen*, display_mode&gt; ScreenModeMap;
++	ScreenModeMap previousModes;
++	bool previousModesFailed = false;
++
++	if (_changedScreens != NULL) {
++		*_changedScreens = 0;
++
++		try {
++			for (int32 i = 0; i &lt; fScreenList.CountItems(); i++) {
++				Screen* screen = fScreenList.ItemAt(i)-&gt;screen;
++
++				display_mode mode;
++				screen-&gt;GetMode(&amp;mode);
++
++				previousModes.insert(std::make_pair(screen, mode));
++			}
++		} catch (...) {
++			previousModesFailed = true;
++			*_changedScreens = ~0L;
++		}
++	}
++
+ 	_Reset();
+ 
+ 	// Copy current Desktop workspace settings
+@@ -64,7 +89,7 @@
+ 	ScreenList list;
+ 	status_t status = gScreenManager-&gt;AcquireScreens(&amp;desktop, NULL, 0, false,
+ 		list);
+-	if (status &lt; B_OK) {
++	if (status != B_OK) {
+ 		// TODO: we would try again here with force == true
+ 		return status;
+ 	}
+@@ -73,6 +98,17 @@
+ 		Screen* screen = list.ItemAt(i);
+ 
+ 		AddScreen(screen);
++
++		if (!previousModesFailed &amp;&amp; _changedScreens != NULL) {
++			// Figure out which screens have changed their mode
++			display_mode mode;
++			screen-&gt;GetMode(&amp;mode);
++
++			ScreenModeMap::const_iterator found = previousModes.find(screen);
++			if (found != previousModes.end()
++				&amp;&amp; memcmp(&amp;mode, &amp;found-&gt;second, sizeof(display_mode)))
++				*_changedScreens |= 1 &lt;&lt; i;
++		}
+ 	}
+ 
+ 	return B_OK;
+@@ -147,11 +183,12 @@
+ 			status = screen-&gt;SetMode(*mode, true);
+ 		// TODO: named settings will get lost if setting the mode failed!
+ 	}
+-	if (status &lt; B_OK) {
+-		// TODO: more intelligent standard mode (monitor preference, desktop default, ...)
++	if (status != B_OK) {
+ 		status_t status = screen-&gt;SetPreferredMode();
+-		if (status != B_OK)
++		if (status != B_OK) {
++			// TODO: more intelligent standard mode (desktop default, ...)
+ 			status = screen-&gt;SetBestMode(1024, 768, B_RGB32, 60.f);
++		}
+ 		if (status != B_OK)
+ 			screen-&gt;SetBestMode(800, 600, B_RGB32, 60.f, false);
+ 	}
+
+Modified: haiku/trunk/src/servers/app/VirtualScreen.h
+===================================================================
+--- haiku/trunk/src/servers/app/VirtualScreen.h	2009-08-20 09:18:32 UTC (rev 32536)
++++ haiku/trunk/src/servers/app/VirtualScreen.h	2009-08-20 09:45:54 UTC (rev 32537)
+@@ -32,7 +32,8 @@
+ 								{ return fHWInterface; }
+ 
+ 		status_t			RestoreConfiguration(Desktop&amp; desktop,
+-								const BMessage* settings);
++								const BMessage* settings,
++								uint32* _changedScreens = NULL);
+ 		status_t			StoreConfiguration(BMessage&amp; settings);
+ 
+ 		status_t			AddScreen(Screen* screen);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="019610.html">[Haiku-commits] r32536 - haiku/trunk/src/servers/app
+</A></li>
+	<LI>Next message: <A HREF="019612.html">[Haiku-commits] r32538 - haiku/trunk/src/kits/tracker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19611">[ date ]</a>
+              <a href="thread.html#19611">[ thread ]</a>
+              <a href="subject.html#19611">[ subject ]</a>
+              <a href="author.html#19611">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

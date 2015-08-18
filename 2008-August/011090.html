@@ -1,0 +1,620 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27057 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-August/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27057%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808190033.m7J0X1lo012502%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="011089.html">
+   <LINK REL="Next"  HREF="011091.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27057 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27057%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200808190033.m7J0X1lo012502%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27057 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Tue Aug 19 02:33:01 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="011089.html">[Haiku-commits] r27056 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/vm
+</A></li>
+        <LI>Next message: <A HREF="011091.html">[Haiku-commits] r27058 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11090">[ date ]</a>
+              <a href="thread.html#11090">[ thread ]</a>
+              <a href="subject.html#11090">[ subject ]</a>
+              <a href="author.html#11090">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-08-19 02:32:54 +0200 (Tue, 19 Aug 2008)
+New Revision: 27057
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27057&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27057&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+   haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h
+Log:
+Patch by Zhao Shuai with small changes by myself:
+* Some renaming: A location in a swap file where a page can be stored is
+  now called &quot;slot&quot; instead of &quot;page&quot; or &quot;swap page&quot;.
+* swap_slot_alloc(): Update the hint more correctly after allocating
+  slots at the hint.
+* swap_space_reserve(): When less than the requested space could be
+  reserved, it always returned 0 and leaked the remaining pages.
+* swap_file_delete(): sSwapFileListLock wasn't unlocked in error cases.
+  Use MutexLocker now.
+* swap_free_page_swap_space(): sAvailSwapSpace wasn't updated.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-18 23:28:34 UTC (rev 27056)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.cpp	2008-08-19 00:32:54 UTC (rev 27057)
+@@ -25,6 +25,7 @@
+ #include &lt;heap.h&gt;
+ #include &lt;slab/Slab.h&gt;
+ #include &lt;syscalls.h&gt;
++#include &lt;util/AutoLock.h&gt;
+ #include &lt;util/DoublyLinkedList.h&gt;
+ #include &lt;util/OpenHashTable.h&gt;
+ #include &lt;vfs.h&gt;
+@@ -46,7 +47,7 @@
+ #define SWAP_BLOCK_SHIFT 5		/* 1 &lt;&lt; SWAP_BLOCK_SHIFT == SWAP_BLOCK_PAGES */
+ #define SWAP_BLOCK_MASK  (SWAP_BLOCK_PAGES - 1)
+ 
+-#define SWAP_PAGE_NONE (~(swap_addr_t)0)
++#define SWAP_SLOT_NONE (~(swap_addr_t)0)
+ 
+ // bitmap allocation macros
+ #define NUM_BYTES_PER_WORD 4
+@@ -67,11 +68,11 @@
+ 
+ struct swap_file : DoublyLinkedListLinkImpl&lt;swap_file&gt; {
+ 	struct vnode	*vnode;
+-	swap_addr_t		first_page;
+-	swap_addr_t		last_page;
+-	swap_addr_t		used;   // # of pages used
+-	uint32			*maps;  // bitmap for the pages
+-	swap_addr_t		hint;   // next free page
++	swap_addr_t		first_slot;
++	swap_addr_t		last_slot;
++	swap_addr_t		used;   // # of slots used
++	uint32			*maps;  // bitmap for the slots
++	swap_addr_t		hint;   // next free slot
+ };
+ 
+ struct swap_hash_key {
+@@ -83,7 +84,7 @@
+ struct swap_block : HashTableLink&lt;swap_block&gt; {
+ 	swap_hash_key	key;
+ 	uint32			used;
+-	swap_addr_t		swap_pages[SWAP_BLOCK_PAGES];
++	swap_addr_t		swap_slots[SWAP_BLOCK_PAGES];
+ };
+ 
+ struct SwapHashTableDefinition {
+@@ -135,26 +136,26 @@
+ 
+ 
+ static swap_addr_t
+-swap_page_alloc(uint32 npages)
++swap_slot_alloc(uint32 count)
+ {
+ 	mutex_lock(&amp;sSwapFileListLock);
+ 
+ 	if (sSwapFileList.IsEmpty()) {
+ 		mutex_unlock(&amp;sSwapFileListLock);
+-		panic(&quot;swap_page_alloc(): no swap file in the system\n&quot;);
+-		return SWAP_PAGE_NONE;
++		panic(&quot;swap_slot_alloc(): no swap file in the system\n&quot;);
++		return SWAP_SLOT_NONE;
+ 	}
+ 
+ 	// compute how many pages are free in all swap files
+ 	uint32 freeSwapPages = 0;
+ 	for (SwapFileList::Iterator it = sSwapFileList.GetIterator();
+ 			swap_file *file = it.Next();)
+-		freeSwapPages += file-&gt;last_page - file-&gt;first_page - file-&gt;used;
++		freeSwapPages += file-&gt;last_slot - file-&gt;first_slot - file-&gt;used;
+ 
+-	if (freeSwapPages &lt; npages) {
++	if (freeSwapPages &lt; count) {
+ 		mutex_unlock(&amp;sSwapFileListLock);
+-		panic(&quot;swap_page_alloc(): swap space exhausted!\n&quot;);
+-		return SWAP_PAGE_NONE;
++		panic(&quot;swap_slot_alloc(): swap space exhausted!\n&quot;);
++		return SWAP_SLOT_NONE;
+ 	}
+ 
+ 	swap_addr_t hint = 0;
+@@ -164,11 +165,11 @@
+ 			sSwapFileAlloc = sSwapFileList.First();
+ 
+ 		hint = sSwapFileAlloc-&gt;hint;
+-		swap_addr_t pageCount = sSwapFileAlloc-&gt;last_page
+-			- sSwapFileAlloc-&gt;first_page;
++		swap_addr_t pageCount = sSwapFileAlloc-&gt;last_slot
++			- sSwapFileAlloc-&gt;first_slot;
+ 
+ 		swap_addr_t i = 0;
+-		while (i &lt; npages &amp;&amp; (hint + npages) &lt;= pageCount) {
++		while (i &lt; count &amp;&amp; (hint + count) &lt;= pageCount) {
+ 			if (TESTBIT(sSwapFileAlloc-&gt;maps, hint + i)) {
+ 				hint++;
+ 				i = 0;
+@@ -176,74 +177,81 @@
+ 				i++;
+ 		}
+ 
+-		if (i == npages)
++		if (i == count)
+ 			break;
+ 
+ 		// this swap_file is full, find another
+ 		sSwapFileAlloc = sSwapFileList.GetNext(sSwapFileAlloc);
+ 	}
+ 
+-	// no swap file can alloc so many pages, we return SWAP_PAGE_NONE
++	// no swap file can alloc so many pages, we return SWAP_SLOT_NONE
+ 	// and VMAnonymousCache::Write() will adjust allocation amount
+ 	if (j == sSwapFileCount) {
+ 		mutex_unlock(&amp;sSwapFileListLock);
+-		return SWAP_PAGE_NONE;
++		return SWAP_SLOT_NONE;
+ 	}
+ 
+-	swap_addr_t swapAddress = sSwapFileAlloc-&gt;first_page + hint;
++	swap_addr_t slotIndex = sSwapFileAlloc-&gt;first_slot + hint;
+ 
+-	for (uint32 i = 0; i &lt; npages; i++)
++	for (uint32 i = 0; i &lt; count; i++)
+ 		SETBIT(sSwapFileAlloc-&gt;maps, hint + i);
+-	if (hint == sSwapFileAlloc-&gt;hint)
+-		sSwapFileAlloc-&gt;hint += npages;
++	if (hint == sSwapFileAlloc-&gt;hint) {
++		sSwapFileAlloc-&gt;hint += count;
++		swap_addr_t pageCount = sSwapFileAlloc-&gt;last_slot
++			- sSwapFileAlloc-&gt;first_slot;
++		while (TESTBIT(sSwapFileAlloc-&gt;maps, sSwapFileAlloc-&gt;hint)
++			&amp;&amp; sSwapFileAlloc-&gt;hint &lt; pageCount) {
++			sSwapFileAlloc-&gt;hint++;
++		}
++	}
+ 
+-	sSwapFileAlloc-&gt;used += npages;
++	sSwapFileAlloc-&gt;used += count;
+ 
+-	// if this swap file has used more than 90% percent of its pages
++	// if this swap file has used more than 90% percent of its slots
+ 	// switch to another
+     if (sSwapFileAlloc-&gt;used
+-			&gt; 9 * (sSwapFileAlloc-&gt;last_page - sSwapFileAlloc-&gt;first_page) / 10)
++			&gt; 9 * (sSwapFileAlloc-&gt;last_slot - sSwapFileAlloc-&gt;first_slot) / 10)
+ 		sSwapFileAlloc = sSwapFileList.GetNext(sSwapFileAlloc);
+ 
+ 	mutex_unlock(&amp;sSwapFileListLock);
+ 
+-	return swapAddress;
++	return slotIndex;
+ }
+ 
+ 
+ static swap_file *
+-find_swap_file(swap_addr_t swapAddress)
++find_swap_file(swap_addr_t slotIndex)
+ {
+ 	for (SwapFileList::Iterator it = sSwapFileList.GetIterator();
+ 			swap_file *swapFile = it.Next();) {
+-		if (swapAddress &gt;= swapFile-&gt;first_page
+-				&amp;&amp; swapAddress &lt; swapFile-&gt;last_page)
++		if (slotIndex &gt;= swapFile-&gt;first_slot
++				&amp;&amp; slotIndex &lt; swapFile-&gt;last_slot)
+ 			return swapFile;
+ 	}
+ 
+-	panic(&quot;find_swap_file(): can't find swap file for %ld\n&quot;, swapAddress);
++	panic(&quot;find_swap_file(): can't find swap file for slot %ld\n&quot;, slotIndex);
+ 	return NULL;
+ }
+ 
+ 
+ static void
+-swap_page_dealloc(swap_addr_t swapAddress, uint32 npages)
++swap_slot_dealloc(swap_addr_t slotIndex, uint32 count)
+ {
+-	if (swapAddress == SWAP_PAGE_NONE)
++	if (slotIndex == SWAP_SLOT_NONE)
+ 		return;
+ 
+ 	mutex_lock(&amp;sSwapFileListLock);
+-	swap_file *swapFile = find_swap_file(swapAddress);
++	swap_file *swapFile = find_swap_file(slotIndex);
+ 
+-	swapAddress -= swapFile-&gt;first_page;
++	slotIndex -= swapFile-&gt;first_slot;
+ 
+-	for (uint32 i = 0; i &lt; npages; i++)
+-		CLEARBIT(swapFile-&gt;maps, swapAddress + i);
++	for (uint32 i = 0; i &lt; count; i++)
++		CLEARBIT(swapFile-&gt;maps, slotIndex + i);
+ 
+-	if (swapFile-&gt;hint &gt; swapAddress)
+-		swapFile-&gt;hint = swapAddress;
++	if (swapFile-&gt;hint &gt; slotIndex)
++		swapFile-&gt;hint = slotIndex;
+ 
+-	swapFile-&gt;used -= npages;
++	swapFile-&gt;used -= count;
+ 	mutex_unlock(&amp;sSwapFileListLock);
+ }
+ 
+@@ -255,8 +263,8 @@
+ 	if (sAvailSwapSpace &gt;= amount)
+ 		sAvailSwapSpace -= amount;
+ 	else {
++		amount = sAvailSwapSpace;
+ 		sAvailSwapSpace = 0;
+-		amount = sAvailSwapSpace;
+ 	}
+ 	mutex_unlock(&amp;sAvailSwapSpaceLock);
+ 
+@@ -281,11 +289,11 @@
+ 	// free allocated swap space and swap block
+ 	for (off_t offset = virtual_base, toFree = fAllocatedSwapSize;
+ 			offset &lt; virtual_end &amp;&amp; toFree &gt; 0; offset += B_PAGE_SIZE) {
+-		swap_addr_t swapAddr = _SwapBlockGetAddress(offset &gt;&gt; PAGE_SHIFT);
+-		if (swapAddr == SWAP_PAGE_NONE)
++		swap_addr_t slotIndex = _SwapBlockGetAddress(offset &gt;&gt; PAGE_SHIFT);
++		if (slotIndex == SWAP_SLOT_NONE)
+ 			continue;
+ 
+-		swap_page_dealloc(swapAddr, 1);
++		swap_slot_dealloc(slotIndex, 1);
+ 		_SwapBlockFree(offset &gt;&gt; PAGE_SHIFT, 1);
+ 		toFree -= B_PAGE_SIZE;
+ 	}
+@@ -339,7 +347,7 @@
+ bool
+ VMAnonymousCache::HasPage(off_t offset)
+ {
+-	if (_SwapBlockGetAddress(offset &gt;&gt; PAGE_SHIFT) != SWAP_PAGE_NONE)
++	if (_SwapBlockGetAddress(offset &gt;&gt; PAGE_SHIFT) != SWAP_SLOT_NONE)
+ 		return true;
+ 
+ 	return false;
+@@ -353,16 +361,16 @@
+ 	off_t pageIndex = offset &gt;&gt; PAGE_SHIFT;
+ 
+ 	for (uint32 i = 0, j = 0; i &lt; count; i = j) {
+-		swap_addr_t startSwapAddr = _SwapBlockGetAddress(pageIndex + i);
++		swap_addr_t startSlotIndex = _SwapBlockGetAddress(pageIndex + i);
+ 		for (j = i + 1; j &lt; count; j++) {
+-			swap_addr_t swapAddr = _SwapBlockGetAddress(pageIndex + j);
+-			if (swapAddr != startSwapAddr + j - i)
++			swap_addr_t slotIndex = _SwapBlockGetAddress(pageIndex + j);
++			if (slotIndex != startSlotIndex + j - i)
+ 				break;
+ 		}
+ 
+-		swap_file *swapFile = find_swap_file(startSwapAddr);
++		swap_file *swapFile = find_swap_file(startSlotIndex);
+ 
+-		off_t pos = (startSwapAddr - swapFile-&gt;first_page) * PAGE_SIZE;
++		off_t pos = (startSlotIndex - swapFile-&gt;first_slot) * B_PAGE_SIZE;
+ 
+ 		status_t status = vfs_read_pages(swapFile-&gt;vnode, NULL, pos, vecs + i,
+ 				j - i, 0, _numBytes);
+@@ -382,9 +390,9 @@
+ 
+ 	Lock();
+ 	for (uint32 i = 0; i &lt; count; i++) {
+-		swap_addr_t swapAddr = _SwapBlockGetAddress(pageIndex + i);
+-		if (swapAddr != SWAP_PAGE_NONE) {
+-			swap_page_dealloc(swapAddr, 1);
++		swap_addr_t slotIndex = _SwapBlockGetAddress(pageIndex + i);
++		if (slotIndex != SWAP_SLOT_NONE) {
++			swap_slot_dealloc(slotIndex, 1);
+ 			_SwapBlockFree(pageIndex + i, 1);
+ 			fAllocatedSwapSize -= B_PAGE_SIZE;
+ 		}
+@@ -398,16 +406,16 @@
+ 
+ 	uint32 n = count;
+ 	for (uint32 i = 0; i &lt; count; i += n) {
+-		swap_addr_t swapAddr;
+-		// try to allocate n pages, if fail, try to allocate n/2
+-		while ((swapAddr = swap_page_alloc(n)) == SWAP_PAGE_NONE &amp;&amp; n &gt;= 2)
++		swap_addr_t slotIndex;
++		// try to allocate n slots, if fail, try to allocate n/2
++		while ((slotIndex = swap_slot_alloc(n)) == SWAP_SLOT_NONE &amp;&amp; n &gt;= 2)
+ 			n &gt;&gt;= 1;
+-		if (swapAddr == SWAP_PAGE_NONE)
++		if (slotIndex == SWAP_SLOT_NONE)
+ 			panic(&quot;VMAnonymousCache::Write(): can't allocate swap space\n&quot;);
+ 
+-		swap_file *swapFile = find_swap_file(swapAddr);
++		swap_file *swapFile = find_swap_file(slotIndex);
+ 
+-		off_t pos = (swapAddr - swapFile-&gt;first_page) * B_PAGE_SIZE;
++		off_t pos = (slotIndex - swapFile-&gt;first_slot) * B_PAGE_SIZE;
+ 
+ 		status_t status = vfs_write_pages(swapFile-&gt;vnode, NULL, pos, vecs + i,
+ 				n, flags, _numBytes);
+@@ -416,11 +424,11 @@
+ 			fAllocatedSwapSize -= n * B_PAGE_SIZE;
+ 			Unlock();
+ 
+-			swap_page_dealloc(swapAddr, n);
++			swap_slot_dealloc(slotIndex, n);
+ 			return status;
+ 		}
+ 
+-		_SwapBlockBuild(pageIndex + i, swapAddr, n);
++		_SwapBlockBuild(pageIndex + i, slotIndex, n);
+ 	}
+ 
+ 	return B_OK;
+@@ -451,8 +459,8 @@
+ 
+ 		if (fPrecommittedPages == 0) {
+ 			// try to commit additional swap space/memory
+-			if (swap_space_reserve(PAGE_SIZE) == PAGE_SIZE)
+-				fCommittedSwapSize += PAGE_SIZE;
++			if (swap_space_reserve(B_PAGE_SIZE) == B_PAGE_SIZE)
++				fCommittedSwapSize += B_PAGE_SIZE;
+ 			else if (vm_try_reserve_memory(B_PAGE_SIZE, 0) != B_OK)
+ 				return B_NO_MEMORY;
+ 
+@@ -487,29 +495,29 @@
+ 		_Commit(actualSize);
+ 
+ 	for (off_t offset = source-&gt;virtual_base; offset &lt; source-&gt;virtual_end;
+-			offset += PAGE_SIZE) {
++			offset += B_PAGE_SIZE) {
+ 		off_t pageIndex = offset &gt;&gt; PAGE_SHIFT;
+-		swap_addr_t sourceSwapIndex = source-&gt;_SwapBlockGetAddress(pageIndex);
++		swap_addr_t sourceSlotIndex = source-&gt;_SwapBlockGetAddress(pageIndex);
+ 
+-		if (sourceSwapIndex == SWAP_PAGE_NONE)
++		if (sourceSlotIndex == SWAP_SLOT_NONE)
+ 			// this page is not swapped out
+ 			continue;
+ 
+ 		if (LookupPage(offset)) {
+ 			// this page is shadowed and we can find it in the new cache,
+ 			// free the swap space
+-			swap_page_dealloc(sourceSwapIndex, 1);
++			swap_slot_dealloc(sourceSlotIndex, 1);
+ 		} else {
+-			swap_addr_t swapIndex = _SwapBlockGetAddress(pageIndex);
++			swap_addr_t slotIndex = _SwapBlockGetAddress(pageIndex);
+ 
+-			if (swapIndex == SWAP_PAGE_NONE) {
++			if (slotIndex == SWAP_SLOT_NONE) {
+ 				// the page is not shadowed,
+ 				// assign the swap address to the new cache
+-				_SwapBlockBuild(pageIndex, sourceSwapIndex, 1);
++				_SwapBlockBuild(pageIndex, sourceSlotIndex, 1);
+ 				fAllocatedSwapSize += B_PAGE_SIZE;
+ 			} else {
+ 				// the page is shadowed and is also swapped out
+-				swap_page_dealloc(sourceSwapIndex, 1);
++				swap_slot_dealloc(sourceSlotIndex, 1);
+ 			}
+ 		}
+ 		source-&gt;fAllocatedSwapSize -= B_PAGE_SIZE;
+@@ -520,13 +528,13 @@
+ 
+ void
+ VMAnonymousCache::_SwapBlockBuild(off_t startPageIndex,
+-	swap_addr_t startSwapAddress, uint32 count)
++	swap_addr_t startSlotIndex, uint32 count)
+ {
+ 	mutex_lock(&amp;sSwapHashLock);
+ 
+ 	for (uint32 i = 0; i &lt; count; i++) {
+ 		off_t pageIndex = startPageIndex + i;
+-		swap_addr_t swapAddress = startSwapAddress + i;
++		swap_addr_t slotIndex = startSlotIndex + i;
+ 
+ 		swap_hash_key key = { this, pageIndex };
+ 
+@@ -544,13 +552,13 @@
+ 			swap-&gt;key.page_index = pageIndex &amp; ~(off_t)SWAP_BLOCK_MASK;
+ 			swap-&gt;used = 0;
+ 			for (uint32 i = 0; i &lt; SWAP_BLOCK_PAGES; i++)
+-				swap-&gt;swap_pages[i] = SWAP_PAGE_NONE;
++				swap-&gt;swap_slots[i] = SWAP_SLOT_NONE;
+ 
+ 			sSwapHashTable.Insert(swap);
+ 		}
+ 
+ 		swap_addr_t blockIndex = pageIndex &amp; SWAP_BLOCK_MASK;
+-		swap-&gt;swap_pages[blockIndex] = swapAddress;
++		swap-&gt;swap_slots[blockIndex] = slotIndex;
+ 
+ 		swap-&gt;used++;
+ 	}
+@@ -569,9 +577,9 @@
+ 		swap_hash_key key = { this, pageIndex };
+ 		swap_block *swap = sSwapHashTable.Lookup(key);
+ 		if (swap != NULL) {
+-			swap_addr_t swapAddr = swap-&gt;swap_pages[pageIndex &amp; SWAP_BLOCK_MASK];
+-			if (swapAddr != SWAP_PAGE_NONE) {
+-				swap-&gt;swap_pages[pageIndex &amp; SWAP_BLOCK_MASK] = SWAP_PAGE_NONE;
++			swap_addr_t swapAddr = swap-&gt;swap_slots[pageIndex &amp; SWAP_BLOCK_MASK];
++			if (swapAddr != SWAP_SLOT_NONE) {
++				swap-&gt;swap_slots[pageIndex &amp; SWAP_BLOCK_MASK] = SWAP_SLOT_NONE;
+ 				swap-&gt;used--;
+ 				if (swap-&gt;used == 0) {
+ 					sSwapHashTable.Remove(swap);
+@@ -592,16 +600,16 @@
+ 
+ 	swap_hash_key key = { this, pageIndex };
+ 	swap_block *swap = sSwapHashTable.Lookup(key);
+-	swap_addr_t swapAddress = SWAP_PAGE_NONE;
++	swap_addr_t slotIndex = SWAP_SLOT_NONE;
+ 
+ 	if (swap != NULL) {
+ 		swap_addr_t blockIndex = pageIndex &amp; SWAP_BLOCK_MASK;
+-		swapAddress = swap-&gt;swap_pages[blockIndex];
++		slotIndex = swap-&gt;swap_slots[blockIndex];
+ 	}
+ 
+ 	mutex_unlock(&amp;sSwapHashLock);
+ 
+-	return swapAddress;
++	return slotIndex;
+ }
+ 
+ 
+@@ -702,23 +710,22 @@
+ 	memset(swap-&gt;maps, 0, (pageCount + 7) / 8);
+ 	swap-&gt;hint = 0;
+ 
+-	// set start page index and add this file to swap file list
++	// set slot index and add this file to swap file list
+ 	mutex_lock(&amp;sSwapFileListLock);
+ 	if (sSwapFileList.IsEmpty()) {
+-		swap-&gt;first_page = 0;
+-		swap-&gt;last_page = pageCount;
+-	}
+-	else {
++		swap-&gt;first_slot = 0;
++		swap-&gt;last_slot = pageCount;
++	} else {
+ 		// leave one page gap between two swap files
+-		swap-&gt;first_page = sSwapFileList.Last()-&gt;last_page + 1;
+-		swap-&gt;last_page = swap-&gt;first_page + pageCount;
++		swap-&gt;first_slot = sSwapFileList.Last()-&gt;last_slot + 1;
++		swap-&gt;last_slot = swap-&gt;first_slot + pageCount;
+ 	}
+ 	sSwapFileList.Add(swap);
+ 	sSwapFileCount++;
+ 	mutex_unlock(&amp;sSwapFileListLock);
+ 
+ 	mutex_lock(&amp;sAvailSwapSpaceLock);
+-	sAvailSwapSpace += pageCount * PAGE_SIZE;
++	sAvailSwapSpace += pageCount * B_PAGE_SIZE;
+ 	mutex_unlock(&amp;sAvailSwapSpaceLock);
+ 
+ 	return B_OK;
+@@ -730,12 +737,10 @@
+ {
+ 	vnode *node = NULL;
+ 	status_t status = vfs_get_vnode_from_path(path, true, &amp;node);
+-	if (status != B_OK) {
+-		vfs_put_vnode(node);
++	if (status != B_OK)
+ 		return status;
+-	}
+ 
+-	mutex_lock(&amp;sSwapFileListLock);
++	MutexLocker locker(sSwapFileListLock);
+ 
+ 	swap_file *swapFile = NULL;
+ 	for (SwapFileList::Iterator it = sSwapFileList.GetIterator();
+@@ -757,10 +762,10 @@
+ 
+ 	sSwapFileList.Remove(swapFile);
+ 	sSwapFileCount--;
+-	mutex_unlock(&amp;sSwapFileListLock);
++	locker.Unlock();
+ 
+ 	mutex_lock(&amp;sAvailSwapSpaceLock);
+-	sAvailSwapSpace -= (swapFile-&gt;last_page - swapFile-&gt;first_page) * PAGE_SIZE;
++	sAvailSwapSpace -= (swapFile-&gt;last_slot - swapFile-&gt;first_slot) * PAGE_SIZE;
+ 	mutex_unlock(&amp;sAvailSwapSpaceLock);
+ 
+ 	vfs_put_vnode(swapFile-&gt;vnode);
+@@ -847,14 +852,19 @@
+ 	if (cache == NULL)
+ 		return false;
+ 
+-	swap_addr_t swapAddress = cache-&gt;_SwapBlockGetAddress(page-&gt;cache_offset);
+-	if (swapAddress == SWAP_PAGE_NONE)
++	swap_addr_t slotIndex = cache-&gt;_SwapBlockGetAddress(page-&gt;cache_offset);
++	if (slotIndex == SWAP_SLOT_NONE)
+ 		return false;
+ 
+-	swap_page_dealloc(swapAddress, 1);
++	swap_slot_dealloc(slotIndex, 1);
+ 	cache-&gt;fAllocatedSwapSize -= B_PAGE_SIZE;
+ 	cache-&gt;_SwapBlockFree(page-&gt;cache_offset, 1);
+-	return true;
++
++	mutex_lock(&amp;sAvailSwapSpaceLock);
++	sAvailSwapSpace += B_PAGE_SIZE;
++	mutex_unlock(&amp;sAvailSwapSpaceLock);
++
++  	return true;
+ }
+ 
+ 
+@@ -874,14 +884,14 @@
+ {
+ 	mutex_lock(&amp;sSwapFileListLock);
+ 
+-	uint32 totalSwapPages = 0;
++	uint32 totalSwapSlots = 0;
+ 	for (SwapFileList::Iterator it = sSwapFileList.GetIterator();
+ 			swap_file *swapFile = it.Next();)
+-		totalSwapPages += swapFile-&gt;last_page - swapFile-&gt;first_page;
++		totalSwapSlots += swapFile-&gt;last_slot - swapFile-&gt;first_slot;
+ 
+ 	mutex_unlock(&amp;sSwapFileListLock);
+ 
+-	return totalSwapPages;
++	return totalSwapSlots;
+ }
+ 
+ #endif	// ENABLE_SWAP_SUPPORT
+
+Modified: haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h	2008-08-18 23:28:34 UTC (rev 27056)
++++ haiku/trunk/src/system/kernel/vm/VMAnonymousCache.h	2008-08-19 00:32:54 UTC (rev 27057)
+@@ -47,7 +47,7 @@
+ 
+ private:
+ 			void		_SwapBlockBuild(off_t pageIndex,
+-							swap_addr_t swapAddress, uint32 count);
++							swap_addr_t slotIndex, uint32 count);
+ 			void        _SwapBlockFree(off_t pageIndex, uint32 count);
+ 			swap_addr_t	_SwapBlockGetAddress(off_t pageIndex);
+ 			status_t	_Commit(off_t size);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="011089.html">[Haiku-commits] r27056 - in haiku/trunk: headers/private/kernel	src/system/kernel/cache src/system/kernel/vm
+</A></li>
+	<LI>Next message: <A HREF="011091.html">[Haiku-commits] r27058 - haiku/trunk/src/system/kernel/cache
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11090">[ date ]</a>
+              <a href="thread.html#11090">[ thread ]</a>
+              <a href="subject.html#11090">[ subject ]</a>
+              <a href="author.html#11090">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

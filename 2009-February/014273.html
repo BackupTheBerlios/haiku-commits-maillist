@@ -1,0 +1,193 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r29154 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-February/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29154%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid&In-Reply-To=%3C200902072309.n17N91Up001839%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014272.html">
+   <LINK REL="Next"  HREF="014274.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r29154 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid</H1>
+    <B>mmlr at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r29154%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid&In-Reply-To=%3C200902072309.n17N91Up001839%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r29154 -	haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid">mmlr at mail.berlios.de
+       </A><BR>
+    <I>Sun Feb  8 00:09:01 CET 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014272.html">[Haiku-commits] r29153 -	haiku/trunk/src/system/libroot/posix/glibc/libio
+</A></li>
+        <LI>Next message: <A HREF="014274.html">[Haiku-commits] r29155 - haiku/trunk/src/kits/tracker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14273">[ date ]</a>
+              <a href="thread.html#14273">[ thread ]</a>
+              <a href="subject.html#14273">[ subject ]</a>
+              <a href="author.html#14273">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: mmlr
+Date: 2009-02-08 00:09:00 +0100 (Sun, 08 Feb 2009)
+New Revision: 29154
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=29154&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=29154&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.cpp
+Log:
+* Correctly handle the phantom state. In this state we don't have any valid key
+  information and we must not overwrite the last valid buffer. Otherwise we
+  generate spurious key ups when entering and spurious key downs when leaving
+  the phantom state.
+* Implement getting/setting of keyboard repeat delay and rate so they become
+  settable by the keyboard preferences.
+* Rework repeat handling a bit. With a large enough repeat delay (i.e. bigger
+  than the report interval of the device) we would never get the timeout case
+  and therefore never start repeating.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.cpp	2009-02-07 20:05:39 UTC (rev 29153)
++++ haiku/trunk/src/add-ons/kernel/drivers/input/usb_hid/KeyboardDevice.cpp	2009-02-07 23:09:00 UTC (rev 29154)
+@@ -65,6 +65,8 @@
+ {
+ 	switch (op) {
+ 		case KB_READ:
++		{
++			bigtime_t enterTime = system_time();
+ 			while (_RingBufferReadable() == 0) {
+ 				if (!_IsTransferUnprocessed()) {
+ 					status_t result = _ScheduleTransfer();
+@@ -82,24 +84,69 @@
+ 					_SetTransferProcessed();
+ 					if (result != B_OK)
+ 						return result;
+-				} else if (result == B_TIMED_OUT &amp;&amp; IsOpen()) {
+-					// this case is for handling key repeats, it means
+-					// no interrupt transfer has happened
++				} else if (result != B_TIMED_OUT)
++					return result;
++
++				if (!IsOpen())
++					return B_ERROR;
++
++				if (_RingBufferReadable() == 0 &amp;&amp; fCurrentRepeatKey != 0
++					&amp;&amp; system_time() - enterTime &gt; fCurrentRepeatDelay) {
++					// this case is for handling key repeats, it means no
++					// interrupt transfer has happened or it didn't produce any
++					// new key events, but a repeated key down is due
+ 					_WriteKey(fCurrentRepeatKey, true);
++
+ 					// the next timeout is reduced to the repeat_rate
+ 					fCurrentRepeatDelay = fRepeatRate;
+ 					break;
+-				} else
+-					return result;
++				}
+ 			}
+ 
+ 			// process what is in the ring_buffer, it could be written
+ 			// there because we handled an interrupt transfer or because
+ 			// we wrote the current repeat key
+ 			return _RingBufferRead(buffer, sizeof(raw_key_info));
++		}
+ 
+ 		case KB_SET_LEDS:
+-			return _SetLEDs((uint8 *)buffer);
++		{
++			uint8 ledData[4];
++			if (user_memcpy(ledData, buffer, sizeof(ledData)) != B_OK)
++				return B_BAD_ADDRESS;
++			return _SetLEDs(ledData);
++		}
++
++		case KB_SET_KEY_REPEAT_RATE:
++		{
++			int32 repeatRate;
++			if (user_memcpy(&amp;repeatRate, buffer, sizeof(repeatRate)) != B_OK)
++				return B_BAD_ADDRESS;
++
++			if (repeatRate == 0 || repeatRate &gt; 1000000)
++				return B_BAD_VALUE;
++
++			fRepeatRate = 10000000 / repeatRate;
++			return B_OK;
++		}
++
++		case KB_GET_KEY_REPEAT_RATE:
++		{
++			int32 repeatRate = 10000000 / fRepeatRate;
++			if (user_memcpy(buffer, &amp;repeatRate, sizeof(repeatRate)) != B_OK)
++				return B_BAD_ADDRESS;
++			return B_OK;
++		}
++
++		case KB_SET_KEY_REPEAT_DELAY:
++			if (user_memcpy(&amp;fRepeatDelay, buffer, sizeof(fRepeatDelay)) != B_OK)
++				return B_BAD_ADDRESS;
++			return B_OK;
++
++		case KB_GET_KEY_REPEAT_DELAY:
++			if (user_memcpy(buffer, &amp;fRepeatDelay, sizeof(fRepeatDelay)) != B_OK)
++				return B_BAD_ADDRESS;
++			return B_OK;
+ 	}
+ 
+ 	TRACE_ALWAYS(&quot;keyboard device unhandled control 0x%08lx\n&quot;, op);
+@@ -319,6 +366,22 @@
+ 			_WriteKey(sModifierTable[i], (fTransferBuffer[0] &gt;&gt; i) &amp; 1);
+ 	}
+ 
++	bool phantomState = true;
++	for (size_t i = 2; i &lt; fTotalReportSize; i++) {
++		if (fTransferBuffer[i] != 0x01) {
++			phantomState = false;
++			break;
++		}
++	}
++
++	if (phantomState) {
++		// no valid key information is present in this state and we don't
++		// want to overwrite our last buffer as otherwise we generate
++		// spurious key ups now and spurious key downs when leaving the
++		// phantom state again
++		return B_OK;
++	}
++
+ 	bool keyDown = false;
+ 	uint8 *current = fLastTransferBuffer;
+ 	uint8 *compare = fTransferBuffer;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014272.html">[Haiku-commits] r29153 -	haiku/trunk/src/system/libroot/posix/glibc/libio
+</A></li>
+	<LI>Next message: <A HREF="014274.html">[Haiku-commits] r29155 - haiku/trunk/src/kits/tracker
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14273">[ date ]</a>
+              <a href="thread.html#14273">[ thread ]</a>
+              <a href="subject.html#14273">[ subject ]</a>
+              <a href="author.html#14273">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

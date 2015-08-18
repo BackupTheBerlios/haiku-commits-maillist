@@ -1,0 +1,176 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r24806 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24806%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200804051023.m35ANB2C004148%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007501.html">
+   <LINK REL="Next"  HREF="007505.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r24806 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r24806%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200804051023.m35ANB2C004148%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r24806 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sat Apr  5 12:23:11 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007501.html">[Haiku-commits] r24805 -	haiku/trunk/src/system/boot/platform/bios_ia32
+</A></li>
+        <LI>Next message: <A HREF="007505.html">[Haiku-commits] r24807 - haiku/trunk/headers/os/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7502">[ date ]</a>
+              <a href="thread.html#7502">[ thread ]</a>
+              <a href="subject.html#7502">[ subject ]</a>
+              <a href="author.html#7502">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-04-05 12:23:11 +0200 (Sat, 05 Apr 2008)
+New Revision: 24806
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=24806&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=24806&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/block_cache.cpp
+Log:
+The wait_for_notifications() function now detects if it has been run from
+within the notifier/writer thread, and will then flush the notifications
+directly. This should fix #2008 again.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/block_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-04-05 10:16:49 UTC (rev 24805)
++++ haiku/trunk/src/system/kernel/cache/block_cache.cpp	2008-04-05 10:23:11 UTC (rev 24806)
+@@ -287,6 +287,7 @@
+ static mutex sCachesLock;
+ static sem_id sEventSemaphore;
+ static mutex sNotificationsLock;
++static thread_id sWriterNotifyThread;
+ static DoublyLinkedListLink&lt;block_cache&gt; sMarkCache;
+ 	// TODO: this only works if the link is the first entry of block_cache
+ static object_cache *sBlockCache;
+@@ -1353,33 +1354,6 @@
+ #endif	// DEBUG_BLOCK_CACHE
+ 
+ 
+-static void
+-notify_sync(int32 transactionID, int32 event, void *_cache)
+-{
+-	block_cache *cache = (block_cache *)_cache;
+-
+-	cache-&gt;condition_variable.NotifyOne();
+-}
+-
+-
+-static void
+-wait_for_notifications(block_cache *cache)
+-{
+-	// add sync notification
+-	cache_notification notification;
+-	set_notification(NULL, notification, TRANSACTION_WRITTEN, notify_sync,
+-		cache);
+-
+-	ConditionVariableEntry&lt;block_cache&gt; entry;
+-	entry.Add(cache);
+-
+-	add_notification(cache, &amp;notification, TRANSACTION_WRITTEN, false);
+-
+-	// wait for notification hook to be called
+-	entry.Wait();
+-}
+-
+-
+ static block_cache *
+ get_next_locked_block_cache(block_cache *last)
+ {
+@@ -1559,6 +1533,40 @@
+ }
+ 
+ 
++static void
++notify_sync(int32 transactionID, int32 event, void *_cache)
++{
++	block_cache *cache = (block_cache *)_cache;
++
++	cache-&gt;condition_variable.NotifyOne();
++}
++
++
++static void
++wait_for_notifications(block_cache *cache)
++{
++	if (find_thread(NULL) == sWriterNotifyThread) {
++		// We're the notifier thread, don't wait, but flush all pending
++		// notifications directly.
++		flush_pending_notifications(cache);
++		return;
++	}
++
++	// add sync notification
++	cache_notification notification;
++	set_notification(NULL, notification, TRANSACTION_WRITTEN, notify_sync,
++		cache);
++
++	ConditionVariableEntry&lt;block_cache&gt; entry;
++	entry.Add(cache);
++
++	add_notification(cache, &amp;notification, TRANSACTION_WRITTEN, false);
++
++	// wait for notification hook to be called
++	entry.Wait();
++}
++
++
+ extern &quot;C&quot; status_t
+ block_cache_init(void)
+ {
+@@ -1577,10 +1585,10 @@
+ 	if (sEventSemaphore &lt; B_OK)
+ 		return sEventSemaphore;
+ 
+-	thread_id thread = spawn_kernel_thread(&amp;block_notifier_and_writer,
++	sWriterNotifyThread = spawn_kernel_thread(&amp;block_notifier_and_writer,
+ 		&quot;block writer/notifier&quot;, B_LOW_PRIORITY, NULL);
+-	if (thread &gt;= B_OK)
+-		send_signal_etc(thread, SIGCONT, B_DO_NOT_RESCHEDULE);
++	if (sWriterNotifyThread &gt;= B_OK)
++		send_signal_etc(sWriterNotifyThread, SIGCONT, B_DO_NOT_RESCHEDULE);
+ 
+ #ifdef DEBUG_BLOCK_CACHE
+ 	add_debugger_command_etc(&quot;block_caches&quot;, &amp;dump_caches,
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007501.html">[Haiku-commits] r24805 -	haiku/trunk/src/system/boot/platform/bios_ia32
+</A></li>
+	<LI>Next message: <A HREF="007505.html">[Haiku-commits] r24807 - haiku/trunk/headers/os/interface
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7502">[ date ]</a>
+              <a href="thread.html#7502">[ thread ]</a>
+              <a href="subject.html#7502">[ subject ]</a>
+              <a href="author.html#7502">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

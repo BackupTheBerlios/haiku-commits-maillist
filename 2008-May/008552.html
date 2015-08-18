@@ -1,0 +1,167 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25345 - haiku/trunk/src/system/kernel/posix
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-May/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25345%20-%20haiku/trunk/src/system/kernel/posix&In-Reply-To=%3C200805071210.m47CAcH1006247%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008551.html">
+   <LINK REL="Next"  HREF="008553.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25345 - haiku/trunk/src/system/kernel/posix</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25345%20-%20haiku/trunk/src/system/kernel/posix&In-Reply-To=%3C200805071210.m47CAcH1006247%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25345 - haiku/trunk/src/system/kernel/posix">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed May  7 14:10:38 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008551.html">[Haiku-commits] r25344 - haiku/trunk/src/apps/poorman
+</A></li>
+        <LI>Next message: <A HREF="008553.html">[Haiku-commits] r25346 - haiku/trunk/src/add-ons/accelerants
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8552">[ date ]</a>
+              <a href="thread.html#8552">[ thread ]</a>
+              <a href="subject.html#8552">[ subject ]</a>
+              <a href="author.html#8552">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-05-07 14:10:38 +0200 (Wed, 07 May 2008)
+New Revision: 25345
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25345&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25345&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/posix/realtime_sem.cpp
+Log:
+* Don't try to strdup() the name given for an unnamed semaphore.
+* When initializing an unnamed semaphore failed, it would be deleted
+  twice.
+* The user structure pointer wasn't correctly passed when initializing
+  named semaphores.
+* When opening a named semaphore failed after it has already been
+  published, it is now unlinked again.
+* The timeout passed to sem_timedwait() is relative to the Epoch. We
+  need to offset to system time.
+* Added TODO regarding a per team semaphore limit.
+
+
+Modified: haiku/trunk/src/system/kernel/posix/realtime_sem.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/posix/realtime_sem.cpp	2008-05-07 12:07:22 UTC (rev 25344)
++++ haiku/trunk/src/system/kernel/posix/realtime_sem.cpp	2008-05-07 12:10:38 UTC (rev 25345)
+@@ -15,6 +15,7 @@
+ #include &lt;fs/KPath.h&gt;
+ #include &lt;kernel.h&gt;
+ #include &lt;lock.h&gt;
++#include &lt;real_time_clock.h&gt;
+ #include &lt;syscall_restart.h&gt;
+ #include &lt;team.h&gt;
+ #include &lt;thread.h&gt;
+@@ -46,9 +47,11 @@
+ 
+ 	status_t Init(const char* name, mode_t mode, int32 semCount)
+ 	{
+-		fName = strdup(name);
+-		if (fName == NULL)
+-			return B_NO_MEMORY;
++		if (name != NULL) {
++			fName = strdup(name);
++			if (fName == NULL)
++				return B_NO_MEMORY;
++		}
+ 
+ 		fID = create_sem(semCount, name);
+ 		if (fID &lt; 0)
+@@ -171,6 +174,7 @@
+ 			return ENOENT;
+ 
+ 		// does not exist yet -- create
++// TODO: Enforce per team semaphore limit!
+ 		sem = new(std::nothrow) SemInfo;
+ 		if (sem == NULL)
+ 			return B_NO_MEMORY;
+@@ -362,16 +366,15 @@
+ 
+ 	status_t CreateAnonymousSem(uint32 semCount, int&amp; _id)
+ 	{
++// TODO: Enforce per team semaphore limit!
+ 		SemInfo* sem = new(std::nothrow) SemInfo;
+ 		if (sem == NULL)
+ 			return B_NO_MEMORY;
+ 		ObjectDeleter&lt;SemInfo&gt; semDeleter(sem);
+ 
+ 		status_t error = sem-&gt;Init(NULL, 0, semCount);
+-		if (error != B_OK) {
+-			delete sem;
++		if (error != B_OK)
+ 			return error;
+-		}
+ 
+ 		TeamSemInfo* teamSem = new(std::nothrow) TeamSemInfo(sem, NULL);
+ 		if (teamSem == NULL)
+@@ -414,15 +417,19 @@
+ 		}
+ 
+ 		// not open yet -- create a new team sem
+-		teamSem = new(std::nothrow) TeamSemInfo(sem, NULL);
++		teamSem = new(std::nothrow) TeamSemInfo(sem, userSem);
+ 		if (teamSem == NULL) {
+ 			sem-&gt;ReleaseReference();
++			if (_created)
++				sSemTable.UnlinkSem(name);
+ 			return B_NO_MEMORY;
+ 		}
+ 
+ 		error = fSemaphores.Insert(teamSem);
+ 		if (error != B_OK) {
+ 			delete teamSem;
++			if (_created)
++				sSemTable.UnlinkSem(name);
+ 			return error;
+ 		}
+ 
+@@ -469,7 +476,8 @@
+ 			error = acquire_sem_etc(id, 1, B_CAN_INTERRUPT, 0);
+ 		} else {
+ 			error = acquire_sem_etc(id, 1, B_CAN_INTERRUPT | B_ABSOLUTE_TIMEOUT,
+-				timeout);
++				timeout - rtc_boot_time());
++					// The given absolute timeout is relative to the Epoch.
+ 		}
+ 
+ 		return error == B_BAD_SEM_ID ? B_BAD_VALUE : error;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008551.html">[Haiku-commits] r25344 - haiku/trunk/src/apps/poorman
+</A></li>
+	<LI>Next message: <A HREF="008553.html">[Haiku-commits] r25346 - haiku/trunk/src/add-ons/accelerants
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8552">[ date ]</a>
+              <a href="thread.html#8552">[ thread ]</a>
+              <a href="subject.html#8552">[ subject ]</a>
+              <a href="author.html#8552">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

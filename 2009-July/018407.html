@@ -1,0 +1,277 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31875 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31875%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/audio/hda&In-Reply-To=%3C200907282236.n6SMaHOh019138%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="018406.html">
+   <LINK REL="Next"  HREF="018416.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31875 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda</H1>
+    <B>korli at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31875%20-%0A%09haiku/trunk/src/add-ons/kernel/drivers/audio/hda&In-Reply-To=%3C200907282236.n6SMaHOh019138%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31875 -	haiku/trunk/src/add-ons/kernel/drivers/audio/hda">korli at mail.berlios.de
+       </A><BR>
+    <I>Wed Jul 29 00:36:17 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="018406.html">[Haiku-commits] r31874 - in	haiku/branches/components/gsoc-locale-kit: headers/os/locale	src/kits/locale src/preferences/locale
+</A></li>
+        <LI>Next message: <A HREF="018416.html">[Haiku-commits] r31875 - haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18407">[ date ]</a>
+              <a href="thread.html#18407">[ thread ]</a>
+              <a href="subject.html#18407">[ subject ]</a>
+              <a href="author.html#18407">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: korli
+Date: 2009-07-29 00:36:13 +0200 (Wed, 29 Jul 2009)
+New Revision: 31875
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31875&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31875&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp
+   haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp
+Log:
+* now uses only one buffer_ready semaphore, this way the buffer exchange is done asap, useful when rates/formats are different between playback and record.
+* checked what offsets my hardware my hardware really had: it affected only playback, and was 192 for 16 bits and 256 for 20/24 bits. With these values, playback and record are crystal clear. 
+As I can't find any references for such offset values anywhere, sorry it's not supposed to work out of the box on all hardware. Maybe we could adjust the offset at runtime.
+
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h	2009-07-28 22:17:36 UTC (rev 31874)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/driver.h	2009-07-28 22:36:13 UTC (rev 31875)
+@@ -88,7 +88,8 @@
+ 	uint32			num_codecs;
+ 
+ 	hda_stream*		streams[HDA_MAX_STREAMS];
+-
++	sem_id			buffer_ready_sem;
++	
+ 	uint8 Read8(uint32 reg)
+ 	{
+ 		return *(regs + reg);
+@@ -147,10 +148,10 @@
+ 					/* Virtual addresses for buffer */
+ 	uint32		physical_buffers[STREAM_MAX_BUFFERS];
+ 					/* Physical addresses for buffer */
+-	sem_id		buffer_ready_sem;
+-	bigtime_t	real_time;
+-	uint64		frames_count;
+-	int32		buffer_cycle;
++	
++	volatile bigtime_t	real_time;
++	volatile uint64		frames_count;
++	volatile int32		buffer_cycle;
+ 
+ 	uint32		rate, bps;			/* Samplerate &amp; bits per sample */
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp	2009-07-28 22:17:36 UTC (rev 31874)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp	2009-07-28 22:36:13 UTC (rev 31875)
+@@ -111,11 +111,13 @@
+ 
+ 	stream-&gt;real_time = system_time();
+ 	stream-&gt;frames_count += stream-&gt;buffer_length;
+-	stream-&gt;buffer_cycle = ((position / bufferSize) + 1) % stream-&gt;num_buffers;
++	stream-&gt;buffer_cycle = position / bufferSize;
+ 
+ 	release_spinlock(&amp;stream-&gt;lock);
+ 
+-	release_sem_etc(stream-&gt;buffer_ready_sem, 1, B_DO_NOT_RESCHEDULE);
++	release_sem_etc(controller-&gt;buffer_ready_sem, 1, B_DO_NOT_RESCHEDULE);
++	
++	//dprintf(&quot;stream_handle_interrupt %d %d %ld\n&quot;, stream-&gt;id, stream-&gt;buffer_cycle, position);
+ }
+ 
+ 
+@@ -389,9 +391,6 @@
+ void
+ hda_stream_delete(hda_stream* stream)
+ {
+-	if (stream-&gt;buffer_ready_sem &gt;= B_OK)
+-		delete_sem(stream-&gt;buffer_ready_sem);
+-
+ 	if (stream-&gt;buffer_area &gt;= B_OK)
+ 		delete_area(stream-&gt;buffer_area);
+ 
+@@ -411,7 +410,6 @@
+ 	if (stream == NULL)
+ 		return NULL;
+ 
+-	stream-&gt;buffer_ready_sem = B_ERROR;
+ 	stream-&gt;buffer_area = B_ERROR;
+ 	stream-&gt;buffer_descriptors_area = B_ERROR;
+ 	stream-&gt;type = type;
+@@ -464,11 +462,7 @@
+ hda_stream_start(hda_controller* controller, hda_stream* stream)
+ {
+ 	dprintf(&quot;hda_stream_start() offset %lx\n&quot;, stream-&gt;offset);
+-	stream-&gt;buffer_ready_sem = create_sem(0, stream-&gt;type == STREAM_PLAYBACK
+-		? &quot;hda_playback_sem&quot; : &quot;hda_record_sem&quot;);
+-	if (stream-&gt;buffer_ready_sem &lt; B_OK)
+-		return stream-&gt;buffer_ready_sem;
+-
++	
+ 	controller-&gt;Write32(HDAC_INTR_CONTROL, controller-&gt;Read32(HDAC_INTR_CONTROL)
+ 		| (1 &lt;&lt; (stream-&gt;offset / HDAC_STREAM_SIZE)));
+ 	stream-&gt;Write8(HDAC_STREAM_CONTROL0, stream-&gt;Read8(HDAC_STREAM_CONTROL0)
+@@ -494,8 +488,6 @@
+ 		&amp; ~(1 &lt;&lt; (stream-&gt;offset / HDAC_STREAM_SIZE)));
+ 
+ 	stream-&gt;running = false;
+-	delete_sem(stream-&gt;buffer_ready_sem);
+-	stream-&gt;buffer_ready_sem = -1;
+ 
+ 	return B_OK;
+ }
+@@ -547,19 +539,19 @@
+ 		}
+ 	}
+ 
+-    // Stream interrupts seem to arrive too early on most HDA
+-    // so we adjust buffer descriptors to take this into account
+-    uint32 offset;
+-    if (format &amp; FORMAT_44_1_BASE_RATE) {
+-        offset = (stream-&gt;sample_size * stream-&gt;num_channels) * stream-&gt;rate
+-        	/ 44100;
+-    } else {
+-        offset = (stream-&gt;sample_size * stream-&gt;num_channels) * stream-&gt;rate
+-        	/ 48000;
+-    }
+-	if (stream-&gt;controller-&gt;pci_info.vendor_id != INTEL_VENDORID)
+-		offset *= 32;
+-
++	// Stream interrupts seem to arrive too early on most HDA
++	// so we adjust buffer descriptors to take this into account
++	// TODO check on other vendors, uncomment last line in stream_handle_interrupt()
++	// Tested only on Intel ICH8
++	uint32 offset = 0;
++	if (stream-&gt;type == STREAM_PLAYBACK) {
++		if (stream-&gt;sample_size == 2)
++			offset = 6;
++		else if (stream-&gt;sample_size &gt; 2)
++			offset = 8;
++	}
++	offset *= 32;
++	
+ 	/* Calculate size of buffer (aligned to 128 bytes) */
+ 	bufferSize = stream-&gt;sample_size * stream-&gt;num_channels
+ 		* stream-&gt;buffer_length;
+@@ -567,8 +559,8 @@
+ 
+ 	dprintf(&quot;HDA: sample size %ld, num channels %ld, buffer length %ld, offset %ld **********\n&quot;,
+ 		stream-&gt;sample_size, stream-&gt;num_channels, stream-&gt;buffer_length, offset);
+-	dprintf(&quot;IRA: %s: setup stream %ld: SR=%ld, SF=%ld F=0x%x\n&quot;, __func__, stream-&gt;id,
+-		stream-&gt;rate, stream-&gt;bps, format);
++	dprintf(&quot;IRA: %s: setup stream %ld: SR=%ld, SF=%ld F=0x%x (0x%lx)\n&quot;, __func__, stream-&gt;id,
++		stream-&gt;rate, stream-&gt;bps, format, stream-&gt;sample_format);
+ 
+ 	/* Calculate total size of all buffers (aligned to size of B_PAGE_SIZE) */
+ 	alloc = bufferSize * stream-&gt;num_buffers;
+@@ -854,12 +846,21 @@
+ 			break;
+ 		}
+ 	}
++	
++	controller-&gt;buffer_ready_sem = create_sem(0, &quot;hda_buffer_sem&quot;);
++	if (controller-&gt;buffer_ready_sem &lt; B_OK) {
++		dprintf(&quot;hda: failed to create semaphore\n&quot;);
++		status = ENODEV;
++		goto corb_rirb_failed;
++	}
+ 
+ 	if (controller-&gt;active_codec != NULL)
+ 		return B_OK;
+ 
+ 	dprintf(&quot;hda: no active codec\n&quot;);
+ 	status = ENODEV;
++	
++	delete_sem(controller-&gt;buffer_ready_sem);
+ 
+ corb_rirb_failed:
+ 	controller-&gt;Write32(HDAC_INTR_CONTROL, 0);
+@@ -905,6 +906,11 @@
+ 
+ 	/* Stop all audio streams */
+ 	hda_hw_stop(controller);
++	
++	if (controller-&gt;buffer_ready_sem &gt;= B_OK) {
++		delete_sem(controller-&gt;buffer_ready_sem);
++		controller-&gt;buffer_ready_sem = B_ERROR;
++	}
+ 
+ 	reset_controller(controller);
+ 
+
+Modified: haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp	2009-07-28 22:17:36 UTC (rev 31874)
++++ haiku/trunk/src/add-ons/kernel/drivers/audio/hda/hda_multi_audio.cpp	2009-07-28 22:36:13 UTC (rev 31875)
+@@ -847,7 +847,7 @@
+ #endif
+ 
+ 	/* do playback */
+-	err = acquire_sem_etc(audioGroup-&gt;playback_stream-&gt;buffer_ready_sem,
++	err = acquire_sem_etc(audioGroup-&gt;codec-&gt;controller-&gt;buffer_ready_sem,
+ 		1, B_CAN_INTERRUPT, 0);
+ 	if (err != B_OK) {
+ 		dprintf(&quot;%s: Error waiting for playback buffer to finish (%s)!\n&quot;, __func__,
+@@ -858,7 +858,7 @@
+ 	status = disable_interrupts();
+ 	acquire_spinlock(&amp;audioGroup-&gt;playback_stream-&gt;lock);
+ 
+-	buffer_info.playback_buffer_cycle = audioGroup-&gt;playback_stream-&gt;buffer_cycle;
++	buffer_info.playback_buffer_cycle = (audioGroup-&gt;playback_stream-&gt;buffer_cycle) % audioGroup-&gt;playback_stream-&gt;num_buffers;
+ 	buffer_info.played_real_time = audioGroup-&gt;playback_stream-&gt;real_time;
+ 	buffer_info.played_frames_count = audioGroup-&gt;playback_stream-&gt;frames_count;
+ 
+@@ -866,7 +866,7 @@
+ 
+ 	if (audioGroup-&gt;record_stream) {
+ 		acquire_spinlock(&amp;audioGroup-&gt;record_stream-&gt;lock);
+-		buffer_info.record_buffer_cycle = audioGroup-&gt;record_stream-&gt;buffer_cycle;
++		buffer_info.record_buffer_cycle = (audioGroup-&gt;record_stream-&gt;buffer_cycle - 1) % audioGroup-&gt;record_stream-&gt;num_buffers;
+ 		buffer_info.recorded_real_time = audioGroup-&gt;record_stream-&gt;real_time;
+ 		buffer_info.recorded_frames_count = audioGroup-&gt;record_stream-&gt;frames_count;
+ 		release_spinlock(&amp;audioGroup-&gt;record_stream-&gt;lock);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="018406.html">[Haiku-commits] r31874 - in	haiku/branches/components/gsoc-locale-kit: headers/os/locale	src/kits/locale src/preferences/locale
+</A></li>
+	<LI>Next message: <A HREF="018416.html">[Haiku-commits] r31875 - haiku/trunk/src/add-ons/kernel/drivers/audio/hda
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18407">[ date ]</a>
+              <a href="thread.html#18407">[ thread ]</a>
+              <a href="subject.html#18407">[ subject ]</a>
+              <a href="author.html#18407">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

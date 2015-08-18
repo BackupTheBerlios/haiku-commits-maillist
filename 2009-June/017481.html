@@ -1,0 +1,1101 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31244 - in haiku/trunk/src/apps/debugger: . arch	arch/x86 debug_info
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31244%20-%20in%20haiku/trunk/src/apps/debugger%3A%20.%20arch%0A%09arch/x86%20debug_info&In-Reply-To=%3C200906252351.n5PNpASI008417%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017485.html">
+   <LINK REL="Next"  HREF="017483.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31244 - in haiku/trunk/src/apps/debugger: . arch	arch/x86 debug_info</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31244%20-%20in%20haiku/trunk/src/apps/debugger%3A%20.%20arch%0A%09arch/x86%20debug_info&In-Reply-To=%3C200906252351.n5PNpASI008417%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31244 - in haiku/trunk/src/apps/debugger: . arch	arch/x86 debug_info">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Jun 26 01:51:10 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017485.html">[Haiku-commits] r31243 - in haiku/trunk/src: add-ons/kernel/debugger/demangle  apps/debugger/demangler
+</A></li>
+        <LI>Next message: <A HREF="017483.html">[Haiku-commits] r31245 -	haiku/trunk/src/add-ons/kernel/debugger/demangle
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17481">[ date ]</a>
+              <a href="thread.html#17481">[ thread ]</a>
+              <a href="subject.html#17481">[ subject ]</a>
+              <a href="author.html#17481">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-06-26 01:51:09 +0200 (Fri, 26 Jun 2009)
+New Revision: 31244
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31244&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31244&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/apps/debugger/BreakpointManager.cpp
+   haiku/trunk/src/apps/debugger/BreakpointManager.h
+   haiku/trunk/src/apps/debugger/arch/InstructionInfo.cpp
+   haiku/trunk/src/apps/debugger/arch/InstructionInfo.h
+Modified:
+   haiku/trunk/src/apps/debugger/Jamfile
+   haiku/trunk/src/apps/debugger/MessageCodes.h
+   haiku/trunk/src/apps/debugger/TeamDebugger.cpp
+   haiku/trunk/src/apps/debugger/TeamDebugger.h
+   haiku/trunk/src/apps/debugger/ThreadHandler.cpp
+   haiku/trunk/src/apps/debugger/ThreadHandler.h
+   haiku/trunk/src/apps/debugger/arch/Architecture.h
+   haiku/trunk/src/apps/debugger/arch/x86/ArchitectureX86.cpp
+   haiku/trunk/src/apps/debugger/arch/x86/ArchitectureX86.h
+   haiku/trunk/src/apps/debugger/debug_info/DebugInfo.h
+   haiku/trunk/src/apps/debugger/debug_info/DebuggerDebugInfo.cpp
+   haiku/trunk/src/apps/debugger/debug_info/DebuggerDebugInfo.h
+Log:
+* Moved breakpoint management into new class BreakpointManager and added
+  support for temporary breakpoints.
+* TeamDebugger: No longer handle debug events in the listener thread. Instead
+  post a message to the looper thread. Makes the locking a bit easier.
+* Architecture: Added virtual GetInstructionInfo() and GetStatement() returning
+  information on the instruction respectively a statement at a given address.
+  Implemented for x86.
+* DebugInfo: Added virtual GetStatement() and implemented it for
+  DebuggerDebugInfo by means of using the Architecture.
+* Implemented step over/into/out support. Works in principle, but has no
+  handling for PLTs yet, i.e. stepping into functions of other libraries
+  requires two steps ATM.
+
+
+Added: haiku/trunk/src/apps/debugger/BreakpointManager.cpp
+===================================================================
+--- haiku/trunk/src/apps/debugger/BreakpointManager.cpp	2009-06-25 22:49:07 UTC (rev 31243)
++++ haiku/trunk/src/apps/debugger/BreakpointManager.cpp	2009-06-25 23:51:09 UTC (rev 31244)
+@@ -0,0 +1,235 @@
++/*
++ * Copyright 2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++
++#include &quot;BreakpointManager.h&quot;
++
++#include &lt;stdio.h&gt;
++
++#include &lt;new&gt;
++
++#include &lt;AutoLocker.h&gt;
++
++#include &quot;DebuggerInterface.h&quot;
++#include &quot;TeamDebugModel.h&quot;
++
++
++BreakpointManager::BreakpointManager(TeamDebugModel* debugModel,
++	DebuggerInterface* debuggerInterface)
++	:
++	fLock(&quot;breakpoint manager&quot;),
++	fDebugModel(debugModel),
++	fDebuggerInterface(debuggerInterface)
++{
++}
++
++
++BreakpointManager::~BreakpointManager()
++{
++}
++
++
++status_t
++BreakpointManager::Init()
++{
++	return fLock.InitCheck();
++}
++
++
++status_t
++BreakpointManager::InstallUserBreakpoint(target_addr_t address,
++	bool enabled)
++{
++	user_breakpoint_state state = enabled
++		? USER_BREAKPOINT_ENABLED : USER_BREAKPOINT_DISABLED;
++
++	AutoLocker&lt;TeamDebugModel&gt; modelLocker(fDebugModel);
++
++	// If there already is a breakpoint, it might already have the requested
++	// state.
++	Breakpoint* breakpoint = fDebugModel-&gt;BreakpointAtAddress(address);
++	if (breakpoint != NULL &amp;&amp; breakpoint-&gt;UserState() == state)
++		return B_OK;
++
++	// create a breakpoint, if it doesn't exist yet
++	if (breakpoint == NULL) {
++		Image* image = fDebugModel-&gt;GetTeam()-&gt;ImageByAddress(address);
++		if (image == NULL)
++			return B_BAD_ADDRESS;
++
++		breakpoint = new(std::nothrow) Breakpoint(image, address);
++		if (breakpoint == NULL)
++			return B_NO_MEMORY;
++
++		if (!fDebugModel-&gt;AddBreakpoint(breakpoint))
++			return B_NO_MEMORY;
++	}
++
++	user_breakpoint_state oldState = breakpoint-&gt;UserState();
++
++	// set the breakpoint state
++	breakpoint-&gt;SetUserState(state);
++	fDebugModel-&gt;NotifyUserBreakpointChanged(breakpoint);
++
++	AutoLocker&lt;BLocker&gt; installLocker(fLock);
++		// We need to make the installation decision with both locks held, and
++		// we keep this lock until we have the breakpoint installed/uninstalled.
++
++	bool install = breakpoint-&gt;ShouldBeInstalled();
++	if (breakpoint-&gt;IsInstalled() == install)
++		return B_OK;
++
++	// The breakpoint needs to be installed/uninstalled.
++	Reference&lt;Breakpoint&gt; breakpointReference(breakpoint);
++	modelLocker.Unlock();
++
++	status_t error = install
++		? fDebuggerInterface-&gt;InstallBreakpoint(address)
++		: fDebuggerInterface-&gt;UninstallBreakpoint(address);
++
++	// Mark the breakpoint installed/uninstalled, if everything went fine.
++	if (error == B_OK) {
++		breakpoint-&gt;SetInstalled(install);
++		return B_OK;
++	}
++
++	// revert on error
++	installLocker. Unlock();
++	modelLocker.Lock();
++
++	breakpoint-&gt;SetUserState(oldState);
++	fDebugModel-&gt;NotifyUserBreakpointChanged(breakpoint);
++
++	if (breakpoint-&gt;IsUnused())
++		fDebugModel-&gt;RemoveBreakpoint(breakpoint);
++
++	return error;
++}
++
++
++void
++BreakpointManager::UninstallUserBreakpoint(target_addr_t address)
++{
++	AutoLocker&lt;TeamDebugModel&gt; modelLocker(fDebugModel);
++
++	Breakpoint* breakpoint = fDebugModel-&gt;BreakpointAtAddress(address);
++	if (breakpoint == NULL || breakpoint-&gt;UserState() == USER_BREAKPOINT_NONE)
++		return;
++
++	// set the breakpoint state
++	breakpoint-&gt;SetUserState(USER_BREAKPOINT_NONE);
++	fDebugModel-&gt;NotifyUserBreakpointChanged(breakpoint);
++
++	AutoLocker&lt;BLocker&gt; installLocker(fLock);
++		// We need to make the uninstallation decision with both locks held, and
++		// we keep this lock until we have the breakpoint uninstalled.
++
++	// check whether the breakpoint needs to be uninstalled
++	bool uninstall = !breakpoint-&gt;ShouldBeInstalled()
++		&amp;&amp; breakpoint-&gt;IsInstalled();
++
++	// if unused remove it
++	Reference&lt;Breakpoint&gt; breakpointReference(breakpoint);
++	if (breakpoint-&gt;IsUnused())
++		fDebugModel-&gt;RemoveBreakpoint(breakpoint);
++
++	modelLocker.Unlock();
++
++	if (uninstall) {
++		fDebuggerInterface-&gt;UninstallBreakpoint(address);
++		breakpoint-&gt;SetInstalled(false);
++	}
++}
++
++
++status_t
++BreakpointManager::InstallTemporaryBreakpoint(target_addr_t address,
++	BreakpointClient* client)
++{
++	AutoLocker&lt;TeamDebugModel&gt; modelLocker(fDebugModel);
++
++	// create a breakpoint, if it doesn't exist yet
++	Breakpoint* breakpoint = fDebugModel-&gt;BreakpointAtAddress(address);
++	if (breakpoint == NULL) {
++		Image* image = fDebugModel-&gt;GetTeam()-&gt;ImageByAddress(address);
++		if (image == NULL)
++			return B_BAD_ADDRESS;
++
++		breakpoint = new(std::nothrow) Breakpoint(image, address);
++		if (breakpoint == NULL)
++			return B_NO_MEMORY;
++
++		if (!fDebugModel-&gt;AddBreakpoint(breakpoint))
++			return B_NO_MEMORY;
++	}
++
++	Reference&lt;Breakpoint&gt; breakpointReference(breakpoint);
++
++	// add the client
++	status_t error;
++	if (breakpoint-&gt;AddClient(client)) {
++		AutoLocker&lt;BLocker&gt; installLocker(fLock);
++			// We need to make the installation decision with both locks held,
++			// and we keep this lock until we have the breakpoint installed.
++
++		if (breakpoint-&gt;IsInstalled())
++			return B_OK;
++
++		// install
++		modelLocker.Unlock();
++
++		error = fDebuggerInterface-&gt;InstallBreakpoint(address);
++		if (error == B_OK) {
++			breakpoint-&gt;SetInstalled(true);
++			return B_OK;
++		}
++
++		installLocker.Unlock();
++		modelLocker.Lock();
++
++		breakpoint-&gt;RemoveClient(client);
++	} else
++		error = B_NO_MEMORY;
++
++	// clean up on error
++	if (breakpoint-&gt;IsUnused())
++		fDebugModel-&gt;RemoveBreakpoint(breakpoint);
++
++	return error;
++}
++
++
++void
++BreakpointManager::UninstallTemporaryBreakpoint(target_addr_t address,
++	BreakpointClient* client)
++{
++	AutoLocker&lt;TeamDebugModel&gt; modelLocker(fDebugModel);
++
++	Breakpoint* breakpoint = fDebugModel-&gt;BreakpointAtAddress(address);
++	if (breakpoint == NULL)
++		return;
++
++	// remove the client
++	breakpoint-&gt;RemoveClient(client);
++
++	AutoLocker&lt;BLocker&gt; installLocker(fLock);
++		// We need to make the uninstallation decision with both locks held, and
++		// we keep this lock until we have the breakpoint uninstalled.
++
++	// check whether the breakpoint needs to be uninstalled
++	bool uninstall = !breakpoint-&gt;ShouldBeInstalled()
++		&amp;&amp; breakpoint-&gt;IsInstalled();
++
++	// if unused remove it
++	Reference&lt;Breakpoint&gt; breakpointReference(breakpoint);
++	if (breakpoint-&gt;IsUnused())
++		fDebugModel-&gt;RemoveBreakpoint(breakpoint);
++
++	modelLocker.Unlock();
++
++	if (uninstall) {
++		fDebuggerInterface-&gt;UninstallBreakpoint(address);
++		breakpoint-&gt;SetInstalled(false);
++	}
++}
+
+Added: haiku/trunk/src/apps/debugger/BreakpointManager.h
+===================================================================
+--- haiku/trunk/src/apps/debugger/BreakpointManager.h	2009-06-25 22:49:07 UTC (rev 31243)
++++ haiku/trunk/src/apps/debugger/BreakpointManager.h	2009-06-25 23:51:09 UTC (rev 31244)
+@@ -0,0 +1,43 @@
++/*
++ * Copyright 2009, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef BREAKPOINT_MANAGER_H
++#define BREAKPOINT_MANAGER_H
++
++#include &lt;Locker.h&gt;
++
++#include &quot;Breakpoint.h&quot;
++
++
++class DebuggerInterface;
++class TeamDebugModel;
++
++
++class BreakpointManager {
++public:
++								BreakpointManager(TeamDebugModel* debugModel,
++									DebuggerInterface* debuggerInterface);
++								~BreakpointManager();
++
++			status_t			Init();
++
++			status_t			InstallUserBreakpoint(target_addr_t address,
++									bool enabled);
++			void				UninstallUserBreakpoint(target_addr_t address);
++
++			status_t			InstallTemporaryBreakpoint(
++									target_addr_t address,
++									BreakpointClient* client);
++			void				UninstallTemporaryBreakpoint(
++									target_addr_t address,
++									BreakpointClient* client);
++
++private:
++			BLocker				fLock;	// used to synchronize un-/installing
++			TeamDebugModel*		fDebugModel;
++			DebuggerInterface*	fDebuggerInterface;
++};
++
++
++#endif	// BREAKPOINT_MANAGER_H
+
+Modified: haiku/trunk/src/apps/debugger/Jamfile
+===================================================================
+--- haiku/trunk/src/apps/debugger/Jamfile	2009-06-25 22:49:07 UTC (rev 31243)
++++ haiku/trunk/src/apps/debugger/Jamfile	2009-06-25 23:51:09 UTC (rev 31244)
+@@ -21,6 +21,7 @@
+ SubDirHdrs [ FDirName $(debugAnalyzerSources) gui ] ;
+ 
+ Application Debugger :
++	BreakpointManager.cpp
+ 	Debugger.cpp
+ #	ElfFile.cpp
+ 	Jobs.cpp
+@@ -31,6 +32,7 @@
+ 	# arch
+ 	Architecture.cpp
+ 	CpuState.cpp
++	InstructionInfo.cpp
+ 	Register.cpp
+ 
+ 	# arch/x86
+
+Modified: haiku/trunk/src/apps/debugger/MessageCodes.h
+===================================================================
+--- haiku/trunk/src/apps/debugger/MessageCodes.h	2009-06-25 22:49:07 UTC (rev 31243)
++++ haiku/trunk/src/apps/debugger/MessageCodes.h	2009-06-25 23:51:09 UTC (rev 31244)
+@@ -20,6 +20,7 @@
+ 	MSG_THREAD_STACK_TRACE_CHANGED		= 'tstc',
+ 	MSG_STACK_FRAME_SOURCE_CODE_CHANGED	= 'sfsc',
+ 	MSG_USER_BREAKPOINT_CHANGED			= 'ubrc',
++	MSG_DEBUGGER_EVENT					= 'dbge',
+ 
+ 	MSG_TEAM_DEBUGGER_QUIT				= 'dbqt'
+ };
+
+Modified: haiku/trunk/src/apps/debugger/TeamDebugger.cpp
+===================================================================
+--- haiku/trunk/src/apps/debugger/TeamDebugger.cpp	2009-06-25 22:49:07 UTC (rev 31243)
++++ haiku/trunk/src/apps/debugger/TeamDebugger.cpp	2009-06-25 23:51:09 UTC (rev 31244)
+@@ -17,6 +17,7 @@
+ 
+ #include &quot;debug_utils.h&quot;
+ 
++#include &quot;BreakpointManager.h&quot;
+ #include &quot;CpuState.h&quot;
+ #include &quot;DebuggerInterface.h&quot;
+ #include &quot;Jobs.h&quot;
+@@ -34,6 +35,7 @@
+ 	fTeamID(-1),
+ 	fDebuggerInterface(NULL),
+ 	fWorker(NULL),
++	fBreakpointManager(NULL),
+ 	fDebugEventListener(-1),
+ 	fTeamWindow(NULL),
+ 	fTerminating(false),
+@@ -74,6 +76,7 @@
+ 		threadHandler = next;
+ 	}
+ 
++	delete fBreakpointManager;
+ 	delete fDebuggerInterface;
+ 	delete fWorker;
+ 	delete fDebugModel;
+@@ -140,6 +143,16 @@
+ 	if (error != B_OK)
+ 		return error;
+ 
++	// create the breakpoint manager
++	fBreakpointManager = new(std::nothrow) BreakpointManager(fDebugModel,
++		fDebuggerInterface);
++	if (fBreakpointManager == NULL)
++		return B_NO_MEMORY;
++
++	error = fBreakpointManager-&gt;Init();
++	if (error != B_OK)
++		return error;
++
+ 	// set team debugging flags
+ 	fDebuggerInterface-&gt;SetTeamDebuggingFlags(
+ 		B_TEAM_DEBUG_THREADS | B_TEAM_DEBUG_IMAGES);
+@@ -157,7 +170,8 @@
+ 				return error;
+ 
+ 			ThreadHandler* handler = new(std::nothrow) ThreadHandler(
+-				fDebugModel, thread, fWorker, fDebuggerInterface);
++				fDebugModel, thread, fWorker, fDebuggerInterface,
++				fBreakpointManager);
+ 			if (handler == NULL)
+ 				return B_NO_MEMORY;
+ 
+@@ -293,6 +307,16 @@
+ 			break;
+ 		}
+ 
++		case MSG_DEBUGGER_EVENT:
++		{
++			DebugEvent* event;
++			if (message-&gt;FindPointer(&quot;event&quot;, (void**)&amp;event) != B_OK)
++				break;
++
++			_HandleDebuggerMessage(event);
++			delete event;
++		}
++
+ 		default:
+ 			BLooper::MessageReceived(message);
+ 			break;
+@@ -468,13 +492,12 @@
+ 			continue;
+ 		}
+ 
+-		_HandleDebuggerMessage(event);
+-
+-//		if (event-&gt;EventType() == B_DEBUGGER_MESSAGE_TEAM_DELETED
+-//			|| event-&gt;EventType() == B_DEBUGGER_MESSAGE_TEAM_EXEC) {
+-//			// TODO:...
+-//			break;
+-//		}
++		BMessage message(MSG_DEBUGGER_EVENT);
++		if (message.AddPointer(&quot;event&quot;, event) != B_OK
++			|| PostMessage(&amp;message) != B_OK) {
++			// TODO: Continue thread if necessary!
++			delete event;
++		}
+ 	}
+ 
+ 	return B_OK;
+@@ -591,7 +614,8 @@
+ 		fTeam-&gt;AddThread(info, &amp;thread);
+ 
+ 		ThreadHandler* handler = new(std::nothrow) ThreadHandler(
+-			fDebugModel, thread, fWorker, fDebuggerInterface);
++			fDebugModel, thread, fWorker, fDebuggerInterface,
++			fBreakpointManager);
+ 		if (handler != NULL) {
+ 			fThreadHandlers.Insert(handler);
+ 			handler-&gt;Init();
+@@ -633,78 +657,12 @@
+ }
+ 
+ 
+-status_t
+-TeamDebugger::_SetUserBreakpoint(target_addr_t address, bool enabled)
+-{
+-	user_breakpoint_state state = enabled
+-		? USER_BREAKPOINT_ENABLED : USER_BREAKPOINT_DISABLED;
+-
+-	AutoLocker&lt;TeamDebugModel&gt; locker(fDebugModel);
+-
+-	// If there already is a breakpoint, it might already have the requested
+-	// state.
+-	Breakpoint* breakpoint = fDebugModel-&gt;BreakpointAtAddress(address);
+-	if (breakpoint != NULL &amp;&amp; breakpoint-&gt;UserState() == state)
+-		return B_OK;
+-
+-	// create a breakpoint, if it doesn't exist yet
+-	if (breakpoint == NULL) {
+-		Image* image = fTeam-&gt;ImageByAddress(address);
+-		if (image == NULL)
+-			return B_OK;
+-
+-		breakpoint = new(std::nothrow) Breakpoint(image, address);
+-		if (breakpoint == NULL)
+-			return B_NO_MEMORY;
+-
+-		if (!fDebugModel-&gt;AddBreakpoint(breakpoint))
+-			return B_NO_MEMORY;
+-	}
+-
+-	user_breakpoint_state oldState = breakpoint-&gt;UserState();
+-
+-	// set the breakpoint state
+-	breakpoint-&gt;SetUserState(state);
+-	fDebugModel-&gt;NotifyUserBreakpointChanged(breakpoint);
+-
+-	bool install = breakpoint-&gt;ShouldBeInstalled();
+-	if (breakpoint-&gt;IsInstalled() == install)
+-		return B_OK;
+-
+-	// The breakpoint needs to be installed/uninstalled.
+-	locker.Unlock();
+-
+-	status_t error = install
+-		? fDebuggerInterface-&gt;InstallBreakpoint(address)
+-		: fDebuggerInterface-&gt;UninstallBreakpoint(address);
+-
+-	locker.Lock();
+-
+-	breakpoint = fDebugModel-&gt;BreakpointAtAddress(address);
+-
+-	// Mark the breakpoint installed/uninstalled, if everything went fine.
+-	if (error == B_OK) {
+-		breakpoint-&gt;SetInstalled(install);
+-printf(&quot;-&gt; breakpoint %sinstalled successfully!\n&quot;, install ? &quot;&quot; : &quot;un&quot;);
+-		return B_OK;
+-	}
+-
+-	// revert on error
+-	breakpoint-&gt;SetUserState(oldState);
+-	fDebugModel-&gt;NotifyUserBreakpointChanged(breakpoint);
+-
+-	if (breakpoint-&gt;IsUnused())
+-		fDebugModel-&gt;RemoveBreakpoint(breakpoint);
+-
+-	return error;
+-}
+-
+-
+ void
+ TeamDebugger::_HandleSetUserBreakpoint(target_addr_t address, bool enabled)
+ {
+ printf(&quot;TeamDebugger::_HandleSetUserBreakpoint(%#llx, %d)\n&quot;, address, enabled);
+-	status_t error = _SetUserBreakpoint(address, enabled);
++	status_t error = fBreakpointManager-&gt;InstallUserBreakpoint(address,
++		enabled);
+ 	if (error != B_OK) {
+ 		_NotifyUser(&quot;Install Breakpoint&quot;, &quot;Failed to install breakpoint: %s&quot;,
+ 			strerror(error));
+@@ -716,28 +674,7 @@
+ TeamDebugger::_HandleClearUserBreakpoint(target_addr_t address)
+ {
+ printf(&quot;TeamDebugger::_HandleClearUserBreakpoint(%#llx)\n&quot;, address);
+-	AutoLocker&lt;TeamDebugModel&gt; locker(fDebugModel);
+-
+-	Breakpoint* breakpoint = fDebugModel-&gt;BreakpointAtAddress(address);
+-	if (breakpoint == NULL || breakpoint-&gt;UserState() == USER_BREAKPOINT_NONE)
+-		return;
+-
+-	// set the breakpoint state
+-	breakpoint-&gt;SetUserState(USER_BREAKPOINT_NONE);
+-	fDebugModel-&gt;NotifyUserBreakpointChanged(breakpoint);
+-
+-	// check whether the breakpoint needs to be uninstalled
+-	bool uninstall = !breakpoint-&gt;ShouldBeInstalled()
+-		&amp;&amp; breakpoint-&gt;IsInstalled();
+-
+-	// if unused remove it
+-	if (breakpoint-&gt;IsUnused())
+-		fDebugModel-&gt;RemoveBreakpoint(breakpoint);
+-
+-	locker.Unlock();
+-
+-	if (uninstall)
+-		fDebuggerInterface-&gt;UninstallBreakpoint(address);
++	fBreakpointManager-&gt;UninstallUserBreakpoint(address);
+ }
+ 
+ 
+
+Modified: haiku/trunk/src/apps/debugger/TeamDebugger.h
+===================================================================
+--- haiku/trunk/src/apps/debugger/TeamDebugger.h	2009-06-25 22:49:07 UTC (rev 31243)
++++ haiku/trunk/src/apps/debugger/TeamDebugger.h	2009-06-25 23:51:09 UTC (rev 31244)
+@@ -76,10 +76,6 @@
+ 			bool				_HandleImageDeleted(
+ 									ImageDeletedEvent* event);
+ 
+-
+-			status_t			_SetUserBreakpoint(target_addr_t address,
+-									bool enabled);
+-
+ 			void				_HandleSetUserBreakpoint(target_addr_t address,
+ 									bool enabled);
+ 			void				_HandleClearUserBreakpoint(
+@@ -100,6 +96,7 @@
+ 									// protected by the team lock
+ 			DebuggerInterface*	fDebuggerInterface;
+ 			Worker*				fWorker;
++			BreakpointManager*	fBreakpointManager;
+ 			thread_id			fDebugEventListener;
+ 			TeamWindow*			fTeamWindow;
+ 	volatile bool				fTerminating;
+
+Modified: haiku/trunk/src/apps/debugger/ThreadHandler.cpp
+===================================================================
+--- haiku/trunk/src/apps/debugger/ThreadHandler.cpp	2009-06-25 22:49:07 UTC (rev 31243)
++++ haiku/trunk/src/apps/debugger/ThreadHandler.cpp	2009-06-25 23:51:09 UTC (rev 31244)
+@@ -11,28 +11,54 @@
+ 
+ #include &lt;AutoLocker.h&gt;
+ 
++#include &quot;Architecture.h&quot;
++#include &quot;BreakpointManager.h&quot;
+ #include &quot;CpuState.h&quot;
+ #include &quot;DebuggerInterface.h&quot;
++#include &quot;DebugInfo.h&quot;
++#include &quot;FunctionDebugInfo.h&quot;
++#include &quot;ImageDebugInfo.h&quot;
++#include &quot;InstructionInfo.h&quot;
+ #include &quot;Jobs.h&quot;
+ #include &quot;MessageCodes.h&quot;
++#include &quot;SourceCode.h&quot;
++#include &quot;StackTrace.h&quot;
++#include &quot;Statement.h&quot;
+ #include &quot;Team.h&quot;
+ #include &quot;TeamDebugModel.h&quot;
+ #include &quot;Worker.h&quot;
+ 
+ 
++// step modes
++enum {
++	STEP_NONE,
++	STEP_OVER,
++	STEP_INTO,
++	STEP_OUT
++};
++
++
+ ThreadHandler::ThreadHandler(TeamDebugModel* debugModel, Thread* thread,
+-	Worker* worker, DebuggerInterface* debuggerInterface)
++	Worker* worker, DebuggerInterface* debuggerInterface,
++	BreakpointManager* breakpointManager)
+ 	:
+ 	fDebugModel(debugModel),
+ 	fThread(thread),
+ 	fWorker(worker),
+-	fDebuggerInterface(debuggerInterface)
++	fDebuggerInterface(debuggerInterface),
++	fBreakpointManager(breakpointManager),
++	fStepMode(STEP_NONE),
++	fStepStatement(NULL),
++	fBreakpointAddress(0),
++	fPreviousInstructionPointer(0),
++	fSingleStepping(false)
+ {
+ }
+ 
+ 
+ ThreadHandler::~ThreadHandler()
+ {
++	_ClearContinuationState();
+ }
+ 
+ 
+@@ -61,7 +87,52 @@
+ bool
+ ThreadHandler::HandleBreakpointHit(BreakpointHitEvent* event)
+ {
+-	return _HandleThreadStopped(event-&gt;GetCpuState());
++	CpuState* cpuState = event-&gt;GetCpuState();
++	target_addr_t instructionPointer = cpuState-&gt;InstructionPointer();
++
++	// check whether this is a temporary breakpoint we're waiting for
++	if (fBreakpointAddress != 0 &amp;&amp; instructionPointer == fBreakpointAddress
++		&amp;&amp; fStepMode != STEP_NONE) {
++		if (_HandleBreakpointHitStep(cpuState))
++			return true;
++	} else {
++		// Might be a user breakpoint, but could as well be a temporary
++		// breakpoint of another thread.
++		AutoLocker&lt;TeamDebugModel&gt; locker(fDebugModel);
++		Breakpoint* breakpoint = fDebugModel-&gt;BreakpointAtAddress(
++			cpuState-&gt;InstructionPointer());
++		bool continueThread = false;
++		if (breakpoint == NULL) {
++			// spurious breakpoint -- might be a temporary breakpoint, that has
++			// already been uninstalled
++			continueThread = true;
++		} else if (breakpoint-&gt;UserState() != USER_BREAKPOINT_ENABLED) {
++			// breakpoint of another thread or one that has been disabled in
++			// the meantime
++			continueThread = true;
++		}
++
++		if (continueThread) {
++			if (fSingleStepping) {
++				// We might have hit a just-installed software breakpoint and
++				// thus haven't stepped at all. Just try again.
++				if (fPreviousInstructionPointer == instructionPointer) {
++					fDebuggerInterface-&gt;SingleStepThread(ThreadID());
++					return true;
++				}
++
++				// That shouldn't happen. Try something reasonable anyway.
++				if (fStepMode != STEP_NONE) {
++					if (_HandleSingleStepStep(cpuState))
++						return true;
++				}
++			}
++
++			return false;
++		}
++	}
++
++	return _HandleThreadStopped(cpuState);
+ }
+ 
+ 
+@@ -75,6 +146,12 @@
+ bool
+ ThreadHandler::HandleSingleStep(SingleStepEvent* event)
+ {
++	// Check whether we're stepping automatically.
++	if (fStepMode != STEP_NONE) {
++		if (_HandleSingleStepStep(event-&gt;GetCpuState()))
++			return true;
++	}
++
+ 	return _HandleThreadStopped(event-&gt;GetCpuState());
+ }
+ 
+@@ -101,6 +178,12 @@
+ 		return;
+ 	}
+ 
++	// When stepping we need a stack trace. Save it before unsetting the state.
++	CpuState* cpuState = fThread-&gt;GetCpuState();
++	StackTrace* stackTrace = fThread-&gt;GetStackTrace();
++	Reference&lt;CpuState&gt; cpuStateReference(cpuState);
++	Reference&lt;StackTrace&gt; stackTraceReference(stackTrace);
++
+ 	// When continuing the thread update thread state before actually issuing
+ 	// the command, since we need to unlock.
+ 	if (action != MSG_THREAD_STOP)
+@@ -110,28 +193,88 @@
+ 
+ 	switch (action) {
+ 		case MSG_THREAD_RUN:
+-printf(&quot;MSG_THREAD_RUN\n&quot;);
+-			fDebuggerInterface-&gt;ContinueThread(ThreadID());
+-			break;
++			fStepMode = STEP_NONE;
++			_RunThread(0);
++			return;
+ 		case MSG_THREAD_STOP:
+-printf(&quot;MSG_THREAD_STOP\n&quot;);
++			fStepMode = STEP_NONE;
+ 			fDebuggerInterface-&gt;StopThread(ThreadID());
+-			break;
++			return;
+ 		case MSG_THREAD_STEP_OVER:
+-printf(&quot;MSG_THREAD_STEP_OVER\n&quot;);
+-			fDebuggerInterface-&gt;SingleStepThread(ThreadID());
+-			break;
+ 		case MSG_THREAD_STEP_INTO:
+-printf(&quot;MSG_THREAD_STEP_INTO\n&quot;);
+-			fDebuggerInterface-&gt;SingleStepThread(ThreadID());
+-			break;
+ 		case MSG_THREAD_STEP_OUT:
+-printf(&quot;MSG_THREAD_STEP_OUT\n&quot;);
+-			fDebuggerInterface-&gt;SingleStepThread(ThreadID());
+ 			break;
++	}
+ 
+-// TODO: Handle stepping correctly!
++	// We want to step. We need a stack trace for that purpose. If we don't
++	// have one yet, get it. Start with the CPU state.
++	if (stackTrace == NULL &amp;&amp; cpuState == NULL) {
++		if (fDebuggerInterface-&gt;GetCpuState(fThread-&gt;ID(), cpuState) == B_OK)
++			cpuStateReference.SetTo(cpuState, true);
+ 	}
++
++	if (stackTrace == NULL &amp;&amp; cpuState != NULL) {
++		if (fDebuggerInterface-&gt;GetArchitecture()-&gt;CreateStackTrace(
++				fThread-&gt;GetTeam(), this, cpuState, stackTrace) == B_OK) {
++			stackTraceReference.SetTo(stackTrace, true);
++		}
++	}
++
++	if (stackTrace == NULL || stackTrace-&gt;CountFrames() == 0) {
++		_StepFallback();
++		return;
++	}
++
++	StackFrame* frame = stackTrace-&gt;FrameAt(0);
++
++	// When the thread is in a syscall, do the same for all step kinds: Stop it
++	// when it return by means of a breakpoint.
++	if (frame-&gt;Type() == STACK_FRAME_TYPE_SYSCALL) {
++		// set a breakpoint at the CPU state's instruction pointer (points to
++		// the return address, unlike the stack frame's instruction pointer)
++		status_t error = _InstallTemporaryBreakpoint(
++			frame-&gt;GetCpuState()-&gt;InstructionPointer());
++		if (error != B_OK) {
++			_StepFallback();
++			return;
++		}
++
++		fStepMode = STEP_OUT;
++		_RunThread(frame-&gt;GetCpuState()-&gt;InstructionPointer());
++		return;
++	}
++
++	// For &quot;step out&quot; just set a temporary breakpoint on the return address.
++	if (action == MSG_THREAD_STEP_OUT) {
++		status_t error = _InstallTemporaryBreakpoint(frame-&gt;ReturnAddress());
++		if (error != B_OK) {
++			_StepFallback();
++			return;
++		}
++
++		fStepMode = STEP_OUT;
++		_RunThread(frame-&gt;GetCpuState()-&gt;InstructionPointer());
++		return;
++	}
++
++	// For &quot;step in&quot; and &quot;step over&quot; we also need the source code statement at
++	// the current instruction pointer.
++	fStepStatement = _GetStatementAtInstructionPointer(frame);
++	if (fStepStatement == NULL) {
++		_StepFallback();
++		return;
++	}
++
++	if (action == MSG_THREAD_STEP_INTO) {
++		// step into
++		fStepMode = STEP_INTO;
++		_SingleStepThread(frame-&gt;GetCpuState()-&gt;InstructionPointer());
++	} else {
++		// step over
++		fStepMode = STEP_OVER;
++		if (!_DoStepOver(frame-&gt;GetCpuState()))
++			_StepFallback();
++	}
+ }
+ 
+ 
+@@ -173,13 +316,31 @@
+ void
+ ThreadHandler::HandleStackTraceChanged()
+ {
+-printf(&quot;ThreadHandler::_HandleStackTraceChanged()\n&quot;);
+ }
+ 
+ 
++status_t
++ThreadHandler::GetImageDebugInfo(Image* image, ImageDebugInfo*&amp; _info)
++{
++	AutoLocker&lt;Team&gt; teamLocker(fThread-&gt;GetTeam());
++
++	if (image-&gt;GetImageDebugInfo() != NULL) {
++		_info = image-&gt;GetImageDebugInfo();
++		_info-&gt;AddReference();
++		return B_OK;
++	}
++
++	// Let's be lazy. If the image debug info has not been loaded yet, the user
++	// can't have seen any source code either.
++	return B_ENTRY_NOT_FOUND;
++}
++
++
+ bool
+ ThreadHandler::_HandleThreadStopped(CpuState* cpuState)
+ {
++	_ClearContinuationState();
++
+ 	AutoLocker&lt;TeamDebugModel&gt; locker(fDebugModel);
+ 
+ 	_SetThreadState(THREAD_STATE_STOPPED, cpuState);
+@@ -194,3 +355,185 @@
+ 	fThread-&gt;SetState(state);
+ 	fThread-&gt;SetCpuState(cpuState);
+ }
++
++
++Statement*
++ThreadHandler::_GetStatementAtInstructionPointer(StackFrame* frame)
++{
++	AutoLocker&lt;TeamDebugModel&gt; locker(fDebugModel);
++
++	// If there's source code attached to the stack frame, we can just get the
++	// statement.
++	SourceCode* sourceCode = frame-&gt;GetSourceCode();
++	if (sourceCode != NULL) {
++		Statement* statement = sourceCode-&gt;StatementAtAddress(
++			frame-&gt;InstructionPointer());
++		if (statement != NULL)
++			statement-&gt;AddReference();
++		return statement;
++	}
++
++	locker.Unlock();
++
++	// We need to get the statement from the debug info of the function (if
++	// any).
++	FunctionDebugInfo* function = frame-&gt;Function();
++	if (function == NULL)
++		return NULL;
++
++	Statement* statement;
++	if (function-&gt;GetDebugInfo()-&gt;GetStatement(function,
++			frame-&gt;InstructionPointer(), statement) != B_OK) {
++		return NULL;
++	}
++
++	return statement;
++}
++
++
++void
++ThreadHandler::_StepFallback()
++{
++	fStepMode = STEP_NONE;
++	_SingleStepThread(0);
++}
++
++
++bool
++ThreadHandler::_DoStepOver(CpuState* cpuState)
++{
++	// The basic strategy is to single-step out of the statement like for
++	// &quot;step into&quot;, only we have to avoid stepping into subroutines. Hence we
++	// check whether the current instruction is a subroutine call. If not, we
++	// just single-step, otherwise we set a breakpoint after the instruction.
++	InstructionInfo info;
++	if (fDebuggerInterface-&gt;GetArchitecture()-&gt;GetInstructionInfo(
++			cpuState-&gt;InstructionPointer(), info) != B_OK) {
++		return false;
++	}
++
++	if (info.Type() != INSTRUCTION_TYPE_SUBROUTINE_CALL) {
++		_SingleStepThread(cpuState-&gt;InstructionPointer());
++		return true;
++	}
++
++	if (_InstallTemporaryBreakpoint(info.Address() + info.Size()) != B_OK)
++		return false;
++
++	_RunThread(cpuState-&gt;InstructionPointer());
++	return true;
++}
++
++
++status_t
++ThreadHandler::_InstallTemporaryBreakpoint(target_addr_t address)
++{
++	_UninstallTemporaryBreakpoint();
++
++	status_t error = fBreakpointManager-&gt;InstallTemporaryBreakpoint(address,
++		this);
++	if (error != B_OK)
++		return error;
++
++	fBreakpointAddress = address;
++	return B_OK;
++}
++
++
++void
++ThreadHandler::_UninstallTemporaryBreakpoint()
++{
++	if (fBreakpointAddress == 0)
++		return;
++
++	fBreakpointManager-&gt;UninstallTemporaryBreakpoint(fBreakpointAddress, this);
++	fBreakpointAddress = 0;
++}
++
++
++void
++ThreadHandler::_ClearContinuationState()
++{
++	_UninstallTemporaryBreakpoint();
++
++	if (fStepStatement != NULL)
++		fStepStatement-&gt;RemoveReference();
++
++	fStepMode = STEP_NONE;
++	fSingleStepping = false;
++}
++
++
++void
++ThreadHandler::_RunThread(target_addr_t instructionPointer)
++{
++	fPreviousInstructionPointer = instructionPointer;
++	fDebuggerInterface-&gt;ContinueThread(ThreadID());
++	fSingleStepping = false;
++}
++
++
++void
++ThreadHandler::_SingleStepThread(target_addr_t instructionPointer)
++{
++	fPreviousInstructionPointer = instructionPointer;
++	fDebuggerInterface-&gt;SingleStepThread(ThreadID());
++	fSingleStepping = true;
++}
++
++
++bool
++ThreadHandler::_HandleBreakpointHitStep(CpuState* cpuState)
++{
++	// in any case uninstall the temporary breakpoint
++	_UninstallTemporaryBreakpoint();
++
++	switch (fStepMode) {
++		case STEP_OVER:
++			// If we're still in the statement, we continue single-stepping,
++			// otherwise we're done.
++			if (fStepStatement-&gt;ContainsAddress(
++					cpuState-&gt;InstructionPointer())) {
++				_SingleStepThread(cpuState-&gt;InstructionPointer());
++				return true;
++			}
++			return false;
++
++		case STEP_INTO:
++			// Should never happen -- we don't set a breakpoint in this case.
++		case STEP_OUT:
++			// That's the return address, so we're done.
++		default:
++			return false;
++	}
++}
++
++
++bool
++ThreadHandler::_HandleSingleStepStep(CpuState* cpuState)
++{
+
+[... truncated: 438 lines follow ...]
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017485.html">[Haiku-commits] r31243 - in haiku/trunk/src: add-ons/kernel/debugger/demangle  apps/debugger/demangler
+</A></li>
+	<LI>Next message: <A HREF="017483.html">[Haiku-commits] r31245 -	haiku/trunk/src/add-ons/kernel/debugger/demangle
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17481">[ date ]</a>
+              <a href="thread.html#17481">[ thread ]</a>
+              <a href="subject.html#17481">[ subject ]</a>
+              <a href="author.html#17481">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

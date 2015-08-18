@@ -1,0 +1,544 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27804 - haiku/trunk/src/bin/debug/profile
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-October/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27804%20-%20haiku/trunk/src/bin/debug/profile&In-Reply-To=%3C200809302217.m8UMHNuw009866%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   
+   <LINK REL="Next"  HREF="012274.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27804 - haiku/trunk/src/bin/debug/profile</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27804%20-%20haiku/trunk/src/bin/debug/profile&In-Reply-To=%3C200809302217.m8UMHNuw009866%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27804 - haiku/trunk/src/bin/debug/profile">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Wed Oct  1 00:17:23 CEST 2008</I>
+    <P><UL>
+        
+        <LI>Next message: <A HREF="012274.html">[Haiku-commits] r27805 - in haiku/trunk/3rdparty/mmu_man/themes: .	addons
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12273">[ date ]</a>
+              <a href="thread.html#12273">[ thread ]</a>
+              <a href="subject.html#12273">[ subject ]</a>
+              <a href="author.html#12273">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-10-01 00:17:22 +0200 (Wed, 01 Oct 2008)
+New Revision: 27804
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27804&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27804&amp;view=rev</A>
+
+Added:
+   haiku/trunk/src/bin/debug/profile/CallgrindThreadProfileResult.cpp
+   haiku/trunk/src/bin/debug/profile/CallgrindThreadProfileResult.h
+Modified:
+   haiku/trunk/src/bin/debug/profile/Jamfile
+   haiku/trunk/src/bin/debug/profile/Options.h
+   haiku/trunk/src/bin/debug/profile/profile.cpp
+Log:
+Added option &quot;-v &lt;directory&gt;&quot;. The tool will generate output files in
+valgrind's callgrind format in the given directory. Those can be
+analyzed with graphical tools like KCachegrind.
+Recursive functions are probably not handled correctly yet.
+
+
+Added: haiku/trunk/src/bin/debug/profile/CallgrindThreadProfileResult.cpp
+===================================================================
+--- haiku/trunk/src/bin/debug/profile/CallgrindThreadProfileResult.cpp	2008-09-30 21:56:31 UTC (rev 27803)
++++ haiku/trunk/src/bin/debug/profile/CallgrindThreadProfileResult.cpp	2008-09-30 22:17:22 UTC (rev 27804)
+@@ -0,0 +1,277 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++
++#include &quot;CallgrindThreadProfileResult.h&quot;
++
++#include &lt;errno.h&gt;
++#include &lt;sys/stat.h&gt;
++
++#include &lt;algorithm&gt;
++#include &lt;new&gt;
++
++#include &quot;Options.h&quot;
++
++
++// #pragma mark - CallgrindThreadImage
++
++
++CallgrindThreadImage::CallgrindThreadImage(Image* image)
++	:
++	ThreadImage(image),
++	fFunctions(NULL),
++	fOutputIndex(0)
++{
++}
++
++
++CallgrindThreadImage::~CallgrindThreadImage()
++{
++	int32 symbolCount = fImage-&gt;SymbolCount();
++	for (int32 i = 0; i &lt; symbolCount; i++) {
++		while (CallgrindCalledFunction* calledFunction
++				= fFunctions[i].calledFunctions) {
++			fFunctions[i].calledFunctions = calledFunction-&gt;next;
++			delete calledFunction;
++		}
++	}
++
++	delete[] fFunctions;
++}
++
++
++status_t
++CallgrindThreadImage::Init()
++{
++	int32 symbolCount = fImage-&gt;SymbolCount();
++	fFunctions = new(std::nothrow) CallgrindFunction[symbolCount];
++	if (fFunctions == NULL)
++		return B_NO_MEMORY;
++
++	memset(fFunctions, 0, sizeof(CallgrindFunction) * symbolCount);
++
++	return B_OK;
++}
++
++
++void
++CallgrindThreadImage::AddSymbolHit(int32 symbolIndex,
++	CallgrindThreadImage* calledImage, int32 calledSymbol)
++
++{
++	fTotalHits++;
++
++	CallgrindFunction&amp; function = fFunctions[symbolIndex];
++	if (calledImage != NULL) {
++		// check whether the called function is known already
++		CallgrindCalledFunction* calledFunction = function.calledFunctions;
++		while (calledFunction != NULL) {
++			if (calledFunction-&gt;image == calledImage
++				&amp;&amp; calledFunction-&gt;function == calledSymbol) {
++				break;
++			}
++			calledFunction = calledFunction-&gt;next;
++		}
++
++		// create a new CallgrindCalledFunction object, if not known
++		if (calledFunction == NULL) {
++			calledFunction = new(std::nothrow) CallgrindCalledFunction(
++				calledImage, calledSymbol);
++			if (calledFunction == NULL)
++				return;
++
++			calledFunction-&gt;next = function.calledFunctions;
++			function.calledFunctions = calledFunction;
++		}
++
++		calledFunction-&gt;hits++;
++	} else
++		function.hits++;
++}
++
++
++CallgrindFunction*
++CallgrindThreadImage::Functions() const
++{
++	return fFunctions;
++}
++
++
++int32
++CallgrindThreadImage::OutputIndex() const
++{
++	return fOutputIndex;
++}
++
++
++void
++CallgrindThreadImage::SetOutputIndex(int32 index)
++{
++	fOutputIndex = index;
++}
++
++
++// #pragma mark - CallgrindThreadProfileResult
++
++
++CallgrindThreadProfileResult::CallgrindThreadProfileResult()
++	:
++	fTotalTicks(0),
++	fUnkownTicks(0),
++	fDroppedTicks(0),
++	fNextImageOutputIndex(1),
++	fNextFunctionOutputIndex(1)
++{
++}
++
++
++void
++CallgrindThreadProfileResult::AddSamples(addr_t* samples, int32 sampleCount)
++{
++	int32 unknownSamples = 0;
++	CallgrindThreadImage* previousImage = NULL;
++	int32 previousSymbol = -1;
++
++	// TODO: That probably doesn't work with recursive functions.
++	for (int32 i = 0; i &lt; sampleCount; i++) {
++		addr_t address = samples[i];
++		CallgrindThreadImage* image = FindImage(address);
++		int32 symbol = -1;
++		if (image != NULL) {
++			symbol = image-&gt;GetImage()-&gt;FindSymbol(address);
++			if (symbol &gt;= 0) {
++				image-&gt;AddSymbolHit(symbol, previousImage, previousSymbol);
++				previousImage = image;
++				previousSymbol = symbol;
++			}
++		} else
++			unknownSamples++;
++	}
++
++	if (unknownSamples == sampleCount)
++		fUnkownTicks++;
++
++	fTotalTicks++;
++}
++
++
++void
++CallgrindThreadProfileResult::AddDroppedTicks(int32 dropped)
++{
++	fDroppedTicks += dropped;
++}
++
++
++void
++CallgrindThreadProfileResult::PrintResults()
++{
++	// create output file
++	mkdir(gOptions.callgrind_directory, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
++
++	char fileName[B_PATH_NAME_LENGTH];
++	snprintf(fileName, sizeof(fileName), &quot;%s/callgrind.out.%ld&quot;,
++		gOptions.callgrind_directory, fThread-&gt;ID());
++
++	FILE* out = fopen(fileName, &quot;w+&quot;);
++	if (out == NULL) {
++		fprintf(stderr, &quot;%s: Failed to open output file \&quot;%s\&quot;: %s\n&quot;,
++			kCommandName, fileName, strerror(errno));
++		return;
++	}
++
++	// write the header
++	fprintf(out, &quot;version: 1\n&quot;);
++	fprintf(out, &quot;creator: Haiku profile\n&quot;);
++	fprintf(out, &quot;pid: %ld\n&quot;, fThread-&gt;ID());
++	fprintf(out, &quot;cmd: %s\n&quot;, fThread-&gt;Name());
++	fprintf(out, &quot;part: 1\n\n&quot;);
++
++	fprintf(out, &quot;positions: line\n&quot;);
++	fprintf(out, &quot;events: Ticks Time\n&quot;);
++	fprintf(out, &quot;summary: %lld\n&quot;, fTotalTicks);
++
++	// get hit images
++	CallgrindThreadImage* images[fOldImages.Size() + fImages.Size()];
++	int32 imageCount = GetHitImages(images);
++
++	for (int32 i = 0; i &lt; imageCount; i++) {
++		CallgrindThreadImage* image = images[i];
++
++		CallgrindFunction* functions = image-&gt;Functions();
++		int32 imageSymbolCount = image-&gt;GetImage()-&gt;SymbolCount();
++		for (int32 k = 0; k &lt; imageSymbolCount; k++) {
++			CallgrindFunction&amp; function = functions[k];
++			if (function.hits == 0 &amp;&amp; function.calledFunctions == NULL)
++				continue;
++
++			fprintf(out, &quot;\n&quot;);
++			_PrintFunction(out, image, k, false);
++			fprintf(out, &quot;0 %lld %lld\n&quot;, function.hits,
++				function.hits * fInterval);
++
++			CallgrindCalledFunction* calledFunction = function.calledFunctions;
++			while (calledFunction != NULL) {
++				_PrintFunction(out, calledFunction-&gt;image,
++					calledFunction-&gt;function, true);
++				fprintf(out, &quot;calls=%lld 0\n&quot;, calledFunction-&gt;hits);
++				fprintf(out, &quot;0 %lld %lld\n&quot;, calledFunction-&gt;hits,
++					calledFunction-&gt;hits * fInterval);
++				calledFunction = calledFunction-&gt;next;
++			}
++		}
++	}
++
++	// print pseudo-functions for unknown and dropped ticks
++	if (fUnkownTicks + fDroppedTicks &gt; 0) {
++		fprintf(out, &quot;\nob=&lt;pseudo&gt;\n&quot;);
++
++		if (fUnkownTicks &gt; 0) {
++			fprintf(out, &quot;\nfn=unknown\n&quot;);
++			fprintf(out, &quot;0 %lld\n&quot;, fUnkownTicks);
++		}
++
++		if (fDroppedTicks &gt; 0) {
++			fprintf(out, &quot;\nfn=dropped\n&quot;);
++			fprintf(out, &quot;0 %lld\n&quot;, fDroppedTicks);
++		}
++	}
++
++	fclose(out);
++}
++
++
++CallgrindThreadImage*
++CallgrindThreadProfileResult::CreateThreadImage(Image* image)
++{
++	return new(std::nothrow) CallgrindThreadImage(image);
++}
++
++
++void
++CallgrindThreadProfileResult::_PrintFunction(FILE* out,
++	CallgrindThreadImage* image, int32 functionIndex, bool called)
++{
++	if (image-&gt;OutputIndex() == 0) {
++		// need to print the image name
++		int32 index = fNextImageOutputIndex++;
++		image-&gt;SetOutputIndex(index);
++		fprintf(out, &quot;%sob=(%ld) %s:%ld\n&quot;, called ? &quot;c&quot; : &quot;&quot;, index,
++			image-&gt;GetImage()-&gt;Info().name, image-&gt;ID());
++	} else {
++		// image is already known
++		// TODO: We may not need to print it at all!
++		fprintf(out, &quot;%sob=(%ld)\n&quot;, called ? &quot;c&quot; : &quot;&quot;, image-&gt;OutputIndex());
++	}
++
++	CallgrindFunction&amp; function = image-&gt;Functions()[functionIndex];
++	if (function.outputIndex == 0) {
++		// need to print the function name
++		function.outputIndex = fNextFunctionOutputIndex++;
++		fprintf(out, &quot;%sfn=(%ld) %s\n&quot;, called ? &quot;c&quot; : &quot;&quot;, function.outputIndex,
++			image-&gt;GetImage()-&gt;Symbols()[functionIndex]-&gt;Name());
++	} else {
++		// function is already known
++		fprintf(out, &quot;%sfn=(%ld)\n&quot;, called ? &quot;c&quot; : &quot;&quot;, function.outputIndex);
++	}
++}
+
+Added: haiku/trunk/src/bin/debug/profile/CallgrindThreadProfileResult.h
+===================================================================
+--- haiku/trunk/src/bin/debug/profile/CallgrindThreadProfileResult.h	2008-09-30 21:56:31 UTC (rev 27803)
++++ haiku/trunk/src/bin/debug/profile/CallgrindThreadProfileResult.h	2008-09-30 22:17:22 UTC (rev 27804)
+@@ -0,0 +1,89 @@
++/*
++ * Copyright 2008, Ingo Weinhold, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">ingo_weinhold at gmx.de.</A>
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef CALLGRIND_THREAD_PROFILE_RESULT_H
++#define CALLGRIND_THREAD_PROFILE_RESULT_H
++
++#include &lt;stdio.h&gt;
++
++#include &quot;Thread.h&quot;
++
++
++class CallgrindThreadImage;
++
++
++struct CallgrindCalledFunction {
++	CallgrindCalledFunction*	next;
++	CallgrindThreadImage*		image;
++	int32						function;
++	int64						hits;
++
++	CallgrindCalledFunction(CallgrindThreadImage* image, int32 function)
++		:
++		next(NULL),
++		image(image),
++		function(function),
++		hits(0)
++	{
++	}
++};
++
++
++struct CallgrindFunction {
++	int64						hits;
++	CallgrindCalledFunction*	calledFunctions;
++	int32						outputIndex;
++									// index when generating the output file
++};
++
++
++class CallgrindThreadImage : public ThreadImage,
++	public DoublyLinkedListLinkImpl&lt;CallgrindThreadImage&gt; {
++public:
++								CallgrindThreadImage(Image* image);
++	virtual						~CallgrindThreadImage();
++
++	virtual	status_t			Init();
++
++	inline	void				AddSymbolHit(int32 symbolIndex,
++									CallgrindThreadImage* calledImage,
++									int32 calledSymbol);
++
++	inline	CallgrindFunction*	Functions() const;
++
++	inline	int32				OutputIndex() const;
++	inline	void				SetOutputIndex(int32 index);
++
++private:
++			CallgrindFunction*	fFunctions;
++			int32				fOutputIndex;
++};
++
++
++class CallgrindThreadProfileResult
++	: public AbstractThreadProfileResult&lt;CallgrindThreadImage&gt; {
++public:
++								CallgrindThreadProfileResult();
++
++	virtual	void				AddSamples(addr_t* samples,
++									int32 sampleCount);
++	virtual	void				AddDroppedTicks(int32 dropped);
++	virtual	void				PrintResults();
++
++	virtual CallgrindThreadImage* CreateThreadImage(Image* image);
++
++private:
++			void				_PrintFunction(FILE* out,
++									CallgrindThreadImage* image,
++									int32 functionIndex, bool called);
++private:
++			int64				fTotalTicks;
++			int64				fUnkownTicks;
++			int64				fDroppedTicks;
++			int32				fNextImageOutputIndex;
++			int32				fNextFunctionOutputIndex;
++};
++
++
++#endif	// CALLGRIND_THREAD_PROFILE_RESULT_H
+
+Modified: haiku/trunk/src/bin/debug/profile/Jamfile
+===================================================================
+--- haiku/trunk/src/bin/debug/profile/Jamfile	2008-09-30 21:56:31 UTC (rev 27803)
++++ haiku/trunk/src/bin/debug/profile/Jamfile	2008-09-30 22:17:22 UTC (rev 27804)
+@@ -11,6 +11,7 @@
+ BinCommand profile
+ 	:
+ 	BasicThreadProfileResult.cpp
++	CallgrindThreadProfileResult.cpp
+ 	Image.cpp
+ 	Team.cpp
+ 	Thread.cpp
+
+Modified: haiku/trunk/src/bin/debug/profile/Options.h
+===================================================================
+--- haiku/trunk/src/bin/debug/profile/Options.h	2008-09-30 21:56:31 UTC (rev 27803)
++++ haiku/trunk/src/bin/debug/profile/Options.h	2008-09-30 22:17:22 UTC (rev 27804)
+@@ -16,6 +16,7 @@
+ 		interval(1000),
+ 		stack_depth(5),
+ 		output(NULL),
++		callgrind_directory(NULL),
+ 		profile_kernel(true),
+ 		profile_loading(false),
+ 		profile_teams(true),
+@@ -27,6 +28,7 @@
+ 	bigtime_t	interval;
+ 	int32		stack_depth;
+ 	FILE*		output;
++	const char*	callgrind_directory;
+ 	bool		profile_kernel;
+ 	bool		profile_loading;
+ 	bool		profile_teams;
+
+Modified: haiku/trunk/src/bin/debug/profile/profile.cpp
+===================================================================
+--- haiku/trunk/src/bin/debug/profile/profile.cpp	2008-09-30 21:56:31 UTC (rev 27803)
++++ haiku/trunk/src/bin/debug/profile/profile.cpp	2008-09-30 22:17:22 UTC (rev 27804)
+@@ -24,6 +24,7 @@
+ #include &lt;util/DoublyLinkedList.h&gt;
+ 
+ #include &quot;BasicThreadProfileResult.h&quot;
++#include &quot;CallgrindThreadProfileResult.h&quot;
+ #include &quot;debug_utils.h&quot;
+ #include &quot;Image.h&quot;
+ #include &quot;Options.h&quot;
+@@ -67,6 +68,8 @@
+ 	&quot;                   caller stack per tick. If the topmost address doesn't\n&quot;
+ 	&quot;                   hit a known image, the next address will be matched\n&quot;
+ 	&quot;                   (and so on).\n&quot;
++	&quot;  -v &lt;directory&gt; - Create valgrind/callgrind output. &lt;directory&gt; is the\n&quot;
++	&quot;                   directory where to put the output files.\n&quot;
+ ;
+ 
+ 
+@@ -176,7 +179,9 @@
+ 	status_t _CreateThreadProfileResult(Thread* thread)
+ 	{
+ 		ThreadProfileResult* profileResult;
+-		if (gOptions.analyze_full_stack)
++		if (gOptions.callgrind_directory != NULL)
++			profileResult = new(std::nothrow) CallgrindThreadProfileResult;
++		else if (gOptions.analyze_full_stack)
+ 			profileResult = new(std::nothrow) InclusiveThreadProfileResult;
+ 		else
+ 			profileResult = new(std::nothrow) ExclusiveThreadProfileResult;
+@@ -239,7 +244,7 @@
+ 		};
+ 
+ 		opterr = 0; // don't print errors
+-		int c = getopt_long(argc, (char**)argv, &quot;+cCfhi:klo:s:&quot;, sLongOptions,
++		int c = getopt_long(argc, (char**)argv, &quot;+cCfhi:klo:s:v:&quot;, sLongOptions,
+ 			NULL);
+ 		if (c == -1)
+ 			break;
+@@ -273,6 +278,11 @@
+ 			case 's':
+ 				stackDepth = atol(optarg);
+ 				break;
++			case 'v':
++				gOptions.callgrind_directory = optarg;
++				gOptions.analyze_full_stack = true;
++				gOptions.stack_depth = 64;
++				break;
+ 			default:
+ 				print_usage_and_exit(true);
+ 				break;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	
+	<LI>Next message: <A HREF="012274.html">[Haiku-commits] r27805 - in haiku/trunk/3rdparty/mmu_man/themes: .	addons
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12273">[ date ]</a>
+              <a href="thread.html#12273">[ thread ]</a>
+              <a href="subject.html#12273">[ subject ]</a>
+              <a href="author.html#12273">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

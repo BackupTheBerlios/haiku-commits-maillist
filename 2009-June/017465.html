@@ -1,0 +1,266 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r31232 - haiku/trunk/src/apps/debugger/arch/x86
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2009-June/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31232%20-%20haiku/trunk/src/apps/debugger/arch/x86&In-Reply-To=%3C200906242338.n5ONcU2x031330%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017464.html">
+   <LINK REL="Next"  HREF="017466.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r31232 - haiku/trunk/src/apps/debugger/arch/x86</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r31232%20-%20haiku/trunk/src/apps/debugger/arch/x86&In-Reply-To=%3C200906242338.n5ONcU2x031330%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r31232 - haiku/trunk/src/apps/debugger/arch/x86">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Jun 25 01:38:30 CEST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017464.html">[Haiku-commits] r31231 - in	haiku/trunk/src/tests/add-ons/kernel/file_systems/beserved/FileSharing-Windows:	. VS2008
+</A></li>
+        <LI>Next message: <A HREF="017466.html">[Haiku-commits] r31233 - haiku/trunk/src/apps/debugger/demangler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17465">[ date ]</a>
+              <a href="thread.html#17465">[ thread ]</a>
+              <a href="subject.html#17465">[ subject ]</a>
+              <a href="author.html#17465">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2009-06-25 01:38:29 +0200 (Thu, 25 Jun 2009)
+New Revision: 31232
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=31232&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=31232&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/apps/debugger/arch/x86/ArchitectureX86.cpp
+   haiku/trunk/src/apps/debugger/arch/x86/ArchitectureX86.h
+Log:
+Recognize non-frameless functions and deal with situations where the instruction
+pointer is before/in the prologue or after the epilogue. No solution for
+frameless functions yet.
+
+
+Modified: haiku/trunk/src/apps/debugger/arch/x86/ArchitectureX86.cpp
+===================================================================
+--- haiku/trunk/src/apps/debugger/arch/x86/ArchitectureX86.cpp	2009-06-24 23:14:10 UTC (rev 31231)
++++ haiku/trunk/src/apps/debugger/arch/x86/ArchitectureX86.cpp	2009-06-24 23:38:29 UTC (rev 31232)
+@@ -119,17 +119,76 @@
+ 	uint32 framePointer = cpuState-&gt;IntRegisterValue(X86_REGISTER_EBP);
+ 	uint32 eip = cpuState-&gt;IntRegisterValue(X86_REGISTER_EIP);
+ 
++	bool readStandardFrame = true;
++	uint32 previousFramePointer = 0;
++	uint32 returnAddress = 0;
++
+ 	// check for syscall frames
+ 	stack_frame_type frameType;
++	bool hasPrologue = false;
+ 	if (isTopFrame &amp;&amp; cpuState-&gt;InterruptVector() == 99) {
+ 		// The thread is performing a syscall. So this frame is not really the
+ 		// top-most frame and we need to adjust the eip.
+ 		frameType = STACK_FRAME_TYPE_SYSCALL;
+ 		eip -= 2;
+ 			// int 99, sysenter, and syscall all are 2 byte instructions
+-	} else
+-		frameType = STACK_FRAME_TYPE_STANDARD;
+ 
++		// The syscall stubs are frameless, the return address is on top of the
++		// stack.
++		uint32 esp = cpuState-&gt;IntRegisterValue(X86_REGISTER_ESP);
++		uint32 address;
++		if (fDebuggerInterface-&gt;ReadMemory(esp, &amp;address, 4) == 4) {
++			returnAddress = address;
++			previousFramePointer = framePointer;
++			framePointer = 0;
++			readStandardFrame = false;
++		}
++	} else {
++		hasPrologue = _HasFunctionPrologue(function);
++		if (hasPrologue)
++			frameType = STACK_FRAME_TYPE_STANDARD;
++		else
++			frameType = STACK_FRAME_TYPE_FRAMELESS;
++		// TODO: Handling for frameless functions. It's not trivial to find the
++		// return address on the stack, though.
++
++		// If the function is not frameless and we're at the top frame we need
++		// to check whether the prologue has not been executed (completely) or
++		// we're already after the epilogue.
++		if (hasPrologue &amp;&amp; isTopFrame) {
++			uint32 stack = 0;
++			if (eip &lt; function-&gt;Address() + 3) {
++				// The prologue has not been executed yet, i.e. there's no
++				// stack frame yet. Get the return address from the stack.
++				stack = cpuState-&gt;IntRegisterValue(X86_REGISTER_ESP);
++				if (eip &gt; function-&gt;Address()) {
++					// The &quot;push %ebp&quot; has already been executed.
++					stack += 4;
++				}
++			} else {
++				// Not in the function prologue, but maybe after the epilogue.
++				// The epilogue is a single &quot;pop %ebp&quot;, so we check whether the
++				// current instruction is already a &quot;ret&quot;.
++				uint8 code[1];
++				if (fDebuggerInterface-&gt;ReadMemory(eip, &amp;code, 1) == 1
++					&amp;&amp; code[0] == 0xc3) {
++					stack = cpuState-&gt;IntRegisterValue(X86_REGISTER_ESP);
++				}
++			}
++
++			if (stack != 0) {
++				uint32 address;
++				if (fDebuggerInterface-&gt;ReadMemory(stack, &amp;address, 4) == 4) {
++					returnAddress = address;
++					previousFramePointer = framePointer;
++					framePointer = 0;
++					readStandardFrame = false;
++					frameType = STACK_FRAME_TYPE_FRAMELESS;
++				}
++			}
++		}
++	}
++
+ 	// create the stack frame
+ 	StackFrame* frame = new(std::nothrow) StackFrame(frameType, cpuState,
+ 		framePointer, eip);
+@@ -137,21 +196,32 @@
+ 		return B_NO_MEMORY;
+ 	Reference&lt;StackFrame&gt; frameReference(frame, true);
+ 
+-	// read the previous frame and return address and create the CPU state
++	// read the previous frame and return address, if this is a standard frame
++	if (readStandardFrame) {
++		uint32 frameData[2];
++		if (framePointer != 0
++			&amp;&amp; fDebuggerInterface-&gt;ReadMemory(framePointer, frameData, 8)
++				== 8) {
++			previousFramePointer = frameData[0];
++			returnAddress = frameData[1];
++		}
++	}
++
++	// create the CPU state, if we have any info
+ 	CpuStateX86* previousCpuState = NULL;
+-	uint32 frameData[2];
+-	if (framePointer != 0
+-		&amp;&amp; fDebuggerInterface-&gt;ReadMemory(framePointer, frameData, 8) == 8) {
++	if (returnAddress != 0) {
+ 		// prepare the previous CPU state
+ 		previousCpuState = new(std::nothrow) CpuStateX86;
+ 		if (previousCpuState == NULL)
+ 			return B_NO_MEMORY;
+ 
+-		frame-&gt;SetReturnAddress(frameData[1]);
+-		previousCpuState-&gt;SetIntRegister(X86_REGISTER_EBP, frameData[0]);
+-		previousCpuState-&gt;SetIntRegister(X86_REGISTER_EIP, frameData[1]);
++		previousCpuState-&gt;SetIntRegister(X86_REGISTER_EBP,
++			previousFramePointer);
++		previousCpuState-&gt;SetIntRegister(X86_REGISTER_EIP, returnAddress);
+ 	}
+ 
++	frame-&gt;SetReturnAddress(returnAddress);
++
+ 	_previousFrame = frameReference.Detach();
+ 	_previousCpuState = previousCpuState;
+ 	return B_OK;
+@@ -171,17 +241,17 @@
+ 	uint32 eip = cpuState-&gt;IntRegisterValue(X86_REGISTER_EIP);
+ 	if (previousFunction == NULL || eip &lt;= previousFunction-&gt;Address())
+ 		return;
+-	target_addr_t functionAddresss = previousFunction-&gt;Address();
++	target_addr_t functionAddress = previousFunction-&gt;Address();
+ 
+ 	// allocate a buffer for the function code to disassemble
+-	size_t bufferSize = eip - functionAddresss;
++	size_t bufferSize = eip - functionAddress;
+ 	void* buffer = malloc(bufferSize);
+ 	if (buffer == NULL)
+ 		return;
+ 	MemoryDeleter bufferDeleter(buffer);
+ 
+ 	// read the code
+-	ssize_t bytesRead = fDebuggerInterface-&gt;ReadMemory(functionAddresss, buffer,
++	ssize_t bytesRead = fDebuggerInterface-&gt;ReadMemory(functionAddress, buffer,
+ 		bufferSize);
+ 	if (bytesRead != (ssize_t)bufferSize)
+ 		return;
+@@ -190,7 +260,7 @@
+ 	DisassemblerX86 disassembler;
+ 	target_addr_t instructionAddress;
+ 	target_size_t instructionSize;
+-	if (disassembler.Init(functionAddresss, buffer, bufferSize) == B_OK
++	if (disassembler.Init(functionAddress, buffer, bufferSize) == B_OK
+ 		&amp;&amp; disassembler.GetPreviousInstruction(eip, instructionAddress,
+ 			instructionSize) == B_OK) {
+ 		eip -= instructionSize;
+@@ -252,3 +322,21 @@
+ {
+ 	_AddRegister(index, name, REGISTER_FORMAT_INTEGER, bitSize, type);
+ }
++
++
++bool
++ArchitectureX86::_HasFunctionPrologue(FunctionDebugInfo* function) const
++{
++	if (function == NULL)
++		return false;
++
++	// check whether the function has the typical prologue
++	if (function-&gt;Size() &lt; 3)
++		return false;
++
++	uint8 buffer[3];
++	if (fDebuggerInterface-&gt;ReadMemory(function-&gt;Address(), buffer, 3) != 3)
++		return false;
++
++	return buffer[0] == 0x55 &amp;&amp; buffer[1] == 0x89 &amp;&amp; buffer[2] == 0xe5;
++}
+
+Modified: haiku/trunk/src/apps/debugger/arch/x86/ArchitectureX86.h
+===================================================================
+--- haiku/trunk/src/apps/debugger/arch/x86/ArchitectureX86.h	2009-06-24 23:14:10 UTC (rev 31231)
++++ haiku/trunk/src/apps/debugger/arch/x86/ArchitectureX86.h	2009-06-24 23:38:29 UTC (rev 31232)
+@@ -45,6 +45,9 @@
+ 									const char* name, uint32 bitSize,
+ 									register_type type);
+ 
++			bool				_HasFunctionPrologue(
++									FunctionDebugInfo* function) const;
++
+ private:
+ 			Array&lt;Register&gt;		fRegisters;
+ };
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017464.html">[Haiku-commits] r31231 - in	haiku/trunk/src/tests/add-ons/kernel/file_systems/beserved/FileSharing-Windows:	. VS2008
+</A></li>
+	<LI>Next message: <A HREF="017466.html">[Haiku-commits] r31233 - haiku/trunk/src/apps/debugger/demangler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17465">[ date ]</a>
+              <a href="thread.html#17465">[ thread ]</a>
+              <a href="subject.html#17465">[ subject ]</a>
+              <a href="author.html#17465">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

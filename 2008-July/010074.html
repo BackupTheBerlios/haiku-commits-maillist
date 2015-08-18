@@ -1,0 +1,189 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26295 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26295%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200807071253.m67Crrup006407%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010073.html">
+   <LINK REL="Next"  HREF="010078.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26295 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26295%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200807071253.m67Crrup006407%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26295 - haiku/trunk/src/system/kernel/cache">axeld at mail.berlios.de
+       </A><BR>
+    <I>Mon Jul  7 14:53:53 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010073.html">[Haiku-commits] r26294 - haiku/trunk/src/system/kernel/fs
+</A></li>
+        <LI>Next message: <A HREF="010078.html">[Haiku-commits] r26296 - in haiku/trunk: headers/private/fs_shell	src/system/kernel/fs src/tools/fs_shell
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10074">[ date ]</a>
+              <a href="thread.html#10074">[ thread ]</a>
+              <a href="subject.html#10074">[ subject ]</a>
+              <a href="author.html#10074">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-07-07 14:53:53 +0200 (Mon, 07 Jul 2008)
+New Revision: 26295
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26295&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26295&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_map.cpp
+Log:
+* Added a lock to FileMap - since the map is retrieved lazily, and file
+  systems like BFS only hold a read lock when reading the map, accessing the
+  file map wasn't safe.
+* Made FileMap::Free() private, and renamed it to _Free().
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_map.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_map.cpp	2008-07-07 12:45:38 UTC (rev 26294)
++++ haiku/trunk/src/system/kernel/cache/file_map.cpp	2008-07-07 12:53:53 UTC (rev 26295)
+@@ -62,7 +62,6 @@
+ 
+ 			void			Invalidate(off_t offset, off_t size);
+ 			void			SetSize(off_t size);
+-			void			Free();
+ 
+ 			status_t		Translate(off_t offset, size_t size,
+ 								file_io_vec* vecs, size_t* _count);
+@@ -78,11 +77,14 @@
+ 			status_t		_MakeSpace(size_t count);
+ 			status_t		_Add(file_io_vec* vecs, size_t vecCount,
+ 								off_t&amp; lastOffset);
++			void			_InvalidateAfter(off_t offset);
++			void			_Free();
+ 
+ 	union {
+ 		file_extent	fDirect[CACHED_FILE_EXTENTS];
+ 		file_extent_array fIndirect;
+ 	};
++	mutex			fLock;
+ 	size_t			fCount;
+ 	struct vnode*	fVnode;
+ 	off_t			fSize;
+@@ -98,6 +100,7 @@
+ 
+ FileMap::FileMap(struct vnode* vnode, off_t size)
+ {
++	mutex_init(&amp;fLock, &quot;file map&quot;);
+ 	fCount = 0;
+ 	fVnode = vnode;
+ 	fSize = size;
+@@ -111,7 +114,8 @@
+ 
+ FileMap::~FileMap()
+ {
+-	Free();
++	_Free();
++	mutex_destroy(&amp;fLock);
+ 
+ #ifdef DEBUG_FILE_MAP
+ 	MutexLocker _(sLock);
+@@ -260,17 +264,9 @@
+ }
+ 
+ 
+-/*!	Invalidates or removes the specified part of the file map.
+-*/
+ void
+-FileMap::Invalidate(off_t offset, off_t size)
++FileMap::_InvalidateAfter(off_t offset)
+ {
+-	// TODO: honour size, we currently always remove everything after &quot;offset&quot;
+-	if (offset == 0) {
+-		Free();
+-		return;
+-	}
+-
+ 	uint32 index;
+ 	file_extent* extent = _FindExtent(offset, &amp;index);
+ 	if (extent != NULL) {
+@@ -282,18 +278,37 @@
+ }
+ 
+ 
++/*!	Invalidates or removes the specified part of the file map.
++*/
+ void
++FileMap::Invalidate(off_t offset, off_t size)
++{
++	MutexLocker _(fLock);
++
++	// TODO: honour size, we currently always remove everything after &quot;offset&quot;
++	if (offset == 0) {
++		_Free();
++		return;
++	}
++
++	_InvalidateAfter(offset);
++}
++
++
++void
+ FileMap::SetSize(off_t size)
+ {
++	MutexLocker _(fLock);
++
+ 	if (size &lt; fSize)
+-		Invalidate(size, fSize - size);
++		_InvalidateAfter(size);
+ 
+ 	fSize = size;
+ }
+ 
+ 
+ void
+-FileMap::Free()
++FileMap::_Free()
+ {
+ 	if (fCount &gt; CACHED_FILE_EXTENTS)
+ 		free(fIndirect.array);
+@@ -305,6 +320,8 @@
+ status_t
+ FileMap::Translate(off_t offset, size_t size, file_io_vec* vecs, size_t* _count)
+ {
++	MutexLocker _(fLock);
++
+ 	size_t maxVecs = *_count;
+ 	status_t status = B_OK;
+ 
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010073.html">[Haiku-commits] r26294 - haiku/trunk/src/system/kernel/fs
+</A></li>
+	<LI>Next message: <A HREF="010078.html">[Haiku-commits] r26296 - in haiku/trunk: headers/private/fs_shell	src/system/kernel/fs src/tools/fs_shell
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10074">[ date ]</a>
+              <a href="thread.html#10074">[ thread ]</a>
+              <a href="subject.html#10074">[ subject ]</a>
+              <a href="author.html#10074">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

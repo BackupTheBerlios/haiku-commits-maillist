@@ -1,0 +1,325 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r19771 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2007-January/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19771%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200701121507.l0CF7JV5005873%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000175.html">
+   <LINK REL="Next"  HREF="000177.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r19771 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r19771%20-%20in%20haiku/trunk%3A%20headers/private/kernel%0A%09src/system/kernel/vm&In-Reply-To=%3C200701121507.l0CF7JV5005873%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r19771 - in haiku/trunk: headers/private/kernel	src/system/kernel/vm">axeld at mail.berlios.de
+       </A><BR>
+    <I>Fri Jan 12 16:07:19 CET 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000175.html">[Haiku-commits] r19770 - in haiku/trunk: build/jam src/bin/coreutils/src
+</A></li>
+        <LI>Next message: <A HREF="000177.html">[Haiku-commits] r19772 - haiku/trunk/src/add-ons/translators/sgi
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#176">[ date ]</a>
+              <a href="thread.html#176">[ thread ]</a>
+              <a href="subject.html#176">[ subject ]</a>
+              <a href="author.html#176">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2007-01-12 16:07:18 +0100 (Fri, 12 Jan 2007)
+New Revision: 19771
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=19771&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=19771&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/kernel/vm_types.h
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+   haiku/trunk/src/system/kernel/vm/vm_cache.c
+   haiku/trunk/src/system/kernel/vm/vm_store_anonymous_noswap.c
+Log:
+* Private and temporary vm_caches now maintain their new virtual_base field, which allows
+  them to commit substantially less memory (we we're committing about 40 MB (!) too much
+  after a complete system boot). This means you'll run out of memory less likely now.
+* fill_area_info() no longer filters out kernel protection flags - we may want to keep
+  filtering them when called from userland, though, dunno.
+* Added new debugger command &quot;avail&quot; which shows how much memory has been committed, and
+  how much is regarded as free space.
+
+
+Modified: haiku/trunk/headers/private/kernel/vm_types.h
+===================================================================
+--- haiku/trunk/headers/private/kernel/vm_types.h	2007-01-11 20:27:22 UTC (rev 19770)
++++ haiku/trunk/headers/private/kernel/vm_types.h	2007-01-12 15:07:18 UTC (rev 19771)
+@@ -1,5 +1,5 @@
+ /* 
+- * Copyright 2002-2006, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2002-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  *
+  * Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.
+@@ -75,7 +75,9 @@
+ 	vm_cache_ref		*ref;
+ 	struct vm_cache		*source;
+ 	struct vm_store		*store;
++	off_t				virtual_base;
+ 	off_t				virtual_size;
++		// the size is absolute, and independent from virtual_base
+ 	uint32				page_count;
+ 	uint32				temporary : 1;
+ 	uint32				scan_skip : 1;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2007-01-11 20:27:22 UTC (rev 19770)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2007-01-12 15:07:18 UTC (rev 19771)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2002-2006, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2002-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  *
+  * Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.
+@@ -506,9 +506,8 @@
+ 	off_t offset, addr_t size, uint32 addressSpec, int wiring, int protection,
+ 	int mapping, vm_area **_area, const char *areaName)
+ {
++	vm_cache_ref *cacheRef;
+ 	vm_cache *cache;
+-	vm_cache_ref *cacheRef;
+-
+ 	status_t status;
+ 
+ 	TRACE((&quot;map_backing_store: aspace %p, store %p, *vaddr %p, offset 0x%Lx, size %lu, addressSpec %ld, wiring %d, protection %d, _area %p, area_name '%s'\n&quot;,
+@@ -528,7 +527,6 @@
+ 		vm_cache *newCache;
+ 		vm_store *newStore;
+ 
+-		// ToDo: panic???
+ 		// create an anonymous store object
+ 		newStore = vm_store_create_anonymous_noswap((protection &amp; B_STACK_AREA) != 0,
+ 			USER_STACK_GUARD_PAGES);
+@@ -557,6 +555,7 @@
+ 		cache = newCache;
+ 		cacheRef = newCache-&gt;ref;
+ 		store = newStore;
++		cache-&gt;virtual_base = offset;
+ 		cache-&gt;virtual_size = offset + size;
+ 	}
+ 
+@@ -1658,7 +1657,8 @@
+ 					count++;
+ 				}
+ 
+-				status = cache-&gt;store-&gt;ops-&gt;commit(cache-&gt;store, count * B_PAGE_SIZE);
++				status = cache-&gt;store-&gt;ops-&gt;commit(cache-&gt;store,
++					cache-&gt;virtual_base + count * B_PAGE_SIZE);
+ 
+ 				// ToDo: we may be able to join with our source cache, if count == 0
+ 			}
+@@ -1905,6 +1905,7 @@
+ 		kprintf(&quot;  %p\n&quot;, consumer);
+ 	}
+ 	kprintf(&quot;store: %p\n&quot;, cache-&gt;store);
++	kprintf(&quot;virtual_base: 0x%Lx\n&quot;, cache-&gt;virtual_base);
+ 	kprintf(&quot;virtual_size: 0x%Lx\n&quot;, cache-&gt;virtual_size);
+ 	kprintf(&quot;temporary: %ld\n&quot;, cache-&gt;temporary);
+ 	kprintf(&quot;scan_skip: %ld\n&quot;, cache-&gt;scan_skip);
+@@ -2008,6 +2009,15 @@
+ }
+ 
+ 
++static int
++dump_available_memory(int argc, char **argv)
++{
++	kprintf(&quot;Available memory: %Ld/%lu bytes\n&quot;,
++		sAvailableMemory, vm_page_num_pages() * B_PAGE_SIZE);
++	return 0;
++}
++
++
+ status_t
+ vm_delete_areas(struct vm_address_space *addressSpace)
+ {
+@@ -2356,6 +2366,7 @@
+ 	add_debugger_command(&quot;area&quot;, &amp;dump_area, &quot;Dump info about a particular area&quot;);
+ 	add_debugger_command(&quot;cache_ref&quot;, &amp;dump_cache_ref, &quot;Dump cache_ref data structure&quot;);
+ 	add_debugger_command(&quot;cache&quot;, &amp;dump_cache, &quot;Dump cache_ref data structure&quot;);
++	add_debugger_command(&quot;avail&quot;, &amp;dump_available_memory, &quot;Dump available memory&quot;);
+ //	add_debugger_command(&quot;dl&quot;, &amp;display_mem, &quot;dump memory long words (64-bit)&quot;);
+ 	add_debugger_command(&quot;dw&quot;, &amp;display_mem, &quot;dump memory words (32-bit)&quot;);
+ 	add_debugger_command(&quot;ds&quot;, &amp;display_mem, &quot;dump memory shorts (16-bit)&quot;);
+@@ -2971,6 +2982,30 @@
+ }
+ 
+ 
++static void
++fill_area_info(struct vm_area *area, area_info *info, size_t size)
++{
++	strlcpy(info-&gt;name, area-&gt;name, B_OS_NAME_LENGTH);
++	info-&gt;area = area-&gt;id;
++	info-&gt;address = (void *)area-&gt;base;
++	info-&gt;size = area-&gt;size;
++	info-&gt;protection = area-&gt;protection;
++	info-&gt;lock = B_FULL_LOCK;
++	info-&gt;team = area-&gt;address_space-&gt;id;
++	info-&gt;copy_count = 0;
++	info-&gt;in_count = 0;
++	info-&gt;out_count = 0;
++		// ToDo: retrieve real values here!
++
++	mutex_lock(&amp;area-&gt;cache_ref-&gt;lock);
++
++	// Note, this is a simplification; the cache could be larger than this area
++	info-&gt;ram_size = area-&gt;cache_ref-&gt;cache-&gt;page_count * B_PAGE_SIZE;
++
++	mutex_unlock(&amp;area-&gt;cache_ref-&gt;lock);
++}
++
++
+ //	#pragma mark -
+ 
+ 
+@@ -3005,7 +3040,7 @@
+ }
+ 
+ 
+-//	#pragma mark -
++//	#pragma mark - kernel public API
+ 
+ 
+ long
+@@ -3205,30 +3240,6 @@
+ }
+ 
+ 
+-static void
+-fill_area_info(struct vm_area *area, area_info *info, size_t size)
+-{
+-	strlcpy(info-&gt;name, area-&gt;name, B_OS_NAME_LENGTH);
+-	info-&gt;area = area-&gt;id;
+-	info-&gt;address = (void *)area-&gt;base;
+-	info-&gt;size = area-&gt;size;
+-	info-&gt;protection = area-&gt;protection &amp; B_USER_PROTECTION;
+-	info-&gt;lock = B_FULL_LOCK;
+-	info-&gt;team = area-&gt;address_space-&gt;id;
+-	info-&gt;copy_count = 0;
+-	info-&gt;in_count = 0;
+-	info-&gt;out_count = 0;
+-		// ToDo: retrieve real values here!
+-
+-	mutex_lock(&amp;area-&gt;cache_ref-&gt;lock);
+-
+-	// Note, this is a simplification; the cache could be larger than this area
+-	info-&gt;ram_size = area-&gt;cache_ref-&gt;cache-&gt;page_count * B_PAGE_SIZE;
+-
+-	mutex_unlock(&amp;area-&gt;cache_ref-&gt;lock);
+-}
+-
+-
+ status_t
+ _get_area_info(area_id id, area_info *info, size_t size)
+ {
+@@ -3580,7 +3591,7 @@
+ }
+ 
+ 
+-//	#pragma mark -
++//	#pragma mark - Userland syscalls
+ 
+ 
+ status_t
+@@ -3647,6 +3658,9 @@
+ 	if (status &lt; B_OK)
+ 		return status;
+ 
++	// TODO: do we want to prevent userland from seeing kernel protections?
++	//info.protection &amp;= B_USER_PROTECTION;
++
+ 	if (user_memcpy(userInfo, &amp;info, sizeof(area_info)) &lt; B_OK)
+ 		return B_BAD_ADDRESS;
+ 
+@@ -3670,6 +3684,8 @@
+ 	if (status != B_OK)
+ 		return status;
+ 
++	//info.protection &amp;= B_USER_PROTECTION;
++
+ 	if (user_memcpy(userCookie, &amp;cookie, sizeof(int32)) &lt; B_OK
+ 		|| user_memcpy(userInfo, &amp;info, sizeof(area_info)) &lt; B_OK)
+ 		return B_BAD_ADDRESS;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_cache.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_cache.c	2007-01-11 20:27:22 UTC (rev 19770)
++++ haiku/trunk/src/system/kernel/vm/vm_cache.c	2007-01-12 15:07:18 UTC (rev 19771)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2002-2006, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2002-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  *
+  * Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.
+@@ -103,6 +103,7 @@
+ 	cache-&gt;page_list = NULL;
+ 	cache-&gt;ref = NULL;
+ 	cache-&gt;source = NULL;
++	cache-&gt;virtual_base = 0;
+ 	cache-&gt;virtual_size = 0;
+ 	cache-&gt;temporary = 0;
+ 	cache-&gt;scan_skip = 0;
+
+Modified: haiku/trunk/src/system/kernel/vm/vm_store_anonymous_noswap.c
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm_store_anonymous_noswap.c	2007-01-11 20:27:22 UTC (rev 19770)
++++ haiku/trunk/src/system/kernel/vm/vm_store_anonymous_noswap.c	2007-01-12 15:07:18 UTC (rev 19771)
+@@ -1,5 +1,5 @@
+ /* 
+- * Copyright 2002-2006, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
++ * Copyright 2002-2007, Axel D&#246;rfler, <A HREF="https://lists.berlios.de/mailman/listinfo/haiku-commits">axeld at pinc-software.de.</A>
+  * Distributed under the terms of the MIT License.
+  *
+  * Copyright 2001-2002, Travis Geiselbrecht. All rights reserved.
+@@ -52,6 +52,9 @@
+ 	if (store-&gt;can_overcommit)
+ 		return B_OK;
+ 
++	size -= store-&gt;vm.cache-&gt;virtual_base;
++		// anonymous stores don't need to span over their whole source
++
+ 	// Check to see how much we could commit - we need real memory
+ 
+ 	if (size &gt; store-&gt;vm.committed_size) {
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000175.html">[Haiku-commits] r19770 - in haiku/trunk: build/jam src/bin/coreutils/src
+</A></li>
+	<LI>Next message: <A HREF="000177.html">[Haiku-commits] r19772 - haiku/trunk/src/add-ons/translators/sgi
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#176">[ date ]</a>
+              <a href="thread.html#176">[ thread ]</a>
+              <a href="subject.html#176">[ subject ]</a>
+              <a href="author.html#176">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

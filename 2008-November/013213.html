@@ -1,0 +1,520 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r28455 - in haiku/trunk:	headers/private/runtime_loader src/system/runtime_loader
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-November/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28455%20-%20in%20haiku/trunk%3A%0A%09headers/private/runtime_loader%20src/system/runtime_loader&In-Reply-To=%3C200811020316.mA23GV5o025671%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="013212.html">
+   <LINK REL="Next"  HREF="013214.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r28455 - in haiku/trunk:	headers/private/runtime_loader src/system/runtime_loader</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r28455%20-%20in%20haiku/trunk%3A%0A%09headers/private/runtime_loader%20src/system/runtime_loader&In-Reply-To=%3C200811020316.mA23GV5o025671%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r28455 - in haiku/trunk:	headers/private/runtime_loader src/system/runtime_loader">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sun Nov  2 04:16:31 CET 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="013212.html">[Haiku-commits] r28454 - haiku/trunk/src/system/runtime_loader
+</A></li>
+        <LI>Next message: <A HREF="013214.html">[Haiku-commits] r28456 - in haiku/trunk:	headers/private/runtime_loader headers/private/system	src/system/libroot src/system/libroot/os	src/system/libroot/posix src/system/libroot/posix/stdlib	src/system/libroot/posix/unistd
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13213">[ date ]</a>
+              <a href="thread.html#13213">[ thread ]</a>
+              <a href="subject.html#13213">[ subject ]</a>
+              <a href="author.html#13213">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-11-02 04:16:30 +0100 (Sun, 02 Nov 2008)
+New Revision: 28455
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=28455&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=28455&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/headers/private/runtime_loader/runtime_loader.h
+   haiku/trunk/src/system/runtime_loader/elf.cpp
+Log:
+* Changed the way symbols are resolved. For each root image (program,
+  add-on) we create a breadth-first sorted image list and use that to
+  search for symbols.
+* Added support for preloading libraries. The environment variable
+  LD_PRELOAD can contain a whitespace-separated list of shared objects
+  that will be loaded before the program. This allows to replace
+  symbols without changing the executable or libraries.
+* Resolved TODO in load_program() regarding the order of remapping the
+  images and initializing the dependencies (problem fixed in r28453).
+
+
+Modified: haiku/trunk/headers/private/runtime_loader/runtime_loader.h
+===================================================================
+--- haiku/trunk/headers/private/runtime_loader/runtime_loader.h	2008-11-02 02:59:15 UTC (rev 28454)
++++ haiku/trunk/headers/private/runtime_loader/runtime_loader.h	2008-11-02 03:16:30 UTC (rev 28455)
+@@ -65,6 +65,11 @@
+ 	uint32				num_needed;
+ 	struct image_t		**needed;
+ 
++	// For &quot;root&quot; images (the program, add-ons): Symbols are searched in the
++	// images in array order.
++	uint32				symbol_resolution_image_count;
++	struct image_t		**symbol_resolution_images;
++
+ 	// describes the text and data regions
+ 	uint32				num_regions;
+ 	elf_region_t		regions[1];
+
+Modified: haiku/trunk/src/system/runtime_loader/elf.cpp
+===================================================================
+--- haiku/trunk/src/system/runtime_loader/elf.cpp	2008-11-02 02:59:15 UTC (rev 28454)
++++ haiku/trunk/src/system/runtime_loader/elf.cpp	2008-11-02 03:16:30 UTC (rev 28455)
+@@ -11,13 +11,13 @@
+ 
+ #include &quot;runtime_loader_private.h&quot;
+ 
+-#include &lt;OS.h&gt;
+-
+-#include &lt;string.h&gt;
++#include &lt;ctype.h&gt;
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+ 
++#include &lt;OS.h&gt;
++
+ #include &lt;elf32.h&gt;
+ #include &lt;runtime_loader.h&gt;
+ #include &lt;syscalls.h&gt;
+@@ -83,6 +83,8 @@
+ static bool sProgramLoaded = false;
+ static const char *sSearchPathSubDir = NULL;
+ static bool sInvalidImageIDs;
++static image_t **sPreloadedImages = NULL;
++static uint32 sPreloadedImageCount = 0;
+ 
+ // a recursive lock
+ static sem_id sSem;
+@@ -1002,29 +1004,19 @@
+ 
+ 
+ static struct Elf32_Sym*
+-find_symbol_recursively_impl(image_t* image, const char* name,
++find_symbol_in_root_image_list(image_t* rootImage, const char* name,
+ 	image_t** foundInImage)
+ {
+-	image-&gt;flags |= RFLAG_VISITED;
+-
+-	struct Elf32_Sym *symbol;
+-
+-	// look up the symbol in this image
+-	if (image-&gt;dynamic_ptr) {
+-		symbol = find_symbol(image, name, B_SYMBOL_TYPE_ANY);
+-		if (symbol) {
+-			*foundInImage = image;
+-			return symbol;
+-		}
+-	}
+-
+-	// recursively search dependencies
+-	for (uint32 i = 0; i &lt; image-&gt;num_needed; i++) {
+-		if (!(image-&gt;needed[i]-&gt;flags &amp; RFLAG_VISITED)) {
+-			symbol = find_symbol_recursively_impl(image-&gt;needed[i], name,
+-				foundInImage);
+-			if (symbol)
++	int32 count = rootImage-&gt;symbol_resolution_image_count;
++	image_t** images = rootImage-&gt;symbol_resolution_images;
++	for (int32 i = 0; i &lt; count; i++) {
++		image_t* image = images[i];
++		if (image-&gt;dynamic_ptr) {
++			Elf32_Sym* symbol = find_symbol(image, name, B_SYMBOL_TYPE_ANY);
++			if (symbol) {
++				*foundInImage = image;
+ 				return symbol;
++			}
+ 		}
+ 	}
+ 
+@@ -1032,60 +1024,15 @@
+ }
+ 
+ 
+-static void
+-clear_image_flag_recursively(image_t* image, uint32 flag)
+-{
+-	image-&gt;flags &amp;= ~flag;
+-
+-	for (uint32 i = 0; i &lt; image-&gt;num_needed; i++) {
+-		if (image-&gt;needed[i]-&gt;flags &amp; flag)
+-			clear_image_flag_recursively(image-&gt;needed[i], flag);
+-	}
+-}
+-
+-
+ static struct Elf32_Sym*
+-find_symbol_recursively(image_t* image, const char* name,
+-	image_t** foundInImage)
+-{
+-	struct Elf32_Sym* symbol = find_symbol_recursively_impl(image, name,
+-		foundInImage);
+-	clear_image_flag_recursively(image, RFLAG_VISITED);
+-	return symbol;
+-}
+-
+-
+-static struct Elf32_Sym*
+-find_symbol_in_loaded_images(const char* name, image_t** foundInImage)
+-{
+-	return find_symbol_recursively(sLoadedImages.head, name, foundInImage);
+-}
+-
+-
+-static struct Elf32_Sym*
+ find_undefined_symbol(image_t* rootImage, image_t* image, const char* name,
+ 	image_t** foundInImage)
+ {
+ 	// If not simulating BeOS style symbol resolution, undefined symbols are
+ 	// searched recursively starting from the root image.
+-	// TODO: Breadth first might be better than the depth first strategy used
+-	// here. We're also visiting images multiple times. Consider building a
+-	// breadth-first sorted array of images for each root image.
+-	if ((rootImage-&gt;flags &amp; IMAGE_FLAG_R5_SYMBOL_RESOLUTION) == 0) {
+-		Elf32_Sym* symbol = find_symbol_recursively(rootImage, name,
+-			foundInImage);
+-		if (symbol != NULL)
+-			return symbol;
++	if ((rootImage-&gt;flags &amp; IMAGE_FLAG_R5_SYMBOL_RESOLUTION) == 0)
++		return find_symbol_in_root_image_list(rootImage, name, foundInImage);
+ 
+-		// If the root image is not the program image (i.e. it is a dynamically
+-		// loaded add-on or library), we try the program image hierarchy too.
+-		image_t* programImage = get_program_image();
+-		if (rootImage != programImage)
+-			return find_symbol_recursively(programImage, name, foundInImage);
+-
+-		return NULL;
+-	}
+-
+ 	// BeOS style symbol resolution: It is sufficient to check the direct
+ 	// dependencies. The linker would have complained, if the symbol wasn't
+ 	// there.
+@@ -1561,6 +1508,36 @@
+ }
+ 
+ 
++static uint32
++topological_sort_breadth_first(image_t* image, image_t** list, uint32 sortFlag)
++{
++	if ((image-&gt;flags &amp; sortFlag) != 0)
++		return 0;
++
++	// We directly use the result list as queue for the breadth first search.
++	list[0] = image;
++	image-&gt;flags |= sortFlag;
++
++	int32 index = 0;
++	int32 count = 1;
++
++	while (index &lt; count) {
++		image = list[index++];
++
++		for (uint32 i = 0; i &lt; image-&gt;num_needed; i++) {
++			image_t* neededImage = image-&gt;needed[i];
++			if ((neededImage-&gt;flags &amp; sortFlag) == 0) {
++				// dependency not yet visited -- add to queue
++				list[count++] = neededImage;
++				neededImage-&gt;flags |= sortFlag;
++			}
++		}
++	}
++
++	return count;
++}
++
++
+ static ssize_t
+ get_sorted_image_list(image_t *image, image_t ***_list, uint32 sortFlag)
+ {
+@@ -1580,17 +1557,81 @@
+ }
+ 
+ 
++static ssize_t
++get_sorted_image_list_breadth_first(image_t* image, image_t*** _list,
++	uint32 sortFlag)
++{
++	image_t** list = (image_t**)malloc(sLoadedImageCount * sizeof(image_t*));
++	if (list == NULL) {
++		FATAL(&quot;memory shortage in get_sorted_image_list()&quot;);
++		*_list = NULL;
++		return B_NO_MEMORY;
++	}
++
++	memset(list, 0, sLoadedImageCount * sizeof(image_t *));
++
++	*_list = list;
++
++	return topological_sort_breadth_first(image, list, sortFlag);
++}
++
++
+ static status_t
+ relocate_dependencies(image_t *image)
+ {
+-	ssize_t count, i;
++	// build an array of images in the order we want to lookup symbols
++	image_t** lookupList;
++	ssize_t lookupCount = get_sorted_image_list_breadth_first(image,
++		&amp;lookupList, RFLAG_VISITED);
++	if (lookupCount &lt; 0)
++		return lookupCount;
++
++	// If the image is not the program image, add it and its dependencies, too.
++	if (sProgramImage != NULL &amp;&amp; image != sProgramImage) {
++		lookupCount += topological_sort_breadth_first(sProgramImage,
++			lookupList + lookupCount, RFLAG_VISITED);
++	}
++
++	// If we have pre-loaded images, prepend them.
++	if (sPreloadedImageCount &gt; 0) {
++		// Count the ones that have to be added -- normally all, but one never
++		// knows.
++		uint32 preloadedCount = 0;
++		for (uint32 i = 0; i &lt; sPreloadedImageCount; i++) {
++			image_t* preloadedImage = sPreloadedImages[i];
++			if ((preloadedImage-&gt;flags &amp; RFLAG_VISITED) == 0)
++				preloadedCount++;
++		}
++
++		// add them
++		if (preloadedCount &gt; 0) {
++			memmove(lookupList + preloadedCount, lookupList,
++				lookupCount * sizeof(image_t*));
++			lookupCount += preloadedCount;
++
++			preloadedCount = 0;
++			for (uint32 i = 0; i &lt; sPreloadedImageCount; i++) {
++				image_t* preloadedImage = sPreloadedImages[i];
++				if ((preloadedImage-&gt;flags &amp; RFLAG_VISITED) == 0)
++					lookupList[preloadedCount++] = preloadedImage;
++			}
++		}
++	}
++
++	// clear the &quot;visited&quot; flag
++	for (int32 i = 0; i &lt; lookupCount; i++)
++		lookupList[i]-&gt;flags &amp;= ~RFLAG_VISITED;
++
++	image-&gt;symbol_resolution_images = lookupList;
++	image-&gt;symbol_resolution_image_count = lookupCount;
++
++	// get the images that still have to be relocated
+ 	image_t **list;
+-
+-	count = get_sorted_image_list(image, &amp;list, RFLAG_RELOCATED);
++	ssize_t count = get_sorted_image_list(image, &amp;list, RFLAG_RELOCATED);
+ 	if (count &lt; B_OK)
+ 		return count;
+ 
+-	for (i = 0; i &lt; count; i++) {
++	for (ssize_t i = 0; i &lt; count; i++) {
+ 		status_t status = relocate_image(image, list[i]);
+ 		if (status &lt; B_OK)
+ 			return status;
+@@ -1652,6 +1693,124 @@
+ }
+ 
+ 
++void
++inject_runtime_loader_api(image_t* rootImage)
++{
++	// We patch any exported __gRuntimeLoader symbols to point to our private
++	// API.
++	image_t* image;
++	Elf32_Sym* symbol = find_symbol_in_root_image_list(rootImage,
++		&quot;__gRuntimeLoader&quot;, &amp;image);
++
++	if (symbol != NULL) {
++		void** _export = (void**)(symbol-&gt;st_value + image-&gt;regions[0].delta);
++		*_export = &gRuntimeLoader;
++	}
++}
++
++
++static status_t
++add_preloaded_image(image_t* image)
++{
++	// We realloc() everytime -- not particularly efficient, but good enough for
++	// small number of preloaded images.
++	image_t** newArray = (image_t**)realloc(sPreloadedImages,
++		sizeof(image_t*) * (sPreloadedImageCount + 1));
++	if (newArray == NULL)
++		return B_NO_MEMORY;
++
++	sPreloadedImages = newArray;
++	newArray[sPreloadedImageCount++] = image;
++
++	return B_OK;
++}
++
++
++image_id
++preload_image(char const* path)
++{
++	if (path == NULL)
++		return B_BAD_VALUE;
++
++	KTRACE(&quot;rld: preload_image(\&quot;%s\&quot;)&quot;, path);
++
++	image_t *image = NULL;
++	status_t status = load_container(path, B_ADD_ON_IMAGE, NULL, &amp;image);
++	if (status &lt; B_OK) {
++		rld_unlock();
++		KTRACE(&quot;rld: preload_image(\&quot;%s\&quot;) failed to load container: %s&quot;, path,
++			strerror(status));
++		return status;
++	}
++
++	for (image_t* otherImage = sLoadedImages.head; otherImage != NULL;
++			otherImage = otherImage-&gt;next) {
++		status = load_dependencies(otherImage);
++		if (status &lt; B_OK)
++			goto err;
++	}
++
++	status = relocate_dependencies(image);
++	if (status &lt; B_OK)
++		goto err;
++
++	status = add_preloaded_image(image);
++	if (status &lt; B_OK)
++		goto err;
++
++	inject_runtime_loader_api(image);
++
++	remap_images();
++	init_dependencies(image, true);
++
++	KTRACE(&quot;rld: preload_image(\&quot;%s\&quot;) done: id: %ld&quot;, path, image-&gt;id);
++
++	return image-&gt;id;
++
++err:
++	KTRACE(&quot;rld: preload_image(\&quot;%s\&quot;) failed: %s&quot;, path, strerror(status));
++
++	dequeue_image(&amp;sLoadedImages, image);
++	sLoadedImageCount--;
++	delete_image(image);
++	return status;
++}
++
++
++static void
++preload_images()
++{
++	const char* imagePaths = getenv(&quot;LD_PRELOAD&quot;);
++	if (imagePaths == NULL)
++		return;
++
++	while (*imagePaths != '\0') {
++		// find begin of image path
++		while (*imagePaths != '\0' &amp;&amp; isspace(*imagePaths))
++			imagePaths++;
++
++		if (*imagePaths == '\0')
++			break;
++
++		// find end of image path
++		const char* imagePath = imagePaths;
++		while (*imagePaths != '\0' &amp;&amp; !isspace(*imagePaths))
++			imagePaths++;
++
++		// extract the path
++		char path[B_PATH_NAME_LENGTH];
++		size_t pathLen = imagePaths - imagePath;
++		if (pathLen &gt; sizeof(path) - 1)
++			continue;
++		memcpy(path, imagePath, pathLen);
++		path[pathLen] = '\0';
++
++		// load the image
++		preload_image(path);
++	}
++}
++
++
+ //	#pragma mark - libroot.so exported functions
+ 
+ 
+@@ -1666,6 +1825,8 @@
+ 	rld_lock();
+ 		// for now, just do stupid simple global locking
+ 
++	preload_images();
++
+ 	TRACE((&quot;rld: load %s\n&quot;, path));
+ 
+ 	status = load_container(path, B_APP_IMAGE, NULL, &amp;sProgramImage);
+@@ -1682,25 +1843,17 @@
+ 	if (status &lt; B_OK)
+ 		goto err;
+ 
+-	// We patch any exported __gRuntimeLoader symbols to point to our private API
+-	{
+-		struct Elf32_Sym *symbol = find_symbol_in_loaded_images(
+-			&quot;__gRuntimeLoader&quot;, &amp;image);
+-		if (symbol != NULL) {
+-			void **_export = (void **)(symbol-&gt;st_value + image-&gt;regions[0].delta);
+-			*_export = &gRuntimeLoader;
+-		}
+-	}
++	inject_runtime_loader_api(sProgramImage);
+ 
+-	init_dependencies(sLoadedImages.head, true);
+ 	remap_images();
+-		// ToDo: once setup_system_time() is fixed, move this one line higher!
++	init_dependencies(sProgramImage, true);
+ 
+ 	// Since the images are initialized now, we no longer should use our
+ 	// getenv(), but use the one from libroot.so
+ 	{
+-		struct Elf32_Sym *symbol = find_symbol_in_loaded_images(&quot;getenv&quot;,
+-			&amp;image);
++		struct Elf32_Sym *symbol = find_symbol_in_root_image_list(sProgramImage,
++			&quot;getenv&quot;, &amp;image);
++
+ 		if (symbol != NULL)
+ 			gGetEnv = (char* (*)(const char*))
+ 				(symbol-&gt;st_value + image-&gt;regions[0].delta);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="013212.html">[Haiku-commits] r28454 - haiku/trunk/src/system/runtime_loader
+</A></li>
+	<LI>Next message: <A HREF="013214.html">[Haiku-commits] r28456 - in haiku/trunk:	headers/private/runtime_loader headers/private/system	src/system/libroot src/system/libroot/os	src/system/libroot/posix src/system/libroot/posix/stdlib	src/system/libroot/posix/unistd
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#13213">[ date ]</a>
+              <a href="thread.html#13213">[ thread ]</a>
+              <a href="subject.html#13213">[ subject ]</a>
+              <a href="author.html#13213">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

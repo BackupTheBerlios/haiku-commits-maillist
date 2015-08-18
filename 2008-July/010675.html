@@ -1,0 +1,152 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26700 - haiku/trunk/src/system/kernel/cache
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26700%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200807311923.m6VJNINf008268%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010674.html">
+   <LINK REL="Next"  HREF="010676.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26700 - haiku/trunk/src/system/kernel/cache</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26700%20-%20haiku/trunk/src/system/kernel/cache&In-Reply-To=%3C200807311923.m6VJNINf008268%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26700 - haiku/trunk/src/system/kernel/cache">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Thu Jul 31 21:23:18 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010674.html">[Haiku-commits] r26699 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+        <LI>Next message: <A HREF="010676.html">[Haiku-commits] r26701 - haiku/trunk/headers/os/bluetooth/HCI
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10675">[ date ]</a>
+              <a href="thread.html#10675">[ thread ]</a>
+              <a href="subject.html#10675">[ subject ]</a>
+              <a href="author.html#10675">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-07-31 21:23:17 +0200 (Thu, 31 Jul 2008)
+New Revision: 26700
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26700&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26700&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/cache/file_cache.cpp
+Log:
+In cache_io(): Don't keep the cache locked while doing a
+user_{memcpy,memset}(), since that can cause a page fault, which needs
+pages and might try to steal some from our cache.
+
+
+Modified: haiku/trunk/src/system/kernel/cache/file_cache.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/cache/file_cache.cpp	2008-07-31 14:22:52 UTC (rev 26699)
++++ haiku/trunk/src/system/kernel/cache/file_cache.cpp	2008-07-31 19:23:17 UTC (rev 26700)
+@@ -626,39 +626,52 @@
+ 		}
+ 
+ 		size_t bytesInPage = min_c(size_t(B_PAGE_SIZE - pageOffset), bytesLeft);
+-		addr_t virtualAddress;
+ 
+ 		TRACE((&quot;lookup page from offset %Ld: %p, size = %lu, pageOffset &quot;
+ 			&quot;= %lu\n&quot;, offset, page, bytesLeft, pageOffset));
+ 
+ 		if (page != NULL) {
+-			vm_get_physical_page(page-&gt;physical_page_number * B_PAGE_SIZE,
+-				&amp;virtualAddress, PHYSICAL_PAGE_CAN_WAIT);
+-
+ 			// Since we don't actually map pages as part of an area, we have
+-			// to manually maintain its usage_count
++			// to manually maintain their usage_count
+ 			page-&gt;usage_count = 2;
+ 
+-			// and copy the contents of the page already in memory
+-			if (doWrite) {
+-				if (useBuffer) {
+-					user_memcpy((void *)(virtualAddress + pageOffset),
+-						(void *)buffer, bytesInPage);
+-				} else {
+-					user_memset((void *)(virtualAddress + pageOffset),
+-						0, bytesInPage);
++			if (doWrite || useBuffer) {
++				// Since the following user_mem{cpy,set}() might cause a page
++				// fault, which in turn might cause pages to be reserved, we
++				// need to unlock the cache temporarily to avoid a potential
++				// deadlock. To make sure that our page doesn't go away, we mark
++				// it busy for the time.
++				uint8 oldPageState = page-&gt;state;
++				page-&gt;state = PAGE_STATE_BUSY;
++				locker.Unlock();
++
++				addr_t virtualAddress;
++				vm_get_physical_page(page-&gt;physical_page_number * B_PAGE_SIZE,
++					&amp;virtualAddress, PHYSICAL_PAGE_CAN_WAIT);
++
++				// copy the contents of the page already in memory
++				if (doWrite) {
++					if (useBuffer) {
++						user_memcpy((void *)(virtualAddress + pageOffset),
++							(void *)buffer, bytesInPage);
++					} else {
++						user_memset((void *)(virtualAddress + pageOffset),
++							0, bytesInPage);
++					}
++				} else if (useBuffer) {
++					user_memcpy((void *)buffer,
++						(void *)(virtualAddress + pageOffset), bytesInPage);
+ 				}
+ 
+-				// make sure the page is in the modified list
+-				if (page-&gt;state != PAGE_STATE_MODIFIED)
++				vm_put_physical_page(virtualAddress);
++
++				locker.Lock();
++
++				page-&gt;state = oldPageState;
++				if (doWrite &amp;&amp; page-&gt;state != PAGE_STATE_MODIFIED)
+ 					vm_page_set_state(page, PAGE_STATE_MODIFIED);
+-			} else if (useBuffer) {
+-				user_memcpy((void *)buffer,
+-					(void *)(virtualAddress + pageOffset), bytesInPage);
+ 			}
+ 
+-			vm_put_physical_page(virtualAddress);
+-
+ 			if (bytesLeft &lt;= bytesInPage) {
+ 				// we've read the last page, so we're done!
+ 				locker.Unlock();
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010674.html">[Haiku-commits] r26699 -	haiku/trunk/src/system/kernel/device_manager
+</A></li>
+	<LI>Next message: <A HREF="010676.html">[Haiku-commits] r26701 - haiku/trunk/headers/os/bluetooth/HCI
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10675">[ date ]</a>
+              <a href="thread.html#10675">[ thread ]</a>
+              <a href="subject.html#10675">[ subject ]</a>
+              <a href="author.html#10675">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

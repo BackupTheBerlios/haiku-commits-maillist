@@ -1,0 +1,282 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r25218 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-April/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25218%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200804271814.m3RIE3bx029853%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008262.html">
+   <LINK REL="Next"  HREF="008274.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r25218 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp</H1>
+    <B>axeld at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r25218%20-%0A%09haiku/trunk/src/add-ons/kernel/network/protocols/tcp&In-Reply-To=%3C200804271814.m3RIE3bx029853%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r25218 -	haiku/trunk/src/add-ons/kernel/network/protocols/tcp">axeld at mail.berlios.de
+       </A><BR>
+    <I>Sun Apr 27 20:14:03 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008262.html">[Haiku-commits] r25217 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+        <LI>Next message: <A HREF="008274.html">[Haiku-commits] r25218 - haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8264">[ date ]</a>
+              <a href="thread.html#8264">[ thread ]</a>
+              <a href="subject.html#8264">[ subject ]</a>
+              <a href="author.html#8264">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: axeld
+Date: 2008-04-27 20:14:03 +0200 (Sun, 27 Apr 2008)
+New Revision: 25218
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=25218&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=25218&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
+   haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.h
+Log:
+* _BindToEphemeral() now remembers the last port it used, and tries a higher
+  one next. This should work around the problem Ingo observed with the OpenSSH
+  tests (not tested, though).
+* The only TCP compliant fix for this problem would be to not enter time wait
+  for local connections at all (which I will do soon).
+* Another work around other implementations use is to accept incoming
+  connections for time wait endpoints (the connection will then be replaced).
+  I'm not yet sure if I want that behaviour, though.
+* Added tracing for unbinding endpoints (with stack trace) to investigate
+  another bug (sometimes closed connections aren't actually closed).
+
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp	2008-04-27 17:17:20 UTC (rev 25217)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.cpp	2008-04-27 18:14:03 UTC (rev 25218)
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2006-2007, Haiku, Inc. All Rights Reserved.
++ * Copyright 2006-2008, Haiku, Inc. All Rights Reserved.
+  * Distributed under the terms of the MIT License.
+  *
+  * Authors:
+@@ -10,12 +10,14 @@
+ 
+ #include &quot;EndpointManager.h&quot;
+ 
++#include &lt;new&gt;
+ #include &lt;unistd.h&gt;
+ 
+ #include &lt;KernelExport.h&gt;
+ 
+ #include &lt;NetUtilities.h&gt;
+ #include &lt;util/AutoLock.h&gt;
++#include &lt;tracing.h&gt;
+ 
+ #include &quot;TCPEndpoint.h&quot;
+ 
+@@ -27,7 +29,50 @@
+ #	define TRACE(x)
+ #endif
+ 
++//#define ENDPOINT_TRACING
++#ifdef ENDPOINT_TRACING
++namespace EndpointTracing {
+ 
++class Unbind : public AbstractTraceEntry {
++	public:
++		Unbind(TCPEndpoint* endpoint)
++			:
++			fEndpoint(endpoint)
++		{
++			fStackTrace = capture_tracing_stack_trace(10, 0, false);
++
++			endpoint-&gt;LocalAddress().AsString(fLocal, sizeof(fLocal), true);
++			endpoint-&gt;PeerAddress().AsString(fPeer, sizeof(fPeer), true);
++			Initialized();
++		}
++
++		virtual void DumpStackTrace(TraceOutput&amp; out)
++		{
++			out.PrintStackTrace(fStackTrace);
++		}
++
++		virtual void AddDump(TraceOutput&amp; out)
++		{
++			out.Print(&quot;tcp:e:unbind: %p, local %s, peer %s&quot;
++				&quot;%lu&quot;, fEndpoint, fLocal, fPeer);
++		}
++
++	protected:
++		TCPEndpoint*	fEndpoint;
++		tracing_stack_trace* fStackTrace;
++		char			fLocal[32];
++		char			fPeer[32];
++};
++
++}	// namespace EndpointTracing
++
++#	define T(x)	new(std::nothrow) EndpointTracing::x
++
++#else
++#	define T(x)
++#endif	// ENDPOINT_TRACING
++
++
+ static const uint16 kLastReservedPort = 1023;
+ static const uint16 kFirstEphemeralPort = 40000;
+ 
+@@ -70,6 +115,9 @@
+ }
+ 
+ 
++//	#pragma mark -
++
++
+ size_t
+ EndpointHashDefinition::HashKey(uint16 port) const
+ {
+@@ -106,8 +154,14 @@
+ }
+ 
+ 
++//	#pragma mark -
++
++
+ EndpointManager::EndpointManager(net_domain *domain)
+-	: fDomain(domain), fConnectionHash(this)
++	:
++	fDomain(domain),
++	fConnectionHash(this),
++	fLastPort(kFirstEphemeralPort)
+ {
+ 	benaphore_init(&amp;fLock, &quot;endpoint manager&quot;);
+ }
+@@ -138,8 +192,7 @@
+ //	#pragma mark - connections
+ 
+ 
+-/*!
+-	Returns the endpoint matching the connection.
++/*!	Returns the endpoint matching the connection.
+ 	You must hold the manager's lock when calling this method.
+ */
+ TCPEndpoint *
+@@ -236,7 +289,7 @@
+ 		return endpoint;
+ 	}
+ 
+-	// no matching endpoint exists	
++	// no matching endpoint exists
+ 	TRACE((&quot;TCP: no matching endpoint!\n&quot;));
+ 
+ 	return NULL;
+@@ -310,28 +363,30 @@
+ {
+ 	TRACE((&quot;EndpointManager::BindToEphemeral(%p)\n&quot;, endpoint));
+ 
+-	uint32 max = kFirstEphemeralPort + 65536;
++	uint32 max = fLastPort + 65536;
+ 
+ 	for (int32 i = 1; i &lt; 5; i++) {
+ 		// try to retrieve a more or less random port
+-		uint32 counter = kFirstEphemeralPort;
+ 		uint32 step = i == 4 ? 1 : (system_time() &amp; 0x1f) + 1;
++		uint32 counter = fLastPort + step;
+ 
+ 		while (counter &lt; max) {
+ 			uint16 port = counter &amp; 0xffff;
+ 			if (port &lt;= kLastReservedPort)
+ 				port += kLastReservedPort;
+ 
++			fLastPort = port;
+ 			port = htons(port);
+ 
+ 			if (!fEndpointHash.Lookup(port).HasNext()) {
++				// found a port
+ 				SocketAddressStorage newAddress(AddressModule());
+ 				newAddress.SetTo(address);
+ 				newAddress.SetPort(port);
+ 
+-				// found a port
+-				TRACE((&quot;   EndpointManager::BindToEphemeral(%p) -&gt; %s\n&quot;, endpoint,
+-					AddressString(Domain(), *newAddress, true).Data()));
++				TRACE((&quot;   EndpointManager::BindToEphemeral(%p) -&gt; %s\n&quot;,
++					endpoint, AddressString(Domain(), *newAddress,
++					true).Data()));
+ 
+ 				return _Bind(endpoint, *newAddress);
+ 			}
+@@ -364,6 +419,7 @@
+ EndpointManager::Unbind(TCPEndpoint *endpoint)
+ {
+ 	TRACE((&quot;EndpointManager::Unbind(%p)\n&quot;, endpoint));
++	T(Unbind(endpoint));
+ 
+ 	if (endpoint == NULL || !endpoint-&gt;IsBound()) {
+ 		TRACE((&quot;  endpoint is unbound.\n&quot;));
+@@ -429,10 +485,10 @@
+ 	kprintf(&quot;%10s %20s %20s %8s %8s %12s\n&quot;, &quot;address&quot;, &quot;local&quot;, &quot;peer&quot;,
+ 		&quot;recv-q&quot;, &quot;send-q&quot;, &quot;state&quot;);
+ 
+-	ConnectionTable::Iterator it = fConnectionHash.GetIterator();
++	ConnectionTable::Iterator iterator = fConnectionHash.GetIterator();
+ 
+-	while (it.HasNext()) {
+-		TCPEndpoint *endpoint = it.Next();
++	while (iterator.HasNext()) {
++		TCPEndpoint *endpoint = iterator.Next();
+ 
+ 		char localBuf[64], peerBuf[64];
+ 		endpoint-&gt;LocalAddress().AsString(localBuf, sizeof(localBuf), true);
+
+Modified: haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.h
+===================================================================
+--- haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.h	2008-04-27 17:17:20 UTC (rev 25217)
++++ haiku/trunk/src/add-ons/kernel/network/protocols/tcp/EndpointManager.h	2008-04-27 18:14:03 UTC (rev 25218)
+@@ -101,9 +101,10 @@
+ 		typedef OpenHashTable&lt;ConnectionHashDefinition&gt; ConnectionTable;
+ 		typedef MultiHashTable&lt;EndpointHashDefinition&gt; EndpointTable;
+ 
+-		ConnectionTable fConnectionHash;
+-		EndpointTable fEndpointHash;
+-		benaphore fLock;
++		ConnectionTable	fConnectionHash;
++		EndpointTable	fEndpointHash;
++		uint16			fLastPort;
++		benaphore		fLock;
+ };
+ 
+ #endif	// ENDPOINT_MANAGER_H
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008262.html">[Haiku-commits] r25217 -	haiku/trunk/src/add-ons/kernel/network/stack
+</A></li>
+	<LI>Next message: <A HREF="008274.html">[Haiku-commits] r25218 - haiku/trunk/src/add-ons/kernel/network/protocols/tcp
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8264">[ date ]</a>
+              <a href="thread.html#8264">[ thread ]</a>
+              <a href="subject.html#8264">[ subject ]</a>
+              <a href="author.html#8264">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

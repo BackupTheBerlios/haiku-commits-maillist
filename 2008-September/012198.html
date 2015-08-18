@@ -1,0 +1,175 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r27757 - in haiku/trunk/src/system/kernel: .	arch/x86 vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-September/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27757%20-%20in%20haiku/trunk/src/system/kernel%3A%20.%0A%09arch/x86%20vm&In-Reply-To=%3C200809271408.m8RE8EdF028297%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012197.html">
+   <LINK REL="Next"  HREF="012200.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r27757 - in haiku/trunk/src/system/kernel: .	arch/x86 vm</H1>
+    <B>bonefish at BerliOS</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r27757%20-%20in%20haiku/trunk/src/system/kernel%3A%20.%0A%09arch/x86%20vm&In-Reply-To=%3C200809271408.m8RE8EdF028297%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r27757 - in haiku/trunk/src/system/kernel: .	arch/x86 vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Sat Sep 27 16:08:14 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012197.html">[Haiku-commits] r27756 -	haiku/trunk/src/add-ons/kernel/file_systems/googlefs
+</A></li>
+        <LI>Next message: <A HREF="012200.html">[Haiku-commits] r27758 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12198">[ date ]</a>
+              <a href="thread.html#12198">[ thread ]</a>
+              <a href="subject.html#12198">[ subject ]</a>
+              <a href="author.html#12198">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-09-27 16:08:13 +0200 (Sat, 27 Sep 2008)
+New Revision: 27757
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=27757&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=27757&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/arch/x86/arch_int.c
+   haiku/trunk/src/system/kernel/signal.cpp
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+Changed the handling for hardware-caused terminal signals:
+* No longer send a SIGKILL when a page fault occurred, there was no
+  signal handler, and the debugger told us to continue as usual. Instead
+  we send a SIGSEGV. Instead in handle_signal() when not in the main
+  thread and there's no handler for the signal, we first send the main
+  thread a SIGKILL before letting the thread die.
+  So in cases where the main thread caused an unhandled page fault, the
+  team will die from the SIGSEGV, now. This fixes bug #2773. 
+* For the other hardware-caused signals we do now do the same as in case
+  of page faults, i.e. we first check whether the thread has a handler
+  for the signal in question. If so, we don't notify the debugger, but
+  send the signal right away.
+* B_GENERAL_PROTECTION_FAULT is translated to SIGILL now. Seems better
+  than SIGKILL.
+
+
+Modified: haiku/trunk/src/system/kernel/arch/x86/arch_int.c
+===================================================================
+--- haiku/trunk/src/system/kernel/arch/x86/arch_int.c	2008-09-27 01:04:05 UTC (rev 27756)
++++ haiku/trunk/src/system/kernel/arch/x86/arch_int.c	2008-09-27 14:08:13 UTC (rev 27757)
+@@ -756,7 +756,7 @@
+ 
+ 		case 13: 	// General Protection Exception (#GP)
+ 			type = B_GENERAL_PROTECTION_FAULT;
+-			signal = SIGKILL;
++			signal = SIGILL;
+ 			break;
+ 
+ 		case 16: 	// x87 FPU Floating-Point Error (#MF)
+@@ -780,9 +780,18 @@
+ 	}
+ 
+ 	if (IFRAME_IS_USER(frame)) {
++		struct sigaction action;
++		struct thread* thread = thread_get_current_thread();
++
+ 		enable_interrupts();
+ 
+-		if (user_debug_exception_occurred(type, signal))
++		// If the thread has a signal handler for the signal, we simply send it
++		// the signal. Otherwise we notify the user debugger first.
++		if (sigaction(signal, NULL, &amp;action) == 0
++			&amp;&amp; action.sa_handler != SIG_DFL
++			&amp;&amp; action.sa_handler != SIG_IGN) {
++			send_signal(thread-&gt;id, SIGSEGV);
++		} else if (user_debug_exception_occurred(type, signal))
+ 			send_signal(team_get_current_team_id(), signal);
+ 	} else {
+ 		char name[32];
+
+Modified: haiku/trunk/src/system/kernel/signal.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/signal.cpp	2008-09-27 01:04:05 UTC (rev 27756)
++++ haiku/trunk/src/system/kernel/signal.cpp	2008-09-27 14:08:13 UTC (rev 27757)
+@@ -383,12 +383,18 @@
+ 
+ 					return true;
+ 
+-				case SIGQUIT:
++				case SIGSEGV:
++				case SIGFPE:
+ 				case SIGILL:
+ 				case SIGTRAP:
++					// If this is the main thread, we just fall through and let
++					// this signal kill the team. Otherwise we send a SIGKILL to
++					// the main thread first, since the signal will kill this
++					// thread only.
++					if (thread != thread-&gt;team-&gt;main_thread)
++						send_signal(thread-&gt;team-&gt;main_thread-&gt;id, SIGKILL);
++				case SIGQUIT:
+ 				case SIGABRT:
+-				case SIGFPE:
+-				case SIGSEGV:
+ 				case SIGPOLL:
+ 				case SIGPROF:
+ 				case SIGSYS:
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2008-09-27 01:04:05 UTC (rev 27756)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2008-09-27 14:08:13 UTC (rev 27757)
+@@ -4288,9 +4288,9 @@
+ 			// TODO: the fault_callback is a temporary solution for vm86
+ 			if (thread-&gt;fault_callback == NULL
+ 				|| thread-&gt;fault_callback(address, faultAddress, isWrite)) {
+-				// If the thread has a signal handler for SIGSEGV we simply send
+-				// it the signal. Otherwise we notify the user debugger. If
+-				// anything goes wrong, we kill the team.
++				// If the thread has a signal handler for SIGSEGV, we simply
++				// send it the signal. Otherwise we notify the user debugger
++				// first.
+ 				struct sigaction action;
+ 				if (sigaction(SIGSEGV, NULL, &amp;action) == 0
+ 					&amp;&amp; action.sa_handler != SIG_DFL
+@@ -4298,7 +4298,7 @@
+ 					send_signal(thread-&gt;id, SIGSEGV);
+ 				} else if (user_debug_exception_occurred(B_SEGMENT_VIOLATION,
+ 						SIGSEGV)) {
+-					send_signal(team_get_current_team_id(), SIGKILL);
++					send_signal(thread-&gt;id, SIGSEGV);
+ 				}
+ 			}
+ 		}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012197.html">[Haiku-commits] r27756 -	haiku/trunk/src/add-ons/kernel/file_systems/googlefs
+</A></li>
+	<LI>Next message: <A HREF="012200.html">[Haiku-commits] r27758 - haiku/trunk/src/system/kernel
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12198">[ date ]</a>
+              <a href="thread.html#12198">[ thread ]</a>
+              <a href="subject.html#12198">[ subject ]</a>
+              <a href="author.html#12198">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>

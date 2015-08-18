@@ -1,0 +1,288 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Haiku-commits] r26628 - haiku/trunk/src/system/kernel/vm
+   </TITLE>
+   <LINK REL="Index" HREF="http://lists.berlios.de/pipermail/haiku-commits/2008-July/index.html" >
+   <LINK REL="made" HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26628%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200807251205.m6PC5q3s002714%40sheep.berlios.de%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010574.html">
+   <LINK REL="Next"  HREF="010577.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Haiku-commits] r26628 - haiku/trunk/src/system/kernel/vm</H1>
+    <B>bonefish at mail.berlios.de</B> 
+    <A HREF="mailto:haiku-commits%40lists.berlios.de?Subject=Re%3A%20%5BHaiku-commits%5D%20r26628%20-%20haiku/trunk/src/system/kernel/vm&In-Reply-To=%3C200807251205.m6PC5q3s002714%40sheep.berlios.de%3E"
+       TITLE="[Haiku-commits] r26628 - haiku/trunk/src/system/kernel/vm">bonefish at mail.berlios.de
+       </A><BR>
+    <I>Fri Jul 25 14:05:52 CEST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010574.html">[Haiku-commits] r26627 - in haiku/trunk:	headers/private/kernel/arch/m68k src/system/boot/platform/atari_m68k	src/system/kernel/arch/m68k src/system/kernel/platform/atari_m68k
+</A></li>
+        <LI>Next message: <A HREF="010577.html">[Haiku-commits] r26629 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10576">[ date ]</a>
+              <a href="thread.html#10576">[ thread ]</a>
+              <a href="subject.html#10576">[ subject ]</a>
+              <a href="author.html#10576">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: bonefish
+Date: 2008-07-25 14:05:51 +0200 (Fri, 25 Jul 2008)
+New Revision: 26628
+ViewCVS: <A HREF="http://svn.berlios.de/viewcvs/haiku?rev=26628&amp;view=rev">http://svn.berlios.de/viewcvs/haiku?rev=26628&amp;view=rev</A>
+
+Modified:
+   haiku/trunk/src/system/kernel/vm/vm.cpp
+Log:
+* Added &quot;boolean getNewReference&quot; parameter to the vm_address_space*
+  versions of the AddressSpaceReadLocker constructor and SetTo(). When
+  true it will get a new reference to the address space.
+* Changed vm_soft_fault(): Now it gets the address space as a
+  parameter (for page faults getting it happens in vm_page_fault()).
+  This should fix lock_memory_etc() for other teams -- it used the
+  correct address space before, but the invoked vm_soft_fault() always
+  used the current team's address space.
+
+
+Modified: haiku/trunk/src/system/kernel/vm/vm.cpp
+===================================================================
+--- haiku/trunk/src/system/kernel/vm/vm.cpp	2008-07-25 00:25:27 UTC (rev 26627)
++++ haiku/trunk/src/system/kernel/vm/vm.cpp	2008-07-25 12:05:51 UTC (rev 26628)
+@@ -64,12 +64,12 @@
+ class AddressSpaceReadLocker {
+ public:
+ 	AddressSpaceReadLocker(team_id team);
+-	AddressSpaceReadLocker(vm_address_space* space);
++	AddressSpaceReadLocker(vm_address_space* space, bool getNewReference);
+ 	AddressSpaceReadLocker();
+ 	~AddressSpaceReadLocker();
+ 
+ 	status_t SetTo(team_id team);
+-	void SetTo(vm_address_space* space);
++	void SetTo(vm_address_space* space, bool getNewReference);
+ 	status_t SetFromArea(area_id areaID, vm_area*&amp; area);
+ 
+ 	bool IsLocked() const { return fLocked; }
+@@ -212,7 +212,8 @@
+ // function declarations
+ static void delete_area(vm_address_space *addressSpace, vm_area *area);
+ static vm_address_space *get_address_space_by_area_id(area_id id);
+-static status_t vm_soft_fault(addr_t address, bool isWrite, bool isUser);
++static status_t vm_soft_fault(vm_address_space *addressSpace, addr_t address,
++	bool isWrite, bool isUser);
+ static status_t map_backing_store(vm_address_space *addressSpace,
+ 	vm_cache *cache, void **_virtualAddress, off_t offset, addr_t size,
+ 	uint32 addressSpec, int wiring, int protection, int mapping,
+@@ -231,13 +232,16 @@
+ }
+ 
+ 
+-//! Takes over the reference of the address space
+-AddressSpaceReadLocker::AddressSpaceReadLocker(vm_address_space* space)
++/*! Takes over the reference of the address space, if \a getNewReference is
++	\c false.
++*/
++AddressSpaceReadLocker::AddressSpaceReadLocker(vm_address_space* space,
++		bool getNewReference)
+ 	:
+ 	fSpace(NULL),
+ 	fLocked(false)
+ {
+-	SetTo(space);
++	SetTo(space, getNewReference);
+ }
+ 
+ 
+@@ -277,11 +281,17 @@
+ }
+ 
+ 
+-//! Takes over the reference of the address space
++/*! Takes over the reference of the address space, if \a getNewReference is
++	\c false.
++*/
+ void
+-AddressSpaceReadLocker::SetTo(vm_address_space* space)
++AddressSpaceReadLocker::SetTo(vm_address_space* space, bool getNewReference)
+ {
+ 	fSpace = space;
++
++	if (getNewReference)
++		atomic_add(&amp;fSpace-&gt;ref_count, 1);
++
+ 	rw_lock_read_lock(&amp;fSpace-&gt;lock);
+ 	fLocked = true;
+ }
+@@ -3965,7 +3975,38 @@
+ 
+ 	*newIP = 0;
+ 
+-	status_t status = vm_soft_fault(address, isWrite, isUser);
++	addr_t pageAddress = ROUNDOWN(address, B_PAGE_SIZE);
++
++	status_t status = B_OK;
++
++	vm_address_space *addressSpace;
++
++	if (IS_KERNEL_ADDRESS(pageAddress)) {
++		addressSpace = vm_get_kernel_address_space();
++	} else if (IS_USER_ADDRESS(pageAddress)) {
++		addressSpace = vm_get_current_user_address_space();
++		if (addressSpace == NULL) {
++			if (!isUser) {
++				dprintf(&quot;vm_page_fault: kernel thread accessing invalid user &quot;
++					&quot;memory!\n&quot;);
++				status = B_BAD_ADDRESS;
++			} else {
++				// XXX weird state.
++				panic(&quot;vm_page_fault: non kernel thread accessing user memory &quot;
++					&quot;that doesn't exist!\n&quot;);
++				status = B_BAD_ADDRESS;
++			}
++		}
++	} else {
++		// the hit was probably in the 64k DMZ between kernel and user space
++		// this keeps a user space thread from passing a buffer that crosses
++		// into kernel space
++		status = B_BAD_ADDRESS;
++	}
++
++	if (status == B_OK)
++		status = vm_soft_fault(addressSpace, pageAddress, isWrite, isUser);
++
+ 	if (status &lt; B_OK) {
+ 		dprintf(&quot;vm_page_fault: vm_soft_fault returned error '%s' on fault at 0x%lx, ip 0x%lx, write %d, user %d, thread 0x%lx\n&quot;,
+ 			strerror(status), address, faultAddress, isWrite, isUser,
+@@ -3984,17 +4025,16 @@
+ 			}
+ 		} else {
+ #if 1
+-			// ToDo: remove me once we have proper userland debugging support (and tools)
+-			vm_address_space *addressSpace = vm_get_current_user_address_space();
+-			vm_area *area;
++			rw_lock_read_lock(&amp;addressSpace-&gt;lock);
+ 
+-			rw_lock_read_lock(&amp;addressSpace-&gt;lock);
++			// TODO: remove me once we have proper userland debugging support
++			// (and tools)
++			vm_area *area = vm_area_lookup(addressSpace, faultAddress);
++
+ // TODO: The user_memcpy() below can cause a deadlock, if it causes a page
+ // fault and someone is already waiting for a write lock on the same address
+ // space. This thread will then try to acquire the semaphore again and will
+ // be queued after the writer.
+-			area = vm_area_lookup(addressSpace, faultAddress);
+-
+ 			dprintf(&quot;vm_page_fault: sending team \&quot;%s\&quot; 0x%lx SIGSEGV, ip %#lx (\&quot;%s\&quot; +%#lx)\n&quot;,
+ 				thread_get_current_thread()-&gt;team-&gt;name,
+ 				thread_get_current_thread()-&gt;team-&gt;id, faultAddress,
+@@ -4051,8 +4091,8 @@
+ #endif	// 0 (stack trace)
+ 
+ 			rw_lock_read_unlock(&amp;addressSpace-&gt;lock);
+-			vm_put_address_space(addressSpace);
+ #endif
++
+ 			struct thread *thread = thread_get_current_thread();
+ 			// TODO: the fault_callback is a temporary solution for vm86
+ 			if (thread-&gt;fault_callback == NULL
+@@ -4063,6 +4103,8 @@
+ 		}
+ 	}
+ 
++	vm_put_address_space(addressSpace);
++
+ 	return B_HANDLED_INTERRUPT;
+ }
+ 
+@@ -4448,41 +4490,20 @@
+ 
+ 
+ static status_t
+-vm_soft_fault(addr_t originalAddress, bool isWrite, bool isUser)
++vm_soft_fault(vm_address_space *addressSpace, addr_t originalAddress,
++	bool isWrite, bool isUser)
+ {
+-	vm_address_space *addressSpace;
+-
+ 	FTRACE((&quot;vm_soft_fault: thid 0x%lx address 0x%lx, isWrite %d, isUser %d\n&quot;,
+ 		thread_get_current_thread_id(), originalAddress, isWrite, isUser));
+ 
+-	addr_t address = ROUNDOWN(originalAddress, B_PAGE_SIZE);
++	AddressSpaceReadLocker locker(addressSpace, true);
+ 
+-	if (IS_KERNEL_ADDRESS(address)) {
+-		addressSpace = vm_get_kernel_address_space();
+-	} else if (IS_USER_ADDRESS(address)) {
+-		addressSpace = vm_get_current_user_address_space();
+-		if (addressSpace == NULL) {
+-			if (!isUser) {
+-				dprintf(&quot;vm_soft_fault: kernel thread accessing invalid user memory!\n&quot;);
+-				return B_BAD_ADDRESS;
+-			} else {
+-				// XXX weird state.
+-				panic(&quot;vm_soft_fault: non kernel thread accessing user memory that doesn't exist!\n&quot;);
+-			}
+-		}
+-	} else {
+-		// the hit was probably in the 64k DMZ between kernel and user space
+-		// this keeps a user space thread from passing a buffer that crosses
+-		// into kernel space
+-		return B_BAD_ADDRESS;
+-	}
+-
+-	AddressSpaceReadLocker locker(addressSpace);
+-
+ 	atomic_add(&amp;addressSpace-&gt;fault_count, 1);
+ 
+ 	// Get the area the fault was in
+ 
++	addr_t address = ROUNDOWN(originalAddress, B_PAGE_SIZE);
++
+ 	vm_area *area = vm_area_lookup(addressSpace, address);
+ 	if (area == NULL) {
+ 		dprintf(&quot;vm_soft_fault: va 0x%lx not covered by area in address space\n&quot;,
+@@ -5000,7 +5021,8 @@
+ 			}
+ 		}
+ 
+-		status = vm_soft_fault(base, (flags &amp; B_READ_DEVICE) != 0, isUser);
++		status = vm_soft_fault(addressSpace, base, (flags &amp; B_READ_DEVICE) != 0,
++			isUser);
+ 		if (status != B_OK)	{
+ 			dprintf(&quot;lock_memory(address = %p, numBytes = %lu, flags = %lu) failed: %s\n&quot;,
+ 				(void *)unalignedBase, numBytes, flags, strerror(status));
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010574.html">[Haiku-commits] r26627 - in haiku/trunk:	headers/private/kernel/arch/m68k src/system/boot/platform/atari_m68k	src/system/kernel/arch/m68k src/system/kernel/platform/atari_m68k
+</A></li>
+	<LI>Next message: <A HREF="010577.html">[Haiku-commits] r26629 - haiku/trunk/src/system/kernel/vm
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10576">[ date ]</a>
+              <a href="thread.html#10576">[ thread ]</a>
+              <a href="subject.html#10576">[ subject ]</a>
+              <a href="author.html#10576">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://lists.berlios.de/mailman/listinfo/haiku-commits">More information about the Haiku-commits
+mailing list</a><br>
+</body></html>
